@@ -23,6 +23,12 @@ description: Create new agent skills with proper structure, progressive disclosu
    - Anything missing or unclear?
    - Should any section be more/less detailed?
 
+4. **Install** - place the skill where Claude Code can find it:
+   - Write the skill to `~/Code/agent-skills/<skill-name>/`
+   - Symlink it into Claude Code's skills dir:
+     `ln -s ~/Code/agent-skills/<skill-name> ~/.claude/skills/<skill-name>`
+   - If `~/.claude/skills` is itself a symlink to `~/Code/agent-skills`, the per-skill symlink is unnecessary — the skill is already visible.
+
 ## Skill Structure
 
 ```
