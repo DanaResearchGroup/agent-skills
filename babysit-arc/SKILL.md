@@ -67,10 +67,16 @@ ARC/RMG checkout → restart from the instance dir (ARC resumes from `restart.ym
 budget (3)**, then mark `blocked`/`crashed` and **continue with the others** (one bad instance never
 stalls the pool).
 
-- **Code fixes stay UNSTAGED — never `git add`/`git commit`.** Leave the edit in the working tree and
-  record it in a **per-project `FIXES.md`**: bug, root cause, the diff/solution, files touched,
-  timestamp. **Do not auto-edit the vault note** (Alon promotes confirmed learnings to the vault
-  manually). Re-apply such uncommitted fixes after a fresh checkout.
+- **Record fixes by scope — code stays UNSTAGED (never `git add`/`git commit`):**
+  - **Per-run fix** (one crash's diff in this campaign): leave the code edit **unstaged** in the
+    working tree and log it in a **per-project `FIXES.md`** (bug, root cause, diff/solution, files
+    touched, timestamp). Re-apply uncommitted code fixes after a fresh checkout.
+  - **Validated, generalizable learning** (a genuinely new failure mode + fix, or a confirmed
+    config/queue/LOT gotcha): **consolidate it into the vault** per the runbook — **merge and
+    integrate into the relevant existing section, don't append duplicates; confirmed-only, never
+    speculation.** Put OL/zeus-environment issues in `Code/ARC/ARC on OL — Zeus Troubleshooting &
+    Knowledge.md` (its newest-at-top log) and general ARC/RMG code/failure-mode learnings in
+    `knowledge/wiki/Running ARC On Zeus.md` (§4–5 bug catalog). This vault update is silent (no Slack).
 
 ## Success criteria — scientific correctness is the bar
 Mark an instance `processed` only when the result exists **and** is scientifically sane (per the
