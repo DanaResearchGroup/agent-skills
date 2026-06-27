@@ -4,6 +4,7 @@
 [![Claude Code](https://img.shields.io/badge/Claude%20Code-skills-8A2BE2)](https://docs.anthropic.com/en/docs/claude-code)
 [![skills](https://img.shields.io/badge/skills-20-blue)](#whats-in-here)
 [![secret scan](https://img.shields.io/badge/secret%20scan-gitleaks-success)](.github/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Personal [Claude Code](https://docs.anthropic.com/en/docs/claude-code) skills for our
 research group. A skill is a Markdown playbook (`<skill>/SKILL.md`) that Claude Code loads
@@ -100,6 +101,27 @@ Verify with `/plugin` — you should see `superpowers` enabled. Full docs:
 
 Plus **gstack** (installed in step 3) and the **Superpowers** plugin (step 4).
 
+## Other agents (Codex, Copilot CLI, Gemini)
+
+The skills here are **agent-agnostic in format**: a `<skill>/SKILL.md` with `name`/`description`
+frontmatter is loaded natively by Claude Code, OpenAI Codex, Copilot CLI, and Gemini CLI alike.
+What changes per agent is **where you symlink the repo**:
+
+| Agent | Skills directory (symlink target for step 1) |
+| --- | --- |
+| Claude Code | `~/.claude/skills` |
+| Codex | `~/.codex/skills` (or the shared `~/.agents/skills`) |
+| Copilot CLI / Gemini CLI | `~/.agents/skills` (shared cross-runtime path) |
+
+So on Codex, do step 1 as `ln -s ~/Code/agent-skills ~/.codex/skills` instead. Caveats:
+
+- The **Slack** and **babysit** skills hard-code `~/.claude/...` paths — adapt them to your
+  agent's home (e.g. `~/.codex`) per [ADAPTATION.md](ADAPTATION.md).
+- **gstack** (step 3) is Claude-Code-specific — skip it on other agents.
+- **Superpowers** (step 4) ships its own Codex/Copilot/Gemini install — see
+  [its docs](https://github.com/obra/superpowers).
+- Skills that dispatch sub-agents need Codex's multi-agent tools enabled in `~/.codex/config.toml`.
+
 ## Maintaining this repo
 
 - **Lint locally before pushing:** `python3 bin/lint-skills.py` (also runs in CI on every PR).
@@ -109,4 +131,4 @@ Plus **gstack** (installed in step 3) and the **Superpowers** plugin (step 4).
 
 ## License
 
-No license yet — internal group use. Ask before redistributing.
+[MIT](LICENSE) © 2026 Alon Grinberg Dana.
