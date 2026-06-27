@@ -15,6 +15,10 @@ __pycache__/
 # Superpowers working files must never be tracked (global rule)
 docs/superpowers/
 
+# Externally-managed marketplace plugins installed into this skills dir
+# (their own repos — install/update from their marketplaces, don't vendor here)
+ui-ux-pro-max-skill/
+
 # ── gstack ──────────────────────────────────────────────────────────────
 # gstack is installed separately (README step 3) into this dir; its skills
 # sync into the top-level folders below. None of it belongs in this repo.
