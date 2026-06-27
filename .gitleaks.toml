@@ -1,0 +1,16 @@
+# gitleaks config for the secret-scan CI job.
+# Extends the default ruleset; only adds allowlist entries for known-safe docs.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Documentation placeholders that are not real secrets"
+# SETUP.md shows the Slack bot-token shape as `xoxb-…` / `xoxb-...` placeholders,
+# never a real token. Allow only the ellipsis placeholder forms, not real tokens
+# (real ones have the numeric/alphanumeric structure after `xoxb-`).
+regexes = [
+  '''xoxb-[.…]+''',
+]
+paths = [
+  '''SETUP\.md''',
+]
