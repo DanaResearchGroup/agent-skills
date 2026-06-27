@@ -1,0 +1,81 @@
+# Secrets & local config (never commit) — see SETUP.md
+.slack-bot-token
+*.token
+settings.local.json
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+
+# Python
+__pycache__/
+*.pyc
+
+# Superpowers working files must never be tracked (global rule)
+docs/superpowers/
+
+# Externally-managed marketplace plugins installed into this skills dir
+# (their own repos — install/update from their marketplaces, don't vendor here)
+ui-ux-pro-max-skill/
+
+# ── gstack ──────────────────────────────────────────────────────────────
+# gstack is installed separately (README step 3) into this dir; its skills
+# sync into the top-level folders below. None of it belongs in this repo.
+# If gstack adds new skills, append them here (or regenerate this block).
+gstack/
+_gstack-command/
+autoplan/
+benchmark/
+benchmark-models/
+browse/
+canary/
+careful/
+codex/
+connect-chrome/
+context-restore/
+context-save/
+cso/
+design-consultation/
+design-html/
+design-review/
+design-shotgun/
+devex-review/
+diagram/
+document-generate/
+document-release/
+freeze/
+gstack-upgrade/
+guard/
+health/
+investigate/
+ios-clean/
+ios-design-review/
+ios-fix/
+ios-qa/
+ios-sync/
+land-and-deploy/
+landing-report/
+learn/
+make-pdf/
+office-hours/
+open-gstack-browser/
+pair-agent/
+plan-ceo-review/
+plan-design-review/
+plan-devex-review/
+plan-eng-review/
+plan-tune/
+qa/
+qa-only/
+retro/
+review/
+scrape/
+setup-browser-cookies/
+setup-deploy/
+setup-gbrain/
+ship/
+skillify/
+spec/
+sync-gbrain/
+unfreeze/
