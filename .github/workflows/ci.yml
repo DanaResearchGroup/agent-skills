@@ -28,3 +28,5 @@ jobs:
         uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Explicit so the repo allowlist applies regardless of auto-detection.
+          GITLEAKS_CONFIG: ${{ github.workspace }}/.gitleaks.toml
