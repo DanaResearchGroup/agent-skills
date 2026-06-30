@@ -62,7 +62,8 @@ Merge into `~/.claude/settings.json` (not in this repo):
   }
 }
 ```
-Replace `USER` with your actual home path.
+Replace `/home/USER` with your actual absolute home path (for example,
+`/Users/alice` on macOS).
 
 ### 4. Verify
 Open a Claude Code session and say *"use slack-notify to send a test ping"*.
@@ -79,11 +80,15 @@ The sender (`bin/cc-slack-post.py`) reads:
 
 ## Portability note
 
-The `slack-ask` / `slack-notify` skills and the allow-rule reference the absolute
-path `/home/alon/.claude/bin/cc-slack-post.py`. On a machine with a different home
-(different username, or macOS `/Users/...`), update that path in:
-- `slack-ask/SKILL.md` and `slack-notify/SKILL.md`
-- the allow-rule in `~/.claude/settings.json`
+The `slack-ask` / `slack-notify` skills call
+`$HOME/.claude/bin/cc-slack-post.py`; the shell expands `$HOME`, so those repo
+files usually need no per-user path edits.
+
+The allow-rule in `~/.claude/settings.json` is different: use the literal
+absolute helper path, such as
+`Bash(/home/alice/.claude/bin/cc-slack-post.py:*)` or
+`Bash(/Users/alice/.claude/bin/cc-slack-post.py:*)`. Permission allow-rules do
+not expand `$HOME`.
 
 ## What is NOT in this repo (by design)
 

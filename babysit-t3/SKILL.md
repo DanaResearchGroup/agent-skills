@@ -140,7 +140,7 @@ relaunch every non-terminal campaign (T3 self-resumes), verify resumed iteration
 
 ## Slack policy — minimal, high-signal (every message means "needs me")
 Invoke the existing **`slack-ask`** / **`slack-notify`** skills (they post as the bot via
-`/home/alon/.claude/bin/cc-slack-post.py` to `#cc-comm`). Send Slack **only** in these cases:
+`$HOME/.claude/bin/cc-slack-post.py` to `#cc-comm`). Send Slack **only** in these cases:
 1. **Real blocker → `slack-ask`** (pause + wait): zeus unreachable, broken settings/branches/envs, a
    failure surviving the fix→relaunch budget, T3 restarting from scratch instead of resuming, disk/
    quota exhaustion, an ambiguous result you can't safely accept or reject.  Record in `STATUS.md`

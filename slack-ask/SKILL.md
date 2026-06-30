@@ -16,10 +16,12 @@ also asking.
 ## Config
 
 - **Channel**: `#cc-comm` → `channel_id` = `C0B993YLDPT` (stable across machines).
-- **Send helper**: `/home/alon/.claude/bin/cc-slack-post.py "<message>" [thread_ts]`
+- **Send helper**: `$HOME/.claude/bin/cc-slack-post.py "<message>" [thread_ts]`
   — posts as the bot (reads the bot token from `~/.claude/.slack-bot-token`),
   prints `OK` then the message `ts`. It's allowlisted in settings.json, so it
-  runs without a permission prompt (unattended-safe). Do **not** use inline
+  runs without a permission prompt (unattended-safe). The command may use
+  `$HOME`, but the `~/.claude/settings.json` allow-rule must use the literal
+  absolute helper path. Do **not** use inline
   `curl` with heredocs — that trips the "expansion obfuscation" guard and prompts.
 - **Human user id**: `U01FB823VSR` (Alon). Only a reply from this user (not the
   bot, not yourself) counts as the answer.
@@ -35,7 +37,7 @@ also asking.
    helper via Bash (mind shell quoting; the message uses Slack mrkdwn —
    `*bold*`, `_italic_`, `` `code` ``, `\n` for newlines):
    ```bash
-   /home/alon/.claude/bin/cc-slack-post.py "❓ *<machine>* needs input — \`<task>\`
+   $HOME/.claude/bin/cc-slack-post.py "❓ *<machine>* needs input — \`<task>\`
    <cwd>
 
    <your question, with concrete options if it's a choice>
@@ -73,7 +75,7 @@ also asking.
 4. **Acknowledge and continue.** Post a short threaded confirmation by passing
    the root `ts` as the second arg, then use the answer to proceed:
    ```bash
-   /home/alon/.claude/bin/cc-slack-post.py "✅ Got it — continuing." "<ts>"
+   $HOME/.claude/bin/cc-slack-post.py "✅ Got it — continuing." "<ts>"
    ```
 
 ## Notes
@@ -82,6 +84,6 @@ also asking.
   root `ts` again) rather than starting a new message.
 - Never treat your own/bot messages as the answer — filter strictly on
   `user == U01FB823VSR`.
-- On a machine with a different home dir, adjust the helper path here and the
-  matching allow-rule in `settings.json`.
+- On a machine with a different home dir, keep `$HOME` here and update only the
+  matching allow-rule in `settings.json` to the literal absolute helper path.
 - For a one-way notification that needs no reply, use the `slack-notify` skill.
