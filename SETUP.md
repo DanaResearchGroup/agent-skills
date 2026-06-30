@@ -5,6 +5,28 @@ Personal Claude Code skills. Most skills are self-contained — clone, symlink i
 a little extra per-machine wiring (a bot token + an allowlist) so they can notify
 you and run unattended.
 
+## New member — Claude Code only (start here)
+
+The minimal path to mirror the environment. Skips Codex, Slack, and MCP for now
+(see [DRGScripts/onboarding/ONBOARDING.md](https://github.com/DanaResearchGroup/DRGScripts/blob/main/onboarding/ONBOARDING.md)
+for the full guided runbook your Claude Code can execute).
+
+```bash
+# 1. Clone (not fork) into ~/Code
+git clone https://github.com/alongd/agent-skills ~/Code/agent-skills
+
+# 2. Make it your Claude Code skills dir
+ln -s ~/Code/agent-skills ~/.claude/skills
+
+# 3. Wire the context-% status line in ~/.claude/settings.json:
+#      "statusLine": { "type": "command",
+#        "command": "<absolute path to>/agent-skills/bin/cc-statusline.sh" }
+chmod +x ~/Code/agent-skills/bin/cc-statusline.sh
+```
+
+Updates later: see [UPDATING.md](./UPDATING.md) (or tell Claude Code "update my
+agent-skills"). That is all the non-Slack skills need.
+
 ## Quick start (any machine)
 
 ```bash
