@@ -15,9 +15,11 @@ identity is what actually triggers a notification.
 ## Config
 
 - **Channel**: `#cc-comm` → `channel_id` = `C0B993YLDPT`.
-- **Send helper**: `/home/alon/.claude/bin/cc-slack-post.py "<message>"`
+- **Send helper**: `$HOME/.claude/bin/cc-slack-post.py "<message>"`
   — posts as the bot (token from `~/.claude/.slack-bot-token`), allowlisted so it
-  runs without a prompt. To DM instead of the channel, set
+  runs without a prompt. The command may use `$HOME`, but the
+  `~/.claude/settings.json` allow-rule must use the literal absolute helper path.
+  To DM instead of the channel, set
   `CC_SLACK_CHANNEL=U01FB823VSR` in the environment for the call.
 
 ## Procedure
@@ -25,7 +27,7 @@ identity is what actually triggers a notification.
 1. Run `hostname` so the message says which machine it came from.
 2. Send via Bash:
    ```bash
-   /home/alon/.claude/bin/cc-slack-post.py "<emoji> *<machine>* — \`<task>\`
+   $HOME/.claude/bin/cc-slack-post.py "<emoji> *<machine>* — \`<task>\`
    <one-line status>
    <optional detail or link>"
    ```

@@ -206,7 +206,7 @@ re-launch every non-`processed` instance, re-run pre-flight.
 
 ## Slack policy — minimal, high-signal (every message means "needs me")
 Invoke the existing **`slack-ask`** / **`slack-notify`** skills (they post as the bot via
-`/home/alon/.claude/bin/cc-slack-post.py` to `#cc-comm`). Send Slack **only** in these cases:
+`$HOME/.claude/bin/cc-slack-post.py` to `#cc-comm`). Send Slack **only** in these cases:
 1. **Real blocker** (zeus unreachable, broken `~/.arc/settings.py`/branches, a failure surviving the
    fix→restart budget, near the zeus hard quota, an ambiguous result you can't safely accept or reject,
    any infra loss that stalls the run). Record it in `STATUS.md` first. **Mode matters:**
