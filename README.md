@@ -94,7 +94,7 @@ Verify with `/plugin` — you should see `superpowers` enabled. Full docs:
 
 | Group | Skills |
 | --- | --- |
-| **Research automation** | `babysit-arc`, `babysit-t3` — run/babysit ARC & T3 campaigns on `zeus` |
+| **Research automation** | `babysit-arc`, `babysit-t3` — run/babysit ARC & T3 campaigns -- Please **NEVER** automate agents on a server without consulting the server owner (your PI) first! |
 | **Notifications** | `slack-ask`, `slack-notify` — reach you over Slack during unattended runs |
 | **Engineering (Matt Pocock)** | `tdd`, `to-issues`, `to-prd`, `triage`, `prototype`, `codebase-design`, `domain-modeling`, `improve-codebase-architecture`, `grill-me`, `grill-with-docs`, `resolving-merge-conflicts`, `setup-matt-pocock-skills` |
 | **Workflow** | `handoff`, `writing-git-commits`, `edit-article`, `obsidian-vault` |
