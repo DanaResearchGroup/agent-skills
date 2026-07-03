@@ -239,6 +239,27 @@ mid-run is fully recoverable — keep `progress.md` current at every checkpoint 
   "Decision points") → write `/handoff`, ask via AskUserQuestion, stop.
 - Same step fails 3 times → stop, write progress.md Blockers, escalate with what you tried.
 
+## Implementation & install (bundled, portable)
+
+The whole automation harness ships **inside this skill** under `bin/`, so it is reusable on
+any machine (copy the skill, run the installer, arm it). See `README.md` for full operator
+docs. The scripts are self-locating and store runtime data under **`AUTODEV_HOME`** (default
+`~/agents`) — code in the skill, data outside the repo.
+
+- `bin/install.sh` — wires the statusLine + `Stop` + `SessionStart(compact)` hooks into
+  `~/.claude/settings.json`, all pointing at this skill's `bin/` (idempotent; preserves other
+  hooks). Run once per machine: `bash ~/.claude/skills/autodev/bin/install.sh`.
+- `bin/cc-statusline.sh` — writes live context % + tmux pane to `$AUTODEV_HOME/state/<sid>.*`
+  and renders the automation badge.
+- `bin/cc-stop-hook.sh` — at each turn end, marks idle and launches both watchers (`$HERE/…`).
+- `bin/cc-sessionstart-compact.sh` — post-compaction reload-instruction backup.
+- `bin/auto-handoff-watch.sh` — context-threshold → `/handoff`/`/compact`/reload engine.
+- `bin/session-resume-watch.sh` — **Phoenix** usage/session-limit → `/usage-credits`/wait → `continue`.
+
+Control switches live in `$AUTODEV_HOME/state/` (`auto-handoff.armed`, `disable-auto-compact`,
+`disable-auto-resume`, `no-usage-credits`); logs in `$AUTODEV_HOME/logs/`. Hooks load per
+session, so install/relocation takes effect for **new** sessions only.
+
 ## Rules
 
 - Autonomous by default. Routine choices are yours; only stop for real blockers/decisions.
