@@ -1,6 +1,6 @@
 ---
 name: babysit-arc
-description: Autonomously run and babysit ARC (Automated Rate Calculator) campaigns on the OL workstation — generate run folders from a reaction/species spec, launch instances that submit QM jobs to the zeus PBS cluster, watch them, auto-fix known crashes and restart, and judge scientific correctness. Reaches the user over Slack only when it truly needs them (a real blocker or a confirmed scientific deviation) or when a campaign finishes. Use when asked to run/babysit an ARC campaign, run ARC on OL/zeus, compute k(T) or thermo for a set of reactions, or resume/monitor an ARC run.
+description: Autonomously run and babysit ARC (Automated Rate Calculator) campaigns on the OL workstation. Reaches the user over Slack only when it truly needs them (a real blocker or a confirmed scientific deviation) or when a campaign finishes. Use when asked to start a new ARC campaign (run ARC on OL/zeus, compute k(T) or thermo for a set of reactions), or to resume/monitor an existing ARC run.
 ---
 
 # babysit-arc — run + babysit ARC campaigns on OL (with Slack)
@@ -29,8 +29,8 @@ Then read the run's state files: the launch file `~/Projects/ARC_CAMPAIGNS.md` a
 ## Autonomy contract
 Run **without questions**, applying the documented defaults; **record every decision/anomaly/action as
 a timestamped line in `STATUS.md`**, never halt for a choice the runbook already resolves. Reach the
-user (Slack) **only** for the three cases in the Slack policy below. Never fabricate progress or grind
-silently — on a true blocker, report honestly in `STATUS.md` and ask.
+user (Slack) **only** for the three cases in the Slack policy below. On a true blocker, report honestly
+in `STATUS.md` and ask.
 
 ## Phase A — generation (spec → run folders)
 Follow the runbook's Phase A: resolve species (SMILES; RMG adjacency lists for fragile aromatics/
@@ -62,41 +62,14 @@ conda run -n arc_env python -c "import sys; from arc.common import read_yaml_fil
 A failed load → fix the input; **never launch a broken instance.** Re-run this check on **every newly
 generated deviation sibling folder** (`…b`/`…c`) before launching it, not just the originals.
 
-## Phase B — pre-flight (once per session)
+## Phase B1 — pre-flight (once per session)
 Per the runbook + troubleshooting note (don't inline the configs here): correct **branches** on the
 **main checkout** (not a worktree) and **recompile** if a branch switch touched Cython (`make-compile`
 in `arc_env` / `make` in `rmg_env`); apply the **uncommitted** `arc/scheduler.py` server-poll edit
 `time.sleep(30)`→`time.sleep(180)`; confirm **zeus is defined in `~/.arc/settings.py` and reachable**
 (`ssh -o BatchMode=yes -o ConnectTimeout=15 alon@zeus.technion.ac.il 'echo ok'`); verify envs.
 
-## Running unattended — supervisor poll-loop (keeps context low)
-Prefer running under the bundled **`arc_babysitter.sh`** supervisor rather than one long session. It
-is the mother process: it spawns a **fresh headless `claude -p` per pass** (`--dangerously-skip-
-permissions`), sleeps ~30 min between passes, exits when the pool is `DONE`, and on `PAUSED` **stays
-resident slow-polling the state file** until you resolve the blocker and flip it back to `RUNNING`
-(it does **not** exit on a blocker anymore). A fresh process each pass means **context never grows — no
-`/compact` or handoff is ever needed** (the agent can't self-`/compact` or self-respawn anyway; the
-supervisor owns the lifecycle). It also takes a **single-orchestrator lockfile**
-(`~/Projects/.arc_babysitter.lock`) so a second copy can't start and double-book zeus.
-
-**Launch options:**
-- **Reboot-resilient (recommended for multi-day runs):** the bundled **`arc-babysitter.service`**
-  systemd *user* unit auto-starts the supervisor on boot, rebuilding from `STATUS.md`
-  (`systemctl --user enable --now arc-babysitter`; needs `loginctl enable-linger alon`). See USAGE.md.
-- **Manual tmux:** `tmux new -s arc 'bash ~/.claude/skills/babysit-arc/arc_babysitter.sh'`; relaunch
-  the same line after a reboot (manual tmux does **not** auto-restart — the first pass rebuilds state).
-
-**Resume after a blocker:** fix the cause, then `echo RUNNING > ~/Projects/.arc_babysitter.state` — the
-resident supervisor picks it up and runs the next pass (which re-evaluates; if still blocked it
-re-`PAUSED`s).
-
-**Per-pass contract (when supervised):** do **exactly one** babysitting pass, then **stop** — don't
-stay resident or sleep. End each pass by writing one word to `~/Projects/.arc_babysitter.state`:
-`DONE` (whole pool terminal **and** teardown done), `PAUSED` (a blocker — also `slack-notify` and
-record it in `STATUS.md`; do **not** block on `slack-ask`), or `RUNNING`. Sequential passes preserve
-the single-orchestrator / one-pool invariant automatically.
-
-## Phase B — launch + babysitting (per pass)
+## Phase B2 — launch + babysitting (per pass)
 Launch one **detached** ARC process per instance from its dir (`setsid python ~/Code/ARC/ARC.py
 input.yml &`), record PID+time in `STATUS.md`; **single orchestrator / one pool** across campaigns.
 **Batch size is bounded by the SSH budget, not just host resources:** autodetect from host (`nproc`,
@@ -149,6 +122,33 @@ stalls the pool).
     Knowledge.md` (its newest-at-top log) and general ARC/RMG code/failure-mode learnings in
     `knowledge/wiki/Running ARC On Zeus.md` (§4–5 bug catalog). This vault update is silent (no Slack).
 
+## Running unattended — supervisor poll-loop (keeps context low)
+Prefer running under the bundled **`arc_babysitter.sh`** supervisor rather than one long session. It
+is the mother process: it spawns a **fresh headless `claude -p` per pass** (`--dangerously-skip-
+permissions`), sleeps ~30 min between passes, exits when the pool is `DONE`, and on `PAUSED` **stays
+resident slow-polling the state file** until you resolve the blocker and flip it back to `RUNNING`
+(it does **not** exit on a blocker anymore). A fresh process each pass means **context never grows — no
+`/compact` or handoff is ever needed** (the agent can't self-`/compact` or self-respawn anyway; the
+supervisor owns the lifecycle). It also takes a **single-orchestrator lockfile**
+(`~/Projects/.arc_babysitter.lock`) so a second copy can't start and double-book zeus.
+
+**Launch options:**
+- **Reboot-resilient (recommended for multi-day runs):** the bundled **`arc-babysitter.service`**
+  systemd *user* unit auto-starts the supervisor on boot, rebuilding from `STATUS.md`
+  (`systemctl --user enable --now arc-babysitter`; needs `loginctl enable-linger alon`). See USAGE.md.
+- **Manual tmux:** `tmux new -s arc 'bash ~/.claude/skills/babysit-arc/arc_babysitter.sh'`; relaunch
+  the same line after a reboot (manual tmux does **not** auto-restart — the first pass rebuilds state).
+
+**Resume after a blocker:** fix the cause, then `echo RUNNING > ~/Projects/.arc_babysitter.state` — the
+resident supervisor picks it up and runs the next pass (which re-evaluates; if still blocked it
+re-`PAUSED`s).
+
+**Per-pass contract (when supervised):** do **exactly one** babysitting pass, then **stop** — don't
+stay resident or sleep. End each pass by writing one word to `~/Projects/.arc_babysitter.state`:
+`DONE` (whole pool terminal **and** teardown done), `PAUSED` (a blocker — also `slack-notify` and
+record it in `STATUS.md`; do **not** block on `slack-ask`), or `RUNNING`. Sequential passes preserve
+the single-orchestrator / one-pool invariant automatically.
+
 ## Issues ledger (`ISSUES.md`, per project) — human follow-up
 The per-project **`ISSUES.md`** is the human punch-list for after the run, distinct from `STATUS.md`
 (live job ledger) and `FIXES.md` (code-fix log), and **finer-grained** (one instance may be fine yet
@@ -162,8 +162,7 @@ afterward; keeping it current is **silent** (no Slack).
 ## `REPORT.md` (per project) — the single clean human deliverable
 `STATUS.md`/`ISSUES.md`/`FIXES.md` are **working files**; `REPORT.md` is the **one thing the user
 reads** when a campaign finishes (or pauses). Generate/refresh it at any terminal state and on PAUSED.
-Keep it **minimal, skimmable, and informative** — fixed sections, newest decisive facts first, no
-process noise:
+Fixed sections, newest decisive facts first, no process noise:
 - **Wins** — what converged and was **accepted** (k(T)/k∞/thermo) with the LOT, one line each.
 - **Didn't converge / blocked** — each unconverged species, TS-not-found, or `blocked`/`crashed`
   instance with **why** (root cause in plain terms) and a **recommendation** (next LOT, adapter, manual
@@ -225,7 +224,7 @@ Invoke the existing **`slack-ask`** / **`slack-notify`** skills (they post as th
    Throttle to one per 24 h; skip if the pool finished or paused that day (those already notify).
 
 **Otherwise: no Slack.** Normal progress, routine auto-fixes, quota warnings below the threshold, and
-per-pass heartbeats go to `STATUS.md` only — do not spam the channel.
+per-pass heartbeats go to `STATUS.md` only.
 
 ## Related
 Vault: `[[ARC Campaign Runbook]]` · `[[Running ARC On Zeus]]` · `ARC on OL — Zeus Troubleshooting`.
