@@ -13,7 +13,7 @@ for the full guided runbook your Claude Code can execute).
 
 ```bash
 # 1. Clone (not fork) into ~/Code
-git clone https://github.com/alongd/agent-skills ~/Code/agent-skills
+git clone https://github.com/DanaResearchGroup/agent-skills ~/Code/agent-skills
 
 # 2. Make it your Claude Code skills dir
 ln -s ~/Code/agent-skills ~/.claude/skills
@@ -31,7 +31,7 @@ agent-skills"). That is all the non-Slack skills need.
 
 ```bash
 # 1. Clone this repo
-git clone https://github.com/alongd/agent-skills ~/Code/agent-skills
+git clone https://github.com/DanaResearchGroup/agent-skills ~/Code/agent-skills
 
 # 2. Make it your skills dir (whole repo) + link the Slack sender
 ln -s ~/Code/agent-skills ~/.claude/skills

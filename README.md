@@ -1,9 +1,8 @@
 # agent-skills
 
-[![CI](https://github.com/alongd/agent-skills/actions/workflows/ci.yml/badge.svg)](https://github.com/alongd/agent-skills/actions/workflows/ci.yml)
+[![CI](https://github.com/DanaResearchGroup/agent-skills/actions/workflows/ci.yml/badge.svg)](https://github.com/DanaResearchGroup/agent-skills/actions/workflows/ci.yml)
 [![Claude Code](https://img.shields.io/badge/Claude%20Code-skills-8A2BE2)](https://docs.anthropic.com/en/docs/claude-code)
 [![skills](https://img.shields.io/badge/skills-20-blue)](#whats-in-here)
-[![secret scan](https://img.shields.io/badge/secret%20scan-gitleaks-success)](https://github.com/alongd/agent-skills/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Personal [Claude Code](https://docs.anthropic.com/en/docs/claude-code) skills for our
@@ -27,7 +26,7 @@ This repo **is** your skills directory: you symlink the whole thing into
 ### 1. Clone and make it your skills directory
 
 ```bash
-git clone https://github.com/alongd/agent-skills ~/Code/agent-skills
+git clone https://github.com/DanaResearchGroup/agent-skills ~/Code/agent-skills
 ln -s ~/Code/agent-skills ~/.claude/skills
 ```
 
