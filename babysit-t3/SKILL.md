@@ -67,10 +67,10 @@ auto-restart itself).
 
 **Per-pass contract (when supervised):** do **exactly one** babysitting pass, then **stop** — don't
 stay resident or sleep. End each pass by writing one word to `~/Projects/.t3_babysitter.state`:
-`DONE` (whole pool terminal **and** teardown done), `PAUSED` (a blocker — also `slack-ask`), or
-`RUNNING`. On a blocker, `slack-ask` blocks within the pass until the reply or the pass timeout; if
-the blocker still stands, record the open question in `STATUS.md` and write `PAUSED` — the
-supervisor exits, and after resolving over Slack the user relaunches the same tmux line.
+`DONE` (whole pool terminal **and** teardown done), `PAUSED` (a blocker — also `slack-notify` and
+record the open question in `STATUS.md`; do **not** block on `slack-ask` — inside a supervised pass
+it would stall the one-pass timeout), or `RUNNING`. On `PAUSED` the supervisor exits; after
+resolving over Slack the user relaunches the same tmux line (the next pass re-evaluates).
 
 **Single orchestrator — shared with ARC.** T3 and ARC campaigns share zeus and the same `~/Code/ARC`
 checkout. **Never run `t3_babysitter.sh` and `arc_babysitter.sh` at the same time** — check in
@@ -141,12 +141,15 @@ relaunch every non-terminal campaign (T3 self-resumes), verify resumed iteration
 ## Slack policy — minimal, high-signal (every message means "needs me")
 Invoke the existing **`slack-ask`** / **`slack-notify`** skills (they post as the bot via
 `$HOME/.claude/bin/cc-slack-post.py` to `#cc-comm`). Send Slack **only** in these cases:
-1. **Real blocker → `slack-ask`** (pause + wait): zeus unreachable, broken settings/branches/envs, a
-   failure surviving the fix→relaunch budget, T3 restarting from scratch instead of resuming, disk/
-   quota exhaustion, an ambiguous result you can't safely accept or reject.  Record in `STATUS.md`
-   first; resume per the reply.
-2. **Scientific deviation → `slack-ask`** (confirm first): any diagnosed change to `input.yml` or
-   course-correction. Present diagnosis + recommendation; on approval, spawn the sibling-folder run.
+1. **Real blocker**: zeus unreachable, broken settings/branches/envs, a failure surviving the
+   fix→relaunch budget, T3 restarting from scratch instead of resuming, disk/quota exhaustion, an
+   ambiguous result you can't safely accept or reject. Record in `STATUS.md` first. **Mode matters:**
+   - **Interactive (single session): `slack-ask`** (blocking) — pause + wait, resume per the reply.
+   - **Supervised (poll-loop): `slack-notify`** the blocker + **set state `PAUSED`** (do **not** block
+     on `slack-ask` — it would stall the one-pass timeout). The supervisor exits; relaunch after you fix it.
+2. **Scientific deviation → `slack-ask`** (confirm first; supervised → `slack-notify` + `PAUSED`): any
+   diagnosed change to `input.yml` or course-correction. Present diagnosis + recommendation; on
+   approval, spawn the sibling-folder run.
 3. **Campaign finished → `slack-notify`** (one summary): iterations + quality verdict (RMSE trail,
    NTC, coverage) + where the final mechanism/libraries are. With a shared pool, notify when the
    whole pool is terminal.
