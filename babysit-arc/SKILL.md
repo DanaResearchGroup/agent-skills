@@ -39,23 +39,15 @@ and **prune only net / well-skipping** reactions (keep every elementary reaction
 partition into instances, write one `input.yml` per folder via the project's `gen_arc_inputs.py`, then
 (re)generate `INDEX.md`/`STATUS.md` rows.
 
-**TS-adapter family gate (set expectations before burning compute)** — from the OL troubleshooting
-note's adapter findings: **`R_Recombination` reactions are barrierless (no saddle-point TS), so ARC
-cannot compute them** → **quietly exclude them during generation (no Slack)** and **list each one in the
-artifact** (`REPORT.md`/`ISSUES.md`) with the clear reason — *"barrierless bond fission, no TS for ARC
-to locate."* Reactions handled by the **`linear`** adapter (R_Addition / Intra_R_Add / 1,2_Insertion)
-have a **low TS-guess success rate** (no guesses, sub-threshold imaginary freq, 2nd-order saddles,
-non-converging opt, CPU-spin hangs) → flag them in `STATUS.md`, **validate one early** before fanning
-out, and don't expect the `heuristics`-grade hit rate H_Abstraction enjoys.
+Apply the runbook's **TS-adapter family gate** (ARC Campaign Runbook §Phase A step 2; details in
+Running ARC On Zeus §4 adapters): quietly exclude barrierless **`R_Recombination`** reactions during
+generation (no Slack) and list each in `REPORT.md`/`ISSUES.md` with the reason; flag **`linear`**-adapter
+families (R_Addition / Intra_R_Add / 1,2_Insertion) as low-yield and **validate one early** before
+fanning out.
 
-**Validate every `input.yml` by loading an ARC object — before launching ANY instance** (catches bad
-job-type keys, malformed LOT, unresolved species, bad family early; runnable on **any** machine with
-ARC importable — even before copying to OL). Mirror exactly what `ARC.py` does *before* `.execute()`:
-read the input with ARC's own `read_yaml_file` (adjacency-list + `project_directory` preprocessing
-plain `yaml.safe_load` misses), construct `ARC(**input_dict)`, and **never call `execute()`**.
-Constructing the object runs all of ARC's input parsing/validation (species resolution,
-`determine_family`, LOT lookup) and submits **no jobs**. (ARC has **no `from_dict()` classmethod** —
-the `ARC(**input_dict)` constructor *is* the from-dict path.)
+**Validate every `input.yml` by loading an ARC object — before launching ANY instance** (ARC Campaign
+Runbook §Phase A step 5 for the full rationale). Runnable on any machine with ARC importable; constructs
+the object (runs all input parsing/validation), submits no jobs, never calls `execute()`:
 ```bash
 conda run -n arc_env python -c "import sys; from arc.common import read_yaml_file; from arc.main import ARC; ARC(**read_yaml_file(path=sys.argv[1], project_directory='.')); print('OK', sys.argv[1])" <instance>/input.yml
 ```
@@ -80,27 +72,22 @@ checks). The heavy compute is on zeus; more local processes add queue/SSH pressu
 
 Each pass, for every `running` instance check health (PID alive, `arc.log` advancing, jobs cycling
 opt→freq→scan→sp, `restart.yml` updating, zeus jobs not stuck `Q`) and append a **timestamped
-heartbeat** line to `STATUS.md`. **Respect the zeus SSH budget strictly** (vault: Running ARC On Zeus
-§0b — a spamming account gets banned, killing all future projects): all per-pass zeus checks in **one
-batched connection** (`ssh zeus 'qstat -u $USER; quota -s'`, ≤ 4 SSH ops/pass), one `qstat -u $USER`
-for all instances, < ~60 SSH/h combined incl. ARC's own polling; back off ≥ 5 min on SSH failures,
-never tight-loop.
+heartbeat** line to `STATUS.md`. **Respect the zeus SSH budget strictly** (canonical rule: Running ARC
+On Zeus §0b — a spamming account gets banned): all per-pass zeus checks in **one batched connection**
+(`ssh zeus 'qstat -u $USER; quota -s'`, ≤ 4 SSH ops/pass), one `qstat -u $USER` for all instances,
+< ~60 SSH/h combined incl. ARC's own polling; back off ≥ 5 min on SSH failures, never tight-loop.
 
-**Zeus home-quota guard (a known pool-killer — check every pass, free in the batched connection).**
-zeus home is quota-capped (soft/hard, e.g. 300/330 GB) and ARC outputs grow ~1.8 GB/hr, so a long
-campaign steadily re-approaches the cap; crossing the **hard** limit makes *every* instance's SFTP
-write fail at once → simultaneous pool-wide `OSError: [Errno 28] No space left` (even on local writes —
-don't be fooled, OL disk is fine). From the batched `quota -s`: **over soft → warn in `STATUS.md` and
-lower `max_simultaneous_jobs` / hold new launches**; **near hard → pause launches and `slack-ask`/
-`slack-notify`** (free zeus home space or request a bump — the durable fix). No work is lost: every
-`restart.yml` lives on OL.
+Apply the runbook's **zeus home-quota guard** every pass (Running ARC On Zeus §0c; ARC Campaign Runbook
+§Phase B — a known pool-killer): fold `quota -s` into the batched zeus check and act on it — **over soft
+→ warn in `STATUS.md`, lower `max_simultaneous_jobs` / hold new launches**; **near hard → pause launches
+and `slack-ask`/`slack-notify`** (free zeus home or request a bump). No work is lost: every `restart.yml`
+lives on OL.
 
-**Stalled-but-alive escalation (not every wedge is a crash).** A live PID with **no `arc.log` /
-`restart.yml` advance** is *unhealthy* even without a traceback (e.g. the `linear`/BDE conformer
-CPU-spin hang — hours stuck on a tiny fragment, or a job re-submitted in a loop). If an instance shows
-no progress for **> ~3 h** (and zeus jobs aren't merely queued), **kill+restart it** (resumes from
-`restart.yml`; counts against the retry budget); on exhausting the budget mark `blocked`/`crashed`,
-record the signature in `ISSUES.md`, and continue with the pool.
+Apply the runbook's **stalled-but-alive escalation** (ARC Campaign Runbook §Phase B; e.g. the
+`linear`/BDE CPU-spin hang): a live PID with no `arc.log` / `restart.yml` advance for **> ~3 h** (zeus
+jobs not merely queued) → **kill+restart** (resumes from `restart.yml`; counts against the retry budget);
+on budget exhaustion mark `blocked`/`crashed`, record the signature in `ISSUES.md`, and continue with the
+pool.
 
 **Crash → fix → restart:** match the traceback to the vault **known-bug catalog** → fix in the host's
 ARC/RMG checkout → restart from the instance dir (ARC resumes from `restart.yml`); bounded **retry

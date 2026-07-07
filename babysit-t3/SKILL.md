@@ -1,6 +1,6 @@
 ---
 name: babysit-t3
-description: Autonomously run and babysit T3 (Tandem Tool) campaigns on the OL workstation — closed-loop RMG generation → sensitivity analysis (incl. IDT) → ARC QM refinement on zeus. Launches long-lived T3 processes, watches iterations, auto-fixes crashes and relaunches (T3 self-resumes), judges scientific quality per iteration, and consolidates validated learnings into the vault. Reaches the user over Slack only for a real blocker, a confirmed scientific deviation, or campaign completion. Use when asked to run/babysit a T3 campaign or T3-IDT run, run T3 on OL, or resume/monitor a T3 project.
+description: Autonomously run and babysit T3 (Tandem Tool) campaigns on the OL workstation — closed-loop RMG generation → sensitivity analysis (incl. IDT) → ARC QM refinement on zeus. Reaches the user over Slack only for a real blocker, a confirmed scientific deviation, or campaign completion. Use when asked to run/babysit a T3 campaign or T3-IDT run, run T3 on OL, or resume/monitor a T3 project.
 ---
 
 # babysit-t3 — run + babysit T3 campaigns on OL (with Slack)
@@ -32,8 +32,8 @@ Then read the run's state files: the launch file `~/Projects/T3_CAMPAIGNS.md` an
 ## Autonomy contract
 Run **without questions**, applying the documented defaults; **record every decision/anomaly/action
 as a timestamped line in `STATUS.md`**, never halt for a choice the runbook already resolves. Reach
-the user (Slack) **only** for the three cases in the Slack policy below. Never fabricate progress or
-grind silently — on a true blocker, report honestly in `STATUS.md` and ask.
+the user (Slack) **only** for the three cases in the Slack policy below. On a true blocker, report
+honestly in `STATUS.md` and ask.
 
 ## Phase A — campaign prep (spec → project folder)
 Follow the runbook's Phase A: build `input.yml` (rmg / t3 / qm blocks; for IDT campaigns the
@@ -85,8 +85,8 @@ pile up on local RAM. Each pass, per campaign: detect the current phase from the
 `iteration_N/`, check health per the runbook's phase table (PID alive; `RMG.log`/SA outputs/`arc.log`
 advancing; zeus jobs cycling, not stuck `Q`; disk OK locally **and** on zeus), update the iteration
 history (incl. **IDT RMSE(log10)** when logged), and append a **timestamped heartbeat** to
-`STATUS.md`. **Respect the zeus SSH budget strictly** (vault: Running ARC On Zeus §0b — a spamming
-account gets banned): all per-pass zeus checks in **one batched connection** (≤ 4 SSH ops/pass),
+`STATUS.md`. **Respect the zeus SSH budget strictly** (canonical rule: Running ARC On Zeus §0b — a
+spamming account gets banned): all per-pass zeus checks in **one batched connection** (≤ 4 SSH ops/pass),
 one `qstat -u $USER` for all jobs, < ~60 SSH/h combined incl. ARC-incore's own polling; back off
 ≥ 5 min on SSH failures, never tight-loop.
 
@@ -97,13 +97,11 @@ relaunch the same command (T3 auto-resumes) → **verify it resumed at the expec
 restarts from scratch, kill immediately and ask. Bounded budget (**3** per distinct failure), then
 mark `blocked` and **continue with the rest of the pool**.
 
-- **Record fixes by scope — code stays UNSTAGED (never `git add`/`git commit`):**
-  - **Per-run fix:** leave the edit unstaged + log in the campaign's **`FIXES.md`** (bug, root
-    cause, diff, files, timestamp). Re-apply uncommitted fixes after any fresh checkout.
-  - **Validated, generalizable learning:** **consolidate into the vault** per the runbook — **merge
-    into the relevant existing section, don't append duplicates; confirmed-only.** T3-layer →
-    `T3 on OL — Troubleshooting & Knowledge` (bug catalog / newest-at-top log); ARC/zeus-layer →
-    the ARC notes; process-level → the `T3 Campaign Runbook` itself. Silent (no Slack).
+Record fixes by scope — **code stays UNSTAGED (never `git add`/`git commit`)**: per-run fixes → the
+campaign's **`FIXES.md`** (re-apply after any fresh checkout); validated generalizable learnings →
+**consolidate into the vault** per the runbook's layer-scoping (T3 Campaign Runbook §Consolidation:
+T3-layer / ARC-zeus-layer / process-level; merge into the existing section, confirmed-only). Silent
+(no Slack).
 
 ## Issues ledger (`ISSUES.md`, per campaign) — human follow-up
 Distinct from `STATUS.md` (live ledger) and `FIXES.md` (code-fix log), and finer-grained. **Never
@@ -115,11 +113,10 @@ finalize the **wins** summary (iterations, final model size, IDT convergence del
 experiment comparison, ARC coverage). Keeping it current is **silent** (no Slack).
 
 ## Success criteria — scientific correctness is the bar
-Per the runbook: per-iteration (RMG banner + plausible core; SA outputs; sensible QM selections; ARC
-results meeting the **ARC bar**; libraries consumed by the next iteration; RMSE trail not degrading)
-and campaign-end (observable convergence < ~×1.5 between final iterations; **NTC region** present for
-alkane fuels; within ~2–3× of experiment; SA dominated by expected players; ARC refinement coverage
-≥ ~70 %). Never accept a converged-but-wrong mechanism.
+Judge per-iteration and at campaign-end against the runbook's bar (T3 Campaign Runbook §Success
+criteria: RMG banner + plausible core, SA outputs, ARC-bar QM, RMSE trail not degrading; campaign-end
+convergence < ~×1.5, **NTC region** for alkane fuels, within ~2–3× of experiment, SA dominated by
+expected players, ARC coverage ≥ ~70 %). Never accept a converged-but-wrong mechanism.
 
 ## Scientific diagnosis & deviations (slack-ask before deviating)
 Beyond pass/fail, **diagnose result quality**: is the LOT right for the flagged species (T1
