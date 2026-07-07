@@ -21,7 +21,12 @@ see `slack-notify` for the full rationale.)
   prints `OK` then the message `ts`. It's allowlisted in settings.json, so it
   runs without a permission prompt (unattended-safe). The command may use
   `$HOME`, but the `~/.claude/settings.json` allow-rule must use the literal
-  absolute helper path.
+  absolute helper path. Thread replies are always broadcast to the channel
+  (`reply_broadcast`, i.e. "Also send to channel") — the helper sets this
+  automatically. Plain thread replies trigger no Slack alert, so without the
+  broadcast the user never learns a message is pending. Never post a thread
+  reply through any other mechanism (e.g. an MCP send tool) without the
+  equivalent broadcast flag.
 - **Human user id**: `U01FB823VSR` (Alon). Only a reply from this user (not the
   bot, not yourself) counts as the answer.
 

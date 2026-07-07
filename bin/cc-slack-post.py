@@ -36,6 +36,10 @@ def main():
     payload = {"channel": CHANNEL, "text": message}
     if thread:
         payload["thread_ts"] = thread
+        # Always broadcast thread replies to the channel ("Also send to channel"):
+        # plain thread replies do not trigger a Slack alert, so the user never
+        # sees that a message is pending.
+        payload["reply_broadcast"] = True
 
     req = urllib.request.Request(
         "https://slack.com/api/chat.postMessage",
