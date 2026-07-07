@@ -1,6 +1,6 @@
 ---
 name: writing-git-commits
-description: Use when about to run `git commit` (or being asked to commit, stage, or split changes into commits) — keeps commit messages short and readable, splits work into one logical unit per commit, and avoids destructive or unauthorized git actions.
+description: Use when committing, staging, or splitting changes into commits (or about to run `git commit`) — keeps commit messages short and readable, splits work into one logical unit per commit, and avoids destructive or unauthorized git actions.
 ---
 
 # Writing Git Commits
@@ -20,10 +20,9 @@ The diff already shows the *what*.
 
 ## Body
 
-- provide commit description only if needed.
-- If one short line genuinely adds context, add it
-- One line, wrapped at ~72 chars. Never multiple paragraphs.
-- If the commit adds a non-trivial behavior, OK to summarize it as a single short paragraph in the commit description.
+- Add a body only when the *why* is non-obvious. Keep it to one short line
+  or a single tight paragraph; the diff already shows the *what*.
+- Wrap at ~72 chars.
 
 ## Granularity
 
@@ -53,24 +52,6 @@ scheduler: snapshot running jobs to running_jobs.yml hourly
 
 Append per-hour snapshot only when changed; otherwise emit a
 one-line heartbeat in ARC.log.
-```
-
-Good (with brief body):
-```
-Break down driver tests
-
-So that they can run independently by different CI workers
-```
-
-Good (with a short description)
-```
-Update test assertions for Python 3.14 compatibility
-
-- Conformers: updated RDKit force field expected values/coordinates
-- xTB-GSM: updated HNO/HON optimized coordinates
-- Reaction: updated dict key ordering and species coordinates
-- OB SMILES C(1)CC(1) → C1CC1 in species test
-- Various: path handling, deprecated assertDictEqual removal
 ```
 
 

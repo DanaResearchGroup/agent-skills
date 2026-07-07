@@ -1,6 +1,6 @@
 ---
 name: copilot-review
-description: Triage and fix a PR's automated bot review (Copilot + GitHub Advanced Security), squashing each fix into its commit and force-pushing with lease.
+description: Fix a PR's Copilot / GitHub Advanced Security bot review — triage each finding, fix the real ones, and fold the fixes back into history.
 disable-model-invocation: true
 ---
 
@@ -74,11 +74,8 @@ judging; don't trust the comment's framing.
 - **Address**: real correctness/security bugs, resource leaks, missing error handling, genuine
   edge cases the diff introduced.
 - **Skip**: stylistic nits already consistent with the codebase, false positives (the concern
-  doesn't hold when you read the surrounding code), suggestions that fight an existing project
-  convention, or findings on code the PR didn't touch.
-
-Don't reshape code merely to silence a bot — a change made only to make a finding disappear
-validates nothing. Fix the defect when it's real; record the false positive as skipped when it's not.
+  doesn't hold when you read the surrounding code — record as skipped, don't reshape code to silence
+  them), suggestions that fight an existing project convention, or findings on code the PR didn't touch.
 
 Present the triage table (comment → address/skip → reason) and the fixup plan (which fix squashes
 into which commit) and get the user's go-ahead before rewriting history — per the repo's git-history
@@ -91,10 +88,17 @@ rule, history rewrites and force-pushes need approval.
 Make the code changes for each **address** item. Run the repo's tests/linters if the change is
 non-trivial and they're quick; report honestly if anything fails.
 
+**Done when:** every **address**-classified item from step 3 has a corresponding code change (or is
+explicitly re-classified as skip with a one-line reason), and any tests/linters you ran are reported.
+
 ## 5. Fixup into history and force-push
 
 Fold each fix into the commit that introduced the reviewed line rather than stacking "address
 review" commits — one logical change per commit in the final history.
+
+### 5a — Fixup & autosquash
+
+Create one `--fixup` commit per target commit, then autosquash them in.
 
 ```bash
 git log --oneline $(git merge-base HEAD origin/BASE)..HEAD   # find the target commit per fix
@@ -103,17 +107,30 @@ git add path/to/file && git commit --fixup=TARGET_SHA        # one fixup per tar
 # ...repeat for each fix, then autosquash them in. A no-op sequence editor makes the interactive
 # rebase run non-interactively — plain `git rebase --autosquash` (without -i) does NOT squash:
 GIT_SEQUENCE_EDITOR=true git rebase -i --autosquash --autostash $(git merge-base HEAD origin/BASE)
-git log --oneline $(git merge-base HEAD origin/BASE)..HEAD   # verify: no `fixup!` commits remain
+```
+
+A fix with no natural home (addresses freshly added code with no clear owning commit) can stay a
+normal commit — squash only where a target commit clearly owns the line.
+
+### 5b — Verify, then push
+
+Verify the squash landed **before** pushing, then push:
+
+```bash
+git log --oneline $(git merge-base HEAD origin/BASE)..HEAD   # verify: zero `fixup!` subjects remain
+```
+
+**Done when / blocking:** `git log --oneline $(git merge-base HEAD origin/BASE)..HEAD` shows ZERO
+`fixup!` entries and the expected commit count; only THEN run `git push --force-with-lease`. A stray
+`fixup!` commit reaching the remote is the exact failure this skill exists to prevent, so treat this
+zero-`fixup!` check as a hard gate, not a formality.
+
+```bash
 git push --force-with-lease
 ```
 
-Notes:
-- **Verify the squash landed** before pushing — the log above must show zero `fixup!` subjects. A
-  stray `fixup!` commit on the remote is the exact failure this skill exists to prevent.
-- A fix with no natural home (addresses freshly added code with no clear owning commit) can stay a
-  normal commit — squash only where a target commit clearly owns the line.
-- `--force-with-lease` (never bare `--force`) so a concurrent push on the branch aborts you instead
-  of getting clobbered. If the lease is stale, re-fetch and reconcile — don't override with `--force`.
+Use `--force-with-lease` (never bare `--force`) so a concurrent push on the branch aborts you instead
+of getting clobbered. If the lease is stale, re-fetch and reconcile — don't override with `--force`.
 
 **Done when:** each fix is squashed into its target commit, the branch is force-pushed with lease,
 and the PR head reflects the new history. Optionally reply to or resolve the addressed threads and

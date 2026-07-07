@@ -1,6 +1,6 @@
 ---
 name: slack-notify
-description: Send the user a one-way notification over Slack (no reply expected). Use to report progress, completion, or that a long/automated procedure finished or hit an error, when the user may be away from the terminal. Posts to the #cc-comm channel as a bot so the user actually gets notified.
+description: Send the user a one-way notification over Slack (no reply expected). Use to report progress, completion, or that a long/automated procedure finished or hit an error, when the user may be away from the terminal.
 ---
 
 # slack-notify — one-way notification over Slack

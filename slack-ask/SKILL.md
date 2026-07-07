@@ -1,17 +1,17 @@
 ---
 name: slack-ask
-description: Ask the user a question over Slack and block until they reply. Use during automated/unattended procedures when you need human input or a decision and the user is away from the terminal. Posts to the #cc-comm channel as a bot (so the user actually gets notified) and waits for a threaded reply, so the asking instance catches its own answer.
+description: Ask the user a question over Slack and block until they reply. Use during automated/unattended procedures when you need human input or a decision and the user is away from the terminal.
 ---
 
 # slack-ask — bidirectional human-in-the-loop over Slack
 
 Use this when a procedure needs input from the user but they may not be watching
-the terminal. You post a question to Slack **as a bot** (so Slack notifies the
-user — the claude.ai connector posts *as the user*, which Slack never notifies
-about), the user replies **in the thread**, and you read that reply back via the
-connector and continue. Because you only watch the thread you created, the reply
-is routed to *this* CC instance even if other instances on other machines are
-also asking.
+the terminal. You post a question to Slack **as a bot**, the user replies **in
+the thread**, and you read that reply back via the connector and continue.
+Because you only watch the thread you created, the reply is routed to *this* CC
+instance even if other instances on other machines are also asking. (Posting as
+the bot rather than via the claude.ai connector is why Slack actually notifies —
+see `slack-notify` for the full rationale.)
 
 ## Config
 
@@ -21,12 +21,9 @@ also asking.
   prints `OK` then the message `ts`. It's allowlisted in settings.json, so it
   runs without a permission prompt (unattended-safe). The command may use
   `$HOME`, but the `~/.claude/settings.json` allow-rule must use the literal
-  absolute helper path. Do **not** use inline
-  `curl` with heredocs — that trips the "expansion obfuscation" guard and prompts.
+  absolute helper path.
 - **Human user id**: `U01FB823VSR` (Alon). Only a reply from this user (not the
   bot, not yourself) counts as the answer.
-- **Poll schedule** (backoff): every **30s for the first 5 min**, then every
-  **15 min for the next hour**, then every **30 min** thereafter. Adjust per task.
 
 ## Procedure
 
@@ -84,6 +81,4 @@ also asking.
   root `ts` again) rather than starting a new message.
 - Never treat your own/bot messages as the answer — filter strictly on
   `user == U01FB823VSR`.
-- On a machine with a different home dir, keep `$HOME` here and update only the
-  matching allow-rule in `settings.json` to the literal absolute helper path.
 - For a one-way notification that needs no reply, use the `slack-notify` skill.

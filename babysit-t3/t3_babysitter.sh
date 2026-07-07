@@ -39,7 +39,8 @@ risk): batch all per-pass zeus checks into ONE connection, one qstat -u \$USER f
 tight-loop on SSH failures — per the SSH budget in the vault (Running ARC On Zeus section 0b). When \
 the pass is finished, write EXACTLY \
 ONE word to $STATE_FILE: DONE (every campaign in the pool is terminal AND teardown is complete), \
-PAUSED (a blocker needs the user — also slack-ask and record it in STATUS.md), or RUNNING (work \
+PAUSED (a blocker needs the user — also slack-NOTIFY it, do NOT block on slack-ask, and record it in \
+STATUS.md), or RUNNING (work \
 continues). Write nothing else to that file."
 
 echo "$(date '+%F %T') supervisor start (interval=${INTERVAL}s, timeout=${PASS_TIMEOUT})" >> "$LOG"

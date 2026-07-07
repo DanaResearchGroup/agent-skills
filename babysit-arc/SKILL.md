@@ -1,6 +1,6 @@
 ---
 name: babysit-arc
-description: Autonomously run and babysit ARC (Automated Rate Calculator) campaigns on the OL workstation — generate run folders from a reaction/species spec, launch instances that submit QM jobs to the zeus PBS cluster, watch them, auto-fix known crashes and restart, and judge scientific correctness. Reaches the user over Slack only when it truly needs them (a real blocker or a confirmed scientific deviation) or when a campaign finishes. Use when asked to run/babysit an ARC campaign, run ARC on OL/zeus, compute k(T) or thermo for a set of reactions, or resume/monitor an ARC run.
+description: Autonomously run and babysit ARC (Automated Rate Calculator) campaigns on the OL workstation. Reaches the user over Slack only when it truly needs them (a real blocker or a confirmed scientific deviation) or when a campaign finishes. Use when asked to start a new ARC campaign (run ARC on OL/zeus, compute k(T) or thermo for a set of reactions), or to resume/monitor an existing ARC run.
 ---
 
 # babysit-arc — run + babysit ARC campaigns on OL (with Slack)
@@ -29,8 +29,8 @@ Then read the run's state files: the launch file `~/Projects/ARC_CAMPAIGNS.md` a
 ## Autonomy contract
 Run **without questions**, applying the documented defaults; **record every decision/anomaly/action as
 a timestamped line in `STATUS.md`**, never halt for a choice the runbook already resolves. Reach the
-user (Slack) **only** for the three cases in the Slack policy below. Never fabricate progress or grind
-silently — on a true blocker, report honestly in `STATUS.md` and ask.
+user (Slack) **only** for the three cases in the Slack policy below. On a true blocker, report honestly
+in `STATUS.md` and ask.
 
 ## Phase A — generation (spec → run folders)
 Follow the runbook's Phase A: resolve species (SMILES; RMG adjacency lists for fragile aromatics/
@@ -39,35 +39,75 @@ and **prune only net / well-skipping** reactions (keep every elementary reaction
 partition into instances, write one `input.yml` per folder via the project's `gen_arc_inputs.py`, then
 (re)generate `INDEX.md`/`STATUS.md` rows.
 
-**TS-adapter family gate (set expectations before burning compute)** — from the OL troubleshooting
-note's adapter findings: **`R_Recombination` reactions are barrierless (no saddle-point TS), so ARC
-cannot compute them** → **quietly exclude them during generation (no Slack)** and **list each one in the
-artifact** (`REPORT.md`/`ISSUES.md`) with the clear reason — *"barrierless bond fission, no TS for ARC
-to locate."* Reactions handled by the **`linear`** adapter (R_Addition / Intra_R_Add / 1,2_Insertion)
-have a **low TS-guess success rate** (no guesses, sub-threshold imaginary freq, 2nd-order saddles,
-non-converging opt, CPU-spin hangs) → flag them in `STATUS.md`, **validate one early** before fanning
-out, and don't expect the `heuristics`-grade hit rate H_Abstraction enjoys.
+Apply the runbook's **TS-adapter family gate** (ARC Campaign Runbook §Phase A step 2; details in
+Running ARC On Zeus §4 adapters): quietly exclude barrierless **`R_Recombination`** reactions during
+generation (no Slack) and list each in `REPORT.md`/`ISSUES.md` with the reason; flag **`linear`**-adapter
+families (R_Addition / Intra_R_Add / 1,2_Insertion) as low-yield and **validate one early** before
+fanning out.
 
-**Validate every `input.yml` by loading an ARC object — before launching ANY instance** (catches bad
-job-type keys, malformed LOT, unresolved species, bad family early; runnable on **any** machine with
-ARC importable — even before copying to OL). Mirror exactly what `ARC.py` does *before* `.execute()`:
-read the input with ARC's own `read_yaml_file` (adjacency-list + `project_directory` preprocessing
-plain `yaml.safe_load` misses), construct `ARC(**input_dict)`, and **never call `execute()`**.
-Constructing the object runs all of ARC's input parsing/validation (species resolution,
-`determine_family`, LOT lookup) and submits **no jobs**. (ARC has **no `from_dict()` classmethod** —
-the `ARC(**input_dict)` constructor *is* the from-dict path.)
+**Validate every `input.yml` by loading an ARC object — before launching ANY instance** (ARC Campaign
+Runbook §Phase A step 5 for the full rationale). Runnable on any machine with ARC importable; constructs
+the object (runs all input parsing/validation), submits no jobs, never calls `execute()`:
 ```bash
 conda run -n arc_env python -c "import sys; from arc.common import read_yaml_file; from arc.main import ARC; ARC(**read_yaml_file(path=sys.argv[1], project_directory='.')); print('OK', sys.argv[1])" <instance>/input.yml
 ```
 A failed load → fix the input; **never launch a broken instance.** Re-run this check on **every newly
 generated deviation sibling folder** (`…b`/`…c`) before launching it, not just the originals.
 
-## Phase B — pre-flight (once per session)
+## Phase B1 — pre-flight (once per session)
 Per the runbook + troubleshooting note (don't inline the configs here): correct **branches** on the
 **main checkout** (not a worktree) and **recompile** if a branch switch touched Cython (`make-compile`
 in `arc_env` / `make` in `rmg_env`); apply the **uncommitted** `arc/scheduler.py` server-poll edit
 `time.sleep(30)`→`time.sleep(180)`; confirm **zeus is defined in `~/.arc/settings.py` and reachable**
 (`ssh -o BatchMode=yes -o ConnectTimeout=15 alon@zeus.technion.ac.il 'echo ok'`); verify envs.
+
+## Phase B2 — launch + babysitting (per pass)
+Launch one **detached** ARC process per instance from its dir (`setsid python ~/Code/ARC/ARC.py
+input.yml &`), record PID+time in `STATUS.md`; **single orchestrator / one pool** across campaigns.
+**Batch size is bounded by the SSH budget, not just host resources:** autodetect from host (`nproc`,
+`free -g`, ~1–2 GB/Arkane) and the zeus queue (`qstat -u $USER` vs `max_simultaneous_jobs`), **then cap
+so ARC's own polling stays under budget** — each running ARC process spends ~20 SSH/h at the 180 s poll,
+so ~2–3 concurrent ARC processes already consume the < ~60 SSH/h ceiling (leaving room for babysitter
+checks). The heavy compute is on zeus; more local processes add queue/SSH pressure, not throughput.
+
+Each pass, for every `running` instance check health (PID alive, `arc.log` advancing, jobs cycling
+opt→freq→scan→sp, `restart.yml` updating, zeus jobs not stuck `Q`) and append a **timestamped
+heartbeat** line to `STATUS.md`. **Respect the zeus SSH budget strictly** (canonical rule: Running ARC
+On Zeus §0b — a spamming account gets banned): all per-pass zeus checks in **one batched connection**
+(`ssh zeus 'qstat -u $USER; quota -s'`, ≤ 4 SSH ops/pass), one `qstat -u $USER` for all instances,
+< ~60 SSH/h combined incl. ARC's own polling; back off ≥ 5 min on SSH failures, never tight-loop.
+
+Apply the runbook's **zeus home-quota guard** every pass (Running ARC On Zeus §0c; ARC Campaign Runbook
+§Phase B — a known pool-killer): fold `quota -s` into the batched zeus check and act on it — **over soft
+→ warn in `STATUS.md`, lower `max_simultaneous_jobs` / hold new launches**; **near hard → pause launches
+and `slack-ask`/`slack-notify`** (free zeus home or request a bump). No work is lost: every `restart.yml`
+lives on OL.
+
+Apply the runbook's **stalled-but-alive escalation** (ARC Campaign Runbook §Phase B; e.g. the
+`linear`/BDE CPU-spin hang): a live PID with no `arc.log` / `restart.yml` advance for **> ~3 h** (zeus
+jobs not merely queued) → **kill+restart** (resumes from `restart.yml`; counts against the retry budget);
+on budget exhaustion mark `blocked`/`crashed`, record the signature in `ISSUES.md`, and continue with the
+pool.
+
+**Crash → fix → restart:** match the traceback to the vault **known-bug catalog** → fix in the host's
+ARC/RMG checkout → restart from the instance dir (ARC resumes from `restart.yml`); bounded **retry
+budget (3)**, then mark `blocked`/`crashed` and **continue with the others** (one bad instance never
+stalls the pool).
+
+- **Record fixes by scope — code stays UNSTAGED (never `git add`/`git commit`):**
+  - **Per-run fix** (one crash's diff in this campaign): **feel free to apply bug fixes directly to the
+    local ARC/RMG checkout** to unblock the pool — just **never commit/push them**. Leave every edit
+    **unstaged** and log it in a **per-project `FIXES.md`** with a fixed, reviewable schema so the user
+    can later inspect and decide what to commit: **timestamp · bug/symptom · root cause · files touched
+    · the fix (inline unified diff or a `git -C <repo> diff -- <file>` pointer) · which instance(s) it
+    unblocked.** Re-apply unstaged fixes after a fresh checkout. (The user reviews accumulated edits via
+    `git -C ~/Code/ARC diff` after several runs — keep `FIXES.md` the faithful index of that diff.)
+  - **Validated, generalizable learning** (a genuinely new failure mode + fix, or a confirmed
+    config/queue/LOT gotcha): **consolidate it into the vault** per the runbook — **merge and
+    integrate into the relevant existing section, don't append duplicates; confirmed-only, never
+    speculation.** Put OL/zeus-environment issues in `Code/ARC/ARC on OL — Zeus Troubleshooting &
+    Knowledge.md` (its newest-at-top log) and general ARC/RMG code/failure-mode learnings in
+    `knowledge/wiki/Running ARC On Zeus.md` (§4–5 bug catalog). This vault update is silent (no Slack).
 
 ## Running unattended — supervisor poll-loop (keeps context low)
 Prefer running under the bundled **`arc_babysitter.sh`** supervisor rather than one long session. It
@@ -96,59 +136,6 @@ stay resident or sleep. End each pass by writing one word to `~/Projects/.arc_ba
 record it in `STATUS.md`; do **not** block on `slack-ask`), or `RUNNING`. Sequential passes preserve
 the single-orchestrator / one-pool invariant automatically.
 
-## Phase B — launch + babysitting (per pass)
-Launch one **detached** ARC process per instance from its dir (`setsid python ~/Code/ARC/ARC.py
-input.yml &`), record PID+time in `STATUS.md`; **single orchestrator / one pool** across campaigns.
-**Batch size is bounded by the SSH budget, not just host resources:** autodetect from host (`nproc`,
-`free -g`, ~1–2 GB/Arkane) and the zeus queue (`qstat -u $USER` vs `max_simultaneous_jobs`), **then cap
-so ARC's own polling stays under budget** — each running ARC process spends ~20 SSH/h at the 180 s poll,
-so ~2–3 concurrent ARC processes already consume the < ~60 SSH/h ceiling (leaving room for babysitter
-checks). The heavy compute is on zeus; more local processes add queue/SSH pressure, not throughput.
-
-Each pass, for every `running` instance check health (PID alive, `arc.log` advancing, jobs cycling
-opt→freq→scan→sp, `restart.yml` updating, zeus jobs not stuck `Q`) and append a **timestamped
-heartbeat** line to `STATUS.md`. **Respect the zeus SSH budget strictly** (vault: Running ARC On Zeus
-§0b — a spamming account gets banned, killing all future projects): all per-pass zeus checks in **one
-batched connection** (`ssh zeus 'qstat -u $USER; quota -s'`, ≤ 4 SSH ops/pass), one `qstat -u $USER`
-for all instances, < ~60 SSH/h combined incl. ARC's own polling; back off ≥ 5 min on SSH failures,
-never tight-loop.
-
-**Zeus home-quota guard (a known pool-killer — check every pass, free in the batched connection).**
-zeus home is quota-capped (soft/hard, e.g. 300/330 GB) and ARC outputs grow ~1.8 GB/hr, so a long
-campaign steadily re-approaches the cap; crossing the **hard** limit makes *every* instance's SFTP
-write fail at once → simultaneous pool-wide `OSError: [Errno 28] No space left` (even on local writes —
-don't be fooled, OL disk is fine). From the batched `quota -s`: **over soft → warn in `STATUS.md` and
-lower `max_simultaneous_jobs` / hold new launches**; **near hard → pause launches and `slack-ask`/
-`slack-notify`** (free zeus home space or request a bump — the durable fix). No work is lost: every
-`restart.yml` lives on OL.
-
-**Stalled-but-alive escalation (not every wedge is a crash).** A live PID with **no `arc.log` /
-`restart.yml` advance** is *unhealthy* even without a traceback (e.g. the `linear`/BDE conformer
-CPU-spin hang — hours stuck on a tiny fragment, or a job re-submitted in a loop). If an instance shows
-no progress for **> ~3 h** (and zeus jobs aren't merely queued), **kill+restart it** (resumes from
-`restart.yml`; counts against the retry budget); on exhausting the budget mark `blocked`/`crashed`,
-record the signature in `ISSUES.md`, and continue with the pool.
-
-**Crash → fix → restart:** match the traceback to the vault **known-bug catalog** → fix in the host's
-ARC/RMG checkout → restart from the instance dir (ARC resumes from `restart.yml`); bounded **retry
-budget (3)**, then mark `blocked`/`crashed` and **continue with the others** (one bad instance never
-stalls the pool).
-
-- **Record fixes by scope — code stays UNSTAGED (never `git add`/`git commit`):**
-  - **Per-run fix** (one crash's diff in this campaign): **feel free to apply bug fixes directly to the
-    local ARC/RMG checkout** to unblock the pool — just **never commit/push them**. Leave every edit
-    **unstaged** and log it in a **per-project `FIXES.md`** with a fixed, reviewable schema so the user
-    can later inspect and decide what to commit: **timestamp · bug/symptom · root cause · files touched
-    · the fix (inline unified diff or a `git -C <repo> diff -- <file>` pointer) · which instance(s) it
-    unblocked.** Re-apply unstaged fixes after a fresh checkout. (The user reviews accumulated edits via
-    `git -C ~/Code/ARC diff` after several runs — keep `FIXES.md` the faithful index of that diff.)
-  - **Validated, generalizable learning** (a genuinely new failure mode + fix, or a confirmed
-    config/queue/LOT gotcha): **consolidate it into the vault** per the runbook — **merge and
-    integrate into the relevant existing section, don't append duplicates; confirmed-only, never
-    speculation.** Put OL/zeus-environment issues in `Code/ARC/ARC on OL — Zeus Troubleshooting &
-    Knowledge.md` (its newest-at-top log) and general ARC/RMG code/failure-mode learnings in
-    `knowledge/wiki/Running ARC On Zeus.md` (§4–5 bug catalog). This vault update is silent (no Slack).
-
 ## Issues ledger (`ISSUES.md`, per project) — human follow-up
 The per-project **`ISSUES.md`** is the human punch-list for after the run, distinct from `STATUS.md`
 (live job ledger) and `FIXES.md` (code-fix log), and **finer-grained** (one instance may be fine yet
@@ -162,8 +149,7 @@ afterward; keeping it current is **silent** (no Slack).
 ## `REPORT.md` (per project) — the single clean human deliverable
 `STATUS.md`/`ISSUES.md`/`FIXES.md` are **working files**; `REPORT.md` is the **one thing the user
 reads** when a campaign finishes (or pauses). Generate/refresh it at any terminal state and on PAUSED.
-Keep it **minimal, skimmable, and informative** — fixed sections, newest decisive facts first, no
-process noise:
+Fixed sections, newest decisive facts first, no process noise:
 - **Wins** — what converged and was **accepted** (k(T)/k∞/thermo) with the LOT, one line each.
 - **Didn't converge / blocked** — each unconverged species, TS-not-found, or `blocked`/`crashed`
   instance with **why** (root cause in plain terms) and a **recommendation** (next LOT, adapter, manual
@@ -225,7 +211,7 @@ Invoke the existing **`slack-ask`** / **`slack-notify`** skills (they post as th
    Throttle to one per 24 h; skip if the pool finished or paused that day (those already notify).
 
 **Otherwise: no Slack.** Normal progress, routine auto-fixes, quota warnings below the threshold, and
-per-pass heartbeats go to `STATUS.md` only — do not spam the channel.
+per-pass heartbeats go to `STATUS.md` only.
 
 ## Related
 Vault: `[[ARC Campaign Runbook]]` · `[[Running ARC On Zeus]]` · `ARC on OL — Zeus Troubleshooting`.
