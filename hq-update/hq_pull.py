@@ -154,7 +154,9 @@ def scan(vault):
                 note.append(f"🕸 stale {-up}d")
             loc = fm.get("local", "")
             if loc:
-                lp = os.path.expanduser(loc.strip('"').split()[0]) if loc.strip() else ""
+                # loc is already comment-stripped + unquoted by _frontmatter; use it WHOLE.
+                # (do NOT .split() — that broke any local: path containing spaces.)
+                lp = os.path.expanduser(loc.strip()) if loc.strip() else ""
                 if lp and not os.path.exists(lp):
                     note.append("⚠ dead local:")
             cur = fm.get("light", "")
