@@ -83,7 +83,8 @@ python3 ~/.claude/bin/cc-slack-post.py "$MSG"      # prints "OK" + message ts on
 ## Provenance
 Every claim traces to `Status.md` or a node body. Do **not** invent PRs, deadlines, review items,
 or facts — if it isn't in the snapshot or a node, don't assert it. PR references are always live
-links (`[owner/repo#NNN](https://github.com/owner/repo/pull/NNN)`), matching `Status.md`.
+links that carry the PR's title (`[owner/repo#NNN <title>](https://github.com/owner/repo/pull/NNN)`),
+matching `Status.md` — never a bare number without its title (defer to HQ/CLAUDE.md).
 
 ## What good looks like
 > W28: *one thing* = land ARC #878 (unblocks the ⛔ benchmark paper + FA/HOCO + SAF); focus =

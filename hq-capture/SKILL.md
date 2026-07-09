@@ -43,7 +43,9 @@ link the PR and capture the **decision**.
   node-level `blocked` flip — the node's light stays honest (defer to CLAUDE.md).
 
 ## PR references
-Always live links: `[owner/repo#NNN](https://github.com/owner/repo/pull/NNN)`, matching the rest of HQ.
+Always live links that **carry the PR's title**:
+`[owner/repo#NNN <title>](https://github.com/owner/repo/pull/NNN)` — never a bare number without its
+title, matching the rest of HQ (defer to HQ/CLAUDE.md).
 
 ## What good looks like
 > ARC #909 session → `Developer/ARC/repo.md`: the #909 next-action updated in place to its current

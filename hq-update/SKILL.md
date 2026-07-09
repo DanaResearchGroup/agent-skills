@@ -59,8 +59,9 @@ CI-red, or manual `urgency: high`. Done ⇒ archived to `HQ/_archive/`, never re
 `blocked: true` → render **⛔ beside the light** (orthogonal — don't force red; blocked ≠ urgent).
 
 ## PR references
-Always live links: `[#878](https://github.com/<owner>/<repo>/pull/878)`, never a bare `#878`.
-`hq_pull.py` emits linked PRs into [[Status]]; match that in every board/node you write.
+Always live links that **carry the PR's title**: `[#878 sp_composite focal-point/CBS protocols](https://github.com/<owner>/<repo>/pull/878)`
+— never a bare `#878`, never a number without its title. `hq_pull.py` emits title-bearing linked
+PRs into [[Status]]; match that in every board/node you write (defer to HQ/CLAUDE.md).
 
 ## What good looks like
 > #878 sp_composite: live `CONFLICTING` → node next-action flipped `ready-to-merge` → `rebase`;

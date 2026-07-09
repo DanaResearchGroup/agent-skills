@@ -36,9 +36,11 @@ it; this skill only orchestrates and **must not duplicate its depth.** Vault:
    to drop → ask**; priority ties → ask. Guessing here is the same failure as deciding actions.
 4. **Present to Alon; let him decide** — accept / re-word an action / reorder / add / drop. Only
    after he decides do you write.
-5. **Write the agreed set** into the node's `Next actions` (verb-first, PRs live-linked, the action
-   vocabulary), bump `updated:` (`DD/MM/YYYY`), and append one dated `Log` entry recording what was
-   decided and which drift was resolved. Leave `Status.md` / `Dashboard.md` to `hq-update`.
+5. **Write the agreed set** into the node's `Next actions` (verb-first, the action vocabulary, and
+   every PR a **title-bearing live link** — `[#NNN <title>](https://github.com/owner/repo/pull/NNN)`,
+   never a bare number; defer to HQ/CLAUDE.md), bump `updated:` (`DD/MM/YYYY`), and append one dated
+   `Log` entry recording what
+   was decided and which drift was resolved. Leave `Status.md` / `Dashboard.md` to `hq-update`.
 
 ## Action vocabulary
 `review` (someone else's PR you owe a review) · `develop <what's left>` · `rebase-first` (live
