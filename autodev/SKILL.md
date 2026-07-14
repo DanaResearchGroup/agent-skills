@@ -39,6 +39,8 @@ S="$HOME/agents/state"
 MYSID=$(grep -l "^${HERDR_PANE_ID:-__none__}$" "$S"/*.herdr-pane 2>/dev/null | head -1 | xargs -r -n1 basename | sed 's/\.herdr-pane$//')
 [ -z "$MYSID" ] && MYSID=$(grep -l "^${TMUX_PANE:-__none__}$" "$S"/*.tmux-pane 2>/dev/null | head -1 | xargs -r -n1 basename | sed 's/\.tmux-pane$//')
 CTXFILE="$S/${MYSID:-unknown}.ctx"
+# Status-line: mark this session as an autodev run (lights the AUTODEV badge).
+[ -n "$MYSID" ] && [ "$MYSID" != "unknown" ] && touch "$S/$MYSID.autodev" 2>/dev/null || true
 echo "SLUG=$SLUG"
 echo "PROGRESS=$DEV/progress.md"
 echo "CTXFILE=$CTXFILE   (read your live context % from here)"
@@ -239,6 +241,10 @@ mid-run is fully recoverable — keep `progress.md` current at every checkpoint 
   ambiguous, or irreversible/destructive/out-of-scope, or needs user-only info per
   "Decision points") → write `/handoff`, ask via AskUserQuestion, stop.
 - Same step fails 3 times → stop, write progress.md Blockers, escalate with what you tried.
+
+When you stop for any of the above, clear the autodev status-line marker:
+`rm -f "$S/$MYSID.autodev"` (harmless if `$S`/`$MYSID` aren't in scope — it just
+lingers until the session ends).
 
 ## Implementation & install (bundled, portable)
 
