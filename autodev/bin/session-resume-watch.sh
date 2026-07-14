@@ -10,14 +10,14 @@
 #   2. else parse the reset time, sleep until a few minutes PAST it, then send "continue".
 #
 # The context-% signal lives in the statusline JSON; the *limit* signal does NOT — it is only
-# rendered in the pane. So this watcher detects it by reading the tmux pane, not a marker file.
+# rendered in the pane. So this watcher detects it by reading the pane text (herdr or tmux), not a marker file.
 #
 # Conservative + reversible, same doctrine as the handoff watcher:
 #   - Global kill switch:      ~/agents/state/disable-auto-compact   (present => whole system off)
 #   - Phoenix-only kill switch: ~/agents/state/disable-auto-resume    (present => this off)
 #   - Arming:                  ~/agents/state/auto-handoff.armed      (absent  => dry-run, log only)
 #   - Skip paid credits:       ~/agents/state/no-usage-credits        (present => go straight to wait)
-#   - Per-session pane:        ~/agents/state/<sid>.tmux-pane         (required to act)
+#   - Per-session pane:        ~/agents/state/<sid>.{herdr,tmux}-pane (required to act)
 #   - Per-session lock:        only one resume waiter per session at a time.
 #   - While waiting it writes  ~/agents/state/<sid>.limit-wait        (statusline badge +
 #                              the handoff watcher defers while it exists).
@@ -31,16 +31,19 @@ LOGDIR="$AUTODEV_HOME/logs"
 LOG="$LOGDIR/auto-resume.log"
 mkdir -p "$STATE" "$LOGDIR" 2>/dev/null
 
-BUFFER_MIN=4        # send "continue" this many minutes PAST the stated reset time
+# Multiplexer abstraction (herdr | tmux). Absent => watcher safely no-ops.
+_HERE="$(cd "$(dirname "$0")" && pwd)"
+[ -f "$_HERE/mux-lib.sh" ] && . "$_HERE/mux-lib.sh"
+
+BUFFER_MIN=4      # send "continue" this many minutes PAST the stated reset time
 CREDITS_WAIT=8      # seconds to wait after /usage-credits before checking if the limit cleared
 DETECT_RECHECK=3    # seconds between the two initial banner checks
 WAKE=60             # re-check interval during the long wait-for-reset sleep
 MAX_WAIT=93600      # 26h sanity cap; a parsed wait longer than this is treated as a parse error
 POLL=3
 
-# Pane "busy" markers (same set as the handoff watcher) — CC queues input while busy.
-BUSY_RE='esc to interrupt|Crunching|Compacting|Waiting for [0-9]|Press up to edit queued|Running [0-9]+ (shell|command)|Running .*command…|Running .*shell'
-# Usage/session-limit banner markers.
+# Usage/session-limit banner markers (Phoenix-specific; herdr has no native state
+# for this, so the banner is always detected by reading pane text via mux_capture).
 LIMIT_RE='hit your (session|usage|rate)[ ]?limit|(session|usage|rate) limit reached|limit reached ·|hit your limit'
 
 log(){ printf '%s [%s] %s\n' "$(date +'%Y.%m.%d %H.%M.%S')" "$sid" "$*" >> "$LOG"; }
@@ -53,28 +56,28 @@ log(){ printf '%s [%s] %s\n' "$(date +'%Y.%m.%d %H.%M.%S')" "$sid" "$*" >> "$LOG
 DRY=1
 [ -f "$STATE/auto-handoff.armed" ] && DRY=0
 
-# --- pane must be registered + live ---
-panef="$STATE/$sid.tmux-pane"
-[ -f "$panef" ] || exit 0
-pane=$(cat "$panef" 2>/dev/null); [ -n "$pane" ] || exit 0
-tmux list-panes -a -F '#{pane_id}' 2>/dev/null | grep -qx "$pane" || exit 0
+# --- pane must be registered + live (herdr preferred, tmux fallback) ---
+command -v mux_init >/dev/null 2>&1 || exit 0
+mux_init "$sid" || exit 0
+pane="$PANE"
+mux_pane_live || exit 0
 
-snapshot(){ tmux capture-pane -t "$pane" -p 2>/dev/null; }
-has_limit(){ snapshot | grep -Eiq "$LIMIT_RE"; }
-pane_busy(){ snapshot | tail -15 | grep -Eq "$BUSY_RE"; }
-pane_live(){ tmux list-panes -a -F '#{pane_id}' 2>/dev/null | grep -qx "$pane"; }
+snapshot(){ mux_capture; }
+has_limit(){ mux_capture | grep -Eiq "$LIMIT_RE"; }
+pane_busy(){ mux_busy; }
+pane_live(){ mux_pane_live; }
 
-send(){ # one literal line + Enter to the pane
+send(){ # one literal line + Enter to the pane (via herdr/tmux)
   local text="$1"
-  if [ "$DRY" = 1 ]; then log "DRY would send-keys: [$text]"; else
-    tmux send-keys -t "$pane" -l "$text" 2>>"$LOG" && tmux send-keys -t "$pane" Enter 2>>"$LOG"
+  if [ "$DRY" = 1 ]; then log "DRY would send: [$text]"; else
+    mux_send_line "$text" 2>>"$LOG"
     log "SENT: [$text]"
   fi
 }
 send_key(){ # a named key (e.g. Escape), no literal
   local key="$1"
   if [ "$DRY" = 1 ]; then log "DRY would send-key: [$key]"; else
-    tmux send-keys -t "$pane" "$key" 2>>"$LOG"; log "SENT key: [$key]"
+    mux_send_key "$key" 2>>"$LOG"; log "SENT key: [$key]"
   fi
 }
 wait_pane_idle(){ local d=$(( $(date +%s) + ${1:-30} )); while [ "$(date +%s)" -lt "$d" ]; do pane_busy || return 0; sleep "$POLL"; done; return 1; }

@@ -8,14 +8,21 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STATE="$AUTODEV_HOME/state"
 mkdir -p "$STATE" 2>/dev/null
 
+# Multiplexer abstraction (herdr | tmux) for pane registration.
+[ -f "$HERE/mux-lib.sh" ] && . "$HERE/mux-lib.sh"
+
 sid=$(printf '%s' "$input" | jq -r '.session_id // empty')
 tpath=$(printf '%s' "$input" | jq -r '.transcript_path // empty')
 [ -z "$sid" ] && [ -n "$tpath" ] && sid=$(basename "$tpath" .jsonl)
 [ -z "$sid" ] && exit 0
 
 printf '%s\n' "$(date +%s)" > "$STATE/$sid.idle" 2>/dev/null
-# Redundant pane capture (Stop hook inherits CC's tmux env).
-[ -n "${TMUX_PANE:-}" ] && printf '%s\n' "$TMUX_PANE" > "$STATE/$sid.tmux-pane" 2>/dev/null
+# Redundant pane capture (Stop hook inherits CC's herdr/tmux env).
+if command -v mux_register >/dev/null 2>&1; then
+  mux_register "$sid"
+elif [ -n "${TMUX_PANE:-}" ]; then
+  printf '%s\n' "$TMUX_PANE" > "$STATE/$sid.tmux-pane" 2>/dev/null
+fi
 
 # Launch the watchers fully detached so they survive this hook returning and can
 # poll for later turns. Each self-gates (threshold, lock, cooldown, arm).
