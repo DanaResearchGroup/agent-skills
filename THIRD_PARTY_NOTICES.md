@@ -31,6 +31,7 @@ substantially). Each remains under the upstream MIT license reproduced below:
 - `to-issues/`
 - `to-prd/`
 - `triage/`
+- `wayfinder/`
 - `writing-great-skills/`
 
 ```
