@@ -169,6 +169,9 @@ fi
 SESSION_ID=$(sed -n 's/^SESSION_ID://p' "$RUN_OUT" | tail -1)
 [ -n "$SESSION_ID" ] && printf '%s\n' "$SESSION_ID" > "$STORE/.session-id"
 sed '/^SESSION_ID:/d' "$RUN_OUT" > "$ANSWER_FILE.tmp" && mv "$ANSWER_FILE.tmp" "$ANSWER_FILE"
+# Optional: record Codex's context-window fill for the status line (silent no-op
+# without the autodev/status-line infra).
+[ -n "$SESSION_ID" ] && "$HOME/.claude/skills/autodev/bin/codex-spar-ctx.sh" "$SESSION_ID" 2>/dev/null || true
 ```
 
 For later rounds:
@@ -183,6 +186,9 @@ if [ "$CODEX_EXIT" != 0 ]; then
   exit "$CODEX_EXIT"
 fi
 sed '/^SESSION_ID:/d' "$RUN_OUT" > "$ANSWER_FILE.tmp" && mv "$ANSWER_FILE.tmp" "$ANSWER_FILE"
+# Optional: record Codex's context-window fill for the status line (silent no-op
+# without the autodev/status-line infra).
+[ -n "$SESSION_ID" ] && "$HOME/.claude/skills/autodev/bin/codex-spar-ctx.sh" "$SESSION_ID" 2>/dev/null || true
 ```
 
 If `CODEX_EXIT` is `124`, report a 10-minute timeout. If it is non-zero, include the first stderr

@@ -49,10 +49,46 @@ fi
 # ---- original status line rendering (preserved verbatim in behavior) ----
 model=$(printf '%s' "$input" | jq -r '.model.display_name // "Claude"' | sed -E 's/ *\([^)]*\) *$//')
 tok_fmt=$(printf '%s' "$input" | jq -r 'if (.context_window.total_input_tokens // 0) >= 1000 then ((.context_window.total_input_tokens / 1000) | tostring | split(".") | if .[1] then .[0] + "." + (.[1] | .[0:1]) else .[0] end) + "k" else (.context_window.total_input_tokens // 0 | tostring) end')
+# Location segment (repo / branch / worktree / dirty) + context colour via the
+# shared lib, so this stays identical to the group bin/cc-statusline.sh.
+# Degrades to the original 2-colour, no-location behaviour if the lib is absent.
+_ccsl_lib="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../bin/lib" 2>/dev/null && pwd)/cc-statusline-lib.sh"
+loc=""
+if [ -f "$_ccsl_lib" ]; then
+  # shellcheck source=/dev/null
+  . "$_ccsl_lib"
+  dir=$(printf '%s' "$input" | jq -r '.workspace.current_dir // .cwd // empty')
+  loc=$(cc_location "$dir")
+fi
+# Autodev-run badge: lit only when THIS session is marked as an autodev run.
+# autodev/SKILL.md touches "$STATE/$sid.autodev" at run start and clears it at
+# the end, so it never bleeds into other concurrent sessions.
+ad_badge=""
+[ -n "$sid" ] && [ -f "$STATE/$sid.autodev" ] && ad_badge="\033[1;97;44m AUTODEV \033[0m "
+
+# Codex spar context %: shown when a spar round wrote a fresh reading (< 30 min
+# old) via autodev/bin/codex-spar-ctx.sh — i.e. the context fill of the Codex
+# sparring session you're currently bouncing off.
+spar_badge=""
+_scf="$STATE/codex-spar.ctx"
+if [ -f "$_scf" ]; then
+  _sp_pct=$(sed -n 's/^pct=\([0-9.]*\).*/\1/p' "$_scf")
+  _sp_ts=$(sed -n 's/.*ts=\([0-9]*\).*/\1/p' "$_scf")
+  if [ -n "$_sp_pct" ] && [ -n "$_sp_ts" ] && [ "$(( $(date +%s) - _sp_ts ))" -lt 1800 ]; then
+    spar_badge=" \033[35mspar:${_sp_pct}%\033[0m"
+  fi
+fi
+
 if [ -n "$pct" ]; then
   pct_fmt=$(printf '%s' "$pct" | awk '{printf "%.1f", $1}')
-  if awk "BEGIN{exit !($pct < 40)}"; then color="\033[32m"; else color="\033[31m"; fi
-  printf "%b  %s %s %b(%s%%)\033[0m" "$badge" "$model" "$tok_fmt" "$color" "$pct_fmt"
+  if command -v cc_ctx_color >/dev/null 2>&1; then
+    color=$(cc_ctx_color "$pct")
+  elif awk "BEGIN{exit !($pct < 40)}"; then
+    color="\033[32m"
+  else
+    color="\033[31m"
+  fi
+  printf "%b%b  %s %s %b(%s%%)\033[0m%b%b" "$badge" "$ad_badge" "$model" "$tok_fmt" "$color" "$pct_fmt" "$loc" "$spar_badge"
 else
-  printf "%b  %s %s" "$badge" "$model" "$tok_fmt"
+  printf "%b%b  %s %s%b%b" "$badge" "$ad_badge" "$model" "$tok_fmt" "$loc" "$spar_badge"
 fi
