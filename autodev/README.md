@@ -5,7 +5,8 @@ The `autodev` skill drives a long, autonomous feature build (implement → adver
 keeps such a run alive across the two things that normally kill it:
 
 - **auto-handoff watcher** — past a context threshold, at an idle turn boundary, drives
-  `/handoff` → `/compact` → `/rename` → "read the handoff and continue" via `tmux send-keys`.
+  `/handoff` → `/compact` → `/rename` → "read the handoff and continue" by sending keys to the
+  session's pane (herdr or tmux).
 - **Phoenix** (session-limit auto-resume) — on a usage/session-limit stop, runs
   `/usage-credits` or waits until past the stated reset time, then sends `continue`.
 
@@ -20,7 +21,8 @@ autodev/
   README.md                    # this file
   bin/
     install.sh                 # wire the hooks/statusLine into ~/.claude/settings.json
-    cc-statusline.sh           # statusLine: writes context % + tmux pane; renders the badge
+    mux-lib.sh                 # multiplexer abstraction (herdr preferred, tmux fallback)
+    cc-statusline.sh           # statusLine: writes context % + herdr/tmux pane; renders the badge
     cc-stop-hook.sh            # Stop hook: marks idle, launches both watchers (via $HERE)
     cc-sessionstart-compact.sh # SessionStart(compact) hook: reload-after-compaction backup
     auto-handoff-watch.sh      # engine: context-threshold → handoff/compact/reload
@@ -41,7 +43,7 @@ AUTODEV_HOME=~/agents CLAUDE_SETTINGS=~/.claude/settings.json bash .../bin/insta
 
 Requires `jq`. Idempotent (re-running never duplicates entries) and preserves any other hooks
 you already have. Takes effect for **new** Claude Code sessions (hooks load at session start).
-Must run Claude Code **inside tmux** for the send-keys automation to work.
+Must run Claude Code **inside herdr or tmux** for the send-keys automation to work (herdr preferred).
 
 ## Control switches (`$AUTODEV_HOME/state/`, default `~/agents/state/`)
 
@@ -62,12 +64,12 @@ Logs: `$AUTODEV_HOME/logs/{auto-handoff,auto-resume}.log`.
 
 ## Known limits (the fragile, unsupported link)
 
-- Driving CC via `tmux send-keys` is **not officially supported**; mid-typing collisions are
+- Driving CC by sending keys to its pane (herdr or tmux) is **not officially supported**; mid-typing collisions are
   possible. Both watchers gate on a real idle check and **defer** while the pane is busy
   (long turn, `/compact`, or background agents) — CC queues input while busy, so a
   perpetually-busy run may have no safe injection window until it next goes idle.
 - `/compact` cannot be triggered by the model or a hook — only the user or the external
-  watcher (via tmux). CC does not auto-continue after `/compact`; the watcher's explicit
+  watcher (via herdr or tmux). CC does not auto-continue after `/compact`; the watcher's explicit
   continue-send (and the `SessionStart(compact)` hook) is what resumes.
 - **Phoenix unverified-live premises** (can't be probed without a real limit; the
   parse→wait→continue path is dry-run-verified): (a) that the `Stop` hook fires when a turn

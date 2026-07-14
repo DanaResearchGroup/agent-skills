@@ -3,14 +3,14 @@
 # Conservative + reversible by design:
 #   - Global kill switch:  ~/agents/state/disable-auto-compact   (present => off)
 #   - Arming:              ~/agents/state/auto-handoff.armed      (absent  => dry-run)
-#   - Per-session pane:    ~/agents/state/<sid>.tmux-pane         (required to act)
+#   - Per-session pane:    ~/agents/state/<sid>.{herdr,tmux}-pane (required to act)
 #   - Cycle lock + cooldown prevent recursion / double-sends.
 #   - IDLE GATE: never send keys into a busy CC (which would queue them instead of
 #     running the command). Confirms the pane is at an idle prompt first.
 #   - Every decision and action is logged to ~/agents/logs/auto-handoff.log
 #
 # Sequence when triggered (armed, idle): /handoff -> wait idle -> /compact -> wait
-# compaction -> /rename <tmux session name> (re-assert the display name, which compaction
+# compaction -> /rename <session name> (re-assert the display name, which compaction
 # can reset) -> "read <handoff> and continue execution".
 sid="$1"
 [ -n "$sid" ] || exit 0
@@ -21,6 +21,11 @@ LOGDIR="$AUTODEV_HOME/logs"
 LOG="$LOGDIR/auto-handoff.log"
 mkdir -p "$STATE" "$LOGDIR" 2>/dev/null
 
+# Multiplexer abstraction (herdr | tmux). Provides mux_init/mux_pane_live/
+# mux_busy/mux_send_line/mux_session_name. Absent => watcher safely no-ops.
+_HERE="$(cd "$(dirname "$0")" && pwd)"
+[ -f "$_HERE/mux-lib.sh" ] && . "$_HERE/mux-lib.sh"
+
 THRESHOLD=25        # act only when used_percentage > THRESHOLD
 SETTLE=2            # settle before the first idle check
 POLL=3             # poll interval while waiting
@@ -29,9 +34,6 @@ WAIT_IDLE=420       # max seconds to wait for the /handoff turn to finish
 WAIT_COMPACT=300    # max seconds to wait for compaction to complete
 COOLDOWN=900        # suppress re-trigger after a SUCCESSFUL cycle
 RETRY_COOLDOWN=120  # short suppress after a mid-cycle abort
-
-# CC "busy" markers — if any appear in the live pane, input would be queued, not run.
-BUSY_RE='esc to interrupt|Crunching|Compacting|Waiting for [0-9]|Press up to edit queued|Running [0-9]+ (shell|command)|Running .*command…|Running .*shell'
 
 log(){ printf '%s [%s] %s\n' "$(date +'%Y.%m.%d %H.%M.%S')" "$sid" "$*" >> "$LOG"; }
 
@@ -64,15 +66,16 @@ if [ -f "$cdf" ]; then
   fi
 fi
 
-# --- pane registration gate ---
-panef="$STATE/$sid.tmux-pane"
-if [ ! -f "$panef" ]; then log "SKIP no pane registered (pct=$pct) expected $panef"; exit 0; fi
-pane=$(cat "$panef" 2>/dev/null); [ -n "$pane" ] || { log "SKIP empty pane file (pct=$pct)"; exit 0; }
-if ! tmux list-panes -a -F '#{pane_id}' 2>/dev/null | grep -qx "$pane"; then
-  log "SKIP pane $pane not live in tmux (pct=$pct)"; exit 0
+# --- pane registration gate (herdr preferred, tmux fallback) ---
+if ! command -v mux_init >/dev/null 2>&1 || ! mux_init "$sid"; then
+  log "SKIP no pane registered (pct=$pct)"; exit 0
 fi
-# Session name to keep across compaction (the tmux session name, e.g. "build").
-SESSION_NAME=$(tmux display-message -p -t "$pane" '#{session_name}' 2>/dev/null)
+pane="$PANE"
+if ! mux_pane_live; then
+  log "SKIP pane $pane ($MUX) not live (pct=$pct)"; exit 0
+fi
+# Stable label to re-assert after compaction (tmux session name; empty under herdr).
+SESSION_NAME=$(mux_session_name)
 
 # --- cycle lock (atomic mkdir; blocks recursion + concurrent cycles) ---
 lock="$STATE/$sid.cycle.lock"
@@ -80,10 +83,7 @@ if ! mkdir "$lock" 2>/dev/null; then log "SKIP cycle already in progress (pct=$p
 trap 'rmdir "$lock" 2>/dev/null || true' EXIT
 
 # --- idle helpers (pre-send safety gate; avoids queuing into a busy CC) ---
-pane_busy(){ # 0 = busy. Inspect only the bottom status/input area (visible pane,
-  # no scrollback) where CC renders its spinner / "Waiting for agents" / queued input.
-  tmux capture-pane -t "$pane" -p 2>/dev/null | tail -15 | grep -Eq "$BUSY_RE"
-}
+pane_busy(){ mux_busy; }  # 0 = busy (herdr agent_status, or tmux visible-pane scrape)
 wait_pane_idle(){ # $1 timeout; 0 when idle (confirmed twice), 1 on timeout
   local deadline=$(( $(date +%s) + $1 ))
   while [ "$(date +%s)" -lt "$deadline" ]; do
@@ -104,12 +104,12 @@ wait_turn_done(){ # $1 = since epoch, $2 = timeout: idle marker newer AND pane i
   return 1
 }
 
-send(){ # send one literal line + Enter to the registered pane
+send(){ # send one literal line + Enter to the registered pane (via herdr/tmux)
   local text="$1"
   if [ "$DRY" = 1 ]; then
-    log "DRY would send-keys: [$text]"
+    log "DRY would send: [$text]"
   else
-    tmux send-keys -t "$pane" -l "$text" 2>>"$LOG" && tmux send-keys -t "$pane" Enter 2>>"$LOG"
+    mux_send_line "$text" 2>>"$LOG"
     log "SENT: [$text]"
   fi
 }

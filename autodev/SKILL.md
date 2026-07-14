@@ -35,26 +35,27 @@ eval "$(~/.claude/skills/gstack/bin/gstack-slug 2>/dev/null)" 2>/dev/null || tru
 SLUG="${SLUG:-unknown}"
 DEV="$HOME/agents/autodev/$SLUG"; mkdir -p "$DEV"
 S="$HOME/agents/state"
-# Resolve THIS session's own context-% file by matching our tmux pane.
-MYSID=$(grep -l "^${TMUX_PANE:-__none__}$" "$S"/*.tmux-pane 2>/dev/null | head -1 | xargs -r -n1 basename | sed 's/\.tmux-pane$//')
+# Resolve THIS session's own context-% file by matching our pane (herdr preferred, tmux fallback).
+MYSID=$(grep -l "^${HERDR_PANE_ID:-__none__}$" "$S"/*.herdr-pane 2>/dev/null | head -1 | xargs -r -n1 basename | sed 's/\.herdr-pane$//')
+[ -z "$MYSID" ] && MYSID=$(grep -l "^${TMUX_PANE:-__none__}$" "$S"/*.tmux-pane 2>/dev/null | head -1 | xargs -r -n1 basename | sed 's/\.tmux-pane$//')
 CTXFILE="$S/${MYSID:-unknown}.ctx"
 echo "SLUG=$SLUG"
 echo "PROGRESS=$DEV/progress.md"
 echo "CTXFILE=$CTXFILE   (read your live context % from here)"
-echo -n "TMUX: "; [ -n "${TMUX:-}" ] && echo "yes" || echo "NO"
+echo -n "MUX: "; if [ "${HERDR_ENV:-}" = "1" ]; then echo "herdr"; elif [ -n "${TMUX:-}" ]; then echo "tmux"; else echo "NONE"; fi
 echo -n "AUTO_HANDOFF: "; if [ -f "$S/disable-auto-compact" ]; then echo "DISABLED"; elif [ -f "$S/auto-handoff.armed" ]; then echo "ARMED"; else echo "DRY-RUN"; fi
 echo -n "PHOENIX (limit-resume): "; if [ -f "$S/disable-auto-compact" ] || [ -f "$S/disable-auto-resume" ]; then echo "DISABLED"; elif [ -f "$S/auto-handoff.armed" ]; then echo "ARMED"; else echo "DRY-RUN"; fi
 ```
 
 Remember `$CTXFILE` — you read your own live context percentage from it at every phase
-boundary (Phase discipline, below). If `MYSID` is `unknown` (not in tmux, or the statusline
+boundary (Phase discipline, below). If `MYSID` is `unknown` (not in herdr or tmux, or the statusline
 hasn't rendered yet), fall back to your own soft estimate of context usage.
 
 Interpret the output and tell the user in one line whether the auto-handoff loop is
-actually active for this run. It is active ONLY if: running inside tmux AND state is
+actually active for this run. It is active ONLY if: running inside herdr or tmux AND state is
 `ARMED` AND this is a session started AFTER the hooks were installed (hooks load per
 session). If any of those is false, say so plainly:
-- not in tmux or `DRY-RUN`/`DISABLED` → "Auto-handoff is NOT active; I'll proactively
+- not in herdr/tmux or `DRY-RUN`/`DISABLED` → "Auto-handoff is NOT active; I'll proactively
   run `/handoff` near 25% and ask you to run `/compact`." (Codex review still works.)
 - all true → "Auto-handoff active — I'll keep working through compactions hands-free."
 

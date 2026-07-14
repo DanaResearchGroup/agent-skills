@@ -8,6 +8,10 @@ input=$(cat)
 STATE="$AUTODEV_HOME/state"
 mkdir -p "$STATE" 2>/dev/null
 
+# Multiplexer abstraction (herdr | tmux) for pane registration.
+_MUXLIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/mux-lib.sh"
+[ -f "$_MUXLIB" ] && . "$_MUXLIB"
+
 sid=$(printf '%s' "$input" | jq -r '.session_id // empty')
 tpath=$(printf '%s' "$input" | jq -r '.transcript_path // empty')
 [ -z "$sid" ] && [ -n "$tpath" ] && sid=$(basename "$tpath" .jsonl)
@@ -18,7 +22,11 @@ if [ -n "$sid" ]; then
     printf 'pct=%s ts=%s\n' "$pct" "$(date +%s)" > "$STATE/$sid.ctx.tmp" 2>/dev/null \
       && mv "$STATE/$sid.ctx.tmp" "$STATE/$sid.ctx" 2>/dev/null
   fi
-  if [ -n "${TMUX_PANE:-}" ]; then
+  # Register the backend pane (herdr and/or tmux) for the watchers.
+  if command -v mux_register >/dev/null 2>&1; then
+    mux_register "$sid"
+  elif [ -n "${TMUX_PANE:-}" ]; then
+    # Fallback if mux-lib.sh is missing: preserve the original tmux behavior.
     printf '%s\n' "$TMUX_PANE" > "$STATE/$sid.tmux-pane.tmp" 2>/dev/null \
       && mv "$STATE/$sid.tmux-pane.tmp" "$STATE/$sid.tmux-pane" 2>/dev/null
   fi
