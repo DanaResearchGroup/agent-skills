@@ -68,9 +68,18 @@ printf '%s\n' "<full handoff path>" > "$tmp" && mv "$tmp" "$HOME/agents/handoffs
 Then emit this explicit instruction block:
 
 ```text
-Run /compact now. After it completes, I'll reload from the handoff.
+Handoff written and .latest updated.
+
+• If this session's status line shows the 🔴 AUTO-HANDOFF badge: do NOTHING — the auto-handoff
+  watcher will run /compact and reload automatically as soon as the session is idle. It CANNOT
+  act while a background agent or turn is still running (input would be queued), so if it isn't
+  firing, make sure no background agents are left running.
+• If there is NO badge (an older session started before the watcher was installed, or not in
+  tmux): the automation is not attached here — run /compact yourself now.
+
 Reload contract: after compaction, the next Claude Code turn reads
 $(cat ~/agents/handoffs/.latest) and re-orients from it before continuing.
 ```
 
-Claude Code cannot self-trigger `/compact`; the user runs it.
+Claude Code cannot self-trigger `/compact` — only the user or the (badge-confirmed) watcher can.
+The badge is the definitive signal for whether this session has the automation attached.
