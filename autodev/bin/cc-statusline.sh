@@ -68,10 +68,20 @@ ad_badge=""
 
 # Codex spar context %: shown when a spar round wrote a fresh reading (< 30 min
 # old) via autodev/bin/codex-spar-ctx.sh — i.e. the context fill of the Codex
-# sparring session you're currently bouncing off.
+# sparring session you're currently bouncing off. The reading is keyed by project
+# slug, so resolve THIS repo's slug from the current dir (same key the writer
+# uses) and read only that file — the badge never bleeds across projects.
 spar_badge=""
-_scf="$STATE/codex-spar.ctx"
-if [ -f "$_scf" ]; then
+_sp_dir=$(printf '%s' "$input" | jq -r '.workspace.current_dir // .cwd // empty')
+_sp_slug=""
+if [ -n "$_sp_dir" ]; then
+  _GS="$HOME/.claude/skills/gstack/bin/gstack-slug"
+  [ -x "$_GS" ] && _sp_slug=$( (cd "$_sp_dir" 2>/dev/null && eval "$("$_GS" 2>/dev/null)" 2>/dev/null; printf '%s' "${SLUG:-}") )
+  [ -z "$_sp_slug" ] && _sp_slug=$(cd "$_sp_dir" 2>/dev/null && basename "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" | tr -cd 'a-zA-Z0-9._-')
+fi
+_sp_slug=$(printf '%s' "$_sp_slug" | tr -cd 'a-zA-Z0-9._-')
+_scf="$STATE/codex-spar.$_sp_slug.ctx"
+if [ -n "$_sp_slug" ] && [ -f "$_scf" ]; then
   _sp_pct=$(sed -n 's/^pct=\([0-9.]*\).*/\1/p' "$_scf")
   _sp_ts=$(sed -n 's/.*ts=\([0-9]*\).*/\1/p' "$_scf")
   if [ -n "$_sp_pct" ] && [ -n "$_sp_ts" ] && [ "$(( $(date +%s) - _sp_ts ))" -lt 1800 ]; then

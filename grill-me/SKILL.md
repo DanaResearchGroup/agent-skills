@@ -13,14 +13,21 @@ resolving dependencies between decisions one by one.
 
 ## How to Apply
 
-1. **One question at a time.** Don't dump a list. Ask, get the answer, follow up.
+1. **One question at a time, via the AskUserQuestion interface.** Don't dump a
+   list. Prefer presenting each question through the `AskUserQuestion` tool with
+   2-4 concrete options rather than free-form prose — it's faster for the user to
+   answer and forces you to lay out the real alternatives. Ask, get the answer,
+   follow up. (Fall back to plain prose only when the question genuinely can't be
+   framed as options.)
 2. **Walk the tree.** Identify branches in the design. For each branch, surface
    the dependencies, alternatives, and trade-offs. Resolve a branch before
    moving to the next.
 3. **Explore, don't ask.** If a question can be answered by reading the
    codebase, read the codebase instead of asking.
 4. **Always recommend.** For every question, provide your recommended answer
-   with reasoning. The user can accept or push back.
+   with reasoning. The user can accept or push back. When using
+   `AskUserQuestion`, make the recommended choice the first option and mark it
+   "(Recommended)" so the steer is visible at a glance.
 5. **Don't pull punches.** Surface assumptions, edge cases, failure modes,
    scope creep, hidden coupling.
 6. **Stop when the tree is resolved.** When every branch has a decision and

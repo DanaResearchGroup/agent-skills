@@ -112,6 +112,15 @@ Codex runs with `-C <repo> -s read-only`, so it can run git and read any in-repo
 Because the session is persistent (`codex exec resume`), this grounding carries forward to
 every later round — **do not repeat it** on subsequent spars.
 
+**Codex context is self-managed by `/spar`.** The persistent Codex session fills up over a long
+run; `/spar` handles this on its own — when the session gets too full it has the outgoing session
+write a successor handoff, rotates to a fresh Codex session reseeded with it (and re-applies the
+grounding prime), and announces the rotation. You do **nothing** extra for this. When you see a
+`/spar` round announce an auto-handoff, note it in `progress.md` Decisions ("Codex context rotated
+to a fresh session at round N — arc carried via predecessor handoff") so a compacted resume knows
+the Codex memory was rolled over. (This is separate from the Claude Code auto-handoff, which gates
+on *your* context, not Codex's.)
+
 For each milestone, in order:
 
 1. **Implement.** Prefer test-first (invoke the `tdd` skill discipline). Make the
