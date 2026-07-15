@@ -95,7 +95,7 @@ if [ -f "$STORE/.session-id" ] && [ -n "$PYTHON_CMD" ]; then
   OLD_SID=$(cat "$STORE/.session-id")
   # Fresh, per-session fill % straight from THIS session's rollout via the script's stdout
   # (not the shared global status-line file). Fail open: empty/non-numeric PCT -> skip.
-  PCT=$("$HOME/.claude/skills/autodev/bin/codex-spar-ctx.sh" "$OLD_SID" 2>/dev/null | sed -n 's/^pct=//p' | tail -1)
+  PCT=$("$HOME/.claude/skills/autodev/bin/codex-spar-ctx.sh" "$OLD_SID" "$SLUG" 2>/dev/null | sed -n 's/^pct=//p' | tail -1)
   if [ -n "$PCT" ] && awk "BEGIN{exit !($PCT+0 >= $THRESHOLD)}" 2>/dev/null; then
     echo "Codex context ${PCT}% >= ${THRESHOLD}% -- handing off to a fresh session."
     HANDOFF_PROMPT='You are about to be replaced by a successor Codex reviewer that will have ZERO memory of this conversation. Write a concise handoff, in your own words, that is the ONLY thing that carries over. Use these sections:
@@ -270,7 +270,7 @@ SESSION_ID=$(sed -n 's/^SESSION_ID://p' "$RUN_OUT" | tail -1)
 sed '/^SESSION_ID:/d' "$RUN_OUT" > "$ANSWER_FILE.tmp" && mv "$ANSWER_FILE.tmp" "$ANSWER_FILE"
 # Optional: record Codex's context-window fill for the status line (silent no-op
 # without the autodev/status-line infra).
-[ -n "$SESSION_ID" ] && "$HOME/.claude/skills/autodev/bin/codex-spar-ctx.sh" "$SESSION_ID" 2>/dev/null || true
+[ -n "$SESSION_ID" ] && "$HOME/.claude/skills/autodev/bin/codex-spar-ctx.sh" "$SESSION_ID" "$SLUG" 2>/dev/null || true
 ```
 
 For later rounds:
@@ -287,7 +287,7 @@ fi
 sed '/^SESSION_ID:/d' "$RUN_OUT" > "$ANSWER_FILE.tmp" && mv "$ANSWER_FILE.tmp" "$ANSWER_FILE"
 # Optional: record Codex's context-window fill for the status line (silent no-op
 # without the autodev/status-line infra).
-[ -n "$SESSION_ID" ] && "$HOME/.claude/skills/autodev/bin/codex-spar-ctx.sh" "$SESSION_ID" 2>/dev/null || true
+[ -n "$SESSION_ID" ] && "$HOME/.claude/skills/autodev/bin/codex-spar-ctx.sh" "$SESSION_ID" "$SLUG" 2>/dev/null || true
 ```
 
 If `CODEX_EXIT` is `124`, report a 10-minute timeout. If it is non-zero, include the first stderr

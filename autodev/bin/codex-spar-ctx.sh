@@ -1,20 +1,32 @@
 #!/usr/bin/env bash
-# codex-spar-ctx.sh <codex-session-id>
-# Persist the Codex context-window usage of a spar session so the PI's status
-# line can show it (bin/../autodev/bin/cc-statusline.sh reads the file). Called
-# by the /spar skill after each round. Best-effort: any failure is silent.
+# codex-spar-ctx.sh <codex-session-id> [slug]
+# Persist the Codex context-window usage of a spar session so the status line can
+# show it (autodev/bin/cc-statusline.sh reads the file). Called by the /spar skill
+# after each round. Best-effort: any failure is silent.
 #
-# Writes $AUTODEV_HOME/state/codex-spar.ctx:  pct=<n> used=<n> win=<n> ts=<epoch>
+# Writes $AUTODEV_HOME/state/codex-spar.<slug>.ctx:  pct=<n> used=<n> win=<n> ts=<epoch>
+# The file is keyed by project slug so the badge reflects THIS repo's spar
+# session, not whichever project sparred last. If the caller omits <slug> it is
+# derived from the current directory (gstack-slug, falling back to the git
+# toplevel basename) so the status line resolves the same key.
 # Also echoes `pct=<n>` to stdout so callers can read this specific session's
-# fresh fill % directly (the state file is global and may reflect another project).
+# fresh fill % directly.
 set -euo pipefail
 
 sid=${1:-}
+slug=${2:-}
 [ -n "$sid" ] || exit 0
 
 : "${AUTODEV_HOME:=$HOME/agents}"
 state="$AUTODEV_HOME/state"
 mkdir -p "$state" 2>/dev/null || exit 0
+
+if [ -z "$slug" ]; then
+  GS="$HOME/.claude/skills/gstack/bin/gstack-slug"
+  [ -x "$GS" ] && slug=$( (eval "$("$GS" 2>/dev/null)" 2>/dev/null; printf '%s' "${SLUG:-}") )
+  [ -z "$slug" ] && slug=$(basename "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" | tr -cd 'a-zA-Z0-9._-')
+fi
+slug=$(printf '%s' "${slug:-unknown}" | tr -cd 'a-zA-Z0-9._-')
 
 sessions="$HOME/.codex/sessions"
 [ -d "$sessions" ] || exit 0
@@ -24,7 +36,7 @@ rollout=$(find "$sessions" -name "rollout-*-$sid.jsonl" 2>/dev/null | head -1)
 
 py=$(command -v python3 2>/dev/null || command -v python 2>/dev/null) || exit 0
 
-"$py" - "$rollout" "$state/codex-spar.ctx" <<'PY' || exit 0
+"$py" - "$rollout" "$state/codex-spar.$slug.ctx" <<'PY' || exit 0
 import json, os, sys, time
 
 rollout, out = sys.argv[1], sys.argv[2]
