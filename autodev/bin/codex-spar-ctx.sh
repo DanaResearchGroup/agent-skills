@@ -5,6 +5,8 @@
 # by the /spar skill after each round. Best-effort: any failure is silent.
 #
 # Writes $AUTODEV_HOME/state/codex-spar.ctx:  pct=<n> used=<n> win=<n> ts=<epoch>
+# Also echoes `pct=<n>` to stdout so callers can read this specific session's
+# fresh fill % directly (the state file is global and may reflect another project).
 set -euo pipefail
 
 sid=${1:-}
@@ -47,4 +49,7 @@ tmp = out + ".tmp"
 with open(tmp, "w") as f:
     f.write("pct=%s used=%s win=%s ts=%d\n" % (pct, used, win, int(time.time())))
 os.replace(tmp, out)
+# Also emit the fill % to stdout so callers (e.g. the /spar auto-handoff gate)
+# can read THIS session's fresh value without trusting the shared global file.
+print("pct=%s" % pct)
 PY
