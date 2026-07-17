@@ -30,16 +30,29 @@ MUX_BUSY_RE='esc to interrupt|Crunching|Compacting|Waiting for [0-9]|Press up to
 # Record this session's backend pane id(s). Cheap by design: reads env vars only,
 # no subprocess to herdr/tmux, so it is safe on every statusline render. Writes
 # atomically. Records both files when a session is nested in both multiplexers.
+# Reverse pane->owner mapping file for a (mux, pane-id) pair. The pane id is
+# sanitized (':' and '%' -> '_') so it is a safe flat filename. This is the
+# tmux-side (and herdr fallback) source of truth for "who currently owns this
+# pane" — the last session to render a statusline in the pane wins, and a dead
+# session never renders again, so it never reclaims a recycled pane id.
+mux_owner_file(){ # $1 = mux, $2 = paneid
+  printf '%s/.paneowner-%s-%s' "$STATE" "$1" "$(printf '%s' "$2" | tr ':%' '__')"
+}
+
 mux_register(){ # $1 = sid
-  local sid="$1" f
+  local sid="$1" f o
   [ -n "$sid" ] || return 0
   if [ "${HERDR_ENV:-}" = "1" ] && [ -n "${HERDR_PANE_ID:-}" ]; then
     f="$STATE/$sid.herdr-pane"
     printf '%s\n' "$HERDR_PANE_ID" > "$f.tmp" 2>/dev/null && mv "$f.tmp" "$f" 2>/dev/null
+    o=$(mux_owner_file herdr "$HERDR_PANE_ID")
+    printf '%s\n' "$sid" > "$o.tmp" 2>/dev/null && mv "$o.tmp" "$o" 2>/dev/null
   fi
   if [ -n "${TMUX_PANE:-}" ]; then
     f="$STATE/$sid.tmux-pane"
     printf '%s\n' "$TMUX_PANE" > "$f.tmp" 2>/dev/null && mv "$f.tmp" "$f" 2>/dev/null
+    o=$(mux_owner_file tmux "$TMUX_PANE")
+    printf '%s\n' "$sid" > "$o.tmp" 2>/dev/null && mv "$o.tmp" "$o" 2>/dev/null
   fi
 }
 
@@ -67,6 +80,25 @@ mux_pane_live(){
     herdr) herdr pane get "$PANE" >/dev/null 2>&1 ;;
     *) return 1 ;;
   esac
+}
+
+# Session uuid the pane is CURRENTLY bound to (0 args; uses MUX/PANE from
+# mux_init). herdr recycles short pane ids (w1:pY, w1:pC...) when tabs/sessions
+# close, so a live pane may now host a DIFFERENT session than the one that first
+# registered it — mux_pane_live only proves the pane exists, not that it is still
+# ours. This resolves the true current owner so callers can refuse to drive a
+# recycled pane. herdr: authoritative live query (falls back to the reverse-owner
+# file). tmux: the reverse-owner file. Prints the sid, or nothing if unknown.
+mux_pane_owner(){
+  local o v
+  if [ "$MUX" = "herdr" ]; then
+    v=$(herdr pane get "$PANE" 2>/dev/null \
+          | grep -o '"agent_session":{[^}]*}' \
+          | grep -o '"value":"[^"]*"' | head -1 | cut -d'"' -f4)
+    if [ -n "$v" ]; then printf '%s\n' "$v"; return 0; fi
+  fi
+  o=$(mux_owner_file "$MUX" "$PANE")
+  [ -s "$o" ] && cat "$o" 2>/dev/null
 }
 
 # herdr agent state for the pane: prints idle|working|blocked|done|unknown.
