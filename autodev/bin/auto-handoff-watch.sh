@@ -34,6 +34,7 @@ WAIT_IDLE=420       # max seconds to wait for the /handoff turn to finish
 WAIT_COMPACT=300    # max seconds to wait for compaction to complete
 COOLDOWN=900        # suppress re-trigger after a SUCCESSFUL cycle
 RETRY_COOLDOWN=120  # short suppress after a mid-cycle abort
+HEARTBEAT_EVERY=600 # emit at most one HEARTBEAT log line per this many seconds
 
 log(){ printf '%s [%s] %s\n' "$(date +'%Y.%m.%d %H.%M.%S')" "$sid" "$*" >> "$LOG"; }
 
@@ -53,6 +54,20 @@ ctxf="$STATE/$sid.ctx"
 [ -f "$ctxf" ] || exit 0
 pct=$(sed -n 's/^pct=\([0-9.]*\).*/\1/p' "$ctxf")
 [ -n "$pct" ] || exit 0
+
+# --- heartbeat (throttled) ---
+# Proves the watcher is alive during quiet, BELOW-threshold periods, where every
+# gate below exits silently. Without this a benign "nothing to do" is
+# indistinguishable from a dead watcher — which is exactly what made past silence
+# impossible to diagnose. Throttled to one line per HEARTBEAT_EVERY per session.
+hbf="$STATE/$sid.heartbeat"; hb_now=$(date +%s)
+hb_last=0; [ -f "$hbf" ] && hb_last=$(cat "$hbf" 2>/dev/null || echo 0)
+if [ $(( hb_now - hb_last )) -ge "$HEARTBEAT_EVERY" ]; then
+  idle_age="?"
+  [ -f "$STATE/$sid.idle" ] && idle_age=$(( hb_now - $(cat "$STATE/$sid.idle" 2>/dev/null || echo "$hb_now") ))s
+  log "HEARTBEAT pct=$pct thr=$THRESHOLD idle_age=$idle_age armed=$([ "$DRY" = 0 ] && echo 1 || echo 0)"
+  printf '%s\n' "$hb_now" > "$hbf" 2>/dev/null
+fi
 
 # --- threshold gate (float compare) ---
 if awk "BEGIN{exit !($pct > $THRESHOLD)}"; then :; else exit 0; fi
@@ -89,9 +104,26 @@ fi
 SESSION_NAME=$(mux_session_name)
 
 # --- cycle lock (atomic mkdir; blocks recursion + concurrent cycles) ---
+# PID-aware so a crashed/SIGKILLed watcher (EXIT trap never ran) can't wedge every
+# future cycle behind a permanent "already in progress". If the recorded holder is
+# gone, reclaim the lock. A legacy pid-less lock (pre-upgrade watcher) is honored
+# while still fresh, then reclaimed once clearly stale.
 lock="$STATE/$sid.cycle.lock"
-if ! mkdir "$lock" 2>/dev/null; then log "SKIP cycle already in progress (pct=$pct)"; exit 0; fi
-trap 'rmdir "$lock" 2>/dev/null || true' EXIT
+if ! mkdir "$lock" 2>/dev/null; then
+  lpid=$(cat "$lock/pid" 2>/dev/null || true)
+  if [ -n "$lpid" ] && kill -0 "$lpid" 2>/dev/null; then
+    log "SKIP cycle already in progress (pid $lpid, pct=$pct)"; exit 0
+  fi
+  lock_age=$(( $(date +%s) - $(date -r "$lock" +%s 2>/dev/null || echo 0) ))
+  if [ -z "$lpid" ] && [ "$lock_age" -lt $(( WAIT_IDLE + WAIT_COMPACT )) ]; then
+    log "SKIP cycle in progress (legacy lock, age ${lock_age}s, pct=$pct)"; exit 0
+  fi
+  log "reclaim stale cycle lock (holder ${lpid:-none}, age ${lock_age}s, pct=$pct)"
+  rm -rf "$lock" 2>/dev/null
+  mkdir "$lock" 2>/dev/null || { log "SKIP cycle lock race (pct=$pct)"; exit 0; }
+fi
+printf '%s\n' "$$" > "$lock/pid" 2>/dev/null
+trap 'rm -rf "$lock" 2>/dev/null || true' EXIT
 
 # --- idle helpers (pre-send safety gate; avoids queuing into a busy CC) ---
 pane_busy(){ mux_busy; }  # 0 = busy (herdr agent_status, or tmux visible-pane scrape)
