@@ -74,6 +74,17 @@ pane="$PANE"
 if ! mux_pane_live; then
   log "SKIP pane $pane ($MUX) not live (pct=$pct)"; exit 0
 fi
+# --- pane-OWNERSHIP gate ---
+# A live pane is NOT proof it is still ours: herdr/tmux recycle pane ids, so the
+# pane our stale registration points at may now host a DIFFERENT, live session.
+# Injecting here would land /handoff+/compact in someone else's conversation.
+# Refuse, and self-heal by dropping our stale pane binding.
+owner=$(mux_pane_owner)
+if [ -n "$owner" ] && [ "$owner" != "$sid" ]; then
+  log "SKIP pane $pane reused by session $owner (not ours) — cleared stale binding (pct=$pct)"
+  rm -f "$STATE/$sid.$MUX-pane" 2>/dev/null
+  exit 0
+fi
 # Stable label to re-assert after compaction (tmux session name; empty under herdr).
 SESSION_NAME=$(mux_session_name)
 

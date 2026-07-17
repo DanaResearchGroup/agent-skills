@@ -61,6 +61,16 @@ command -v mux_init >/dev/null 2>&1 || exit 0
 mux_init "$sid" || exit 0
 pane="$PANE"
 mux_pane_live || exit 0
+# --- pane-OWNERSHIP gate (see auto-handoff-watch.sh) ---
+# herdr/tmux recycle pane ids; a live pane may now host a different session.
+# Refuse before we even read its banner, so we never resume/inject into someone
+# else's conversation. Self-heal by dropping our stale pane binding.
+owner=$(mux_pane_owner)
+if [ -n "$owner" ] && [ "$owner" != "$sid" ]; then
+  log "SKIP pane $pane reused by session $owner (not ours) — cleared stale binding"
+  rm -f "$STATE/$sid.$MUX-pane" 2>/dev/null
+  exit 0
+fi
 
 snapshot(){ mux_capture; }
 has_limit(){ mux_capture | grep -Eiq "$LIMIT_RE"; }
