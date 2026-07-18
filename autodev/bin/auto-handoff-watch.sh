@@ -29,7 +29,7 @@ mkdir -p "$STATE" "$LOGDIR" 2>/dev/null
 _HERE="$(cd "$(dirname "$0")" && pwd)"
 [ -f "$_HERE/mux-lib.sh" ] && . "$_HERE/mux-lib.sh"
 
-THRESHOLD=25        # act only when used_percentage > THRESHOLD
+THRESHOLD=30        # act only when used_percentage > THRESHOLD
 SETTLE=2            # settle before the first idle check
 POLL=3             # poll interval while waiting
 PRECHECK=45         # max seconds to wait for an idle window before deferring

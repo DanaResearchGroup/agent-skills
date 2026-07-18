@@ -59,7 +59,7 @@ Logs: `$AUTODEV_HOME/logs/{auto-handoff,auto-resume}.log`.
 
 ## Tunables (top of the engine scripts)
 
-- `auto-handoff-watch.sh`: `THRESHOLD=25`, `COOLDOWN=900`, `WAIT_IDLE/WAIT_COMPACT`, `SETTLE`.
+- `auto-handoff-watch.sh`: `THRESHOLD=30`, `COOLDOWN=900`, `WAIT_IDLE/WAIT_COMPACT`, `SETTLE`.
 - `session-resume-watch.sh`: `BUFFER_MIN=4` (minutes past reset), `CREDITS_WAIT`, `WAKE`, `MAX_WAIT`.
 
 ## Known limits (the fragile, unsupported link)
