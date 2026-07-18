@@ -14,6 +14,9 @@
 # can reset) -> "read <handoff> and continue execution".
 sid="$1"
 [ -n "$sid" ] || exit 0
+# sid is used to build state-file paths (incl. `rm -rf` of the cycle lock), so
+# reject anything that could escape $STATE via path traversal before any such use.
+case "$sid" in */*|*..*) exit 0 ;; esac
 
 : "${AUTODEV_HOME:=$HOME/agents}"; export AUTODEV_HOME
 STATE="$AUTODEV_HOME/state"
@@ -32,9 +35,9 @@ POLL=3             # poll interval while waiting
 PRECHECK=45         # max seconds to wait for an idle window before deferring
 WAIT_IDLE=420       # max seconds to wait for the /handoff turn to finish
 WAIT_COMPACT=300    # max seconds to wait for compaction to complete
-COOLDOWN=900        # suppress re-trigger after a SUCCESSFUL cycle
-RETRY_COOLDOWN=120  # short suppress after a mid-cycle abort
+COOLDOWN=900        # suppress re-trigger after a cycle (success OR abort)
 HEARTBEAT_EVERY=600 # emit at most one HEARTBEAT log line per this many seconds
+REQUEST_MAX_AGE=3600 # a .handoff-request older than this is stale -> ignored + removed
 
 log(){ printf '%s [%s] %s\n' "$(date +'%Y.%m.%d %H.%M.%S')" "$sid" "$*" >> "$LOG"; }
 
@@ -69,8 +72,26 @@ if [ $(( hb_now - hb_last )) -ge "$HEARTBEAT_EVERY" ]; then
   printf '%s\n' "$hb_now" > "$hbf" 2>/dev/null
 fi
 
-# --- threshold gate (float compare) ---
-if awk "BEGIN{exit !($pct > $THRESHOLD)}"; then :; else exit 0; fi
+# --- trigger gate: over threshold OR an explicit session handoff-request ---
+# A quiesced session that knows its NEXT phase is heavy can drop
+# $STATE/$sid.handoff-request to hand off at THIS clean boundary even below
+# threshold (e.g. holding at a phase boundary at 22%). The request bypasses ONLY
+# this gate — every safety gate below (cooldown, pane live/owned, cycle lock,
+# idle) still applies, so it fires only when genuinely quiesced and safe.
+req="$STATE/$sid.handoff-request"
+reason=""
+if [ -f "$req" ]; then
+  req_age=$(( $(date +%s) - $(date -r "$req" +%s 2>/dev/null || echo 0) ))
+  if [ "$req_age" -le "$REQUEST_MAX_AGE" ]; then
+    reason=requested
+  else
+    log "SKIP stale handoff-request (age ${req_age}s > ${REQUEST_MAX_AGE}s) — removed (pct=$pct)"
+    rm -f "$req" 2>/dev/null
+  fi
+fi
+if [ -z "$reason" ]; then
+  if awk "BEGIN{exit !($pct > $THRESHOLD)}"; then reason=threshold; else exit 0; fi
+fi
 
 # --- cooldown gate ---
 cdf="$STATE/$sid.cooldown"
@@ -171,7 +192,13 @@ fi
 # between our top-of-script check and now (both watchers launch on the same Stop).
 if [ -f "$STATE/$sid.limit-wait" ]; then log "SKIP session-limit resume pending (late)"; exit 0; fi
 
-log "TRIGGER pct=$pct > $THRESHOLD pane=$pane dry=$DRY"
+log "TRIGGER ($reason) pct=$pct thr=$THRESHOLD pane=$pane dry=$DRY"
+# Consume an explicit request NOW that we're committed to the cycle — before any
+# send. A post-send abort (/handoff or /compact may already have landed) must NOT
+# leave the marker to re-fire on the reloaded, already-compacted session; a fresh
+# request is required to retry. Only touch the marker when it is what triggered us,
+# so a request dropped DURING a threshold cycle survives to be honored next idle.
+[ "$reason" = requested ] && rm -f "$req" 2>/dev/null
 
 # 1) handoff
 t0=$(date +%s)
@@ -215,7 +242,8 @@ else
   send "Resume: read the newest handoff in $AUTODEV_HOME/handoffs and continue execution."
 fi
 
-# 4) stamp cooldown and finish
+# 4) stamp cooldown and finish. (An explicit request was already consumed at
+#    TRIGGER, so nothing to clean up here.)
 date +%s > "$cdf"
-log "CYCLE COMPLETE (dry=$DRY)"
+log "CYCLE COMPLETE ($reason, dry=$DRY)"
 exit 0
