@@ -17,19 +17,22 @@ here (copied from upstream; some adapted for this repository, in places
 substantially). Each remains under the upstream MIT license reproduced below:
 
 - `codebase-design/`
+- `code-review/`
 - `domain-modeling/`
 - `edit-article/`
+- `grilling/`
 - `grill-me/`
 - `grill-with-docs/`
 - `handoff/`
+- `implement/`
 - `improve-codebase-architecture/`
 - `obsidian-vault/`
 - `prototype/`
 - `resolving-merge-conflicts/`
 - `setup-matt-pocock-skills/`
 - `tdd/`
-- `to-issues/`
-- `to-prd/`
+- `to-spec/`
+- `to-tickets/`
 - `triage/`
 - `wayfinder/`
 - `writing-great-skills/`

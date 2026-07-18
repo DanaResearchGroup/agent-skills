@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/DanaResearchGroup/agent-skills/actions/workflows/ci.yml/badge.svg)](https://github.com/DanaResearchGroup/agent-skills/actions/workflows/ci.yml)
 [![Claude Code](https://img.shields.io/badge/Claude%20Code-skills-8A2BE2)](https://docs.anthropic.com/en/docs/claude-code)
-[![skills](https://img.shields.io/badge/skills-22-blue)](#whats-in-here)
+[![skills](https://img.shields.io/badge/skills-34-blue)](#whats-in-here)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Personal [Claude Code](https://docs.anthropic.com/en/docs/claude-code) skills for our
@@ -95,10 +95,27 @@ Verify with `/plugin` — you should see `superpowers` enabled. Full docs:
 | --- | --- |
 | **Research automation** | `babysit-arc`, `babysit-t3` — run/babysit ARC & T3 campaigns -- Please **NEVER** automate agents on a server without consulting the server owner (your PI) first! |
 | **Notifications** | `slack-ask`, `slack-notify` — reach you over Slack during unattended runs |
-| **Matt Pocock** ([`mattpocock/skills`](https://github.com/mattpocock/skills), MIT — see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)) | `tdd`, `to-issues`, `to-prd`, `triage`, `prototype`, `codebase-design`, `domain-modeling`, `improve-codebase-architecture`, `grill-me`, `grill-with-docs`, `resolving-merge-conflicts`, `setup-matt-pocock-skills`, `writing-great-skills`, `handoff`, `edit-article`, `obsidian-vault`, `wayfinder` |
+| **Matt Pocock** ([`mattpocock/skills`](https://github.com/mattpocock/skills), MIT — see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)) | `tdd`, `to-spec`, `to-tickets`, `implement`, `code-review`, `triage`, `prototype`, `codebase-design`, `domain-modeling`, `improve-codebase-architecture`, `grilling`, `grill-me`, `grill-with-docs`, `resolving-merge-conflicts`, `setup-matt-pocock-skills`, `writing-great-skills`, `handoff`, `edit-article`, `obsidian-vault`, `wayfinder` |
 | **Workflow** | `writing-git-commits`, `copilot-review` — fold a PR's Copilot/security bot review back into history; `merged` — after a PR lands, sync `main` and rebase the open PRs onto it |
 
 Plus **gstack** (installed in step 3) and the **Superpowers** plugin (step 4).
+
+## Recommended workflow
+
+The Matt Pocock engineering skills chain into one *idea → shipped* flow. For a
+non-trivial feature, drive them in order:
+
+1. **`/grill-with-docs`** — interview the idea into a sharp, documented design
+   (ADRs + glossary). For work too big to hold in one session, start with
+   **`/wayfinder`** instead to chart it as a shared map of tickets first.
+2. **`/to-spec`** — synthesize the conversation into a spec on your issue tracker.
+3. **`/to-tickets`** — break the spec into tracer-bullet tickets, each with its
+   blocking edges.
+4. **`/implement`** — build the tickets; drives **`/tdd`** as its red-green engine.
+5. **`/code-review`** — review the diff against your repo's standards and the spec.
+
+Run **`/setup-matt-pocock-skills`** once per repo first, so the skills know where
+your issue tracker, triage labels, and domain docs live.
 
 ## Other agents (Codex, Copilot CLI, Gemini)
 
