@@ -197,10 +197,33 @@ never gets checkpointed and blows past 30%. Prevent that:
        + `progress.md` and starting the next phase. This is the deliberate idle beat.
      - **Auto-handoff NOT active**: run `/handoff` yourself, update `progress.md`, tell the
        user to run `/compact` then `continue`, and stop.
-  4. **Else** (`pct` comfortable): proceed straight into the next phase — no yield, no stall.
+  4. **Else** (`pct` comfortable): proceed straight into the next phase — no yield, no stall,
+     **unless** the voluntary-handoff case below applies.
 
 Yielding only when `pct > 30` means you never stall the loop for a checkpoint you don't
 need, and you always hand the watcher a clean idle window exactly when one is required.
+
+**Voluntary early handoff (below threshold).** The `pct > 30` rule is reactive — it fires
+*after* you cross the line. But sometimes you are quiesced at a clean phase boundary at, say,
+22% and you *know* the next phase is heavy (a large mechanism review, a wide multi-file
+refactor, a long spar arc) that will blow well past 30% *inside* the phase, where there is no
+idle window for the watcher to use. In that case, hand off *before* opening the phase rather
+than partway through it: raise a voluntary request, then end your turn.
+
+```bash
+bash ~/.claude/skills/autodev/bin/request-handoff.sh   # drops this session's handoff-request marker
+```
+
+This writes `~/agents/state/<sid>.handoff-request`, a second trigger path that makes the
+watcher run the normal `/handoff` → `/compact` → reload on its **next idle Stop even below
+30%**. It bypasses ONLY the threshold — every other safety gate (idle, pane-live,
+pane-ownership, cooldown, cycle-lock) still applies, and the marker has a TTL so a forgotten
+request cannot fire much later. After raising it, update `progress.md` and **end the turn** —
+do not open the heavy phase, and do **not** run `/handoff` yourself: the watcher runs its own
+`/handoff` → `/compact` → reload on the next idle Stop, so a manual `/handoff` here would just
+duplicate it. Changed your mind before the watcher acts? `request-handoff.sh --cancel` removes
+it. Only the **mother** session should call this (it resolves *its own* sid); never from a
+subagent. This is opt-in — the default remains the reactive `pct > 30` beat above.
 
 ## Step 3 — Context / compaction (resumable by design)
 
