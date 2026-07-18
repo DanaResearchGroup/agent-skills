@@ -1,12 +1,12 @@
 ---
 name: autodev
-description: Use when you want to autonomously build a large or long feature end-to-end in one driven session, with automatic adversarial Codex (/spar) review at every milestone, automatic context handoff/compact/resume past 25%, and automatic recovery from usage/session-limit stops (Phoenix). Invoke with the feature description or a path to a spec.
+description: Use when you want to autonomously build a large or long feature end-to-end in one driven session, with automatic adversarial Codex (/spar) review at every milestone, automatic context handoff/compact/resume past 30%, and automatic recovery from usage/session-limit stops (Phoenix). Invoke with the feature description or a path to a spec.
 argument-hint: "<feature to build, or path to a spec>"
 ---
 
 You are an autonomous feature-development driver. You run a long build loop with two
 always-on behaviors: (1) adversarial Codex review at every milestone via `/spar`, and
-(2) reliance on the auto-handoff watcher to handle context compaction past 25% so the
+(2) reliance on the auto-handoff watcher to handle context compaction past 30% so the
 loop survives across compactions.
 
 Be autonomous. Do not stop for routine choices — use judgment and keep going. Only stop
@@ -58,7 +58,7 @@ actually active for this run. It is active ONLY if: running inside herdr or tmux
 `ARMED` AND this is a session started AFTER the hooks were installed (hooks load per
 session). If any of those is false, say so plainly:
 - not in herdr/tmux or `DRY-RUN`/`DISABLED` → "Auto-handoff is NOT active; I'll proactively
-  run `/handoff` near 25% and ask you to run `/compact`." (Codex review still works.)
+  run `/handoff` near 30% and ask you to run `/compact`." (Codex review still works.)
 - all true → "Auto-handoff active — I'll keep working through compactions hands-free."
 
 ## Step 1 — Scope and plan
@@ -135,7 +135,7 @@ For each milestone, in order:
    If continuous-checkpoint or git is in use, commit the logical unit.
 5. **Checkpoint beat, then continue.** Before spawning the next phase's work, run the
    checkpoint beat (see "Phase discipline & checkpoint beats") — quiesce, read `$CTXFILE`,
-   and yield for auto-handoff if `pct > 25`. Otherwise continue to the next milestone
+   and yield for auto-handoff if `pct > 30`. Otherwise continue to the next milestone
    without waiting for the user.
 
 Spar at EVERY milestone, not just once. The point is continuous adversarial pressure.
@@ -170,7 +170,7 @@ thermo can't actually support) as a last resort to be flagged, not a default.
 The auto-handoff watcher can only inject `/handoff`/`/compact` when CC is at a genuine
 **idle** prompt — never while a turn is running or **background agents** are still going
 (CC queues input while busy, so the keystrokes are lost). A perpetually-busy run therefore
-never gets checkpointed and blows past 25%. Prevent that:
+never gets checkpointed and blows past 30%. Prevent that:
 
 - **Do not overlap phases.** Parallelize *within* a phase (dispatch several subagents at
   once is fine), but **collect every dispatched agent and finish the phase before starting
@@ -187,8 +187,8 @@ never gets checkpointed and blows past 25%. Prevent that:
      ```bash
      pct=$(sed -n 's/^pct=\([0-9.]*\).*/\1/p' "$CTXFILE" 2>/dev/null); echo "ctx=${pct:-?}%"
      ```
-  3. **If `pct > 25`** (or, if `MYSID` was unknown, your soft estimate says you're past ~a
-     quarter):
+  3. **If `pct > 30`** (or, if `MYSID` was unknown, your soft estimate says you're past ~a
+     third):
      - **Auto-handoff ACTIVE** (preflight showed `TMUX: yes` and `AUTO_HANDOFF: ARMED`):
        update `progress.md`, then **end your turn now** with one line, e.g.
        `Checkpoint: ctx <pct>%, quiesced at phase boundary — yielding for auto-handoff.`
@@ -197,14 +197,37 @@ never gets checkpointed and blows past 25%. Prevent that:
        + `progress.md` and starting the next phase. This is the deliberate idle beat.
      - **Auto-handoff NOT active**: run `/handoff` yourself, update `progress.md`, tell the
        user to run `/compact` then `continue`, and stop.
-  4. **Else** (`pct` comfortable): proceed straight into the next phase — no yield, no stall.
+  4. **Else** (`pct` comfortable): proceed straight into the next phase — no yield, no stall,
+     **unless** the voluntary-handoff case below applies.
 
-Yielding only when `pct > 25` means you never stall the loop for a checkpoint you don't
+Yielding only when `pct > 30` means you never stall the loop for a checkpoint you don't
 need, and you always hand the watcher a clean idle window exactly when one is required.
+
+**Voluntary early handoff (below threshold).** The `pct > 30` rule is reactive — it fires
+*after* you cross the line. But sometimes you are quiesced at a clean phase boundary at, say,
+22% and you *know* the next phase is heavy (a large mechanism review, a wide multi-file
+refactor, a long spar arc) that will blow well past 30% *inside* the phase, where there is no
+idle window for the watcher to use. In that case, hand off *before* opening the phase rather
+than partway through it: raise a voluntary request, then end your turn.
+
+```bash
+bash ~/.claude/skills/autodev/bin/request-handoff.sh   # drops this session's handoff-request marker
+```
+
+This writes `~/agents/state/<sid>.handoff-request`, a second trigger path that makes the
+watcher run the normal `/handoff` → `/compact` → reload on its **next idle Stop even below
+30%**. It bypasses ONLY the threshold — every other safety gate (idle, pane-live,
+pane-ownership, cooldown, cycle-lock) still applies, and the marker has a TTL so a forgotten
+request cannot fire much later. After raising it, update `progress.md` and **end the turn** —
+do not open the heavy phase, and do **not** run `/handoff` yourself: the watcher runs its own
+`/handoff` → `/compact` → reload on the next idle Stop, so a manual `/handoff` here would just
+duplicate it. Changed your mind before the watcher acts? `request-handoff.sh --cancel` removes
+it. Only the **mother** session should call this (it resolves *its own* sid); never from a
+subagent. This is opt-in — the default remains the reactive `pct > 30` beat above.
 
 ## Step 3 — Context / compaction (resumable by design)
 
-- The auto-handoff watcher (when active) will, past 25% at a turn boundary, automatically
+- The auto-handoff watcher (when active) will, past 30% at a turn boundary, automatically
   run `/handoff` → `/compact` → inject "read the handoff and continue execution." You do
   not trigger it. Just keep `progress.md` current so a resumed session continues cleanly.
 - When a handoff is written (auto or manual), ensure it names this autodev loop and points
@@ -212,7 +235,7 @@ need, and you always hand the watcher a clean idle window exactly when one is re
 - **On resume after a compaction** (you'll receive an injected instruction to read a
   handoff): read that handoff AND `$DEV/progress.md`, then CONTINUE the loop from `Next`.
   Do not restart from milestone 1; do not re-ask the user what to do.
-- If auto-handoff is NOT active (preflight said so): self-monitor; near ~25% at a clean
+- If auto-handoff is NOT active (preflight said so): self-monitor; near ~30% at a clean
   checkpoint, run `/handoff` yourself, update progress.md, and ask the user to run
   `/compact` then say "continue".
 
