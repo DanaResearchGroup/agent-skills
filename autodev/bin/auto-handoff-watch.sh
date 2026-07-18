@@ -192,13 +192,24 @@ fi
 # between our top-of-script check and now (both watchers launch on the same Stop).
 if [ -f "$STATE/$sid.limit-wait" ]; then log "SKIP session-limit resume pending (late)"; exit 0; fi
 
+# Honor a late cancel: reason=requested was latched before the idle-gate wait, so
+# request-handoff.sh --cancel (or a manual rm) may have removed the marker in the
+# window since. Re-check right before we commit; if it's gone, the request was
+# withdrawn — abort without a cooldown stamp (nothing failed, nothing to suppress).
+if [ "$reason" = requested ] && [ ! -f "$req" ]; then
+  log "ABORT handoff-request withdrawn before trigger (pct=$pct)"; exit 0
+fi
+
 log "TRIGGER ($reason) pct=$pct thr=$THRESHOLD pane=$pane dry=$DRY"
 # Consume an explicit request NOW that we're committed to the cycle — before any
 # send. A post-send abort (/handoff or /compact may already have landed) must NOT
 # leave the marker to re-fire on the reloaded, already-compacted session; a fresh
 # request is required to retry. Only touch the marker when it is what triggered us,
 # so a request dropped DURING a threshold cycle survives to be honored next idle.
-[ "$reason" = requested ] && rm -f "$req" 2>/dev/null
+if [ "$reason" = requested ]; then
+  rm -f "$req" 2>/dev/null
+  [ -f "$req" ] && log "WARN could not remove handoff-request $req — may re-fire after cooldown"
+fi
 
 # 1) handoff
 t0=$(date +%s)
