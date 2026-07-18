@@ -95,6 +95,8 @@ python3 bin/lint-skills.py     # must pass
 ```
 
 Spot-check that overwritten skills byte-match the target and merged skills still carry our local
-intent. Then commit and open a PR per the repo's git rules.
+intent. Then commit and open a PR per the repo's git rules. Once the PR is open, fold any
+bot/reviewer findings back into the commit that introduced them before merge (see `/copilot-review`)
+— a **3-way merge** most often drops an edit where a local modification met an upstream one.
 
 **Done when:** lint is green and the work is on a branch with a PR.

@@ -122,6 +122,8 @@ Then write the three docs files using the seed templates in this skill folder as
 
 For "other" issue trackers, write `docs/agents/issue-tracker.md` from scratch using the user's description.
 
+**Done when:** the `CLAUDE.md` / `AGENTS.md` chosen by the step-4 rules holds a single (non-duplicated) `## Agent skills` block with all three subsections (Issue tracker, Triage labels, Domain docs), and each of the three docs files — `docs/agents/issue-tracker.md`, `docs/agents/triage-labels.md`, `docs/agents/domain.md` — has been written.
+
 ### 5. Done
 
 Tell the user the setup is complete and which engineering skills will now read from these files. Mention they can edit `docs/agents/*.md` directly later — re-running this skill is only necessary if they want to switch issue trackers or restart from scratch.
