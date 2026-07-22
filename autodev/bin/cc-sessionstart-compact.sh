@@ -13,7 +13,10 @@ tpath=$(printf '%s' "$input" | jq -r '.transcript_path // empty')
 [ -z "$sid" ] && [ -n "$tpath" ] && sid=$(basename "$tpath" .jsonl)
 [ -n "$sid" ] && printf '%s\n' "$(date +%s)" > "$STATE/$sid.compacted" 2>/dev/null
 
+# Prefer this session's own snapshot (immune to another concurrent session
+# clobbering the shared pointer); fall back to the shared .latest.
 ptr="$AUTODEV_HOME/handoffs/.latest"
+[ -n "$sid" ] && [ -f "$AUTODEV_HOME/handoffs/.latest.$sid" ] && ptr="$AUTODEV_HOME/handoffs/.latest.$sid"
 ctx="A compaction just occurred. If a recent handoff exists in $AUTODEV_HOME/handoffs, read the newest one and continue."
 if [ -f "$ptr" ]; then
   hf=$(cat "$ptr" 2>/dev/null)

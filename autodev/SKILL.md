@@ -225,6 +225,11 @@ duplicate it. Changed your mind before the watcher acts? `request-handoff.sh --c
 it. Only the **mother** session should call this (it resolves *its own* sid); never from a
 subagent. This is opt-in — the default remains the reactive `pct > 30` beat above.
 
+**Already wrote a handoff below threshold?** (You ran `/handoff` yourself, or the `handoff` skill
+did.) Do **nothing** — the `handoff` skill files a `compact-request`, and the watcher runs a
+**compact-only** cycle: it skips a second `/handoff` and goes straight to `/compact` → reload, even
+below 30%. File it by hand only if needed — `request-handoff.sh --compact-only` (`--cancel` withdraws).
+
 ## Step 3 — Context / compaction (resumable by design)
 
 - The auto-handoff watcher (when active) will, past 30% at a turn boundary, automatically

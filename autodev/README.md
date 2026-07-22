@@ -63,7 +63,7 @@ Logs: `$AUTODEV_HOME/logs/{auto-handoff,auto-resume}.log`.
 
 - `auto-handoff-watch.sh`: `THRESHOLD=30`, `COOLDOWN=900`, `WAIT_IDLE/WAIT_COMPACT`, `SETTLE`.
 - `session-resume-watch.sh`: `BUFFER_MIN=4` (minutes past reset), `CREDITS_WAIT`, `WAKE`, `MAX_WAIT`.
-- `auto-handoff-watch.sh`: `REQUEST_MAX_AGE=3600` — TTL for a voluntary `handoff-request` marker.
+- `auto-handoff-watch.sh`: `REQUEST_MAX_AGE=3600` — TTL for a `handoff-request` / `compact-request` marker.
 
 ## Voluntary handoff-request (hand off below threshold)
 
@@ -85,6 +85,32 @@ threshold gate; every other safety gate (idle, pane-live, pane-ownership, cooldo
 still applies, and it is consumed the moment the watcher commits, so it fires **once**. A marker
 older than `REQUEST_MAX_AGE` (default 1h) is treated as stale, ignored, and removed, so a
 forgotten request can't fire arbitrarily later.
+
+### Compact-request (handoff already written — just compact + reload)
+
+`--compact-only` is a **third trigger path** for the case where a handoff is *already written*
+(you ran `/handoff` yourself, or the `handoff` skill did) and all that's left is the compact +
+reload. The reactive `THRESHOLD` gate never fires below 30%, and a plain `handoff-request` would
+make the watcher write a *second, redundant* handoff — so neither fits.
+
+```bash
+bash ~/.claude/skills/autodev/bin/request-handoff.sh --compact-only            # raise
+bash ~/.claude/skills/autodev/bin/request-handoff.sh --compact-only --cancel   # withdraw
+```
+
+This drops `~/agents/state/<sid>.compact-request`. The watcher honors it as a **compact-only**
+cycle: it **skips `/handoff`** and goes straight to `/compact` → reload (same safety gates, same
+TTL, consumed once). The `handoff` skill files this automatically after every `/handoff`, which
+is what makes a below-threshold handoff actually compact instead of silently stalling. It
+**defers** (no marker) when the watcher is already mid-cycle, so a watcher-driven `/handoff`
+never double-fires a compact.
+
+`--compact-only` also snapshots the shared `.latest` pointer into a per-session
+`~/agents/handoffs/.latest.<sid>` at request time. The watcher and the post-compaction
+SessionStart hook both **prefer** `.latest.<sid>` over the shared `.latest`, so a reload always
+resumes *this* session's handoff even if another concurrent session clobbered the shared pointer
+in between (it is last-writer-wins). In the threshold path the watcher takes the same snapshot
+right after its own `/handoff`.
 
 Resolution of "this session" is `explicit arg` → `$CLAUDE_CODE_SESSION_ID` → the reverse
 pane-owner file, and it **hard-fails if the env id and the pane owner disagree** rather than

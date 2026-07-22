@@ -12,6 +12,9 @@
 # Sequence when triggered (armed, idle): /handoff -> wait idle -> /compact -> wait
 # compaction -> /rename <session name> (re-assert the display name, which compaction
 # can reset) -> "read <handoff> and continue execution".
+# A .compact-request marker triggers a COMPACT-ONLY variant: the /handoff step is
+# skipped (a handoff is already written) and the cycle starts at /compact.
+# Triggers: pct > THRESHOLD | .handoff-request (full cycle) | .compact-request (compact-only).
 sid="$1"
 [ -n "$sid" ] || exit 0
 # sid is used to build state-file paths (incl. `rm -rf` of the cycle lock), so
@@ -37,7 +40,7 @@ WAIT_IDLE=420       # max seconds to wait for the /handoff turn to finish
 WAIT_COMPACT=300    # max seconds to wait for compaction to complete
 COOLDOWN=900        # suppress re-trigger after a cycle (success OR abort)
 HEARTBEAT_EVERY=600 # emit at most one HEARTBEAT log line per this many seconds
-REQUEST_MAX_AGE=3600 # a .handoff-request older than this is stale -> ignored + removed
+REQUEST_MAX_AGE=3600 # a .handoff-request / .compact-request older than this is stale -> ignored + removed
 
 log(){ printf '%s [%s] %s\n' "$(date +'%Y.%m.%d %H.%M.%S')" "$sid" "$*" >> "$LOG"; }
 
@@ -72,14 +75,19 @@ if [ $(( hb_now - hb_last )) -ge "$HEARTBEAT_EVERY" ]; then
   printf '%s\n' "$hb_now" > "$hbf" 2>/dev/null
 fi
 
-# --- trigger gate: over threshold OR an explicit session handoff-request ---
+# --- trigger gate: over threshold OR an explicit handoff/compact request ---
 # A quiesced session that knows its NEXT phase is heavy can drop
 # $STATE/$sid.handoff-request to hand off at THIS clean boundary even below
-# threshold (e.g. holding at a phase boundary at 22%). The request bypasses ONLY
-# this gate — every safety gate below (cooldown, pane live/owned, cycle lock,
-# idle) still applies, so it fires only when genuinely quiesced and safe.
+# threshold (e.g. holding at a phase boundary at 22%). A session that has ALREADY
+# written its own handoff can instead drop $STATE/$sid.compact-request, which
+# triggers a COMPACT-ONLY cycle: skip /handoff, go straight to /compact -> reload
+# (no redundant second handoff). Both bypass ONLY this gate — every safety gate
+# below (cooldown, pane live/owned, cycle lock, idle) still applies, so they fire
+# only when genuinely quiesced and safe.
 req="$STATE/$sid.handoff-request"
+creq="$STATE/$sid.compact-request"
 reason=""
+compact_only=0
 if [ -f "$req" ]; then
   req_age=$(( $(date +%s) - $(date -r "$req" +%s 2>/dev/null || echo 0) ))
   if [ "$req_age" -le "$REQUEST_MAX_AGE" ]; then
@@ -87,6 +95,17 @@ if [ -f "$req" ]; then
   else
     log "SKIP stale handoff-request (age ${req_age}s > ${REQUEST_MAX_AGE}s) — removed (pct=$pct)"
     rm -f "$req" 2>/dev/null
+  fi
+fi
+# compact-request is honored only when no full handoff-request is pending (a
+# handoff-request means "write a fresh handoff too", which supersedes it).
+if [ -z "$reason" ] && [ -f "$creq" ]; then
+  creq_age=$(( $(date +%s) - $(date -r "$creq" +%s 2>/dev/null || echo 0) ))
+  if [ "$creq_age" -le "$REQUEST_MAX_AGE" ]; then
+    reason=compact-requested; compact_only=1
+  else
+    log "SKIP stale compact-request (age ${creq_age}s > ${REQUEST_MAX_AGE}s) — removed (pct=$pct)"
+    rm -f "$creq" 2>/dev/null
   fi
 fi
 if [ -z "$reason" ]; then
@@ -199,6 +218,9 @@ if [ -f "$STATE/$sid.limit-wait" ]; then log "SKIP session-limit resume pending 
 if [ "$reason" = requested ] && [ ! -f "$req" ]; then
   log "ABORT handoff-request withdrawn before trigger (pct=$pct)"; exit 0
 fi
+if [ "$reason" = compact-requested ] && [ ! -f "$creq" ]; then
+  log "ABORT compact-request withdrawn before trigger (pct=$pct)"; exit 0
+fi
 
 log "TRIGGER ($reason) pct=$pct thr=$THRESHOLD pane=$pane dry=$DRY"
 # Consume an explicit request NOW that we're committed to the cycle — before any
@@ -209,16 +231,37 @@ log "TRIGGER ($reason) pct=$pct thr=$THRESHOLD pane=$pane dry=$DRY"
 if [ "$reason" = requested ]; then
   rm -f "$req" 2>/dev/null
   [ -f "$req" ] && log "WARN could not remove handoff-request $req — may re-fire after cooldown"
+elif [ "$reason" = compact-requested ]; then
+  rm -f "$creq" 2>/dev/null
+  [ -f "$creq" ] && log "WARN could not remove compact-request $creq — may re-fire after cooldown"
 fi
 
-# 1) handoff
-t0=$(date +%s)
-send "/handoff"
-if [ "$DRY" = 0 ]; then
-  if ! wait_turn_done "$t0" "$WAIT_IDLE"; then
-    log "ABORT /handoff did not complete within ${WAIT_IDLE}s"; date +%s > "$cdf"; exit 0
+# 1) handoff — skipped in compact-only mode (a handoff is already written).
+if [ "$compact_only" = 1 ]; then
+  log "compact-only: skipping /handoff (handoff already written by session)"
+else
+  t0=$(date +%s)
+  send "/handoff"
+  if [ "$DRY" = 0 ]; then
+    if ! wait_turn_done "$t0" "$WAIT_IDLE"; then
+      log "ABORT /handoff did not complete within ${WAIT_IDLE}s"; date +%s > "$cdf"; exit 0
+    fi
+    log "/handoff turn completed"
   fi
-  log "/handoff turn completed"
+  # Snapshot THIS session's freshly-written pointer before another concurrent
+  # session can clobber the shared .latest, so the reload below is per-session.
+  # (compact-only skips this: request-handoff.sh already snapshotted at request
+  # time, and the shared .latest may since have been clobbered.)
+  if [ -s "$AUTODEV_HOME/handoffs/.latest" ]; then
+    ptmp="$AUTODEV_HOME/handoffs/.latest.$sid.tmp"
+    cp -f "$AUTODEV_HOME/handoffs/.latest" "$ptmp" 2>/dev/null &&
+      mv -f "$ptmp" "$AUTODEV_HOME/handoffs/.latest.$sid" 2>/dev/null ||
+      rm -f "$ptmp" 2>/dev/null
+  else
+    # nothing to snapshot — drop any stale per-session pointer so reload falls
+    # back to the shared .latest rather than reading an old snapshot.
+    rm -f "$AUTODEV_HOME/handoffs/.latest.$sid" 2>/dev/null
+  fi
 fi
 
 # 2) compact (only when idle)
@@ -246,7 +289,11 @@ if [ -n "$SESSION_NAME" ]; then
   send "/rename $SESSION_NAME"
   [ "$DRY" = 0 ] && { sleep 2; wait_pane_idle 30; }
 fi
-hf=""; [ -f "$AUTODEV_HOME/handoffs/.latest" ] && hf=$(cat "$AUTODEV_HOME/handoffs/.latest" 2>/dev/null)
+# Prefer this session's own snapshot (immune to another session clobbering the
+# shared .latest); fall back to the shared pointer.
+ptr="$AUTODEV_HOME/handoffs/.latest.$sid"
+[ -f "$ptr" ] || ptr="$AUTODEV_HOME/handoffs/.latest"
+hf=""; [ -f "$ptr" ] && hf=$(cat "$ptr" 2>/dev/null)
 if [ -n "$hf" ] && { [ "$DRY" = 1 ] || [ -f "$hf" ]; }; then
   send "Read the handoff at \"$hf\" and continue execution from where it leaves off."
 else

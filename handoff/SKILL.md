@@ -58,27 +58,37 @@ When composing **Standing items**, cross-reference by path:
   `sparring-log.md`, and the latest round Q/A if present;
 - latest gstack checkpoint if present.
 
-After writing the handoff, update the deterministic reload pointer:
+After writing the handoff, update the deterministic reload pointer, then file a
+compact-request so the auto-handoff watcher (if installed) finishes the cycle:
 
 ```bash
 tmp="$HOME/agents/handoffs/.latest.tmp"
 printf '%s\n' "<full handoff path>" > "$tmp" && mv "$tmp" "$HOME/agents/handoffs/.latest"
+
+# Tell the auto-handoff watcher a handoff is ready so it runs /compact + reload on
+# its own — even below the 30% context threshold. Without this a below-threshold
+# /handoff would leave the watcher with no trigger and it would never compact.
+# No-op when autodev is not installed; defers automatically when the watcher is
+# already mid-cycle (it will compact itself); also snapshots .latest per-session.
+rh="$HOME/.claude/skills/autodev/bin/request-handoff.sh"
+[ -x "$rh" ] && bash "$rh" --compact-only 2>/dev/null || true
 ```
 
 Then emit this explicit instruction block:
 
 ```text
-Handoff written and .latest updated.
+Handoff written, .latest updated, compact-request filed.
 
 • If this session's status line shows the 🔴 AUTO-HANDOFF badge: do NOTHING — the auto-handoff
-  watcher will run /compact and reload automatically as soon as the session is idle. It CANNOT
-  act while a background agent or turn is still running (input would be queued), so if it isn't
-  firing, make sure no background agents are left running.
+  watcher will run /compact and reload automatically at the next idle Stop (the compact-request
+  filed above makes this fire even below the 30% threshold). It CANNOT act while a background
+  agent or turn is still running (input would be queued), so make sure nothing is left running
+  and end the turn.
 • If there is NO badge (an older session started before the watcher was installed, or not in
   tmux): the automation is not attached here — run /compact yourself now.
 
-Reload contract: after compaction, the next Claude Code turn reads
-$(cat ~/agents/handoffs/.latest) and re-orients from it before continuing.
+Reload contract: after compaction, the next Claude Code turn is handed the handoff to read (via
+the SessionStart hook, or `cat ~/agents/handoffs/.latest`) and re-orients from it before continuing.
 ```
 
 Claude Code cannot self-trigger `/compact` — only the user or the (badge-confirmed) watcher can.
