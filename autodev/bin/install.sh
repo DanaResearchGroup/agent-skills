@@ -22,7 +22,7 @@ SETTINGS="${CLAUDE_SETTINGS:-$HOME/.claude/settings.json}"
 : "${AUTODEV_HOME:=$HOME/agents}"
 
 command -v jq >/dev/null 2>&1 || { echo "error: jq is required" >&2; exit 1; }
-for f in cc-statusline.sh cc-stop-hook.sh cc-sessionstart-compact.sh auto-handoff-watch.sh session-resume-watch.sh; do
+for f in cc-statusline.sh cc-stop-hook.sh cc-sessionstart-compact.sh auto-handoff-watch.sh session-resume-watch.sh request-handoff.sh; do
   [ -f "$HERE/$f" ] || { echo "error: missing $HERE/$f" >&2; exit 1; }
   chmod +x "$HERE/$f"
 done
