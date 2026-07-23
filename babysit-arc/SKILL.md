@@ -11,8 +11,20 @@ file only orchestrates and must not duplicate their depth.** Run it with one lin
 `~/Projects/ARC_CAMPAIGNS.md` and run it autonomously"*.
 
 ## Where it runs
-**OL only** (`hostname Office`, on-network → reaches zeus directly, no VPN). ARC runs in **`arc_env`**;
-RMG/Arkane in **`rmg_env`**. Heavy QM is on zeus (PBS); locally each instance is orchestration + Arkane.
+Runs on **OL or HL** — detect with `hostname` and set up the zeus connection per machine. ARC runs in
+**`arc_env`**; RMG/Arkane in **`rmg_env`**. Heavy QM is on zeus (PBS); locally each instance is
+orchestration + Arkane.
+- **OL** (`hostname` → `Office`) — on the Technion LAN, reaches zeus **directly** (no VPN, no jump). This
+  is the proven path; nothing extra to do.
+- **HL** (off-network) — cannot reach zeus directly. Bring tailscale up **without an exit node**
+  (`sudo tailscale up --reset`; an exit node routes ALL traffic via Technion and breaks connectivity),
+  then reach zeus by **SSH-jumping through `ol`** (tailnet `100.118.88.21`, on-campus). Because ARC
+  connects via **paramiko (which does not automatically use `~/.ssh/config`)**, the jump must be a paramiko
+  `sock=ProxyCommand("ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -W zeus.technion.ac.il:22 alon@100.118.88.21")`
+  in `arc/job/ssh.py::_connect()`
+  (local uncommitted ARC fix, logged in the project `FIXES.md`); restart ARC after patching. Full runbook:
+  vault `Code/ARC/ARC on HL — Zeus via Tailscale OL Jump.md`. Pre-flight check before launching the pool:
+  `ssh -o BatchMode=yes -J alon@100.118.88.21 alon@zeus.technion.ac.il hostname` → `zeus`.
 
 ## Step 0 — read the vault FIRST (authoritative)
 Vault root on OL: `~/Dropbox/Apps/remotely-save/Vault/` (path per machine is in CC memory). Read:
