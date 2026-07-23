@@ -7,54 +7,63 @@ description: Search, create, and manage notes in the Obsidian vault with wikilin
 
 ## Vault location
 
-`~/Dropbox/Vault/AI Research/`
+`~/Dropbox/Apps/remotely-save/Vault/`
 
-Mostly flat at root level.
+(Synced via Dropbox / remotely-save.)
+
+## Structure
+
+Organized into topical **folders** at the root — place a note in the folder that fits its topic:
+
+- `Code/` — dev/infra knowledge, per-project subfolders (`Code/ARC`, `Code/T3`, `Code/Carmel`)
+- `knowledge/` — general knowledge (`knowledge/wiki/` for wiki-style runbooks/guides)
+- `tools/` — tool cheatsheets & indexes
+- `HQ/` — the HQ workspace (read `HQ/CLAUDE.md` before operating on it)
+- `Research/`, `Companies/`, `Group/`, `Teaching/`, `Meetings/`, `ViceDean/` — domain notes
+- Root also holds a few loose notes (`CLAUDE.md`, `learnings.md`, …)
+
+When unsure where a note goes, search for sibling notes on the same topic and match their folder.
 
 ## Naming conventions
 
-- **Index notes**: aggregate related topics (e.g., `Ralph Wiggum Index.md`, `Skills Index.md`, `RAG Index.md`)
-- **Title case** for all note names
-- No folders for organization - use links and index notes instead
+- **Title Case** for note filenames (a few legacy index notes are lowercase, e.g. `knowledge/wiki/index.md`)
+- **Index notes** aggregate related topics (e.g. `Tools Index.md`, `knowledge/wiki/index.md`) — just lists of `[[wikilinks]]`
 
 ## Linking
 
 - Use Obsidian `[[wikilinks]]` syntax: `[[Note Title]]`
-- Notes link to dependencies/related notes at the bottom
-- Index notes are just lists of `[[wikilinks]]`
+- Link related/dependency notes at the bottom of each note
+- Update or add to the relevant index note when creating a new note
 
 ## Workflows
 
 ### Search for notes
 
 ```bash
-# Search by filename
-find "~/Dropbox/Vault/AI Research/" -name "*.md" | grep -i "keyword"
-
-# Search by content
-grep -rl "keyword" "~/Dropbox/Vault/AI Research/" --include="*.md"
+VAULT="$HOME/Dropbox/Apps/remotely-save/Vault"
+# By filename
+find "$VAULT" -name "*.md" | grep -i "keyword"
+# By content
+grep -rl "keyword" "$VAULT" --include="*.md"
 ```
 
 Or use Grep/Glob tools directly on the vault path.
 
 ### Create a new note
 
-1. Use **Title Case** for filename
-2. Write content as a unit of learning (per vault rules)
-3. Add `[[wikilinks]]` to related notes at the bottom
-4. If part of a numbered sequence, use the hierarchical numbering scheme
+1. Pick the right **folder** (match sibling notes on the topic)
+2. Use **Title Case** for the filename
+3. Write content as a self-contained unit of learning
+4. Add `[[wikilinks]]` to related notes at the bottom; add it to the relevant index note
 
-### Find related notes
-
-Search for `[[Note Title]]` across the vault to find backlinks:
+### Find related notes (backlinks)
 
 ```bash
-grep -rl "\\[\\[Note Title\\]\\]" "~/Dropbox/Vault/AI Research/"
+grep -rl "\\[\\[Note Title\\]\\]" "$HOME/Dropbox/Apps/remotely-save/Vault"
 ```
 
 ### Find index notes
 
 ```bash
-find "~/Dropbox/Vault/AI Research/" -name "*Index*"
+find "$HOME/Dropbox/Apps/remotely-save/Vault" -iname "*Index*"
 ```
-
