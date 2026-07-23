@@ -1,0 +1,20 @@
+# MACHINE — resource profile & parallelism capacity
+
+Purpose: know what this box can actually run in parallel so dispatch decisions don't thrash
+it. Update when hardware or the workload shape changes.
+
+## Hardware
+
+{{HARDWARE_TABLE}}
+
+## Parallelism capacity
+
+{{CAPACITY_NOTES}}
+
+## Operating rules that follow
+
+{{CAPACITY_RULES}}
+
+## Live snapshot
+
+(refresh on resume: `free -g`, `df -h /`, `cat /proc/loadavg`, and any running heavy jobs)

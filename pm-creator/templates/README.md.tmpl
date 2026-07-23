@@ -1,0 +1,28 @@
+# {{CAMPAIGN_SLUG}}-pm — {{CAMPAIGN_NAME}} project-management ledger
+
+The overseeing-manager session's repo for the {{CAMPAIGN_NAME}} campaign, spanning:
+{{REPO_LIST}}. Only the manager session writes here. Worker agents receive work via
+self-contained prompt files (dispatched through a lane) and, where persistent, via the target
+repo's `REQUESTS.md` channel.
+
+## Layout
+
+| File / dir | What it is |
+|---|---|
+| `.pm/events.log` | **Authoritative state** — append-only event log (`bin/` reads it; humans don't) |
+| `.pm/index.json` | Regenerable fold of the log (`bin/reconcile` rebuilds it) |
+| `LEDGER.md` | Numbered issues `I-###` — the human narrative of what's open/active/parked/closed |
+| `DISPATCHES.md` | Numbered dispatches `D-###` (+ attempts `A-##`) — narrative of work sent out |
+| `QUESTIONS.md` | Numbered questions `Q-###` and answers `A-###` |
+| `CONVENTIONS.md` | The operating law: numbering, lanes + dispatch identity, model routing, prompt self-containment, request flow |
+| `WORKTREES.md` | Registry of every branch/worktree across the repos, with dispositions |
+| `SESSIONS.md` | herdr session registry — who is doing what |
+| `MACHINE.md` | Resource/capacity profile — what the box can run in parallel |
+| `reports/` | Numbered + versioned + dated reports `R-###_v#_YYYY-MM-DD_slug.md` |
+| `prompts/` | Dispatch prompt files — self-contained, ready to hand to a lane |
+| `bin/` | `reconcile`, `lint-prompt`, `ledger-check`, `dispatch-prep` |
+
+## Operating
+
+Resume a manager session from `RESUME.md`. The manager owns state + coordination and never
+writes product code (`CONVENTIONS.md` §10).

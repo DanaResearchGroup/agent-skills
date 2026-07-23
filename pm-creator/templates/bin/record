@@ -1,0 +1,484 @@
+#!/usr/bin/env bash
+# record — ergonomic wrapper over `pm_apply` for the manager's day-to-day
+# lifecycle bookkeeping (event-log-grammar.md §3/§4, references/enforcement.md).
+#
+# This is a TEMPLATE file: it is copied verbatim into a generated PM repo's
+# `bin/` directory and run from that repo's root. Standalone entrypoint that
+# `source`s `_lib.sh` (bash + python3 only, no jq).
+#
+# The ergonomic contract: the caller NEVER passes `at=` or `from=`.
+#   - `at=` is always `date -u +%Y-%m-%dT%H:%M:%SZ` at apply time.
+#   - `from=` (issue_state, dispatch_state) is always the entity's CURRENT
+#     folded state, read by `pm_fold`-ing the log and inspecting
+#     `.pm/index.json`. A dispatch's current `a=` (attempt) is read the same
+#     way and carried automatically wherever the grammar wants it.
+#
+# `record` holds NO legality table of its own. Every event it builds is sent
+# straight to `pm_apply`, which is the ONE authoritative rule engine
+# (enforcement.md §1): it folds current state, validates the proposed event
+# under one held lock, and appends atomically only on success. If `record`'s
+# locally-derived `from`/current-state is stale (raced by another writer
+# between `_fold` and the `pm_apply` call), `pm_apply` refuses it — that is
+# correct, not a bug to route around here.
+#
+# `record` does NOT handle the READY/FAILED->DISPATCHED transition
+# (dispatch-prep owns that: it mints the attempt and prints the herdr spawn
+# command). It handles every OTHER dispatch_state transition, plus
+# issue_state, result, question, adopt, and note.
+#
+# Subcommands:
+#   record issue <I-###> <TO_STATE> [--by <D-###>]
+#   record dispatch <D-###> <TO_STATE> [--lane human|automation] [--tab <id>]
+#     TO_STATE in {ACKED,VERIFIED,FAILED,ABANDONED,QUARANTINED} (RETURNED is
+#     refused here — reached only via `record result`, see NOTE below)
+#   record result <D-###> [<STATUS>] --sha <hex>
+#     STATUS defaults to RETURNED.
+#   record question <Q-###> <STATE> [--issue <I-###>] [--answers <Q-###>]
+#   record adopt <D-###> --ref <token>
+#   record note --ref <token> [--issue <I-###>] [--dispatch <D-###>]
+#
+# NOTE: `record dispatch <D-###> RETURNED` is always refused here: RETURNED
+# is reached ONLY via a `result` event (enforcement.md §4). This is checked
+# up front and points the caller at `record result`, rather than letting
+# `pm_apply` produce its (correct, but less actionable) generic refusal.
+#
+# NOTE (grammar ambiguity, resolved here): `result`'s required keys per
+# event-log-grammar.md §3 are `d a status result_sha at` — result_sha is
+# REQUIRED, not optional, even though `pm_apply` would happily reject a call
+# missing it. So `--sha <hex>` here is a required flag in practice: `record`
+# refuses with a usage error before ever calling `pm_apply` if it is absent,
+# rather than letting `pm_apply` itself produce a less friendly failure.
+#
+# NOTE (grammar ambiguity, resolved here): `question` events carry no
+# `from`/current-state key at all (grammar §3: required keys are just
+# `q state at`), and `.pm/index.json` does not fold a per-question current
+# state (only the aggregate `open_questions[]` list — see `_lib.sh`'s
+# `pm_fold`). So `record question` has no "current state" to derive or
+# validate against; it just auto-fills `at=` and applies.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./_lib.sh
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/_lib.sh"
+
+now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+usage() {
+  cat <<'EOF'
+usage:
+  record issue <I-###> <TO_STATE> [--by <D-###>]
+  record dispatch <D-###> <TO_STATE> [--lane human|automation] [--tab <id>]
+      TO_STATE in ACKED|VERIFIED|FAILED|ABANDONED|QUARANTINED
+      (RETURNED is refused here; use `record result` instead)
+  record result <D-###> [<STATUS>] --sha <hex>
+      STATUS defaults to RETURNED
+  record question <Q-###> <STATE> [--issue <I-###>] [--answers <Q-###>]
+  record adopt <D-###> --ref <token>
+  record note --ref <token> [--issue <I-###>] [--dispatch <D-###>]
+
+Auto-fills at=<now, UTC> and, where the grammar has a from=/a= field, reads
+the current folded state/attempt from .pm/index.json so the caller never
+passes them. Refuses (no event emitted) an illegal/stale transition.
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# root resolution + fold (mirrors dispatch-prep's local copy of the search,
+# rather than reaching into _lib.sh's underscore-prefixed internals — see
+# dispatch-prep's own comment on the same choice)
+# ---------------------------------------------------------------------------
+
+_find_root() {
+  if [[ -n "${PM_ROOT:-}" ]]; then
+    printf '%s\n' "$PM_ROOT"
+    return 0
+  fi
+  local dir="$PWD"
+  while [[ "$dir" != "/" ]]; do
+    if [[ -d "$dir/.pm" ]]; then
+      printf '%s\n' "$dir"
+      return 0
+    fi
+    dir="$(dirname "$dir")"
+  done
+  echo "record: could not locate .pm/ (searched upward from $PWD; set \$PM_ROOT to override)" >&2
+  return 1
+}
+
+_root="$(_find_root)" || exit 1
+_index="${_root}/.pm/index.json"
+
+_fold() {
+  pm_fold "$_root" || {
+    echo "record: pm_fold failed; refusing to record against an unfoldable log" >&2
+    exit 1
+  }
+  if [[ ! -f "$_index" ]]; then
+    echo "record: no index at $_index after fold" >&2
+    exit 1
+  fi
+}
+
+# current issue state, or "NONE" if the issue has never appeared.
+_issue_state() {
+  local id="$1"
+  ISSUE_ID="$id" python3 -c "
+import json, os, sys
+idx = json.load(open(sys.argv[1]))
+i = os.environ['ISSUE_ID']
+st = idx.get('issues', {}).get(i)
+print((st or {}).get('state') or 'NONE')
+" "$_index"
+}
+
+# current dispatch state + attempt, tab-separated; "NONE\tNONE" if unknown.
+_dispatch_info() {
+  local id="$1"
+  DISPATCH_ID="$id" python3 -c "
+import json, os, sys
+idx = json.load(open(sys.argv[1]))
+d = os.environ['DISPATCH_ID']
+disp = idx.get('dispatches', {}).get(d)
+if disp is None:
+    print('NONE\tNONE')
+else:
+    print((disp.get('state') or 'NONE') + '\t' + (disp.get('attempt') or 'NONE'))
+" "$_index"
+}
+
+# ---------------------------------------------------------------------------
+# id shape guards
+# ---------------------------------------------------------------------------
+
+_require_id() {
+  # Usage: _require_id <label> <prefix> <value>
+  local label="$1" prefix="$2" value="$3"
+  if [[ ! "$value" =~ ^${prefix}-[0-9]+$ ]]; then
+    echo "record: $label must look like ${prefix}-### (got '$value')" >&2
+    exit 2
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# subcommands
+# ---------------------------------------------------------------------------
+
+cmd_issue() {
+  local issue_id="${1:-}" to_state="${2:-}"
+  [[ -z "$issue_id" || -z "$to_state" ]] && {
+    echo "record: usage: record issue <I-###> <TO_STATE> [--by <D-###>]" >&2
+    exit 2
+  }
+  shift 2
+  local by=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --by)
+        by="${2:-}"
+        shift 2
+        ;;
+      *)
+        echo "record issue: unknown argument '$1'" >&2
+        exit 2
+        ;;
+    esac
+  done
+
+  _require_id "issue id" "I" "$issue_id"
+
+  _fold
+  local from_state
+  from_state="$(_issue_state "$issue_id")"
+  if [[ "$from_state" == "NONE" ]]; then
+    # grammar: the first issue_state for a given issue establishes its
+    # initial state; the convention (event-log-grammar.md §4.1) is OPEN.
+    from_state="OPEN"
+  fi
+
+  if [[ "$from_state" == "$to_state" ]]; then
+    echo "record: refusing no-op issue transition for $issue_id: already $from_state. No event was emitted." >&2
+    exit 1
+  fi
+
+  local -a kv=(issue_state i="$issue_id" from="$from_state" to="$to_state" at="$(now_iso)")
+  [[ -n "$by" ]] && kv+=(by="$by")
+  local apply_out
+  if ! apply_out="$(pm_apply "${kv[@]}" 2>&1 1>/dev/null)"; then
+    echo "record: refusing issue transition for $issue_id: current=$from_state requested=$to_state ($apply_out). No event was emitted." >&2
+    exit 1
+  fi
+  echo "record: $issue_id $from_state -> $to_state"
+}
+
+cmd_dispatch() {
+  local dispatch_id="${1:-}" to_state="${2:-}"
+  [[ -z "$dispatch_id" || -z "$to_state" ]] && {
+    echo "record: usage: record dispatch <D-###> <TO_STATE> [--lane human|automation] [--tab <id>]" >&2
+    exit 2
+  }
+  shift 2
+  local lane="human" tab=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --lane)
+        lane="${2:-}"
+        shift 2
+        ;;
+      --tab)
+        tab="${2:-}"
+        shift 2
+        ;;
+      *)
+        echo "record dispatch: unknown argument '$1'" >&2
+        exit 2
+        ;;
+    esac
+  done
+
+  _require_id "dispatch id" "D" "$dispatch_id"
+  if [[ "$lane" != "human" && "$lane" != "automation" ]]; then
+    echo "record dispatch: --lane must be 'human' or 'automation' (got '$lane')" >&2
+    exit 2
+  fi
+  case "$to_state" in
+    ACKED | VERIFIED | FAILED | ABANDONED | QUARANTINED) ;;
+    RETURNED)
+      echo "record dispatch: RETURNED is not a legal dispatch_state; it is reached only via a 'result' event — use 'record result', not 'record dispatch ... RETURNED'" >&2
+      exit 2
+      ;;
+    DISPATCHED)
+      echo "record dispatch: READY/FAILED -> DISPATCHED is handled by bin/dispatch-prep, not record" >&2
+      exit 2
+      ;;
+    *)
+      echo "record dispatch: unknown TO_STATE '$to_state' (expected one of ACKED, VERIFIED, FAILED, ABANDONED, QUARANTINED; RETURNED is reached only via 'record result')" >&2
+      exit 2
+      ;;
+  esac
+
+  _fold
+  local info from_state attempt
+  info="$(_dispatch_info "$dispatch_id")"
+  from_state="${info%%$'\t'*}"
+  attempt="${info#*$'\t'}"
+
+  if [[ "$from_state" == "NONE" ]]; then
+    echo "record: refusing $dispatch_id -> $to_state: $dispatch_id is not registered (no dispatch_new on record). No event was emitted." >&2
+    exit 1
+  fi
+
+  local -a kv=(dispatch_state d="$dispatch_id" from="$from_state" to="$to_state" lane="$lane" at="$(now_iso)")
+  [[ -n "$tab" ]] && kv+=(tab="$tab")
+  local apply_out
+  if ! apply_out="$(pm_apply "${kv[@]}" 2>&1 1>/dev/null)"; then
+    echo "record: refusing dispatch transition for $dispatch_id: current=$from_state requested=$to_state ($apply_out). No event was emitted." >&2
+    exit 1
+  fi
+  echo "record: $dispatch_id $from_state -> $to_state (lane=$lane${attempt:+, attempt=$attempt})"
+}
+
+cmd_result() {
+  local dispatch_id="${1:-}"
+  [[ -z "$dispatch_id" ]] && {
+    echo "record: usage: record result <D-###> [<STATUS>] --sha <hex>" >&2
+    exit 2
+  }
+  shift
+  local status="RETURNED" sha=""
+  # an optional positional STATUS may come first (before any --flag).
+  if [[ $# -gt 0 && "$1" != --* ]]; then
+    status="$1"
+    shift
+  fi
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --sha)
+        sha="${2:-}"
+        shift 2
+        ;;
+      *)
+        echo "record result: unknown argument '$1'" >&2
+        exit 2
+        ;;
+    esac
+  done
+
+  _require_id "dispatch id" "D" "$dispatch_id"
+  if [[ -z "$sha" ]]; then
+    # NOTE (grammar ambiguity, resolved): result_sha is a REQUIRED key for
+    # `result` events (event-log-grammar.md §3); refuse rather than emit an
+    # incomplete event pm_apply would reject anyway.
+    echo "record result: --sha <hex> is required (result_sha is a required key for 'result' events)" >&2
+    exit 2
+  fi
+
+  _fold
+  local info from_state attempt
+  info="$(_dispatch_info "$dispatch_id")"
+  from_state="${info%%$'\t'*}"
+  attempt="${info#*$'\t'}"
+
+  if [[ "$from_state" == "NONE" ]]; then
+    echo "record: refusing result for $dispatch_id: not registered (no dispatch_new). No event was emitted." >&2
+    exit 1
+  fi
+
+  local apply_out
+  if ! apply_out="$(pm_apply result d="$dispatch_id" status="$status" result_sha="$sha" at="$(now_iso)" 2>&1 1>/dev/null)"; then
+    echo "record: refusing result for $dispatch_id: current=$from_state status=$status ($apply_out). No event was emitted." >&2
+    exit 1
+  fi
+  echo "record: result $dispatch_id a=$attempt status=$status result_sha=$sha"
+}
+
+cmd_question() {
+  local question_id="${1:-}" state="${2:-}"
+  [[ -z "$question_id" || -z "$state" ]] && {
+    echo "record: usage: record question <Q-###> <STATE> [--issue <I-###>] [--answers <Q-###>]" >&2
+    exit 2
+  }
+  shift 2
+  local issue="" answers=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --issue)
+        issue="${2:-}"
+        shift 2
+        ;;
+      --answers)
+        answers="${2:-}"
+        shift 2
+        ;;
+      *)
+        echo "record question: unknown argument '$1'" >&2
+        exit 2
+        ;;
+    esac
+  done
+
+  _require_id "question id" "Q" "$question_id"
+  [[ -n "$issue" ]] && _require_id "--issue" "I" "$issue"
+  [[ -n "$answers" ]] && _require_id "--answers" "Q" "$answers"
+
+  local -a kv=(question q="$question_id" state="$state" at="$(now_iso)")
+  [[ -n "$issue" ]] && kv+=(i="$issue")
+  [[ -n "$answers" ]] && kv+=(a_of="$answers")
+  local apply_out
+  if ! apply_out="$(pm_apply "${kv[@]}" 2>&1 1>/dev/null)"; then
+    echo "record: refusing question $question_id -> $state ($apply_out). No event was emitted." >&2
+    exit 1
+  fi
+  echo "record: question $question_id -> $state"
+}
+
+cmd_adopt() {
+  local dispatch_id="${1:-}"
+  [[ -z "$dispatch_id" ]] && {
+    echo "record: usage: record adopt <D-###> --ref <token>" >&2
+    exit 2
+  }
+  shift
+  local ref=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --ref)
+        ref="${2:-}"
+        shift 2
+        ;;
+      *)
+        echo "record adopt: unknown argument '$1'" >&2
+        exit 2
+        ;;
+    esac
+  done
+
+  _require_id "dispatch id" "D" "$dispatch_id"
+  if [[ -z "$ref" ]]; then
+    echo "record adopt: --ref <token> is required" >&2
+    exit 2
+  fi
+
+  _fold
+  local info attempt
+  info="$(_dispatch_info "$dispatch_id")"
+  attempt="${info#*$'\t'}"
+  if [[ "$attempt" == "NONE" ]]; then
+    echo "record: refusing adopt for $dispatch_id: no attempt on record yet (never dispatched). No event was emitted." >&2
+    exit 1
+  fi
+
+  local apply_out
+  if ! apply_out="$(pm_apply adopt d="$dispatch_id" a="$attempt" at="$(now_iso)" ref="$ref" 2>&1 1>/dev/null)"; then
+    echo "record: refusing adopt for $dispatch_id ($apply_out). No event was emitted." >&2
+    exit 1
+  fi
+  echo "record: adopt $dispatch_id a=$attempt ref=$ref"
+}
+
+cmd_note() {
+  local ref="" issue="" dispatch=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --ref)
+        ref="${2:-}"
+        shift 2
+        ;;
+      --issue)
+        issue="${2:-}"
+        shift 2
+        ;;
+      --dispatch)
+        dispatch="${2:-}"
+        shift 2
+        ;;
+      *)
+        echo "record note: unknown argument '$1'" >&2
+        exit 2
+        ;;
+    esac
+  done
+
+  if [[ -z "$ref" ]]; then
+    echo "record: usage: record note --ref <token> [--issue <I-###>] [--dispatch <D-###>]" >&2
+    exit 2
+  fi
+  [[ -n "$issue" ]] && _require_id "--issue" "I" "$issue"
+  [[ -n "$dispatch" ]] && _require_id "--dispatch" "D" "$dispatch"
+
+  local -a kv=(note at="$(now_iso)" ref="$ref")
+  [[ -n "$issue" ]] && kv+=(i="$issue")
+  [[ -n "$dispatch" ]] && kv+=(d="$dispatch")
+  local apply_out
+  if ! apply_out="$(pm_apply "${kv[@]}" 2>&1 1>/dev/null)"; then
+    echo "record: refusing note ref=$ref ($apply_out). No event was emitted." >&2
+    exit 1
+  fi
+  echo "record: note ref=$ref"
+}
+
+# ---------------------------------------------------------------------------
+# dispatch on subcommand
+# ---------------------------------------------------------------------------
+
+sub="${1:-}"
+[[ $# -gt 0 ]] && shift
+
+case "$sub" in
+  issue) cmd_issue "$@" ;;
+  dispatch) cmd_dispatch "$@" ;;
+  result) cmd_result "$@" ;;
+  question) cmd_question "$@" ;;
+  adopt) cmd_adopt "$@" ;;
+  note) cmd_note "$@" ;;
+  -h | --help | "")
+    usage
+    [[ "$sub" == "" ]] && exit 2
+    exit 0
+    ;;
+  *)
+    echo "record: unknown subcommand '$sub'" >&2
+    usage >&2
+    exit 2
+    ;;
+esac

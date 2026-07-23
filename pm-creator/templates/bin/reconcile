@@ -1,0 +1,835 @@
+#!/usr/bin/env bash
+# reconcile — refold the event log, re-render the GENERATED blocks in the
+# registry Markdown files from .pm/index.json (never from Markdown prose),
+# and surface (and idempotently log) divergence between git/herdr reality
+# and the event log.
+#
+# This is a TEMPLATE file: copied verbatim into a generated PM repo's `bin/`
+# directory. Run from the generated repo root (or anywhere under it, or with
+# $PM_ROOT set) — root resolution matches `_lib.sh` (`$PM_ROOT` override,
+# else search upward from $PWD for a directory containing `.pm/`).
+#
+# What it does (references/event-log-grammar.md is the authoritative source):
+#   1. `pm_fold` -> refresh .pm/index.json.
+#   2. Read .pm/config.json (`repos`, `herdr_workspace`), defensively
+#      supporting `repos` as either an object {name: {path, mainline}} or an
+#      array [{name, path, mainline}] (grammar/config template is silent on
+#      which; ledger-check made the same call — mirrored here, plus
+#      `mainline`, which ledger-check does not need).
+#   3. For each configured repo: `pm_git_probe` it, and render a per-repo
+#      worktree table (with a best-effort disposition hint) into the
+#      `<!-- GENERATED:BEGIN worktrees -->...END worktrees -->` markers of
+#      WORKTREES.md. Only the marker interior is ever touched — the header
+#      prose and hand-authored notes outside the markers are byte-for-byte
+#      preserved.
+#   4. Same marker-only treatment for LEDGER.md (`ledger-summary`, from
+#      index.json issues), DISPATCHES.md (`dispatch-summary`, from index.json
+#      dispatches) and QUESTIONS.md (`open-questions`, from index.json
+#      open_questions — the log carries no free text, so this is a bare id
+#      list; the human-authored Q/A prose lives outside the markers).
+#   5. SESSIONS.md (`sessions`): PROBES herdr's actual CLI at runtime rather
+#      than assuming a flag exists. Empirically (see NOTE below), `herdr tab
+#      list` and `herdr workspace list` already emit JSON on stdout by
+#      default (no `--json` needed, and `tab list` doesn't accept one) — that
+#      JSON is what gets rendered, filtered to config's `herdr_workspace`
+#      (matched against the workspace's `label`, falling back to
+#      `workspace_id`). If `herdr` is missing, not on $PATH, or its output
+#      fails to parse as JSON, the block is left with a
+#      "populate by hand" note and a WARN is printed — never a hard failure.
+#   6. Divergence detection: for each repo, non-mainline branches that look
+#      like a ticket handle (`i###-...`, CONVENTIONS.md §7) with no matching
+#      issue ever logged (i.e. no `I-###` key in index.json's issues, in any
+#      state) are "unregistered execution". Same idea for herdr tabs whose
+#      label looks like a ticket/question handle (`i###-...` / `q###-...`,
+#      CONVENTIONS.md §5) with no matching issue/question ever logged. Each
+#      new one gets exactly one `unregistered_execution` event (via
+#      `pm_apply`, ref=<branch-or-tab-id>) — idempotent because the "already
+#      known" set is derived straight from the log's own historical
+#      `unregistered_execution`/`adopt` `ref=` tokens, not a side file. All
+#      of these, plus CLOSED-issue-with-live-matching-worktree (same
+#      naming-convention heuristic ledger-check uses) and configured repos
+#      that are missing on disk, are printed under a CONFLICTS heading —
+#      informational, never fatal.
+#   7. Never parses Markdown prose for state. Never writes outside GENERATED
+#      markers. Exits 0 unless a real error (bad config, unwritable file).
+#
+# NOTE (herdr interface, probed not assumed — see file header §5 above): as
+# of this writing `herdr tab list` / `herdr workspace list` return JSON
+# directly on stdout with no flag required; `herdr tab get <id>` exposes no
+# cwd, so a tab cannot be reliably correlated to a worktree path — WORKTREES.md
+# is therefore built from `pm_git_probe` (git-native) only, and a `LIVE`
+# worktree hint is best-effort via `herdr worktree list` run with cwd set to
+# that repo (its `open_workspace_id` field), silently skipped if unavailable.
+#
+# Idempotency: the WORKTREES/LEDGER/DISPATCHES/QUESTIONS/SESSIONS blocks are
+# pure functions of index.json/config.json/live-git/live-herdr, so an
+# unchanged repo re-renders byte-identical blocks; divergence detection only
+# ever emits a `ref` once per its lifetime, per the log-derived known-set
+# above.
+set -u
+
+_RC_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./_lib.sh
+# shellcheck disable=SC1091
+source "${_RC_SELF}/_lib.sh"
+
+now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+# ---------------------------------------------------------------------------
+# resolve root, fold
+# ---------------------------------------------------------------------------
+
+_rc_root="$(_pm_root "${PM_ROOT:-}")" || exit 1
+
+_rc_config="${_rc_root}/.pm/config.json"
+_rc_events="${_rc_root}/.pm/events.log"
+_rc_index="${_rc_root}/.pm/index.json"
+
+if [[ ! -f "${_rc_config}" ]]; then
+  echo "reconcile: missing ${_rc_config} (not a pm-creator repo?)" >&2
+  exit 1
+fi
+if [[ ! -f "${_rc_events}" ]]; then
+  echo "reconcile: missing ${_rc_events} (not a pm-creator repo?)" >&2
+  exit 1
+fi
+
+if ! pm_fold "${_rc_root}"; then
+  echo "reconcile: pm_fold failed (see above)" >&2
+  exit 1
+fi
+if [[ ! -f "${_rc_index}" ]]; then
+  echo "reconcile: no index at ${_rc_index} after fold" >&2
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# parse repos out of config.json (dict or list; extract name/path/mainline)
+# ---------------------------------------------------------------------------
+
+_rc_repo_rows="$(python3 -c '
+import json, sys
+
+with open(sys.argv[1]) as f:
+    cfg = json.load(f)
+
+repos = cfg.get("repos")
+rows = []
+
+
+def add(name, val):
+    if isinstance(val, dict):
+        path = val.get("path") or ""
+        mainline = val.get("mainline") or ""
+    elif isinstance(val, str):
+        path, mainline = val, ""
+    else:
+        return
+    if path:
+        rows.append((name or "", path, mainline))
+
+
+if isinstance(repos, dict):
+    for name, val in repos.items():
+        add(name, val)
+elif isinstance(repos, list):
+    for val in repos:
+        if isinstance(val, dict):
+            add(val.get("name") or "", val)
+
+for name, path, mainline in rows:
+    print(f"{name}\t{path}\t{mainline}")
+' "${_rc_config}")"
+
+herdr_workspace="$(python3 -c '
+import json, sys
+with open(sys.argv[1]) as f:
+    cfg = json.load(f)
+print(cfg.get("herdr_workspace") or "")
+' "${_rc_config}")"
+
+# ---------------------------------------------------------------------------
+# probe each configured repo: pm_git_probe + a best-effort herdr LIVE hint
+# ---------------------------------------------------------------------------
+
+_rc_repo_entries=()
+if [[ -n "${_rc_repo_rows}" ]]; then
+  while IFS=$'\t' read -r _rc_name _rc_path _rc_mainline; do
+    [[ -z "${_rc_path}" ]] && continue
+    _rc_probe="$(pm_git_probe "${_rc_path}" 2>/dev/null)" || _rc_probe='{"is_repo": false}'
+
+    _rc_herdr_wt='[]'
+    if command -v herdr >/dev/null 2>&1 && [[ -d "${_rc_path}" ]]; then
+      _rc_herdr_wt_raw="$(cd "${_rc_path}" && herdr worktree list 2>/dev/null)" || _rc_herdr_wt_raw=""
+      if [[ -n "${_rc_herdr_wt_raw}" ]]; then
+        _rc_herdr_wt="$(printf '%s' "${_rc_herdr_wt_raw}" | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    print(json.dumps(data.get("result", {}).get("worktrees", [])))
+except Exception:
+    print("[]")
+' 2>/dev/null)"
+        [[ -z "${_rc_herdr_wt}" ]] && _rc_herdr_wt='[]'
+      fi
+    fi
+
+    _rc_repo_entries+=("$(python3 -c '
+import json, sys
+name, path, mainline, probe, herdr_wt = sys.argv[1:6]
+print(json.dumps({
+    "name": name,
+    "path": path,
+    "mainline": mainline,
+    "probe": json.loads(probe),
+    "herdr_worktrees": json.loads(herdr_wt),
+}))
+' "${_rc_name}" "${_rc_path}" "${_rc_mainline}" "${_rc_probe}" "${_rc_herdr_wt}")")
+  done <<< "${_rc_repo_rows}"
+fi
+
+_rc_repos_json="[]"
+if [[ "${#_rc_repo_entries[@]}" -gt 0 ]]; then
+  _rc_repos_json="$(printf '%s\n' "${_rc_repo_entries[@]}" | python3 -c '
+import json, sys
+print(json.dumps([json.loads(line) for line in sys.stdin if line.strip()]))
+')"
+fi
+
+# ---------------------------------------------------------------------------
+# --allow-degraded / PM_RECONCILE_ALLOW_DEGRADED opt-out (L3): herdr is
+# mandated by design (file header §5) — missing/unparseable herdr output is
+# a hard failure by default. Pass --allow-degraded (or set
+# PM_RECONCILE_ALLOW_DEGRADED=1) to restore the legacy warn-and-continue
+# behavior for a momentary outage or first-time bootstrap.
+# ---------------------------------------------------------------------------
+
+_rc_allow_degraded=0
+[[ "${PM_RECONCILE_ALLOW_DEGRADED:-0}" == "1" ]] && _rc_allow_degraded=1
+for _rc_arg in "$@"; do
+  [[ "${_rc_arg}" == "--allow-degraded" ]] && _rc_allow_degraded=1
+done
+
+# ---------------------------------------------------------------------------
+# temp-file bookkeeping: every mktemp result is registered at creation time
+# via _rc_mktemp, and the cleanup trap below is installed BEFORE the first
+# temp file is created, so an early exit on any path (including the
+# herdr-mandated hard failure below) can never leak one.
+#
+# Registration goes to a manifest FILE, not an in-process bash array: every
+# call site invokes _rc_mktemp via command substitution (X="$(_rc_mktemp
+# ...)"), which runs the function body in a forked subshell -- any array
+# mutation made there is discarded once that subshell exits and never
+# reaches this top-level script's variables. A file append, unlike an
+# array append, is a real filesystem effect and survives the subshell
+# exiting, so the manifest itself is created via plain mktemp (not through
+# _rc_mktemp, to avoid a chicken-and-egg self-registration).
+# ---------------------------------------------------------------------------
+
+_rc_tmpmanifest=""
+_rc_mktemp() {
+  local _rc_mktemp_out
+  _rc_mktemp_out="$(mktemp "$1")" || return 1
+  printf '%s\n' "${_rc_mktemp_out}" >>"${_rc_tmpmanifest}"
+  printf '%s\n' "${_rc_mktemp_out}"
+}
+
+# shellcheck disable=SC2329  # invoked indirectly via trap below
+_rc_cleanup() {
+  local rc=$?
+  if [[ -n "${_rc_tmpmanifest}" && -f "${_rc_tmpmanifest}" ]]; then
+    while IFS= read -r _rc_tmpfile; do
+      [[ -n "${_rc_tmpfile}" ]] && rm -f "${_rc_tmpfile}"
+    done <"${_rc_tmpmanifest}"
+    rm -f "${_rc_tmpmanifest}"
+  fi
+  pm_unlock 2>/dev/null || true
+  return "${rc}"
+}
+# Trap installed BEFORE the manifest itself is created, so a crash in the
+# window while mktemp'ing the manifest can never leak it either.
+trap _rc_cleanup EXIT INT TERM
+
+_rc_tmpmanifest="$(mktemp "${TMPDIR:-/tmp}/pm-reconcile-tmpmanifest.XXXXXX")"
+
+# ---------------------------------------------------------------------------
+# probe herdr for SESSIONS.md (PROBE, don't assume — see file header)
+# ---------------------------------------------------------------------------
+
+_rc_herdr_ok=0
+# Filtered ("tabs"/"workspaces" array only) JSON lands in these two files;
+# they are read by the render step below via file path (not env var), so
+# payload size is never bounded by the environment's size limits. Seeded
+# with "[]" so a herdr-unavailable run still has valid files to point at.
+_rc_herdr_tabs_file="$(_rc_mktemp "${TMPDIR:-/tmp}/pm-reconcile-herdr-tabs.XXXXXX")"
+_rc_herdr_ws_file="$(_rc_mktemp "${TMPDIR:-/tmp}/pm-reconcile-herdr-ws.XXXXXX")"
+printf '[]' >"${_rc_herdr_tabs_file}"
+printf '[]' >"${_rc_herdr_ws_file}"
+
+if command -v herdr >/dev/null 2>&1; then
+  _rc_herdr_tab_raw_file="$(_rc_mktemp "${TMPDIR:-/tmp}/pm-reconcile-herdr-tab-raw.XXXXXX")"
+  _rc_herdr_ws_raw_file="$(_rc_mktemp "${TMPDIR:-/tmp}/pm-reconcile-herdr-ws-raw.XXXXXX")"
+  herdr tab list >"${_rc_herdr_tab_raw_file}" 2>/dev/null
+  _rc_tab_rc=$?
+  herdr workspace list >"${_rc_herdr_ws_raw_file}" 2>/dev/null
+  _rc_ws_rc=$?
+
+  if [[ ${_rc_tab_rc} -eq 0 && ${_rc_ws_rc} -eq 0 ]]; then
+    # Raw herdr JSON is read from these files (not an env var/argv string):
+    # herdr output for a busy workspace can exceed typical env-size limits,
+    # which previously caused a silent, false degrade to "herdr unavailable".
+    if python3 - "${_rc_herdr_tab_raw_file}" "${_rc_herdr_ws_raw_file}" \
+      "${_rc_herdr_tabs_file}" "${_rc_herdr_ws_file}" <<'PYEOF'
+import json
+import sys
+
+tab_raw_path, ws_raw_path, tabs_out_path, ws_out_path = sys.argv[1:5]
+try:
+    with open(tab_raw_path) as f:
+        tabs = json.load(f)["result"]["tabs"]
+    with open(ws_raw_path) as f:
+        workspaces = json.load(f)["result"]["workspaces"]
+except Exception:
+    sys.exit(1)
+
+with open(tabs_out_path, "w") as f:
+    json.dump(tabs, f)
+with open(ws_out_path, "w") as f:
+    json.dump(workspaces, f)
+PYEOF
+    then
+      _rc_herdr_ok=1
+    fi
+  fi
+  rm -f "${_rc_herdr_tab_raw_file}" "${_rc_herdr_ws_raw_file}"
+fi
+
+if [[ "${_rc_herdr_ok}" -eq 0 ]]; then
+  if [[ "${_rc_allow_degraded}" -eq 1 ]]; then
+    echo "reconcile: WARN: herdr machine-readable output unavailable — SESSIONS.md sessions block left for hand-population (degraded mode: --allow-degraded/PM_RECONCILE_ALLOW_DEGRADED=1)" >&2
+  else
+    echo "reconcile: ERROR: herdr machine-readable output unavailable, but herdr is mandated (file header §5) — refusing to silently degrade. Pass --allow-degraded or set PM_RECONCILE_ALLOW_DEGRADED=1 to run in degraded mode (SESSIONS.md left for hand-population) instead." >&2
+    exit 1
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# render everything + detect divergence (python3; no jq, per _lib.sh convention)
+#
+# The window from here through the unregistered_execution pm_apply loop
+# below is a single read(known refs)->decide->emit critical section: it is
+# held under ONE pm_lock so a second, concurrent reconcile blocks, then (once
+# it acquires the lock) re-folds and re-reads the now-updated events.log
+# before deciding what is still unregistered — closing the race where two
+# concurrent reconciles both read the same known-refs set and both emit a
+# duplicate unregistered_execution for the same ref. Slow read-only probes
+# (git/herdr, above) intentionally happen OUTSIDE the lock, and so does all
+# Markdown rendering/writing (see the render step after pm_unlock below) —
+# only the fold->decide->emit of unregistered_execution events is atomic.
+# ---------------------------------------------------------------------------
+
+_rc_emit_file="$(_rc_mktemp "${TMPDIR:-/tmp}/pm-reconcile-emit.XXXXXX")"
+_rc_decide_file="$(_rc_mktemp "${TMPDIR:-/tmp}/pm-reconcile-decide.XXXXXX")"
+
+if ! pm_lock "${_rc_root}"; then
+  echo "reconcile: failed to acquire repo lock" >&2
+  exit 1
+fi
+# pm_lock installs its own EXIT/INT/TERM trap; re-install ours so temp files
+# still get cleaned up on abnormal exit.
+trap _rc_cleanup EXIT INT TERM
+
+# Re-fold under the lock so known_refs/issues reflect any events a
+# concurrent process committed between our initial fold (above) and here.
+if ! pm_fold "${_rc_root}"; then
+  echo "reconcile: pm_fold failed (see above)" >&2
+  exit 1
+fi
+
+_rc_decide_out="$(
+  PM_RC_ROOT="${_rc_root}" \
+  PM_RC_INDEX="${_rc_index}" \
+  PM_RC_EVENTS="${_rc_events}" \
+  PM_RC_REPOS="${_rc_repos_json}" \
+  PM_RC_HERDR_WORKSPACE="${herdr_workspace}" \
+  PM_RC_HERDR_OK="${_rc_herdr_ok}" \
+  PM_RC_HERDR_TABS_FILE="${_rc_herdr_tabs_file}" \
+  PM_RC_HERDR_WORKSPACES_FILE="${_rc_herdr_ws_file}" \
+  PM_RC_EMIT_FILE="${_rc_emit_file}" \
+  PM_RC_DECIDE_OUT_FILE="${_rc_decide_file}" \
+  PM_RC_NOW="$(now_iso)" \
+  python3 <<'PYEOF'
+import json
+import os
+import re
+import sys
+
+root = os.environ["PM_RC_ROOT"]
+index_path = os.environ["PM_RC_INDEX"]
+events_path = os.environ["PM_RC_EVENTS"]
+repos = json.loads(os.environ["PM_RC_REPOS"])
+herdr_workspace = os.environ["PM_RC_HERDR_WORKSPACE"]
+herdr_ok = os.environ["PM_RC_HERDR_OK"] == "1"
+with open(os.environ["PM_RC_HERDR_TABS_FILE"]) as _f:
+    herdr_tabs = json.load(_f)
+with open(os.environ["PM_RC_HERDR_WORKSPACES_FILE"]) as _f:
+    herdr_workspaces = json.load(_f)
+emit_file = os.environ["PM_RC_EMIT_FILE"]
+decide_out_file = os.environ["PM_RC_DECIDE_OUT_FILE"]
+now = os.environ["PM_RC_NOW"]
+
+with open(index_path) as f:
+    index = json.load(f)
+
+issues = index.get("issues", {})
+dispatches = index.get("dispatches", {})
+open_questions = index.get("open_questions", [])
+
+conflicts = []
+
+
+def esc_md_inline(s):
+    # Backslash-escape GFM inline-Markdown-active characters so a value we
+    # did not author cannot be reinterpreted as emphasis, code spans,
+    # links, or (if it lands at the very start of a line) a heading/list/
+    # blockquote marker. Must run AFTER the "&"/pipe HTML-entity escaping
+    # above so the backslashes it inserts are never themselves re-escaped.
+    s = re.sub(r'([`*_\[\]()~])', r'\\\1', s)
+    s = re.sub(r'^([#>+-])', r'\\\1', s)
+    # Ordered-list marker: backslash must precede the "." (CommonMark does
+    # not treat "\<digit>" as an escape — only "\." is), not the digits.
+    s = re.sub(r'^(\d+)\.', r'\1\\.', s)
+    return s
+
+
+def esc_md_cell(value):
+    # Sanitize a value for use inside a Markdown table cell: neutralize
+    # embedded HTML, pipes, line breaks, and inline Markdown syntax so a
+    # value we did not author (a repo path, branch name, herdr tab label,
+    # or status string) can never break out of its row/column, fabricate
+    # extra table rows, render as live HTML, or render as live Markdown
+    # (emphasis, code spans, links). Order matters: escape "&" first so the
+    # entities produced by the later replacements are not themselves
+    # re-escaped, then pipes, then the inline-Markdown backslash-escapes.
+    s = "" if value is None else str(value)
+    s = s.replace("&", "&amp;")
+    s = s.replace("<", "&lt;").replace(">", "&gt;")
+    # GFM table-cell pipe escaping via "\|" is ambiguous next to other
+    # backslashes; the HTML entity is unambiguous regardless of context.
+    s = s.replace("|", "&#124;")
+    s = s.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+    s = esc_md_inline(s)
+    return s
+
+
+def esc_md_heading(value):
+    # Sanitize a value for use as Markdown heading text (e.g. "### {name}"):
+    # strip CR/LF so it cannot inject a new line that starts its own
+    # heading/fence, escape HTML so it cannot render as live markup,
+    # neutralize inline Markdown syntax (emphasis, code spans, links) so
+    # the value renders literally, and neutralize a leading "#" or
+    # backtick by escaping just that first character — CommonMark's
+    # ATX-heading rule only fires when "#" is the very first character of
+    # the line, so a leading "\#"/"\`" can never be reinterpreted as a
+    # heading marker or code-fence opener. Order matters: HTML entities
+    # first, then the inline-Markdown backslash-escapes, so the escaping
+    # backslashes are not themselves re-escaped.
+    s = "" if value is None else str(value)
+    s = s.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+    s = s.replace("&", "&amp;")
+    s = s.replace("<", "&lt;").replace(">", "&gt;")
+    s = esc_md_inline(s)
+    return s
+
+# ---------------------------------------------------------------------
+# known refs (idempotency: derived from the log itself, not a side file)
+# and known question ids (any question event ever logged, any state).
+# ---------------------------------------------------------------------
+known_refs = set()
+known_question_ids = set()
+TOKEN_KV = re.compile(r'(\S+)=(\S+)')
+with open(events_path) as f:
+    for line in f:
+        line = line.strip()
+        if not line.startswith("EVENT "):
+            continue
+        parts = line.split(" ")
+        if len(parts) < 2:
+            continue
+        etype = parts[1]
+        kv = dict(TOKEN_KV.findall(" ".join(parts[2:])))
+        if etype in ("unregistered_execution", "adopt") and "ref" in kv:
+            known_refs.add(kv["ref"])
+        if etype == "question" and "q" in kv:
+            known_question_ids.add(kv["q"])
+
+ticket_re = re.compile(r'^(i\d+)-', re.IGNORECASE)
+question_re = re.compile(r'^(q\d+)-', re.IGNORECASE)
+
+
+def issue_id_for_token(token):
+    # "i007" -> "I-007"
+    m = re.match(r'^i(\d+)$', token, re.IGNORECASE)
+    if not m:
+        return None
+    return f"I-{m.group(1)}"
+
+
+def question_id_for_token(token):
+    m = re.match(r'^q(\d+)$', token, re.IGNORECASE)
+    if not m:
+        return None
+    return f"Q-{m.group(1)}"
+
+
+new_refs = []  # (ref, human-readable description)
+
+# ---------------------------------------------------------------------
+# WORKTREES.md — per-repo worktree table + disposition hints
+# ---------------------------------------------------------------------
+worktree_sections = []
+for repo in repos:
+    name = repo.get("name") or "(unnamed)"
+    path = repo.get("path") or ""
+    mainline = repo.get("mainline") or ""
+    probe = repo.get("probe") or {}
+    herdr_wt = repo.get("herdr_worktrees") or []
+
+    live_paths = {
+        w.get("path") for w in herdr_wt if w.get("open_workspace_id")
+    }
+
+    lines = [f"### {esc_md_heading(name)}", "", "| worktree | branch | dirty | ahead/behind | untracked | stash | disposition |",
+             "|---|---|---|---|---|---|---|"]
+
+    if not probe.get("is_repo"):
+        conflicts.append(
+            f"repo '{name}' configured at '{path}' is not a git repository on disk "
+            f"(contract-vs-git mismatch)"
+        )
+        lines.append(f"| {esc_md_cell(path)} | — | — | — | — | — | (not a git repo — see CONFLICTS) |")
+        worktree_sections.append("\n".join(lines))
+        continue
+
+    worktrees = probe.get("worktrees", [])
+    if not worktrees:
+        lines.append("| (no worktrees reported) | | | | | | |")
+
+    for wt in worktrees:
+        wt_path = wt.get("worktree", "")
+        branch = wt.get("branch", "")
+        if branch.startswith("refs/heads/"):
+            branch = branch[len("refs/heads/"):]
+        detached = "detached" in wt or not branch
+        display_branch = branch if branch else "(detached)"
+
+        # disposition hint (best-effort; a human call, not a law)
+        if wt_path == path:
+            # this is the probe target itself; use probe-level dirty/ahead/behind
+            dirty = probe.get("dirty", False)
+            ahead = probe.get("ahead", 0)
+            behind = probe.get("behind", 0)
+            untracked = probe.get("untracked_count", 0)
+            stash = probe.get("stash_count", 0)
+        else:
+            dirty, ahead, behind, untracked, stash = False, 0, 0, 0, 0
+
+        if wt_path in live_paths:
+            disposition = "LIVE"
+        elif mainline and branch == mainline:
+            disposition = "KEEP"
+        elif dirty or ahead:
+            disposition = "DECIDE"
+        elif branch and not detached:
+            disposition = "DORMANT"
+        else:
+            disposition = "DECIDE"
+
+        lines.append(
+            f"| {esc_md_cell(wt_path)} | {esc_md_cell(display_branch)} | {'yes' if dirty else 'no'} | "
+            f"+{ahead}/-{behind} | {untracked} | {stash} | {disposition} |"
+        )
+
+        # -----------------------------------------------------------------
+        # divergence detection: a ticket-shaped branch with no issue ever
+        # logged for it.
+        # -----------------------------------------------------------------
+        if branch and mainline and branch != mainline:
+            m = ticket_re.match(branch)
+            if m:
+                token = m.group(1).lower()
+                issue_id = issue_id_for_token(token)
+                if issue_id and issue_id not in issues:
+                    ref = branch
+                    if ref not in known_refs:
+                        new_refs.append((ref, f"branch '{branch}' in repo '{name}' (no {issue_id} ever logged)"))
+                        known_refs.add(ref)  # de-dup within this same run too
+
+    worktree_sections.append("\n".join(lines))
+
+    # ledger-vs-git: CLOSED issue whose id-token matches a still-live branch
+    for issue_id, v in issues.items():
+        if v.get("state") != "CLOSED":
+            continue
+        token = issue_id.lower().replace("-", "")
+        for wt in worktrees:
+            branch = wt.get("branch", "")
+            if branch.startswith("refs/heads/"):
+                branch = branch[len("refs/heads/"):]
+            base = branch.lower()
+            if base == token or base.startswith(token + "-"):
+                conflicts.append(
+                    f"CLOSED issue {issue_id} still has a live branch '{branch}' "
+                    f"in repo '{name}' (ledger-vs-git mismatch)"
+                )
+
+worktrees_body = "\n\n".join(worktree_sections) if worktree_sections else "(no repos configured)"
+
+# ---------------------------------------------------------------------
+# LEDGER.md — ledger-summary
+# ---------------------------------------------------------------------
+if issues:
+    by_state = {}
+    for i_id, v in sorted(issues.items()):
+        by_state.setdefault(v.get("state"), []).append(i_id)
+    ledger_lines = []
+    for state in sorted(by_state):
+        ledger_lines.append(f"- **{state}**: {', '.join(by_state[state])}")
+    ledger_lines.append("")
+    ledger_lines.append(f"_{len(issues)} issue(s) total._")
+    ledger_body = "\n".join(ledger_lines)
+else:
+    ledger_body = "(no issues yet — run bin/reconcile after the first issue is logged)"
+
+# ---------------------------------------------------------------------
+# DISPATCHES.md — dispatch-summary
+# ---------------------------------------------------------------------
+if dispatches:
+    by_state = {}
+    for d_id, v in sorted(dispatches.items()):
+        by_state.setdefault(v.get("state"), []).append((d_id, v))
+    dispatch_lines = []
+    for state in sorted(by_state):
+        dispatch_lines.append(f"- **{state}**:")
+        for d_id, v in by_state[state]:
+            lane = v.get("lane") or "?"
+            tab = v.get("tab") or "?"
+            attempt = v.get("attempt") or "?"
+            dispatch_lines.append(f"  - {d_id} (attempt={attempt} lane={lane} tab={tab})")
+    dispatch_lines.append("")
+    dispatch_lines.append(f"_{len(dispatches)} dispatch(es) total._")
+    dispatch_body = "\n".join(dispatch_lines)
+else:
+    dispatch_body = "(no dispatches yet)"
+
+# ---------------------------------------------------------------------
+# QUESTIONS.md — open-questions (no free text in the log; ids only)
+# ---------------------------------------------------------------------
+if open_questions:
+    questions_body = "\n".join(f"- {q}" for q in sorted(open_questions))
+else:
+    questions_body = "(no open questions)"
+
+# ---------------------------------------------------------------------
+# SESSIONS.md — sessions (herdr, filtered to config's herdr_workspace)
+# ---------------------------------------------------------------------
+if herdr_ok:
+    ws_id = None
+    for w in herdr_workspaces:
+        if w.get("label") == herdr_workspace or w.get("workspace_id") == herdr_workspace:
+            ws_id = w.get("workspace_id")
+            break
+    if ws_id is None:
+        sessions_body = (
+            f"(herdr is available, but no workspace matching herdr_workspace="
+            f"'{esc_md_cell(herdr_workspace)}' was found — populate by hand)"
+        )
+    else:
+        rows = [t for t in herdr_tabs if t.get("workspace_id") == ws_id]
+        if rows:
+            lines = ["| tab | label | agent_status |", "|---|---|---|"]
+            for t in sorted(rows, key=lambda t: t.get("tab_id", "")):
+                lines.append(
+                    f"| {esc_md_cell(t.get('tab_id', ''))} | {esc_md_cell(t.get('label', ''))} | "
+                    f"{esc_md_cell(t.get('agent_status', ''))} |"
+                )
+            sessions_body = "\n".join(lines)
+
+            # divergence detection: a ticket/question-shaped tab label with
+            # no issue/question ever logged for it.
+            for t in rows:
+                label = t.get("label") or ""
+                tab_id = t.get("tab_id") or ""
+                if not tab_id:
+                    continue
+                m = ticket_re.match(label)
+                if m:
+                    token = m.group(1).lower()
+                    issue_id = issue_id_for_token(token)
+                    if issue_id and issue_id not in issues and tab_id not in known_refs:
+                        new_refs.append((tab_id, f"herdr tab '{tab_id}' label='{label}' (no {issue_id} ever logged)"))
+                        known_refs.add(tab_id)
+                    continue
+                m = question_re.match(label)
+                if m:
+                    token = m.group(1).lower()
+                    q_id = question_id_for_token(token)
+                    if q_id and q_id not in known_question_ids and tab_id not in known_refs:
+                        new_refs.append((tab_id, f"herdr tab '{tab_id}' label='{label}' (no {q_id} ever logged)"))
+                        known_refs.add(tab_id)
+        else:
+            sessions_body = "(no tabs open in this workspace)"
+else:
+    sessions_body = "(herdr machine-readable output unavailable — populate by hand)"
+
+# ---------------------------------------------------------------------
+# write the new unregistered_execution refs for bash to pm_apply
+# ---------------------------------------------------------------------
+with open(emit_file, "w") as f:
+    for ref, _desc in new_refs:
+        f.write(ref + "\n")
+
+for _ref, desc in new_refs:
+    conflicts.append(f"unregistered execution: {desc}")
+
+# ---------------------------------------------------------------------
+# Hand off to the (lock-free) render step: dump everything the marker
+# render needs -- the pre-rendered bodies, the conflicts collected so
+# far, and the summary counts -- as JSON. Markdown file I/O deliberately
+# does NOT happen here: it happens in a second python step, after
+# pm_unlock below, so a slow/unwritable registry file can never block
+# this process's (or a concurrent reconcile's) event-log writes.
+# ---------------------------------------------------------------------
+with open(decide_out_file, "w") as f:
+    json.dump(
+        {
+            "issues": len(issues),
+            "dispatches": len(dispatches),
+            "open_questions": len(open_questions),
+            "repos": len(repos),
+            "herdr_ok": herdr_ok,
+            "conflicts": conflicts,
+            "bodies": {
+                "worktrees": worktrees_body,
+                "ledger-summary": ledger_body,
+                "dispatch-summary": dispatch_body,
+                "open-questions": questions_body,
+                "sessions": sessions_body,
+            },
+        },
+        f,
+    )
+PYEOF
+)"
+_rc_decide_rc=$?
+
+if [[ ${_rc_decide_rc} -ne 0 ]]; then
+  echo "reconcile: reconcile/decide step failed" >&2
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# emit unregistered_execution for each newly-discovered ref (idempotent:
+# the python step already filtered against the log's own known refs). This
+# is still inside the critical section: pm_apply takes pm_lock internally,
+# which is re-entrant (see _lib.sh), so it just bumps our existing lock's
+# depth counter rather than deadlocking or racing against it.
+# ---------------------------------------------------------------------------
+
+if [[ -s "${_rc_emit_file}" ]]; then
+  while IFS= read -r _rc_ref; do
+    [[ -z "${_rc_ref}" ]] && continue
+    pm_apply unregistered_execution at="$(now_iso)" ref="${_rc_ref}" || {
+      echo "reconcile: failed to emit unregistered_execution ref=${_rc_ref}" >&2
+      exit 1
+    }
+  done < "${_rc_emit_file}"
+fi
+
+# End of the read->decide->emit critical section: release the lock before
+# doing any Markdown rendering/writing below.
+pm_unlock
+
+# ---------------------------------------------------------------------------
+# render step (outside the lock): marker-only write into each registry
+# file -- replace ONLY the bytes between BEGIN/END, never anything outside
+# them. Read-only against repo state (all inputs came from the decide
+# step above); the only side effect is the registry Markdown files
+# themselves, so a slow/unwritable file here cannot block another
+# reconcile's -- or this one's -- event-log writes, which already
+# completed above.
+# ---------------------------------------------------------------------------
+
+_rc_report="$(
+  PM_RC_ROOT="${_rc_root}" \
+  PM_RC_DECIDE_IN="${_rc_decide_file}" \
+  python3 <<'PYEOF'
+import json
+import os
+import re
+
+root = os.environ["PM_RC_ROOT"]
+with open(os.environ["PM_RC_DECIDE_IN"]) as f:
+    decided = json.load(f)
+
+conflicts = list(decided["conflicts"])
+bodies = decided["bodies"]
+
+
+def render_marker(md_path, key, body):
+    if not os.path.isfile(md_path):
+        conflicts.append(f"{os.path.basename(md_path)}: file not found at {md_path} -- skipped")
+        return
+    with open(md_path, "r") as f:
+        content = f.read()
+    begin = f"<!-- GENERATED:BEGIN {key} -->"
+    end = f"<!-- GENERATED:END {key} -->"
+    pattern = re.compile(re.escape(begin) + r".*?" + re.escape(end), re.DOTALL)
+    if not pattern.search(content):
+        conflicts.append(
+            f"{os.path.basename(md_path)}: no '{key}' GENERATED markers found -- skipped "
+            f"(scaffold may not have materialized them yet)"
+        )
+        return
+    replacement = f"{begin}\n{body}\n{end}"
+    # NOTE: pass the replacement via a lambda so re.sub treats it as a
+    # literal string -- it must NOT go through re.sub's plain-string
+    # replacement path (which interprets backslash escapes / \g<...>
+    # group references and would corrupt any literal backslash in a
+    # label or path inside `body`).
+    new_content = pattern.sub(lambda _m: replacement, content, count=1)
+    if new_content != content:
+        with open(md_path, "w") as f:
+            f.write(new_content)
+
+
+render_marker(os.path.join(root, "WORKTREES.md"), "worktrees", bodies["worktrees"])
+render_marker(os.path.join(root, "LEDGER.md"), "ledger-summary", bodies["ledger-summary"])
+render_marker(os.path.join(root, "DISPATCHES.md"), "dispatch-summary", bodies["dispatch-summary"])
+render_marker(os.path.join(root, "QUESTIONS.md"), "open-questions", bodies["open-questions"])
+render_marker(os.path.join(root, "SESSIONS.md"), "sessions", bodies["sessions"])
+
+# ---------------------------------------------------------------------
+# report
+# ---------------------------------------------------------------------
+print("=== reconcile ===")
+print(f"issues: {decided['issues']}  dispatches: {decided['dispatches']}  open_questions: {decided['open_questions']}")
+print(f"repos probed: {decided['repos']}  herdr: {'ok' if decided['herdr_ok'] else 'unavailable'}")
+
+if conflicts:
+    print(f"\nCONFLICTS ({len(conflicts)}):")
+    for c in conflicts:
+        print(f"  - {c}")
+else:
+    print("\nCONFLICTS: none")
+PYEOF
+)"
+_rc_report_rc=$?
+
+if [[ ${_rc_report_rc} -ne 0 ]]; then
+  echo "reconcile: rendering step failed" >&2
+  exit 1
+fi
+
+printf '%s\n' "${_rc_report}"
+exit 0

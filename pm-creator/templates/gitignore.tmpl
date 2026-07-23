@@ -1,0 +1,11 @@
+# Derived / transient PM state (regenerable — never authoritative)
+.pm/index.json
+.pm/.lock
+
+# Authoritative + audit records ARE tracked (do not ignore):
+#   .pm/events.log       <- single source of truth for state
+#   .pm/quarantine.log   <- rejected event lines, kept for audit
+
+# Add here any prompt or report path that carries secrets and must NOT be pushed
+# (see CONVENTIONS §9 two-channel discipline; upload policy in the CONFIG block):
+# prompts/*secret*

@@ -1,0 +1,133 @@
+# Conventions — {{CAMPAIGN_NAME}} PM
+
+The operating law for this manager repo. Fixed sections are framework law (do not weaken);
+the config block at the bottom is this campaign's specifics.
+
+## 1. Numbering
+
+- **Issues** — `I-###`, one global sequence across all repos, each tagged with its repo(s):
+  `I-005 [{{PRIMARY_REPO}}]`. States: OPEN, ACTIVE (a current front), IN-PROGRESS
+  (dispatched), TODO (queued), PARKED, BLOCKED (on another ticket), NEEDS-USER (awaiting a
+  user call), CLOSED.
+- **Questions to agents** — `Q-###`; the recorded answer takes the same number as `A-###`.
+- **Reports** — `R-###`, plus a version and a date (§2).
+- **Dispatches** — `D-###`, immutable per dispatch; attempts within a dispatch are `A-##`
+  (§4). The dispatch id is the join key threading an issue → prompt file → worker tab →
+  branch → result.
+
+## 2. Reports: numbered, versioned, dated
+
+Filename: `reports/R-###_v#_YYYY-MM-DD_slug.md`. The `R-###` identifies the document; a
+revision keeps the number, bumps `v#`, carries the new date. Every report opens with a
+one-line TL;DR and grounds every claim in ticket numbers, versions, or commit SHAs.
+
+## 3. State is the EVENT LOG — Markdown is narrative
+
+`.pm/events.log` (grammar: `bin/` reads it; humans don't) is the **single source of truth
+for state**. The Markdown files below are a human narrative and are **never parsed for
+state** — edit them freely. `.pm/index.json` is a regenerable fold of the log; delete and
+`bin/reconcile` rebuilds it. Rule on any disagreement: **the event log + live git/herdr win;
+prose is re-rendered, never trusted as state.** Generated summary blocks sit inside
+`<!-- GENERATED:BEGIN key -->…<!-- END -->` markers — anything you hand-type inside a marker
+is lost on the next `reconcile`.
+
+## 4. Dispatch identity, lanes, and the result contract
+
+- **Two lanes, always available; you direct which handles a dispatch:**
+  - *Automation lane* — a script spawns a herdr worker tab pre-loaded with the prompt and
+    collects the result. Requires herdr machine-readable output.
+  - *Human-gated lane* — you spawn the tab / paste the prompt / relay the result.
+- **Lane ownership is recorded at dispatch** (`READY→DISPATCHED` writes `lane`, `prompt_sha`,
+  attempt; `tab` resolves at ACK). A dispatch owned by one lane is refused by the other.
+- **Out-of-protocol work is absorbed, not hidden.** Work that appears with no matching
+  dispatch is logged `unregistered_execution`; you `adopt` it into a D. The system detects
+  bypass; it does not pretend to prevent it.
+- **Always-human gates (both lanes):** merges to shared/mainline branches, pushes/uploads,
+  and any `NEEDS-USER` item NEVER auto-execute.
+- **Result contract** — every dispatched worker returns: PASS/FAIL · dispatch id · touched
+  files · commit SHAs/branches · tests run + outcome · did-it-change-product-code ·
+  escalated findings · user-action-required. This is a disciplined intake + audit trail,
+  corroborated by `reconcile`'s independent git read — NOT a security guarantee.
+
+## 5. herdr workspace + tab naming
+
+- **Workspace:** `{{HERDR_WORKSPACE}}` for all campaign work; the manager tab stays
+  `{{CAMPAIGN_SLUG}}-PM`.
+- **Tab label = the ticket handle:** `i###-<slug>`, short, lowercase. For pure questions use
+  the `Q` number: `q003-<slug>`.
+- **One tab ↔ one ticket (or one Q).** Close a ticket's tab when it closes; don't let stale
+  idle tabs accumulate.
+- **cwd:** start the tab in the primary repo the ticket touches, or a dedicated worktree.
+
+## 6. Model routing (operator-set, not auto-applied)
+
+The model is set by the person launching the worker session BEFORE pasting the prompt — a
+`Model:` header line is an instruction to that operator, not something the agent reads.
+Defaults by work shape (a *default*, revisit as models change):
+
+{{MODEL_ROUTING}}
+
+When unsure between two tiers, take the cheaper one for execution and the dearer one for
+verdicts.
+
+## 7. Branch + worktree naming (all repos)
+
+- Branch: `i###-<slug>` (lowercase ticket + short slug). One ticket per branch.
+- Worktree dir: `{{WORKTREE_ROOT}}/<RepoName>-i###-<slug>`.
+- Lifecycle: worktree removed + branch deleted once merged into the repo's mainline
+  (see the config block). Provenance needs no live branches — manifests/SHAs are re-checkoutable.
+
+## 8. Prompt self-containment — HARD RULES (a dispatched session sees ONLY the pasted text)
+
+A worker session has **no access** to this repo, these conventions, or any `I/Q/R/D-###`
+numbering. It sees the pasted prompt and nothing else. Therefore:
+
+1. **The header table is operator-facing** (above the "paste below this line" marker, NOT
+   pasted to the agent). Ticket ids, tab names, cross-references belong here.
+2. **Everything below the paste marker must be self-contained.** No bare `I-###`/`Q-###`/
+   `R-###`/`D-###`, no tab names, no "the PM"/"the ledger"/"the manager tracks" as if the
+   agent can resolve them. If a concept from another ticket is needed, **describe the thing**,
+   not its number (say "the unmerged fix `<sha>` in worktree X", not "I-005").
+3. **The only allowed internal token in the pasted body is the dispatch's OWN id**, and only
+   as a report-back label ("cite D-### when you report so it can be filed").
+4. **Ground every reference in something the agent can reach:** absolute paths, git SHAs,
+   branch/worktree names, file:line, env names, commands. A SHA or path is self-resolving; a
+   ticket number is not.
+5. **Self-check before dispatch:** re-read only the pasted portion, as if you were the cold
+   agent. Every noun must be resolvable from the text or the filesystem. `bin/lint-prompt`
+   is a floor for this check — necessary, never sufficient. If any internal label survives
+   below the marker, the prompt is not ready.
+
+This rule is load-bearing: a prompt that leaks internal labels produces an agent guessing at
+scope — the exact miscommunication this repo exists to prevent.
+
+## 9. Request flow
+
+1. File/update the ticket (`LEDGER.md`) and append the state event to the log.
+2. Write a self-contained prompt file `prompts/<ticket>_<slug>_YYYY-MM-DD.md` with an
+   operator-facing header (Ticket, Target repo + worktree, herdr workspace + tab, Model,
+   Effort, Deliverable, Report-back format) and a self-contained body (§8).
+3. For persistent work orders, append a pointer to the target repo's `REQUESTS.md`.
+4. Dispatch via the chosen lane; record the `dispatch_state` event.
+5. Results return through the lane; record the result + verify; update the ticket.
+
+### Two-channel discipline (per repo, untracked, NEVER committed)
+- **`REQUESTS.md`** (repo root) = INBOUND channel to the session that owns that repo's work.
+- **`STATUS.md`** (repo root) = that session's REPLY channel; requesters watch it.
+
+## 10. Manager scope
+
+The manager owns **state + coordination, never PRODUCT code.** It DOES mutate PM state
+through the `bin/` tools and its own edits to this repo. It delegates all code execution to
+worker sessions.
+
+---
+
+## CONFIG — {{CAMPAIGN_NAME}} specifics (edit as the campaign evolves)
+
+- **Repos + mainlines:** {{REPO_LIST}}
+- **Worktree root:** {{WORKTREE_ROOT}}
+- **Remote policy (this PM repo):** {{REMOTE_POLICY}}
+- **Per-repo upload policy:** {{UPLOAD_POLICY}}
+- **Capacity profile:** see `MACHINE.md`{{CAPACITY_NOTE}}
+- **Always-human gates:** {{ALWAYS_HUMAN_GATES}}

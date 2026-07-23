@@ -1,0 +1,23 @@
+# LEDGER — numbered issues (narrative surface)
+
+States: OPEN · ACTIVE (current front) · IN-PROGRESS (dispatched) · TODO (queued) · PARKED ·
+BLOCKED (on ticket) · NEEDS-USER (awaiting the user) · CLOSED.
+Mainlines: {{REPO_LIST}}.
+
+> This file is the human narrative. Authoritative state is `.pm/events.log`; this prose is
+> never parsed. `bin/reconcile` renders the summary block below from the event log.
+
+<!-- GENERATED:BEGIN ledger-summary -->
+(no issues yet — run bin/reconcile after the first issue is logged)
+<!-- GENERATED:END ledger-summary -->
+
+---
+
+## Open
+
+(file the first issue here as `### I-001 [<repo>] · OPEN — <title>` and append an
+`issue_state` event with `bin/` — see CONVENTIONS §9)
+
+## Closed / history
+
+(brief entries; details live in reports/ and the event log)

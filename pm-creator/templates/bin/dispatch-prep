@@ -1,0 +1,300 @@
+#!/usr/bin/env bash
+# dispatch-prep — human-gated-lane dispatch preparation (CONVENTIONS.md §9,
+# event-log-grammar.md §4.2).
+#
+# This is a TEMPLATE file: it is copied verbatim into a generated PM repo's
+# `bin/` directory and run from that repo's root. Standalone entrypoint that
+# `source`s `_lib.sh` (bash + python3 only, no jq).
+#
+# PHASE A (human-gated lane only): this script PREPARES a dispatch — it
+# validates, refuses illegal double-dispatch, records the state transition,
+# and PRINTS the herdr command the operator runs by hand. It never spawns
+# herdr itself and never touches the automation lane.
+#
+# Usage:
+#   bin/dispatch-prep --dispatch D-### --issue I-### --prompt <path> \
+#                      --tab <label> [--repo <name>]
+#
+# What it does, in order:
+#   1. Validates the prompt file exists; hashes its FINALIZED contents into
+#      prompt_sha (sha256, first 8 hex chars — matches the grammar's example
+#      shape, e.g. `ab12cd34`).
+#   2. pm_fold's the event log, then reads the dispatch's current folded
+#      state from .pm/index.json. Refuses (non-zero exit, no events emitted)
+#      unless the dispatch is brand-new, or currently READY, or currently
+#      FAILED (a legal retry) — any other state (DISPATCHED/ACKED/RETURNED/
+#      QUARANTINED/VERIFIED/ABANDONED) means it is already active or
+#      terminal, and a second DISPATCHED transition would violate the
+#      dispatch lifecycle (event-log-grammar.md §4.2).
+#   3. Emits `dispatch_new` (only if this D has never been registered), then
+#      `dispatch_state ... from=<READY|FAILED> to=DISPATCHED lane=human
+#      tab=? prompt_sha=<hash>` under the next attempt number (A-01, or the
+#      prior attempt + 1 on a FAILED retry).
+#   4. Assembles (but does NOT run) the herdr command to spawn the worker
+#      tab, with every interpolated value passed through esc_shell so a
+#      hostile campaign/repo/tab name can't break the printed command.
+#   5. Prints a summary: D, attempt, prompt_sha, tab, and the ready-to-run
+#      command plus a one-line paste instruction.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./_lib.sh
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/_lib.sh"
+
+usage() {
+  cat <<'EOF'
+usage: dispatch-prep --dispatch D-### --issue I-### --prompt <path> --tab <label> [--repo <name>]
+
+Prepares (but does not execute) a human-gated-lane dispatch:
+  - validates the prompt file and hashes its contents (prompt_sha)
+  - refuses cross-lane / double dispatch for an already-active or terminal D
+  - emits dispatch_new (if new) and a READY|FAILED -> DISPATCHED lane=human transition
+  - prints the herdr command to run, plus a one-line paste instruction
+
+This is the human-gated lane: this script prepares, the operator executes.
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# arg parsing
+# ---------------------------------------------------------------------------
+
+dispatch_id=""
+issue_id=""
+prompt_path=""
+tab_label=""
+repo_name=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dispatch)
+      dispatch_id="${2:-}"
+      shift 2
+      ;;
+    --issue)
+      issue_id="${2:-}"
+      shift 2
+      ;;
+    --prompt)
+      prompt_path="${2:-}"
+      shift 2
+      ;;
+    --tab)
+      tab_label="${2:-}"
+      shift 2
+      ;;
+    --repo)
+      repo_name="${2:-}"
+      shift 2
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "dispatch-prep: unknown argument '$1'" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [[ -z "$dispatch_id" || -z "$issue_id" || -z "$prompt_path" || -z "$tab_label" ]]; then
+  echo "dispatch-prep: --dispatch, --issue, --prompt, and --tab are all required" >&2
+  usage >&2
+  exit 2
+fi
+
+if [[ ! "$dispatch_id" =~ ^D-[0-9]+$ ]]; then
+  echo "dispatch-prep: --dispatch must look like D-### (got '$dispatch_id')" >&2
+  exit 2
+fi
+if [[ ! "$issue_id" =~ ^I-[0-9]+$ ]]; then
+  echo "dispatch-prep: --issue must look like I-### (got '$issue_id')" >&2
+  exit 2
+fi
+
+if [[ ! -f "$prompt_path" ]]; then
+  echo "dispatch-prep: no such prompt file: $prompt_path" >&2
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# locate the repo root (mirrors _lib.sh's _pm_root search, kept local rather
+# than reaching into that frozen file's underscore-prefixed internals)
+# ---------------------------------------------------------------------------
+
+_find_root() {
+  if [[ -n "${PM_ROOT:-}" ]]; then
+    printf '%s\n' "$PM_ROOT"
+    return 0
+  fi
+  local dir="$PWD"
+  while [[ "$dir" != "/" ]]; do
+    if [[ -d "$dir/.pm" ]]; then
+      printf '%s\n' "$dir"
+      return 0
+    fi
+    dir="$(dirname "$dir")"
+  done
+  echo "dispatch-prep: could not locate .pm/ (searched upward from $PWD; set \$PM_ROOT to override)" >&2
+  return 1
+}
+
+root="$(_find_root)" || exit 1
+config="$root/.pm/config.json"
+log="$root/.pm/events.log"
+index="$root/.pm/index.json"
+
+if [[ ! -f "$config" ]]; then
+  echo "dispatch-prep: missing $config (not a pm-creator repo?)" >&2
+  exit 1
+fi
+if [[ ! -f "$log" ]]; then
+  echo "dispatch-prep: missing $log (not a pm-creator repo?)" >&2
+  exit 1
+fi
+
+herdr_workspace="$(python3 -c "
+import json, sys
+cfg = json.load(open(sys.argv[1]))
+print(cfg.get('herdr_workspace') or '')
+" "$config")"
+
+if [[ -z "$herdr_workspace" ]]; then
+  echo "dispatch-prep: .pm/config.json has no herdr_workspace set" >&2
+  exit 1
+fi
+
+repo_path=""
+if [[ -n "$repo_name" ]]; then
+  repo_path="$(REPO_NAME="$repo_name" python3 -c "
+import json, os, sys
+cfg = json.load(open(sys.argv[1]))
+repos = cfg.get('repos') or []
+want = os.environ['REPO_NAME']
+path = ''
+# Canonical config schema: repos is a LIST of {name,path,mainline}
+# (matches config.json.tmpl and bin/reconcile). Tolerate a legacy dict too.
+if isinstance(repos, list):
+    for entry in repos:
+        if isinstance(entry, dict) and entry.get('name') == want:
+            path = entry.get('path') or ''
+            break
+elif isinstance(repos, dict):
+    entry = repos.get(want)
+    if isinstance(entry, dict):
+        path = entry.get('path') or ''
+    elif isinstance(entry, str):
+        path = entry
+print(path)
+" "$config")"
+  if [[ -z "$repo_path" ]]; then
+    echo "dispatch-prep: warning: repo '$repo_name' not found in .pm/config.json repos; omitting --cwd" >&2
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# hash the finalized prompt
+# ---------------------------------------------------------------------------
+
+prompt_sha="$(python3 -c "
+import hashlib, sys
+h = hashlib.sha256()
+with open(sys.argv[1], 'rb') as f:
+    h.update(f.read())
+print(h.hexdigest()[:8])
+" "$prompt_path")"
+
+# ---------------------------------------------------------------------------
+# fold the log, read this dispatch's current state + attempt
+# ---------------------------------------------------------------------------
+
+pm_fold "$root" || {
+  echo "dispatch-prep: pm_fold failed; refusing to dispatch against an unfoldable log" >&2
+  exit 1
+}
+
+mapfile -t _disp_info < <(D_ID="$dispatch_id" python3 -c "
+import json, os, sys
+idx = json.load(open(sys.argv[1]))
+d = os.environ['D_ID']
+disp = idx.get('dispatches', {}).get(d)
+if disp is None:
+    print('NONE')
+else:
+    print(disp.get('state') or 'NONE')
+" "$index")
+
+current_state="${_disp_info[0]:-NONE}"
+
+# ---------------------------------------------------------------------------
+# refuse cross-lane / double dispatch
+# ---------------------------------------------------------------------------
+
+case "$current_state" in
+  NONE | READY | FAILED)
+    # brand-new D, first dispatch of a registered-but-undispatched D, or a
+    # legal retry after FAILED — all allowed to proceed.
+    ;;
+  *)
+    echo "dispatch-prep: refusing to dispatch $dispatch_id: current folded state is '$current_state'." >&2
+    echo "  Only a brand-new dispatch, a READY dispatch, or a retry after FAILED may be prepared here." >&2
+    echo "  $dispatch_id is already dispatched/terminal; a second DISPATCHED transition would be illegal" >&2
+    echo "  (event-log-grammar.md §4.2). No event was emitted." >&2
+    exit 1
+    ;;
+esac
+
+now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+# Single atomic transaction: pm_apply/pm_apply_batch mints the attempt (A-0N)
+# for the READY->DISPATCHED / FAILED->DISPATCHED edge, so we must NOT pass
+# a=. If the dispatch is brand-new, dispatch_new + dispatch_state are one
+# batch transaction; otherwise (retry after FAILED, or first dispatch of an
+# already-registered READY dispatch) it's just the dispatch_state event.
+if [[ "$current_state" == "NONE" ]]; then
+  batch_out="$(pm_apply_batch \
+    -- dispatch_new d="$dispatch_id" i="$issue_id" at="$(now_iso)" \
+    -- dispatch_state d="$dispatch_id" from=READY to=DISPATCHED lane=human at="$(now_iso)" tab="?" prompt_sha="$prompt_sha" \
+  )" || {
+    echo "dispatch-prep: refused to prepare $dispatch_id (dispatch_new + dispatch_state transaction failed)" >&2
+    exit 1
+  }
+else
+  batch_out="$(pm_apply dispatch_state d="$dispatch_id" from="$current_state" to=DISPATCHED lane=human at="$(now_iso)" tab="?" prompt_sha="$prompt_sha")" || {
+    echo "dispatch-prep: refused to prepare $dispatch_id (dispatch_state from=$current_state transition failed)" >&2
+    exit 1
+  }
+fi
+
+next_attempt="$(printf '%s\n' "$batch_out" | grep '^EVENT dispatch_state ' | tail -n1 | grep -o ' a=A-[0-9]\+' | cut -d= -f2)"
+if [[ -z "$next_attempt" ]]; then
+  echo "dispatch-prep: could not determine the minted attempt from pm_apply output" >&2
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# assemble (do not run) the herdr spawn command
+# ---------------------------------------------------------------------------
+
+cmd="herdr tab create --workspace $(esc_shell "$herdr_workspace") --label $(esc_shell "$tab_label")"
+if [[ -n "$repo_path" ]]; then
+  cmd+=" --cwd $(esc_shell "$repo_path")"
+fi
+
+echo "dispatch-prep: prepared $dispatch_id attempt $next_attempt (lane=human)"
+echo "  issue:      $issue_id"
+echo "  prompt:     $prompt_path"
+echo "  prompt_sha: $prompt_sha"
+echo "  tab:        $tab_label"
+echo
+echo "Run this to spawn the worker tab (NOT executed automatically):"
+echo
+echo "  $cmd"
+echo
+echo "Then paste the contents of '$prompt_path' into the new tab's agent pane."
+echo
+echo "Once the tab is confirmed, record the ACK by hand, e.g.:"
+echo "  bin/record dispatch $dispatch_id ACKED --tab <real-tab-id>"
