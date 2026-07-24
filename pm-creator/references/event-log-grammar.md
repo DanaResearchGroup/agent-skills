@@ -120,6 +120,8 @@ EVENT result d=D-001 a=A-01 status=RETURNED result_sha=ef56ab78 at=2026-07-23T18
 EVENT dispatch_state d=D-001 a=A-01 from=RETURNED to=VERIFIED lane=human at=2026-07-23T18:45:00Z
 EVENT issue_state i=I-001 from=ACTIVE to=CLOSED at=2026-07-23T18:46:00Z by=D-001
 ```
-Note: `RETURNED` here is recorded by the `result` event; the `dispatch_state … to=RETURNED`
-may be emitted alongside or the fold may derive RETURNED from the result event — the
-canonical rule is that a `result … status=RETURNED` advances the dispatch to RETURNED.
+Note: `RETURNED` is reached **only** by the `result` event, never by a `dispatch_state`.
+`dispatch_state … to=RETURNED` is **not** a legal event — the engine refuses it at write and
+quarantines it at fold (see `enforcement.md` §4). The canonical rule is that a `result …
+status=RETURNED` is what advances the dispatch to RETURNED; the fold derives the RETURNED
+state from that result event.
