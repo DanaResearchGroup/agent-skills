@@ -353,6 +353,23 @@ section_clean_publish() {
   [[ -x "$out/bin/close" ]] && \
     ok "bin/close is copied and executable" \
     || fail "bin/close is copied and executable" "$(ls -la "$out/bin" 2>&1)"
+
+  [[ -x "$out/bin/track" ]] && \
+    ok "bin/track is copied and executable" \
+    || fail "bin/track is copied and executable" "$(ls -la "$out/bin" 2>&1)"
+
+  [[ -f "$out/TRACKER.md" ]] && \
+    ok "TRACKER.md is rendered from the tmpl" \
+    || fail "TRACKER.md is rendered from the tmpl" "$(ls -la "$out" 2>&1)"
+
+  grep -q 'GENERATED:BEGIN tracker' "$out/TRACKER.md" 2>/dev/null && \
+    grep -q 'GENERATED:END tracker' "$out/TRACKER.md" 2>/dev/null && \
+    ok "TRACKER.md has the tracker GENERATED markers" \
+    || fail "TRACKER.md has the tracker GENERATED markers" "$(cat "$out/TRACKER.md" 2>&1)"
+
+  grep -qE '\{\{[A-Z_]+\}\}' "$out/TRACKER.md" 2>/dev/null && \
+    fail "TRACKER.md has no unresolved {{PLACEHOLDER}}" "$(grep -E '\{\{[A-Z_]+\}\}' "$out/TRACKER.md")" \
+    || ok "TRACKER.md has no unresolved {{PLACEHOLDER}}"
 }
 
 # ---------------------------------------------------------------------------

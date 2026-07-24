@@ -48,6 +48,12 @@ is lost on the next `reconcile`.
   files · commit SHAs/branches · tests run + outcome · did-it-change-product-code ·
   escalated findings · user-action-required. This is a disciplined intake + audit trail,
   corroborated by `reconcile`'s independent git read — NOT a security guarantee.
+- **`bin/track --once`** — a manager-triggered stateless reconciliation tick. It takes one
+  fresh `herdr api snapshot`, and for every `ACKED` dispatch whose recorded tab now shows
+  `done`, checks the worker's branch tip against git: fully corroborated cases are
+  auto-recorded `RETURNED` (intake only, never auto-verified); everything else — ambiguous
+  history, a missing/reused tab, no commit — is surfaced in `TRACKER.md` for you to work by
+  hand. Verification and close stay human-gated regardless of what `track` records.
 
 ## 5. herdr workspace + tab naming
 

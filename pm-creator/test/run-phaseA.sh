@@ -121,6 +121,81 @@ EOF
 [ -f "$PM/archive/messages/I-001_go_x_2026-07-24.md" ] && ok "close archived messages/I-001_go_x_2026-07-24.md" || bad "close did not archive messages/I-001_go_x_2026-07-24.md"
 [ -z "$(find "$PM/reports" -mindepth 1 2>/dev/null)" ] && ok "close left reports/ untouched" || bad "close touched reports/"
 
+# --- 4c. bin/track --once: corroborated auto-record within phase-A lifecycle --
+# Proves track's intake dovetails with the existing human-gated verify/close flow:
+# a real branch/worktree with a descendant worker commit, ACKED with a zzz-test-*
+# sentinel tab, herdr shadowed (never touching live workspace w1) to report that
+# tab "done", then track --once auto-records RETURNED (never VERIFIED), and a
+# human record/pm_apply takes it the rest of the way to VERIFIED + issue CLOSED.
+CORROB_BRANCH="i950-corrob"
+CORROB_TAB="zzz-test-track-950"
+( cd "$DEMO" && git branch "$CORROB_BRANCH" ) >/dev/null 2>&1
+( cd "$DEMO" && git worktree add -q "$WORK/wt-950" "$CORROB_BRANCH" ) >/dev/null 2>&1
+( cd "$WORK/wt-950" && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m 'worker commit for I-950' ) >/dev/null 2>&1
+worker_tip_950="$(git -C "$WORK/wt-950" rev-parse HEAD)"
+
+( cd "$PM" && bin/record issue I-950 ACTIVE >/dev/null 2>&1 ) && ok "record issue I-950 ACTIVE" || bad "record issue I-950 ACTIVE failed"
+
+cat > "$PM/prompts/I-950_corrob_2026-07-24.md" <<'EOF'
+# Dispatch — corrob (git-corroborated auto-record leg)
+
+| Ticket | (operator-facing header) |
+
+## Prompt (paste below this line)
+
+Commit a trivial change on your assigned branch.
+EOF
+
+if ( cd "$PM" && bin/dispatch-prep --dispatch D-950 --issue I-950 --prompt prompts/I-950_corrob_2026-07-24.md --tab i950-corrob --repo demo >/dev/null 2>&1 ); then
+  ok "dispatch-prep D-950 emitted dispatch_new + DISPATCHED w/ git metadata"
+else
+  bad "dispatch-prep D-950 failed"
+fi
+
+( cd "$PM" && bin/record dispatch D-950 ACKED --tab "$CORROB_TAB" >/dev/null 2>&1 ) && ok "record ACKED D-950" || bad "record ACKED D-950 failed"
+
+# shadow herdr (zzz-test-* sentinel tab, mirrors track_test.sh's run_track idiom);
+# NEVER touches live workspace w1.
+TRACK_FIXTURE="$WORK/track-fixture.json"
+printf '{"result": {"tabs": [{"tab_id": "%s", "agent_status": "done", "label": "%s", "workspace_id": "zzz-phaseA-smoke"}]}}' \
+  "$CORROB_TAB" "$CORROB_BRANCH" > "$TRACK_FIXTURE"
+
+TRACK_OUT="$(
+  cd "$PM" && \
+  HERDR_SNAPSHOT_FIXTURE="$TRACK_FIXTURE" \
+  PATH="/usr/bin:/bin" \
+  bash -c '
+    herdr() {
+      case "$1 $2" in
+        "api snapshot") cat "$HERDR_SNAPSHOT_FIXTURE" ;;
+        *) return 1 ;;
+      esac
+    }
+    export -f herdr
+    bash bin/track --once
+  ' 2>&1
+)"
+TRACK_RC=$?
+[ "$TRACK_RC" -eq 0 ] && ok "track --once exits 0" || bad "track --once failed: $TRACK_OUT"
+
+if WORKER_TIP_950="$worker_tip_950" python3 - "$PM/.pm/index.json" <<'PY'
+import json, os, sys
+idx = json.load(open(sys.argv[1]))
+d = idx["dispatches"]["D-950"]
+sys.exit(0 if (d.get("state") == "RETURNED" and d.get("result_sha") == os.environ["WORKER_TIP_950"]) else 1)
+PY
+then ok "D-950 auto-recorded RETURNED with result_sha == worker tip"; else bad "D-950 not auto-recorded correctly"; fi
+
+[ "$(grep -c '^EVENT result d=D-950 ' "$PM/.pm/events.log")" = "1" ] && ok "exactly one result event for D-950" || bad "wrong number of result events for D-950"
+
+grep -q "D-950" "$PM/TRACKER.md" && ok "TRACKER.md GENERATED block reflects D-950 auto-record" || bad "TRACKER.md missing D-950"
+
+# human lane: advance RETURNED -> VERIFIED -> issue CLOSED
+( cd "$PM" && bin/record dispatch D-950 VERIFIED >/dev/null 2>&1 ) && ok "record VERIFIED D-950" || bad "record VERIFIED D-950 failed"
+( cd "$PM" && bin/record issue I-950 CLOSED --by D-950 >/dev/null 2>&1 ) && ok "record issue I-950 CLOSED" || bad "record issue I-950 CLOSED failed"
+
+git -C "$DEMO" worktree remove --force "$WORK/wt-950" >/dev/null 2>&1 || true
+
 # --- 5. final integrity + fold ------------------------------------------------
 ( cd "$PM" && bin/reconcile >/dev/null 2>&1 ) && ok "reconcile after round-trip" || bad "reconcile failed after round-trip"
 ( cd "$PM" && bin/ledger-check >/dev/null 2>&1 ) && ok "ledger-check clean after full VERIFIED round-trip" || bad "ledger-check failed after round-trip"
@@ -131,6 +206,14 @@ s = json.dumps(idx)
 sys.exit(0 if ("VERIFIED" in s and "CLOSED" in s) else 1)
 PY
 then ok "index.json shows D-001 VERIFIED + I-001 CLOSED"; else bad "index.json final state wrong"; fi
+if python3 - "$PM/.pm/index.json" <<'PY'
+import json, sys
+idx = json.load(open(sys.argv[1]))
+d = idx["dispatches"]["D-950"]
+i = idx["issues"]["I-950"]
+sys.exit(0 if (d.get("state") == "VERIFIED" and i.get("state") == "CLOSED") else 1)
+PY
+then ok "index.json shows D-950 VERIFIED + I-950 CLOSED"; else bad "index.json final D-950/I-950 state wrong"; fi
 
 echo "-----------------------------------------"
 echo "PASS: $PASS  FAIL: $FAIL"
