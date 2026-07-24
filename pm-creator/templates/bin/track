@@ -1,0 +1,930 @@
+#!/usr/bin/env bash
+# track --once — stateless-reconciliation tick, auto-records only strictly
+# git-corroborated `done` worker tabs (intake only), surfaces everything else.
+#
+# TEMPLATE file: copied verbatim into generated PM repo's `bin/` directory.
+# Standalone entrypoint that `source`s `_lib.sh` (bash + python3 only, no jq).
+#
+# THIS IS THE FIRST pm-creator COMPONENT THAT WRITES TO THE EVENT LOG
+# AUTONOMOUSLY. It never auto-verifies (RETURNED -> VERIFIED stays a human
+# gate) and never guesses: any deviation from the strict corroboration
+# predicate below is surfaced in TRACKER.md, never recorded.
+#
+# One tick == one `herdr api snapshot` (full live-runtime-state JSON, parsed
+# DEFENSIVELY — if herdr is missing/errors/has an unexpected shape, every
+# affected tab degrades to "unknown" and the tick surfaces instead of
+# recording; unlike `reconcile`, herdr is NOT mandated here by design, since
+# `track`'s whole safety model is "when in doubt, surface, never act").
+#
+# For every dispatch currently ACKED in .pm/index.json whose recorded `tab`
+# shows `done` in that snapshot, evaluate a STRICT corroboration predicate.
+# PASS iff ALL of:
+#   (a) the snapshot tab POSITIVELY binds to D: the tab must be present in
+#       the snapshot filtered to the configured `herdr_workspace`, AND its
+#       `label` must be present and share D's branch's ticket prefix (e.g.
+#       branch `i900-widget` <-> label `i900-...`) — absent-from-workspace,
+#       reused, renamed, or unlabeled tabs are treated as an unconfirmed
+#       binding and surfaced, never recorded. RESIDUAL (accepted, B1): this
+#       identity is workspace + tab-id + ticket-prefix, NOT an unforgeable
+#       per-(D,attempt) token — herdr does not currently expose one, so a tab
+#       reused for a different dispatch on the SAME ticket prefix within the
+#       same workspace could in principle satisfy (a) without being the real
+#       worker tab. This is narrowed, not eliminated, by every OTHER
+#       corroboration leg below (branch-issue match, base_sha ancestry, clean
+#       worktree, lock-time re-check) still having to ALSO hold, plus
+#       `track`'s overall "when in doubt, surface" posture; revisit if/when
+#       herdr exposes a stable per-session token;
+#   (b) `base_sha` is a literal, lowercase-hex git object name (never a
+#       revision expression like `HEAD`/`main`/`branch~2`, which would
+#       resolve DYNAMICALLY instead of anchoring a fixed point);
+#   (c) `branch` is NOT the repo's configured `mainline`, and DOES match the
+#       dispatch's own ticket-branch convention (`i<issue-num>-...`, derived
+#       from the dispatch's own `dispatch_new i=I-<num>` in the raw event
+#       log — never guessed from the branch string alone);
+#   (d) in the dispatch's `<repo>`, the recorded `<branch>` tip DESCENDS FROM
+#       the *current attempt's* `base_sha` (real new work on the right
+#       branch) — `repo`/`branch`/`base_sha` in index.json are CLAIMS
+#       (forgeable via pm_apply), so `track` independently re-resolves the
+#       repo's real path from .pm/config.json and runs git itself; the
+#       index's metadata is used only as names/anchors to verify against
+#       real git, never trusted directly;
+#   (e) the worktree that has that branch checked out is CLEAN — no
+#       dirty/untracked changes (a second, worktree-specific `pm_git_probe`
+#       is required here: the primary repo-path probe's own `worktrees`
+#       array entries do NOT carry per-worktree dirty/untracked data — see
+#       `reconcile`'s WORKTREES.md rendering for the same limitation, which
+#       `track` must NOT copy given its stricter correctness bar);
+#   (f) D is STILL ACKED at attempt `a`, RE-CHECKED under `pm_lock`
+#       immediately before the write (closes the TOCTOU race with a human
+#       acting concurrently; a `pm_apply` refusal here is BENIGN — the human
+#       raced us — and is surfaced, never treated as an error); AND the full
+#       git corroboration in (d)/(e) is RE-RUN under that same lock — stage 1
+#       (outside the lock) is only a cheap pre-filter, stage 2's re-run is
+#       authoritative, and the `result_sha` actually recorded is the
+#       LOCK-TIME branch tip, never a stale stage-1 read. If the branch
+#       advanced/rebased/went dirty between the two stages, the recheck
+#       itself decides pass/fail on the fresh state; only a genuine
+#       divergence (no longer clean, no longer a descendant, tip vanished)
+#       surfaces `corroboration-changed-under-lock`. A residual cross-repo,
+#       cross-process micro-window still exists between stage 2's git reads
+#       and the `pm_apply` write a few lines later; this is accepted as
+#       intake-only, human-gated exposure (RETURNED -> VERIFIED still
+#       requires a human), not closed further here.
+# PASS -> `pm_apply result d=D a=a status=RETURNED result_sha=<branch tip>
+# at=<now>` — INTAKE ONLY. ANY deviation -> surfaced in TRACKER.md's
+# `tracker` GENERATED block (regenerated fresh every tick; unchanged state
+# re-renders byte-identical) under one of these enumerated reasons, never
+# guessed, never silently dropped:
+#   missing-metadata, base_sha-not-a-sha, tab-binding-unconfirmed,
+#   status-unknown, herdr-unavailable, branch-is-mainline,
+#   branch-not-a-ticket-branch, branch-issue-mismatch, repo-not-configured,
+#   repo-not-on-disk, base-sha-wrong-length-for-repo, base-sha-unreachable,
+#   branch-missing, worktree-missing, dirty-worktree, no-new-commit,
+#   not-descendant, corroboration-changed-under-lock, already-recorded,
+#   raced-refused.
+#
+# TRUST BOUNDARY (round-9 design, restated here): `repo`'s real path,
+# `mainline`, and `herdr_workspace` all come from `.pm/config.json`, which is
+# the OPERATOR-OWNED trust root for this tool (same status as the code
+# itself) — a corrupted or malicious config.json is operator error, out of
+# `track`'s threat model. What `track` DOES defend against is index.json's
+# per-dispatch `repo`/`branch`/`base_sha`, which are written via `pm_apply`
+# by dispatch-prep/workers and are treated as forgeable CLAIMS re-verified
+# against real git and the operator-owned config on every tick.
+#
+# Usage: bin/track [--once]   (--once is the only mode for now; bare `track`
+#                               defaults to --once)
+set -u
+
+_TR_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./_lib.sh
+# shellcheck disable=SC1091
+source "${_TR_SELF}/_lib.sh"
+
+now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+usage() {
+  cat <<'EOF'
+usage: bin/track [--once]
+
+Stateless-reconciliation tick. Auto-records only strictly git-corroborated
+`done` worker tabs (RETURNED intake only, never auto-verify); surfaces
+everything else into TRACKER.md's generated block. --once is the only mode
+for now (bare `track` defaults to it).
+EOF
+}
+
+_tr_mode="--once"
+if [[ $# -gt 0 ]]; then
+  case "$1" in
+    --once) _tr_mode="--once" ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "track: unknown argument '$1'" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+fi
+
+# ---------------------------------------------------------------------------
+# resolve root, fold
+# ---------------------------------------------------------------------------
+_tr_root="$(_pm_root "${PM_ROOT:-}")" || exit 1
+_tr_config="${_tr_root}/.pm/config.json"
+_tr_events="${_tr_root}/.pm/events.log"
+_tr_index="${_tr_root}/.pm/index.json"
+_tr_tracker_md="${_tr_root}/TRACKER.md"
+
+if [[ ! -f "${_tr_config}" ]]; then
+  echo "track: missing ${_tr_config} (not a pm-creator repo?)" >&2
+  exit 1
+fi
+if [[ ! -f "${_tr_events}" ]]; then
+  echo "track: missing ${_tr_events} (not a pm-creator repo?)" >&2
+  exit 1
+fi
+if ! pm_fold "${_tr_root}"; then
+  echo "track: pm_fold failed (see above)" >&2
+  exit 1
+fi
+if [[ ! -f "${_tr_index}" ]]; then
+  echo "track: no index at ${_tr_index} after fold" >&2
+  exit 1
+fi
+
+# herdr_workspace (trust-root config, see header) -- used to filter the
+# snapshot below to only the tabs that live in the configured workspace.
+_tr_herdr_workspace="$(python3 -c '
+import json, sys
+with open(sys.argv[1]) as f:
+    cfg = json.load(f)
+print(cfg.get("herdr_workspace") or "")
+' "${_tr_config}")"
+
+# ---------------------------------------------------------------------------
+# temp-file bookkeeping (mirrors reconcile: manifest FILE, not a bash array,
+# since array mutations inside a $(...) subshell never reach this script;
+# trap installed BEFORE the manifest itself is mktemp'd, to avoid a
+# chicken-and-egg leak on an early crash).
+# ---------------------------------------------------------------------------
+_tr_tmpmanifest=""
+_tr_mktemp() {
+  local out
+  out="$(mktemp "$1")" || return 1
+  printf '%s\n' "${out}" >>"${_tr_tmpmanifest}"
+  printf '%s\n' "${out}"
+}
+
+# shellcheck disable=SC2329  # invoked indirectly via trap below
+_tr_cleanup() {
+  local rc=$?
+  if [[ -n "${_tr_tmpmanifest}" && -f "${_tr_tmpmanifest}" ]]; then
+    while IFS= read -r f; do
+      [[ -n "${f}" ]] && rm -f "${f}"
+    done <"${_tr_tmpmanifest}"
+    rm -f "${_tr_tmpmanifest}"
+  fi
+  pm_unlock 2>/dev/null || true
+  return "${rc}"
+}
+trap _tr_cleanup EXIT INT TERM
+
+_tr_tmpmanifest="$(mktemp "${TMPDIR:-/tmp}/pm-track-tmpmanifest.XXXXXX")"
+
+# ---------------------------------------------------------------------------
+# one herdr api snapshot (defensive, centralized parse). Raw herdr stdout is
+# written to a FILE, not passed via env var/argv — a busy live snapshot can
+# exceed ARG_MAX (the same real bug `reconcile` fixed for `tab list`). Any
+# failure (herdr missing, non-zero exit, unexpected shape) degrades: the tabs
+# map stays empty, every dispatch's tab reads as "unknown" this tick, and the
+# tick surfaces rather than records — it never hard-fails.
+# ---------------------------------------------------------------------------
+_tr_snapshot_file="$(_tr_mktemp "${TMPDIR:-/tmp}/pm-track-snapshot.XXXXXX")"
+printf '{}' >"${_tr_snapshot_file}"
+_tr_herdr_ok=0
+
+if command -v herdr >/dev/null 2>&1; then
+  _tr_snap_raw="$(_tr_mktemp "${TMPDIR:-/tmp}/pm-track-snapshot-raw.XXXXXX")"
+  if herdr api snapshot >"${_tr_snap_raw}" 2>/dev/null; then
+    if python3 - "${_tr_snap_raw}" "${_tr_snapshot_file}" "${_tr_herdr_workspace}" <<'PYEOF'
+import json
+import sys
+
+raw_path, out_path, herdr_workspace = sys.argv[1:4]
+tabs = {}
+
+# json.load failure (malformed/unparseable snapshot) is distinct from a
+# well-formed-but-sparse/odd shape below: an unparseable snapshot means
+# herdr itself is effectively unavailable this tick, so it exits non-zero
+# and the caller must NOT treat any tab as corroborated -- everything
+# should surface as herdr-unavailable, not per-tab status-unknown. A
+# parsed-but-sparse shape (missing keys, tabs without tab_id, etc.) is
+# legitimate and still exits 0 with whatever tabs could be extracted.
+try:
+    with open(raw_path) as f:
+        data = json.load(f)
+except (ValueError, OSError):
+    sys.exit(3)
+
+try:
+    # Centralized field mapping (easy to adjust if herdr's snapshot shape
+    # changes): tolerate {"result": {"tabs": [...], "workspaces": [...]}}
+    # (matching `tab list`/`workspace list`'s shapes) or bare top-level keys.
+    # Any tab missing tab_id is skipped; agent_status/label/workspace_id are
+    # read as-is (None if absent).
+    result = data.get("result", data) if isinstance(data, dict) else {}
+    raw_tabs = result.get("tabs", []) if isinstance(result, dict) else []
+    raw_workspaces = result.get("workspaces", []) if isinstance(result, dict) else []
+
+    # Resolve the configured herdr_workspace (a label OR a literal
+    # workspace_id) to a workspace_id the same way `reconcile` does. If the
+    # snapshot doesn't carry a "workspaces" array (its exact shape is not
+    # documented -- `herdr api snapshot` is test-mocked only), fall back to
+    # treating the configured value as a literal workspace_id directly.
+    ws_id = None
+    if isinstance(raw_workspaces, list):
+        for w in raw_workspaces:
+            if not isinstance(w, dict):
+                continue
+            if w.get("label") == herdr_workspace or w.get("workspace_id") == herdr_workspace:
+                ws_id = w.get("workspace_id")
+                break
+    if ws_id is None:
+        ws_id = herdr_workspace
+
+    if isinstance(raw_tabs, list):
+        for t in raw_tabs:
+            if not isinstance(t, dict):
+                continue
+            tid = t.get("tab_id")
+            if not tid:
+                continue
+            # Filter to the configured workspace (mirrors `reconcile`'s
+            # SESSIONS.md filtering): a tab outside the configured workspace
+            # is treated identically to a tab absent from the snapshot
+            # entirely -- both surface as `status-unknown` downstream.
+            if herdr_workspace and t.get("workspace_id") != ws_id:
+                continue
+            tabs[tid] = {
+                "agent_status": t.get("agent_status"),
+                "label": t.get("label"),
+                "workspace_id": t.get("workspace_id"),
+            }
+except Exception:
+    tabs = {}
+
+with open(out_path, "w") as f:
+    json.dump(tabs, f)
+PYEOF
+    then
+      _tr_herdr_ok=1
+    fi
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# parse repos out of config.json (dict or list; extract name -> {path,
+# mainline}), same defensive shape-tolerance as `reconcile`. `mainline` is
+# optional per repo entry; if absent, the branch-is-mainline check below
+# simply cannot trigger for that repo (never mistaken for a pass -- it just
+# means this particular guard is a no-op until `mainline` is configured).
+# ---------------------------------------------------------------------------
+_tr_repos_json="$(python3 -c '
+import json, sys
+with open(sys.argv[1]) as f:
+    cfg = json.load(f)
+repos = cfg.get("repos")
+out = {}
+def add(name, val):
+    if isinstance(val, dict):
+        path = val.get("path") or ""
+        mainline = val.get("mainline")
+    elif isinstance(val, str):
+        path = val
+        mainline = None
+    else:
+        return
+    if name and path:
+        out[name] = {"path": path, "mainline": mainline}
+if isinstance(repos, dict):
+    for name, val in repos.items():
+        add(name, val)
+elif isinstance(repos, list):
+    for val in repos:
+        if isinstance(val, dict):
+            add(val.get("name"), val)
+print(json.dumps(out))
+' "${_tr_config}")"
+
+# ---------------------------------------------------------------------------
+# Shared git-corroboration python routines (F2: the SAME logic is re-run
+# fresh in both stage 1's cheap pre-filter and stage 2's authoritative
+# post-lock recheck — never duplicated, never drifting between the two —
+# via `printf '%s\n%s\n' "$_TR_CORROB_PY" "$driver" | python3 -`).
+# ---------------------------------------------------------------------------
+read -r -d '' _TR_CORROB_PY <<'PYEOF' || true
+import json
+import os
+import re
+import subprocess
+
+TICKET_RE = re.compile(r"^(i\d+)-", re.IGNORECASE)
+# F1: the dispatch's own linked issue id, as persisted in the raw event log
+# (`dispatch_new i=I-<num>`) -- always the literal `I-<digits>` form.
+ISSUE_RE = re.compile(r"^I-(\d+)$", re.IGNORECASE)
+# F3: a literal, FULL-LENGTH lowercase-hex git object name only -- never a
+# revision expression (HEAD/main/branch~2/...), which would resolve
+# DYNAMICALLY instead of anchoring a fixed point, and never a SHORT hex
+# prefix, which is *also* a valid git ref name and would let
+# `<base_sha>^{commit}` resolve a moving branch/tag instead of an immutable
+# object. 40 hex == sha-1 object name; 64 hex == sha-256 object name
+# (dispatch-prep records 64-hex on sha256-object-format repos). Checked
+# BEFORE any git use of the value.
+BASE_SHA_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+
+
+def tr_run(args, cwd, timeout=10):
+    try:
+        r = subprocess.run(
+            ["git"] + args, cwd=cwd, capture_output=True, text=True, timeout=timeout
+        )
+        return r.returncode, r.stdout.strip(), r.stderr.strip()
+    except Exception:
+        return 1, "", "exec-failed"
+
+
+def tr_worktree_list(repo_path):
+    rc, out, _ = tr_run(["worktree", "list", "--porcelain"], repo_path)
+    if rc != 0:
+        return []
+    trees = []
+    cur = {}
+    for line in out.splitlines():
+        if not line.strip():
+            if cur:
+                trees.append(cur)
+                cur = {}
+            continue
+        if " " in line:
+            k, v = line.split(" ", 1)
+            cur[k] = v
+        else:
+            cur[line] = True
+    if cur:
+        trees.append(cur)
+    return trees
+
+
+def tr_is_dirty(path):
+    rc, status, _ = tr_run(["status", "--porcelain"], path)
+    if rc != 0:
+        # Can't determine cleanliness -> caller must treat this as dirty
+        # (never assume clean when the probe itself failed).
+        return True
+    return bool(status.strip())
+
+
+def tr_find_issue_for_dispatch(events_path, d):
+    # index.json does not persist dispatch_new's `i=` field, so
+    # independently re-derive the dispatch's own linked issue id by
+    # scanning the raw append-only event log for its `dispatch_new` line
+    # -- never guessed from the branch string alone, and un-forgeable via
+    # pm_apply the way index.json's per-dispatch fields are.
+    try:
+        with open(events_path) as f:
+            for line in f:
+                line = line.rstrip("\n")
+                if not line.startswith("EVENT dispatch_new "):
+                    continue
+                fields = {}
+                for tok in line.split(" ")[2:]:
+                    if tok and "=" in tok:
+                        k, v = tok.split("=", 1)
+                        fields[k] = v
+                if fields.get("d") == d:
+                    return fields.get("i")
+    except OSError:
+        return None
+    return None
+
+
+def tr_corroborate_git(repo_path, branch, base_sha):
+    # Returns (reason, result_sha): reason is None (full pass, result_sha ==
+    # lock-time branch tip) or one of base-sha-wrong-length-for-repo/
+    # base-sha-unreachable/branch-missing/worktree-missing/dirty-worktree/
+    # no-new-commit/not-descendant.
+    #
+    # BASE_SHA_RE only gates *shape* (40 or 64 hex). A 64-hex string is a
+    # valid SHA-1 *object* length mismatch in a sha1 repo, but nothing stops
+    # it from also being a *branch/ref name* -- and vice versa (40-hex ref
+    # name in a sha256 repo). If base_sha were treated as a rev in that case,
+    # `rev-parse "<base_sha>^{commit}"` and `merge-base --is-ancestor` would
+    # resolve a moving ref instead of the immutable object, reopening the
+    # dynamic-ref bypass this function exists to close. Guard against that
+    # two ways: (1) require base_sha's length to match this repo's actual
+    # object format, and (2) require the resolved `^{commit}` object id to
+    # equal base_sha exactly -- a real object peels to itself; a ref name
+    # peels to a *different* id (the commit it points at).
+    rc, obj_format, _ = tr_run(["rev-parse", "--show-object-format"], repo_path)
+    if rc != 0:
+        return "base-sha-unreachable", None
+    obj_format = obj_format.strip()
+    expected_len = {"sha1": 40, "sha256": 64}.get(obj_format)
+    if expected_len is None or len(base_sha) != expected_len:
+        return "base-sha-wrong-length-for-repo", None
+
+    rc, resolved, _ = tr_run(
+        ["rev-parse", "--verify", "--end-of-options", base_sha + "^{commit}"], repo_path
+    )
+    if rc != 0:
+        return "base-sha-unreachable", None
+    if resolved.strip() != base_sha:
+        return "base-sha-unreachable", None
+
+    rc, _, _ = tr_run(["show-ref", "--verify", "--quiet", "refs/heads/" + branch], repo_path)
+    if rc != 0:
+        return "branch-missing", None
+
+    trees = tr_worktree_list(repo_path)
+    match = None
+    for t in trees:
+        wt_branch = t.get("branch", "")
+        if wt_branch.startswith("refs/heads/") and wt_branch[len("refs/heads/"):] == branch:
+            match = t
+            break
+    if match is None:
+        return "worktree-missing", None
+
+    worktree_path = match.get("worktree")
+    branch_tip = match.get("HEAD")
+    if not worktree_path or not branch_tip:
+        return "worktree-missing", None
+
+    if tr_is_dirty(worktree_path):
+        return "dirty-worktree", None
+
+    if branch_tip == base_sha:
+        return "no-new-commit", None
+
+    rc, _, _ = tr_run(["merge-base", "--is-ancestor", base_sha, branch_tip], repo_path)
+    if rc != 0:
+        return "not-descendant", None
+
+    return None, branch_tip
+PYEOF
+
+# ---------------------------------------------------------------------------
+# STAGE 1 (outside any lock, read-only): identify candidate dispatches (ACKED
+# + recorded tab shows "done" in the snapshot) against the fold taken above,
+# and evaluate the strict corroboration predicate for each — independent
+# repo-path re-resolution from config.json (never trusting index.json's repo/
+# branch/base_sha as anything but names/anchors), base_sha shape/reachability,
+# mainline/ticket-branch checks, branch/worktree location, worktree
+# cleanliness, and tip-vs-base_sha ancestry. Slow git/herdr probing happens
+# here, OUTSIDE the lock, matching reconcile's pattern; stage 2 below RE-RUNS
+# the git corroboration under the lock (F2) rather than trusting this pass.
+# ---------------------------------------------------------------------------
+_tr_verdict_file="$(_tr_mktemp "${TMPDIR:-/tmp}/pm-track-verdict.XXXXXX")"
+
+read -r -d '' _tr_stage1_driver <<'PYEOF' || true
+index_path = os.environ["PM_TR_INDEX"]
+snapshot_path = os.environ["PM_TR_SNAPSHOT"]
+repos = json.loads(os.environ["PM_TR_REPOS"])
+herdr_ok = os.environ["PM_TR_HERDR_OK"] == "1"
+events_path = os.environ["PM_TR_EVENTS"]
+out_path = os.environ["PM_TR_OUT"]
+
+with open(index_path) as f:
+    index = json.load(f)
+with open(snapshot_path) as f:
+    snapshot = json.load(f)
+
+results = []  # list of dicts: d, a, tab, branch, verdict("pass"/"surface"), reason/result_sha
+
+dispatches = index.get("dispatches", {})
+for d, disp in sorted(dispatches.items()):
+    if disp.get("state") != "ACKED":
+        continue
+    tab = disp.get("tab")
+    if not tab or tab == "?":
+        continue
+
+    a = disp.get("attempt")
+    repo_name = disp.get("repo")
+    branch = disp.get("branch")
+    attempts = disp.get("attempts") or {}
+    base_sha = (attempts.get(a) or {}).get("base_sha")
+
+    row = {"d": d, "a": a, "tab": tab, "repo": repo_name, "branch": branch}
+
+    def surface(reason):
+        row["verdict"] = "surface"
+        row["reason"] = reason
+        results.append(row)
+
+    # (F6) tab must positively appear in this tick's workspace-filtered
+    # snapshot at all -- if the WHOLE tick's herdr call failed, every such
+    # dispatch degrades to herdr-unavailable; if herdr is fine but this
+    # specific tab is simply absent (never labeled, wrong workspace, not
+    # yet created), it degrades to status-unknown. Neither is silently
+    # skipped.
+    snap_entry = snapshot.get(tab)
+    if snap_entry is None:
+        surface("herdr-unavailable" if not herdr_ok else "status-unknown")
+        continue
+
+    status = snap_entry.get("agent_status")
+    if status != "done":
+        continue  # working/blocked/etc -- ignored entirely this tick
+
+    if not repo_name or not branch or not base_sha:
+        surface("missing-metadata")
+        continue
+
+    # F3: base_sha shape, checked before ANY git use of the value.
+    if not BASE_SHA_RE.match(base_sha):
+        surface("base_sha-not-a-sha")
+        continue
+
+    repo_entry = repos.get(repo_name)
+    repo_path = repo_entry.get("path") if repo_entry else None
+    if not repo_path:
+        surface("repo-not-configured")
+        continue
+
+    rc, _, _ = tr_run(["rev-parse", "--is-inside-work-tree"], repo_path)
+    if rc != 0:
+        surface("repo-not-on-disk")
+        continue
+
+    # F1: refuse mainline / a non-ticket branch, before trusting the branch
+    # string for anything (including the tab-binding check below, which
+    # depends on the branch already looking like a ticket branch).
+    mainline = repo_entry.get("mainline")
+    if mainline and branch == mainline:
+        surface("branch-is-mainline")
+        continue
+    bm = TICKET_RE.match(branch) if branch else None
+    if not bm:
+        surface("branch-not-a-ticket-branch")
+        continue
+    # F1: the branch's ticket number must EQUAL the dispatch's own linked
+    # issue number, re-derived from the raw event log (never guessed from
+    # the branch string alone). issue is persisted as `I-<digits>` (see
+    # dispatch_new's `i=` field) -- if it can't be resolved to that literal
+    # form at all, or the numbers don't match, surface and never record.
+    issue = tr_find_issue_for_dispatch(events_path, d)
+    im = ISSUE_RE.match(issue) if issue else None
+    if not im or bm.group(1).lower() != ("i" + im.group(1)).lower():
+        surface("branch-issue-mismatch")
+        continue
+
+    # F5: positive tab-binding -- the tab's label must be present AND share
+    # the branch's own ticket prefix; unlabeled/reused/renamed tabs are an
+    # unconfirmed binding, never recorded.
+    label = snap_entry.get("label")
+    lm = TICKET_RE.match(label) if label else None
+    if not label or not lm or bm.group(1).lower() != lm.group(1).lower():
+        surface("tab-binding-unconfirmed")
+        continue
+
+    reason, result_sha = tr_corroborate_git(repo_path, branch, base_sha)
+    if reason:
+        surface(reason)
+        continue
+
+    row["verdict"] = "pass"
+    row["result_sha"] = result_sha
+    results.append(row)
+
+with open(out_path, "w") as f:
+    json.dump({"herdr_ok": herdr_ok, "rows": results}, f)
+PYEOF
+
+PM_TR_INDEX="${_tr_index}" \
+  PM_TR_SNAPSHOT="${_tr_snapshot_file}" \
+  PM_TR_REPOS="${_tr_repos_json}" \
+  PM_TR_HERDR_OK="${_tr_herdr_ok}" \
+  PM_TR_EVENTS="${_tr_events}" \
+  PM_TR_OUT="${_tr_verdict_file}" \
+  bash -c 'printf "%s\n%s\n" "$1" "$2" | python3 -' _ "${_TR_CORROB_PY}" "${_tr_stage1_driver}"
+_tr_stage1_rc=$?
+if [[ ${_tr_stage1_rc} -ne 0 ]]; then
+  echo "track: corroboration step failed" >&2
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# STAGE 2 (critical section): pm_lock -> re-fold (closes the TOCTOU race with
+# a concurrent track/human) -> for each stage-1 PASS, re-check D is STILL
+# ACKED at the SAME attempt `a` against the freshly-folded index, then
+# pm_apply the result. An explicit a="$a" is passed so a race (attempt bumped
+# or dispatch moved on) makes pm_apply itself refuse cleanly (benign, not an
+# error) rather than trusting a stale read. -> pm_unlock.
+# ---------------------------------------------------------------------------
+_tr_final_file="$(_tr_mktemp "${TMPDIR:-/tmp}/pm-track-final.XXXXXX")"
+
+if ! pm_lock "${_tr_root}"; then
+  echo "track: failed to acquire repo lock" >&2
+  exit 1
+fi
+# pm_lock installs its own EXIT/INT/TERM trap; re-install ours so temp files
+# are still cleaned up on abnormal exit.
+trap _tr_cleanup EXIT INT TERM
+
+if ! pm_fold "${_tr_root}"; then
+  echo "track: pm_fold failed (see above)" >&2
+  exit 1
+fi
+
+read -r -d '' _tr_stage2_driver <<'PYEOF' || true
+index_path = os.environ["PM_TR_INDEX"]
+verdict_path = os.environ["PM_TR_VERDICT"]
+repos = json.loads(os.environ["PM_TR_REPOS"])
+final_path = os.environ["PM_TR_FINAL"]
+
+with open(index_path) as f:
+    index = json.load(f)
+with open(verdict_path) as f:
+    verdict = json.load(f)
+
+dispatches = index.get("dispatches", {})
+recheck = []
+for row in verdict["rows"]:
+    if row.get("verdict") != "pass":
+        continue
+    disp = dispatches.get(row["d"])
+    if disp is None or disp.get("state") != "ACKED" or disp.get("attempt") != row["a"]:
+        row = dict(row)
+        row["verdict"] = "surface"
+        row["reason"] = "already-recorded"
+        recheck.append(row)
+        continue
+
+    # F2: re-run the FULL git corroboration fresh, under the lock, instead
+    # of trusting stage 1's (pre-lock) read -- any deviation (branch moved,
+    # worktree got dirty, base_sha stopped resolving, ...) between stage 1
+    # and here is a real race and must surface, never record.
+    repo_entry = repos.get(row.get("repo"))
+    repo_path = repo_entry.get("path") if repo_entry else None
+    branch = disp.get("branch")
+    base_sha = (disp.get("attempts") or {}).get(row["a"], {}).get("base_sha")
+    reason = None
+    result_sha = None
+    if not repo_path or not branch or not base_sha:
+        reason = "corroboration-changed-under-lock"
+    else:
+        reason, result_sha = tr_corroborate_git(repo_path, branch, base_sha)
+
+    if reason:
+        row = dict(row)
+        row["verdict"] = "surface"
+        row["reason"] = "corroboration-changed-under-lock"
+        recheck.append(row)
+        continue
+
+    row = dict(row)
+    row["result_sha"] = result_sha  # lock-time tip, not the stale stage-1 read
+    recheck.append(row)
+
+with open(final_path, "w") as f:
+    json.dump(recheck, f)
+PYEOF
+
+PM_TR_INDEX="${_tr_index}" \
+  PM_TR_VERDICT="${_tr_verdict_file}" \
+  PM_TR_REPOS="${_tr_repos_json}" \
+  PM_TR_FINAL="${_tr_final_file}" \
+  bash -c 'printf "%s\n%s\n" "$1" "$2" | python3 -' _ "${_TR_CORROB_PY}" "${_tr_stage2_driver}"
+
+_tr_now="$(now_iso)"
+_tr_recorded_file="$(_tr_mktemp "${TMPDIR:-/tmp}/pm-track-recorded.XXXXXX")"
+printf '[]' >"${_tr_recorded_file}"
+
+python3 -c '
+import json, sys
+with open(sys.argv[1]) as f:
+    rows = json.load(f)
+for row in rows:
+    print(json.dumps(row))
+' "${_tr_final_file}" | {
+  while IFS= read -r _tr_line; do
+    [[ -z "${_tr_line}" ]] && continue
+    _tr_d="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["d"])' "${_tr_line}")"
+    _tr_verdict="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["verdict"])' "${_tr_line}")"
+    if [[ "${_tr_verdict}" != "pass" ]]; then
+      continue
+    fi
+    _tr_a="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["a"])' "${_tr_line}")"
+    _tr_sha="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["result_sha"])' "${_tr_line}")"
+    if pm_apply result d="${_tr_d}" a="${_tr_a}" status=RETURNED result_sha="${_tr_sha}" at="${_tr_now}" >/dev/null 2>"${_tr_root}/.pm/.track-apply-err.tmp"; then
+      python3 -c '
+import json, sys
+path = sys.argv[1]
+row = json.loads(sys.argv[2])
+with open(path) as f:
+    rows = json.load(f)
+rows.append(row)
+with open(path, "w") as f:
+    json.dump(rows, f)
+' "${_tr_recorded_file}" "${_tr_line}"
+    else
+      _tr_err="$(cat "${_tr_root}/.pm/.track-apply-err.tmp" 2>/dev/null || true)"
+      python3 -c '
+import json, sys
+path = sys.argv[1]
+row = json.loads(sys.argv[2])
+row["verdict"] = "surface"
+row["reason"] = "raced-refused"
+row["detail"] = sys.argv[3]
+with open(path) as f:
+    rows = json.load(f)
+rows.append(row)
+with open(path, "w") as f:
+    json.dump(rows, f)
+' "${_tr_final_file}" "${_tr_line}" "${_tr_err}"
+    fi
+    rm -f "${_tr_root}/.pm/.track-apply-err.tmp"
+  done
+}
+
+pm_unlock
+trap _tr_cleanup EXIT INT TERM
+
+# ---------------------------------------------------------------------------
+# STAGE 3 (outside lock): render TRACKER.md's `tracker` GENERATED block —
+# pure function of the stage-1/2 results, marker-interior-only writes, never
+# parses Markdown prose for state. Recorded rows come from _tr_recorded_file;
+# every other row in _tr_final_file plus every stage-1 surface-only row is
+# listed with its reason.
+# ---------------------------------------------------------------------------
+PM_TR_ROOT="${_tr_root}" \
+  PM_TR_VERDICT="${_tr_verdict_file}" \
+  PM_TR_FINAL="${_tr_final_file}" \
+  PM_TR_RECORDED="${_tr_recorded_file}" \
+  PM_TR_TRACKER_MD="${_tr_tracker_md}" \
+  PM_TR_NOW="${_tr_now}" \
+  PM_TR_HERDR_OK="${_tr_herdr_ok}" \
+  python3 <<'PYEOF'
+import json
+import os
+import re
+
+root = os.environ["PM_TR_ROOT"]
+verdict_path = os.environ["PM_TR_VERDICT"]
+final_path = os.environ["PM_TR_FINAL"]
+recorded_path = os.environ["PM_TR_RECORDED"]
+tracker_md = os.environ["PM_TR_TRACKER_MD"]
+now = os.environ["PM_TR_NOW"]
+herdr_ok = os.environ["PM_TR_HERDR_OK"] == "1"
+
+with open(verdict_path) as f:
+    stage1 = json.load(f)["rows"]
+with open(final_path) as f:
+    stage2 = json.load(f)
+with open(recorded_path) as f:
+    recorded = json.load(f)
+
+recorded_ds = {r["d"] for r in recorded}
+
+# Surfaced set: every stage-1 surface-only row, plus every stage-2 row that
+# ended up surfaced (already-recorded / raced-refused), minus anything that
+# actually got recorded.
+surfaced = []
+for row in stage1:
+    if row.get("verdict") == "surface":
+        surfaced.append(row)
+for row in stage2:
+    if row.get("verdict") == "surface" and row["d"] not in recorded_ds:
+        surfaced.append(row)
+
+# ---------------------------------------------------------------------------
+# Markdown-injection defenses (copy-adapted from `reconcile`'s inline
+# esc_md_cell/esc_md_inline; not shared library code, mirroring the pattern).
+# ---------------------------------------------------------------------------
+def esc_md_inline(value):
+    s = "" if value is None else str(value)
+    s = re.sub(r"([`*_\[\]()~])", r"\\\1", s)
+    s = re.sub(r"^([#>+-])", r"\\\1", s)
+    s = re.sub(r"^(\d+)\.", r"\1\\.", s)
+    return s
+
+
+def esc_md_cell(value):
+    s = "" if value is None else str(value)
+    s = s.replace("&", "&amp;")
+    s = s.replace("<", "&lt;").replace(">", "&gt;")
+    s = s.replace("|", "&#124;")
+    s = s.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+    s = esc_md_inline(s)
+    return s
+
+
+lines = []
+if not herdr_ok:
+    lines.append(
+        "> herdr snapshot unavailable this tick — no dispatches were evaluated "
+        "(degrade-and-surface, not a hard failure)."
+    )
+    lines.append("")
+
+if recorded:
+    lines.append("### Auto-recorded this tick")
+    lines.append("")
+    lines.append("| dispatch | attempt | tab | branch | result_sha |")
+    lines.append("| --- | --- | --- | --- | --- |")
+    for r in sorted(recorded, key=lambda r: r["d"]):
+        lines.append(
+            "| {} | {} | {} | {} | {} |".format(
+                esc_md_cell(r["d"]),
+                esc_md_cell(r["a"]),
+                esc_md_cell(r["tab"]),
+                esc_md_cell(r.get("branch")),
+                esc_md_cell(r.get("result_sha")),
+            )
+        )
+    lines.append("")
+else:
+    lines.append("### Auto-recorded this tick")
+    lines.append("")
+    lines.append("(none)")
+    lines.append("")
+
+if surfaced:
+    lines.append("### Surfaced — done tabs NOT auto-recorded")
+    lines.append("")
+    lines.append("| dispatch | tab | branch | reason |")
+    lines.append("| --- | --- | --- | --- |")
+    for r in sorted(surfaced, key=lambda r: r["d"]):
+        lines.append(
+            "| {} | {} | {} | {} |".format(
+                esc_md_cell(r["d"]),
+                esc_md_cell(r.get("tab")),
+                esc_md_cell(r.get("branch")),
+                esc_md_cell(r.get("reason")),
+            )
+        )
+    lines.append("")
+else:
+    lines.append("### Surfaced — done tabs NOT auto-recorded")
+    lines.append("")
+    lines.append("(none)")
+    lines.append("")
+
+lines.append("_last tick: {}_".format(esc_md_cell(now)))
+body = "\n".join(lines)
+
+conflicts = []
+
+
+def render_marker(md_path, key, body):
+    if not os.path.isfile(md_path):
+        conflicts.append(f"{os.path.basename(md_path)}: file not found at {md_path} -- skipped")
+        return
+    with open(md_path, "r") as f:
+        content = f.read()
+    begin = f"<!-- GENERATED:BEGIN {key} -->"
+    end = f"<!-- GENERATED:END {key} -->"
+    pattern = re.compile(re.escape(begin) + r".*?" + re.escape(end), re.DOTALL)
+    if not pattern.search(content):
+        conflicts.append(
+            f"{os.path.basename(md_path)}: no '{key}' GENERATED markers found -- skipped "
+            f"(scaffold may not have materialized them yet)"
+        )
+        return
+    replacement = f"{begin}\n{body}\n{end}"
+    new_content = pattern.sub(lambda _m: replacement, content, count=1)
+    if new_content != content:
+        with open(md_path, "w") as f:
+            f.write(new_content)
+
+
+render_marker(tracker_md, "tracker", body)
+
+print("=== track ===")
+print(f"recorded: {len(recorded)}")
+print(f"surfaced: {len(surfaced)}")
+if not herdr_ok:
+    print("herdr: unavailable this tick (degraded, not fatal)")
+if conflicts:
+    print("CONFLICTS:")
+    for c in conflicts:
+        print(f"  - {c}")
+else:
+    print("CONFLICTS: none")
+for r in sorted(recorded, key=lambda r: r["d"]):
+    print(f"  RECORDED {r['d']} a={r['a']} tab={r['tab']} result_sha={r.get('result_sha')}")
+for r in sorted(surfaced, key=lambda r: r["d"]):
+    print(f"  SURFACED {r['d']} tab={r.get('tab')} reason={r.get('reason')}")
+PYEOF
+_tr_render_rc=$?
+if [[ ${_tr_render_rc} -ne 0 ]]; then
+  echo "track: render step failed" >&2
+  exit 1
+fi
+
+exit 0

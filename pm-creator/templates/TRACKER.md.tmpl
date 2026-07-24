@@ -1,0 +1,16 @@
+# TRACKER — live session auto-record ledger (narrative surface)
+
+`bin/track --once` runs one STATELESS reconciliation tick against `.pm/index.json` + a fresh
+`herdr api snapshot`. For every `ACKED` dispatch whose recorded tab shows `done`, it evaluates a
+strict git-corroboration predicate: fully corroborated tabs are auto-recorded as `RETURNED`
+(intake only — never auto-verified); everything else is surfaced below with the reason it was
+NOT auto-recorded, so the operator can act. Working/blocked tabs are not evaluated and do not
+appear here.
+
+> Human narrative only. Authoritative state is the event log; `bin/track` renders the block
+> below fresh on every `--once` tick (pure function of index/snapshot/git — unchanged state
+> re-renders byte-identical).
+
+<!-- GENERATED:BEGIN tracker -->
+(no track ticks recorded yet — run `bin/track --once`)
+<!-- GENERATED:END tracker -->
