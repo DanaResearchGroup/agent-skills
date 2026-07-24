@@ -123,12 +123,18 @@ it the same way. Both `prompts/` and `messages/` filenames lead with the issue i
 ### Two-channel discipline (per repo, untracked, NEVER committed)
 - **`REQUESTS.md`** (repo root) = INBOUND channel to the session that owns that repo's work.
 - **`STATUS.md`** (repo root) = that session's REPLY channel; requesters watch it.
+- **`PM.md`** (repo root) = a back-pointer stub naming THIS PM repo, so a worker landing in a
+  code repo can find where its work is coordinated. One line — the PM repo's path — is enough.
 
 ## 10. Manager scope
 
 The manager owns **state + coordination, never PRODUCT code.** It DOES mutate PM state
 through the `bin/` tools and its own edits to this repo. It delegates all code execution to
 worker sessions.
+
+**Standing duty — backups.** If this PM repo has no offsite remote (see `REMOTE_POLICY` in
+CONFIG below), there is no copy of the ledger but the local disk. At every major milestone the
+manager reminds the user to take a manual backup.
 
 ## 11. Closing a session (archive)
 
