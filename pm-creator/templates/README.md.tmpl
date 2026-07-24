@@ -20,7 +20,9 @@ repo's `REQUESTS.md` channel.
 | `MACHINE.md` | Resource/capacity profile — what the box can run in parallel |
 | `reports/` | Numbered + versioned + dated reports `R-###_v#_YYYY-MM-DD_slug.md` |
 | `prompts/` | Dispatch prompt files — self-contained, ready to hand to a lane |
-| `bin/` | `reconcile`, `lint-prompt`, `ledger-check`, `dispatch-prep` |
+| `messages/` | Follow-up instructions to an already-live session `<I-###>_<verb>_<slug>_YYYY-MM-DD.md` (verbs: go, reply, …) |
+| `archive/` | Where `bin/close <I-###>` moves a closed issue's `prompts/` + `messages/` (reports stay put) |
+| `bin/` | `reconcile`, `lint-prompt`, `ledger-check`, `dispatch-prep`, `record`, `close` |
 
 ## Operating
 

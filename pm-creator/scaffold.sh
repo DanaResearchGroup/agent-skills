@@ -64,7 +64,8 @@ trap cleanup EXIT
 trap 'cleanup INT' INT
 trap 'cleanup TERM' TERM
 
-mkdir -p "$TMP_OUT/.pm" "$TMP_OUT/bin" "$TMP_OUT/reports" "$TMP_OUT/prompts"
+mkdir -p "$TMP_OUT/.pm" "$TMP_OUT/bin" "$TMP_OUT/reports" "$TMP_OUT/prompts" \
+  "$TMP_OUT/messages" "$TMP_OUT/archive/messages" "$TMP_OUT/archive/prompts"
 
 # Interpolate all templates + write config, via one python pass (robust to
 # multi-line / special-char values; fails if any placeholder lacks a value).

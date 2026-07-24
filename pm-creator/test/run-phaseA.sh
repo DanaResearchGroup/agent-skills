@@ -106,6 +106,21 @@ fi
 ( cd "$PM" && bin/record dispatch D-001 VERIFIED >/dev/null 2>&1 ) && ok "record VERIFIED" || bad "record VERIFIED failed"
 ( cd "$PM" && bin/record issue I-001 CLOSED --by D-001 >/dev/null 2>&1 ) && ok "record issue CLOSED" || bad "record issue CLOSED failed"
 
+# --- 4b. bin/close: archive ephemeral files for an already-CLOSED issue ------
+# (real integration check of close's idempotency: I-001 is CLOSED already at
+# this point, so close must skip the transition gracefully and still archive)
+mkdir -p "$PM/messages"
+cat > "$PM/prompts/I-001_demo2.md" <<'EOF'
+# Dispatch — demo2 (ephemeral, archived on close)
+EOF
+cat > "$PM/messages/I-001_go_x_2026-07-24.md" <<'EOF'
+go x
+EOF
+( cd "$PM" && bin/close I-001 >/dev/null 2>&1 ) && ok "bin/close I-001" || bad "bin/close I-001 failed"
+[ -f "$PM/archive/prompts/I-001_demo2.md" ] && ok "close archived prompts/I-001_demo2.md" || bad "close did not archive prompts/I-001_demo2.md"
+[ -f "$PM/archive/messages/I-001_go_x_2026-07-24.md" ] && ok "close archived messages/I-001_go_x_2026-07-24.md" || bad "close did not archive messages/I-001_go_x_2026-07-24.md"
+[ -z "$(find "$PM/reports" -mindepth 1 2>/dev/null)" ] && ok "close left reports/ untouched" || bad "close touched reports/"
+
 # --- 5. final integrity + fold ------------------------------------------------
 ( cd "$PM" && bin/reconcile >/dev/null 2>&1 ) && ok "reconcile after round-trip" || bad "reconcile failed after round-trip"
 ( cd "$PM" && bin/ledger-check >/dev/null 2>&1 ) && ok "ledger-check clean after full VERIFIED round-trip" || bad "ledger-check failed after round-trip"

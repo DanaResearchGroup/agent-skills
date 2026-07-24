@@ -1,0 +1,211 @@
+#!/usr/bin/env bash
+# close — explicit, auditable, idempotent "close a session and archive its
+# ephemeral working files" step (event-log-grammar.md §3/§4).
+#
+# This is a TEMPLATE file: it is copied verbatim into a generated PM repo's
+# `bin/` directory (alongside `record`, which it invokes as a sibling) and
+# run from that repo's root. Standalone entrypoint, bash + python3 only
+# (no jq).
+#
+# `close` is the explicit, human-gated close-and-archive step: it transitions
+# an issue to CLOSED (reusing `record issue ... CLOSED`, which owns all the
+# from-derivation and legality checks) and then archives the issue's
+# ephemeral working files (`prompts/`, `messages/`) into `archive/`.
+# `reports/` is never touched — reports are the durable artifact, not
+# ephemeral working state. Phase B's future auto-close will call this exact
+# same path, so its behavior (idempotent, dry-runnable, refuses unknown
+# issues) is load-bearing beyond just interactive use.
+#
+# Usage:
+#   close <I-###> [--dry-run]
+#
+# Semantics:
+#   - Refuses (exit 1) if the issue was never registered (no prior
+#     issue_state event) — you cannot close what was never opened.
+#   - Transitions the issue to CLOSED via `record issue <I> CLOSED`, unless
+#     it is already CLOSED (idempotent: skip the transition silently and
+#     proceed straight to archiving).
+#   - Archives every file in `prompts/` and `messages/` whose basename
+#     starts with `<I-###>_` into `archive/prompts/` and `archive/messages/`
+#     respectively. Already-archived files (same basename already present at
+#     the destination) are skipped with a warning, never clobbered.
+#   - `--dry-run` prints what would happen (close + archive moves) without
+#     emitting any event or moving any file.
+#   - Emits a `note --ref archived:<I-###>` event for the audit trail if the
+#     close transition happened and/or any file was archived.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./_lib.sh
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/_lib.sh"
+
+usage() {
+  cat <<'EOF'
+usage: close <I-###> [--dry-run]
+
+Transitions <I-###> to CLOSED (via `record issue <I-###> CLOSED`, skipped if
+already CLOSED) and archives its ephemeral prompts/ and messages/ files into
+archive/prompts/ and archive/messages/. reports/ is never touched.
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# root resolution + fold (mirrors record's local copy of the search, rather
+# than reaching into _lib.sh's underscore-prefixed internals)
+# ---------------------------------------------------------------------------
+
+_find_root() {
+  if [[ -n "${PM_ROOT:-}" ]]; then
+    printf '%s\n' "$PM_ROOT"
+    return 0
+  fi
+  local dir="$PWD"
+  while [[ "$dir" != "/" ]]; do
+    if [[ -d "$dir/.pm" ]]; then
+      printf '%s\n' "$dir"
+      return 0
+    fi
+    dir="$(dirname "$dir")"
+  done
+  echo "close: could not locate .pm/ (searched upward from $PWD; set \$PM_ROOT to override)" >&2
+  return 1
+}
+
+# current issue state, or "NONE" if the issue has never appeared.
+_issue_state() {
+  local id="$1" index="$2"
+  ISSUE_ID="$id" python3 -c "
+import json, os, sys
+idx = json.load(open(sys.argv[1]))
+i = os.environ['ISSUE_ID']
+st = idx.get('issues', {}).get(i)
+print((st or {}).get('state') or 'NONE')
+" "$index"
+}
+
+# ---------------------------------------------------------------------------
+# args
+# ---------------------------------------------------------------------------
+
+issue_id="${1:-}"
+[[ -z "$issue_id" ]] && { usage >&2; exit 2; }
+shift || true
+
+dry_run=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run)
+      dry_run=1
+      shift
+      ;;
+    *)
+      echo "close: unknown argument '$1'" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [[ ! "$issue_id" =~ ^I-[0-9]+$ ]]; then
+  echo "close: issue id must look like I-### (got '$issue_id')" >&2
+  exit 2
+fi
+
+root="$(_find_root)" || exit 1
+index="${root}/.pm/index.json"
+
+pm_fold "$root" || {
+  echo "close: pm_fold failed; refusing to close against an unfoldable log" >&2
+  exit 1
+}
+[[ -f "$index" ]] || {
+  echo "close: no index at $index after fold" >&2
+  exit 1
+}
+
+from_state="$(_issue_state "$issue_id" "$index")"
+if [[ "$from_state" == "NONE" ]]; then
+  echo "close: refusing to close $issue_id: it was never registered (no issue_state event on record). You cannot close an issue that was never opened." >&2
+  exit 1
+fi
+
+did_something=0
+
+if [[ "$from_state" == "CLOSED" ]]; then
+  echo "close: $issue_id already CLOSED; skipping transition"
+else
+  if [[ "$dry_run" -eq 1 ]]; then
+    echo "would close $issue_id (currently $from_state)"
+  else
+    "${SCRIPT_DIR}/record" issue "$issue_id" CLOSED
+    did_something=1
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# archive ephemeral working files
+# ---------------------------------------------------------------------------
+
+is_git_tracked() {
+  # Usage: is_git_tracked <relpath-from-root>
+  git -C "$root" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+    && git -C "$root" ls-files --error-unmatch "$1" >/dev/null 2>&1
+}
+
+archive_dir() {
+  # Usage: archive_dir <subdir-name>   (e.g. "prompts" or "messages")
+  local subdir="$1"
+  local src_dir="${root}/${subdir}"
+  local dest_dir="${root}/archive/${subdir}"
+
+  [[ "$dry_run" -eq 1 ]] || mkdir -p "$dest_dir"
+  [[ -d "$src_dir" ]] || return 0
+
+  local f base dest relpath
+  for f in "$src_dir/${issue_id}_"*; do
+    [[ -e "$f" ]] || continue # no match (glob didn't expand)
+    base="$(basename "$f")"
+    dest="${dest_dir}/${base}"
+    relpath="${subdir}/${base}"
+
+    if [[ -e "$dest" ]]; then
+      echo "close: WARNING: archive/${subdir}/${base} already exists; skipping (not clobbering)" >&2
+      continue
+    fi
+
+    if [[ "$dry_run" -eq 1 ]]; then
+      echo "would archive: ${subdir}/${base} -> archive/${subdir}/${base}"
+      continue
+    fi
+
+    if is_git_tracked "$relpath"; then
+      git -C "$root" mv "$relpath" "archive/${subdir}/${base}"
+    else
+      mv "$f" "$dest"
+    fi
+    echo "close: archived ${subdir}/${base} -> archive/${subdir}/${base}"
+    did_something=1
+  done
+}
+
+if [[ "$dry_run" -eq 0 ]]; then
+  mkdir -p "${root}/archive/prompts" "${root}/archive/messages"
+fi
+
+archive_dir "prompts"
+archive_dir "messages"
+
+if [[ "$dry_run" -eq 1 ]]; then
+  echo "close: dry-run complete for $issue_id; nothing moved, no event emitted"
+  exit 0
+fi
+
+if [[ "$did_something" -eq 1 ]]; then
+  "${SCRIPT_DIR}/record" note --ref "archived:${issue_id}" --issue "$issue_id"
+  echo "close: $issue_id done (transition + archive recorded)"
+else
+  echo "close: $issue_id already closed and nothing to archive; no-op"
+fi
+
+exit 0

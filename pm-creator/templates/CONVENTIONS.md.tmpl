@@ -111,6 +111,15 @@ scope — the exact miscommunication this repo exists to prevent.
 4. Dispatch via the chosen lane; record the `dispatch_state` event.
 5. Results return through the lane; record the result + verify; update the ticket.
 
+Once a session is **live** (already dispatched, already running in a tab), further
+instructions don't go through a new prompt — they go in `messages/`. A reply to the worker's
+question, a go-ahead to merge/commit, or a scope change is written to
+`messages/<I-###>_<verb>_<slug>_YYYY-MM-DD.md` (verb, e.g. `go`, `reply`) and pasted into the
+live tab. The same prompt self-containment rules (§8) apply here: a message pasted into a
+live session is just as unable to resolve a bare `I/Q/R/D-###` as a fresh prompt is — ground
+it the same way. Both `prompts/` and `messages/` filenames lead with the issue id
+`<I-###>_`, so everything for a given issue sorts and greps together.
+
 ### Two-channel discipline (per repo, untracked, NEVER committed)
 - **`REQUESTS.md`** (repo root) = INBOUND channel to the session that owns that repo's work.
 - **`STATUS.md`** (repo root) = that session's REPLY channel; requesters watch it.
@@ -120,6 +129,15 @@ scope — the exact miscommunication this repo exists to prevent.
 The manager owns **state + coordination, never PRODUCT code.** It DOES mutate PM state
 through the `bin/` tools and its own edits to this repo. It delegates all code execution to
 worker sessions.
+
+## 11. Closing a session (archive)
+
+When an issue's work is fully done, `bin/close <I-###>` transitions the issue to CLOSED and
+**moves** its `prompts/` and `messages/` files into `archive/prompts/` and
+`archive/messages/` respectively — matched by the leading `<I-###>_` filename prefix.
+`reports/` is **never** touched by close: it stays in place as the permanent audit trail.
+`bin/close` is idempotent (running it again on an already-closed issue is a no-op) and
+supports `--dry-run` to preview the move without touching the filesystem.
 
 ---
 

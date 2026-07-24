@@ -341,6 +341,18 @@ section_clean_publish() {
   [[ -f "$out/.pm/config.json" && -f "$out/.pm/events.log" && -d "$out/bin" ]] && \
     ok "clean publish produces the full tree" \
     || fail "clean publish produces the full tree" "$(ls -la "$out" 2>&1)"
+
+  [[ -d "$out/prompts" && -d "$out/messages" && -d "$out/reports" ]] && \
+    ok "clean publish creates prompts/, messages/, and reports/" \
+    || fail "clean publish creates prompts/, messages/, and reports/" "$(ls -la "$out" 2>&1)"
+
+  [[ -d "$out/archive/messages" && -d "$out/archive/prompts" ]] && \
+    ok "clean publish creates archive/messages/ and archive/prompts/" \
+    || fail "clean publish creates archive/messages/ and archive/prompts/" "$(ls -la "$out/archive" 2>&1)"
+
+  [[ -x "$out/bin/close" ]] && \
+    ok "bin/close is copied and executable" \
+    || fail "bin/close is copied and executable" "$(ls -la "$out/bin" 2>&1)"
 }
 
 # ---------------------------------------------------------------------------
