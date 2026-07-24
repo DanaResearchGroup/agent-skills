@@ -29,6 +29,9 @@ demo = os.environ["DEMO_PATH"]
 v = {
   "CAMPAIGN_NAME": "Phase-A Smoke",
   "CAMPAIGN_SLUG": "smoke",
+  "STRATEGY_PATH_MD": "Smoke-test the Phase-A core end to end.",
+  "STRATEGY_MILESTONES_MD": "- [ ] M1: scaffold + verify",
+  "STRATEGY_WORKPLAN_MD": "1. Scaffold\n2. Run the round-trip",
   "PRIMARY_REPO": "demo",
   "REPO_LIST": "`demo` → `main`",
   "WORKTREE_ROOT": "/tmp/smoke-wt",

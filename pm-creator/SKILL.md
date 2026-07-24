@@ -34,6 +34,8 @@ a glossary. Extract every value the templates need:
 - model-routing defaults (offer a Haiku/Sonnet/Opus/Fable-by-work-shape table; flag it
   rot-prone)
 - capacity profile (hardware, parallelism ceiling) → `MACHINE.md`
+- the campaign's path (its through-line/end state), high-level milestones, and an initial
+  workplan — devise these WITH the user, not for them; seeds `STRATEGY.md`
 - remote policy for THIS PM repo: local-only, or a **private** GitHub repo
 - per-repo upload policy + always-human gates (merges to shared branches, pushes, NEEDS-USER)
 - which optional slots are active: `RUNS.md` (long jobs), `MACHINE.md` (heavy compute)

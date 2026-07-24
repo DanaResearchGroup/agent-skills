@@ -31,6 +31,11 @@ prose is re-rendered, never trusted as state.** Generated summary blocks sit ins
 `<!-- GENERATED:BEGIN key -->…<!-- END -->` markers — anything you hand-type inside a marker
 is lost on the next `reconcile`.
 
+`STRATEGY.md` is narrative like the rest — never parsed for state — but jointly owned: the
+manager proposes strategy updates (milestones, workplan) and confirms them with the user
+before writing, at milestone boundaries or when the path changes, never unilaterally. Keep it
+short.
+
 ## 4. Dispatch identity, lanes, and the result contract
 
 - **Two lanes, always available; you direct which handles a dispatch:**

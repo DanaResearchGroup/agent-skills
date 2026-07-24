@@ -57,6 +57,9 @@ demo = os.environ["DEMO_PATH"]
 v = {
   "CAMPAIGN_NAME": 'Op "Alpha"\\Beta\nLine2',
   "CAMPAIGN_SLUG": "hostile",
+  "STRATEGY_PATH_MD": "Ship the hostile-op integration end to end.",
+  "STRATEGY_MILESTONES_MD": "- [ ] M1: scaffold the demo repo\n- [ ] M2: ship it",
+  "STRATEGY_WORKPLAN_MD": "1. Scaffold demo\n2. Wire CI",
   "PRIMARY_REPO": "demo",
   "REPO_LIST": "`demo` -> `main`",
   "WORKTREE_ROOT": "/tmp/hostile-wt",
@@ -390,6 +393,20 @@ section_clean_publish() {
   grep -qE '\{\{[A-Z_]+\}\}' "$out/TRACKER.md" 2>/dev/null && \
     fail "TRACKER.md has no unresolved {{PLACEHOLDER}}" "$(grep -E '\{\{[A-Z_]+\}\}' "$out/TRACKER.md")" \
     || ok "TRACKER.md has no unresolved {{PLACEHOLDER}}"
+
+  [[ -f "$out/STRATEGY.md" ]] && \
+    ok "STRATEGY.md is rendered from the tmpl" \
+    || fail "STRATEGY.md is rendered from the tmpl" "$(ls -la "$out" 2>&1)"
+
+  grep -q 'Ship the hostile-op integration end to end.' "$out/STRATEGY.md" 2>/dev/null && \
+    grep -q 'M1: scaffold the demo repo' "$out/STRATEGY.md" 2>/dev/null && \
+    grep -q 'Wire CI' "$out/STRATEGY.md" 2>/dev/null && \
+    ok "STRATEGY.md contains the interpolated path/milestones/workplan content" \
+    || fail "STRATEGY.md contains the interpolated path/milestones/workplan content" "$(cat "$out/STRATEGY.md" 2>&1)"
+
+  grep -qE '\{\{[A-Z_]+\}\}' "$out/STRATEGY.md" 2>/dev/null && \
+    fail "STRATEGY.md has no unresolved {{PLACEHOLDER}}" "$(grep -E '\{\{[A-Z_]+\}\}' "$out/STRATEGY.md")" \
+    || ok "STRATEGY.md has no unresolved {{PLACEHOLDER}}"
 }
 
 # ---------------------------------------------------------------------------
@@ -1027,6 +1044,41 @@ PY
     || ok "no partial --out dir left behind ({{...}}-in-repo-field case)"
 }
 
+# ---------------------------------------------------------------------------
+# 17. STRATEGY.md's placeholders participate in the FAIL-LOUD completeness
+#     check like every other placeholder: omitting one aborts scaffold with
+#     no partial --out, naming the missing key.
+# ---------------------------------------------------------------------------
+section_strategy_missing_key_fails() {
+  local demo values out
+  demo="$WORK/demo17"
+  mkdir -p "$demo"
+  (cd "$demo" && git init -q -b main && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init)
+
+  values="$WORK/values17.json"
+  write_full_values "$values" "$demo"
+  python3 - "$values" <<'PY'
+import json, sys
+p = sys.argv[1]
+v = json.load(open(p))
+del v["STRATEGY_WORKPLAN_MD"]
+json.dump(v, open(p, "w"))
+PY
+
+  out="$WORK/out17"
+  if bash "$SCAFFOLD" --values "$values" --out "$out" >"$WORK/s17.out" 2>"$WORK/s17.err"; then
+    fail "missing STRATEGY_WORKPLAN_MD makes scaffold exit non-zero" "unexpectedly succeeded"
+  else
+    ok "missing STRATEGY_WORKPLAN_MD makes scaffold exit non-zero"
+  fi
+
+  grep -q 'STRATEGY_WORKPLAN_MD' "$WORK/s17.err" && ok "failure output names the missing STRATEGY_WORKPLAN_MD key" \
+    || fail "failure output names the missing STRATEGY_WORKPLAN_MD key" "$(cat "$WORK/s17.err")"
+
+  [[ -e "$out" ]] && fail "no partial --out dir left behind (missing STRATEGY key case)" "found: $out" \
+    || ok "no partial --out dir left behind (missing STRATEGY key case)"
+}
+
 echo "== JSON escaping of hostile values =="
 section_json_escaping
 echo "== no partial dir left on forced failure =="
@@ -1075,6 +1127,8 @@ echo "== round-21: hostile repo field round-trips through normalization =="
 section_repos_hostile_field_round_trips
 echo "== round-21: {{...}}-shaped repo field data still trips the broad survivor guard =="
 section_repos_field_placeholder_token_still_guarded
+echo "== STRATEGY.md: missing new placeholder key fails loud =="
+section_strategy_missing_key_fails
 
 echo
 echo "-----------------------------------------"
