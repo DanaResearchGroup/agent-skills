@@ -142,6 +142,119 @@ seed_acked_dispatch() {
     at="$(now_iso)" tab="$tab" >/dev/null
 }
 
+# ---------------------------------------------------------------------------
+# B2.1 auto-close fixtures
+# ---------------------------------------------------------------------------
+
+# new_tmp_repo_with_git_ac [auto_close=true]
+# Like new_tmp_repo_with_git, but the "demo-repo" config entry carries a
+# complete, FULL configured mainline_ref (refs/heads/main) + fetch_policy
+# (local-only, so G4 never needs a real remote) -- the shape B2.0b's
+# scaffold-time normalization produces -- plus automation.auto_close.
+new_tmp_repo_with_git_ac() {
+  local auto_close="${1:-true}"
+  local d gitrepo
+  d="$(new_tmp_repo_with_git)"
+  gitrepo="$d/target-repo"
+  cat >"$d/.pm/config.json" <<JSON
+{"repos": {"demo-repo": {"path": "$gitrepo", "mainline": "main", "mainline_ref": "refs/heads/main", "fetch_policy": "local-only"}}, "herdr_workspace": "zzz-test-ws", "automation": {"auto_close": $auto_close}}
+JSON
+  echo "$d"
+}
+
+# seed_verified_dispatch <repo> <d> <issue> <tab> <branch> <base_sha> <result_sha>
+# Extends seed_acked_dispatch through the real ACKED->RETURNED->VERIFIED
+# path (result event, then a human dispatch_state VERIFIED transition) --
+# the ONLY legal way to mint a VERIFIED dispatch via pm_apply.
+seed_verified_dispatch() {
+  local repo="$1" d="$2" issue="$3" tab="$4" branch="$5" base_sha="$6" result_sha="$7"
+  seed_acked_dispatch "$repo" "$d" "$issue" "$tab" "$branch" "$base_sha"
+  PM_ROOT="$repo" pm_apply result d="$d" a=A-01 status=RETURNED result_sha="$result_sha" \
+    at="$(now_iso)" >/dev/null
+  PM_ROOT="$repo" pm_apply dispatch_state d="$d" a=A-01 from=RETURNED to=VERIFIED lane=human \
+    at="$(now_iso)" >/dev/null
+}
+
+# seed_issue_state <repo> <issue> <from> <to>
+# Registers (if new) and/or transitions an issue via issue_state. A
+# never-before-seen issue's FIRST issue_state event may set any from=/to=
+# pair (both merely need to be in ISSUE_STATES) since the grammar's
+# from-vs-current consistency check is skipped when cur is None -- so this
+# single call both registers AND activates a brand-new issue.
+seed_issue_state() {
+  local repo="$1" issue="$2" from="$3" to="$4"
+  PM_ROOT="$repo" pm_apply issue_state i="$issue" from="$from" to="$to" \
+    at="$(now_iso)" by=tester >/dev/null
+}
+
+# seed_question <repo> <q> <state> [<issue>]
+# Seeds a `question` event, optionally scoped to an issue (i=). Omitting
+# the issue seeds an UNSCOPED question (open_questions_unscoped).
+seed_question() {
+  local repo="$1" q="$2" state="$3" issue="${4:-}"
+  if [[ -n "$issue" ]]; then
+    PM_ROOT="$repo" pm_apply question q="$q" state="$state" at="$(now_iso)" i="$issue" >/dev/null
+  else
+    PM_ROOT="$repo" pm_apply question q="$q" state="$state" at="$(now_iso)" >/dev/null
+  fi
+}
+
+# ac_merge_worker_tip_to_mainline <gitrepo> <tip_sha>
+# Fast-forwards the local "main" branch ref to <tip_sha> directly (no
+# checkout switch needed -- mainline_ref=refs/heads/main is resolved by
+# tr_g4_check as a plain ref, and fetch_policy=local-only never fetches),
+# simulating "the worker's branch was merged to mainline" for G4 tests.
+ac_merge_worker_tip_to_mainline() {
+  local gitrepo="$1" tip="$2"
+  # update-ref (not `git branch -f`) -- main is checked out in the primary
+  # worktree here, and `git branch -f` on a checked-out branch refuses with
+  # "cannot force update the branch ... used by worktree"; update-ref moves
+  # the ref directly without that worktree-safety check (we never rely on
+  # the primary worktree's working-tree CONTENTS, only the ref value that
+  # mainline_ref=refs/heads/main resolves to).
+  git_or_die "merge worker tip to mainline" -C "$gitrepo" update-ref refs/heads/main "$tip"
+}
+
+# ac_make_worker_commit <gitrepo> <repo> <branch> -- branches off HEAD,
+# worktree-adds it under $repo/wt-<branch>, commits one change, echoes the
+# tip sha. Caller is responsible for `git worktree remove --force` cleanup.
+ac_make_worker_commit() {
+  local gitrepo="$1" repo="$2" branch="$3"
+  git_or_die "ac_make_worker_commit: branch $branch" -C "$gitrepo" branch "$branch"
+  git_or_die "ac_make_worker_commit: worktree add wt-$branch" \
+    -C "$gitrepo" worktree add -q "$repo/wt-$branch" "$branch"
+  (
+    set -e
+    cd "$repo/wt-$branch" || exit 1
+    printf 'work\n' >>README.md
+    git add README.md
+    git commit -q -m 'work'
+  ) >&2 || { echo "FATAL: fixture git setup failed (ac_make_worker_commit: $branch commit)" >&2; exit 1; }
+  git -C "$repo/wt-$branch" rev-parse HEAD
+}
+
+# ac_fetch_policy_config <repo> <gitrepo> <auto_close>
+# Rewrites .pm/config.json with a fetch_policy=fetch demo-repo entry
+# (mainline_ref refs/remotes/origin/main) -- caller must have set up a local
+# bare "origin" remote (never a real network remote).
+ac_fetch_policy_config() {
+  local repo="$1" gitrepo="$2" auto_close="$3"
+  cat >"$repo/.pm/config.json" <<JSON
+{"repos": {"demo-repo": {"path": "$gitrepo", "mainline": "main", "mainline_ref": "refs/remotes/origin/main", "fetch_policy": "fetch"}}, "herdr_workspace": "zzz-test-ws", "automation": {"auto_close": $auto_close}}
+JSON
+}
+
+# ac_add_local_origin <repo> <gitrepo> -- init a local bare origin.git inside
+# the fixture and point demo-repo's "origin" remote at it; pushes current
+# main. Echoes nothing.
+ac_add_local_origin() {
+  local repo="$1" gitrepo="$2"
+  local origin_bare="$repo/origin.git"
+  git_or_die "ac_add_local_origin: init bare origin" init -q --bare "$origin_bare"
+  git_or_die "ac_add_local_origin: add origin remote" -C "$gitrepo" remote add origin "$origin_bare"
+  git_or_die "ac_add_local_origin: push main to origin" -C "$gitrepo" push -q origin main
+}
+
 # run_track <repo_dir> [fixture_json] -- runs bin/track --once with
 # cwd=<repo_dir>, herdr shadowed as a local function returning the given
 # snapshot fixture JSON (or "herdr absent" if no fixture given), never
@@ -176,6 +289,39 @@ run_track() {
     TR_OUT="$(cd "$repo" && PATH="/usr/bin:/bin" bash bin/track --once 2>&1)"
     TR_RC=$?
   fi
+}
+
+# make_git_env_wrapper <wrapper_dir> <log_file> (Codex-sparred defect #4,
+# Medium). Writes a `git` shim into <wrapper_dir> that appends one line per
+# invocation to <log_file> -- "1|<argv...>" if GIT_NO_REPLACE_OBJECTS=1 was
+# set in its own environment, "<unset>|<argv...>" otherwise -- then execs
+# the REAL git (resolved via `command -v git` at wrapper-generation time, so
+# the shim itself never recurses into itself). Used with
+# run_track_with_git_wrapper to prove GIT_NO_REPLACE_OBJECTS=1 is set on
+# EVERY G4 git call track makes, not just the ones inside tr_g4_check's own
+# local run() closure -- including tr_verify_commit's identity anchor and
+# tr_repo_has_grafts's graft probe, both called via the shared tr_run().
+make_git_env_wrapper() {
+  local wrapper_dir="$1" log_file="$2" real_git
+  mkdir -p "$wrapper_dir"
+  real_git="$(command -v git)"
+  cat >"$wrapper_dir/git" <<EOF
+#!/usr/bin/env bash
+printf '%s|%s\n' "\${GIT_NO_REPLACE_OBJECTS:-<unset>}" "\$*" >>"$log_file"
+exec "$real_git" "\$@"
+EOF
+  chmod +x "$wrapper_dir/git"
+}
+
+# run_track_with_git_wrapper <repo_dir> <wrapper_dir> -- like run_track's
+# no-fixture branch (no herdr new intake -> pure AC-pass tick), but with
+# <wrapper_dir> prepended to PATH so the make_git_env_wrapper shim
+# intercepts every `git` invocation track makes.
+run_track_with_git_wrapper() {
+  local repo="$1" wrapper_dir="$2"
+  # shellcheck disable=SC2034  # TR_OUT is set for ad-hoc debugging (print on failure), not asserted on
+  TR_OUT="$(cd "$repo" && PATH="$wrapper_dir:/usr/bin:/bin" bash bin/track --once 2>&1)"
+  TR_RC=$?
 }
 
 snapshot_json() {
@@ -257,6 +403,43 @@ assert_surfaced_not_recorded() {
   assert_true "$label: no result event appended" \
     bash -c '[[ "$(grep -c "^EVENT result d=$1 " "$2/.pm/events.log" || true)" == "0" ]]' \
     _ "$d" "$repo"
+}
+
+issue_state_in_index() {
+  local repo="$1" issue="$2"
+  python3 -c "
+import json
+idx = json.load(open('$repo/.pm/index.json'))
+print(idx.get('issues', {}).get('$issue', {}).get('state', ''))
+" 2>/dev/null
+}
+
+# assert_ac_closed <label> <repo> <issue>
+# Asserts the auto-close pass CLOSED <issue> this tick: index.json state is
+# CLOSED, and TRACKER.md's "Auto-closed this tick" section names it.
+assert_ac_closed() {
+  local label="$1" repo="$2" issue="$3"
+  assert_true "$label: exit 0" bash -c '[[ "$1" == "0" ]]' _ "$TR_RC"
+  assert_eq "$label: issue state is CLOSED" "CLOSED" "$(issue_state_in_index "$repo" "$issue")"
+  assert_true "$label: named in TRACKER.md" \
+    bash -c 'grep -q "$1" "$2/TRACKER.md"' _ "$issue" "$repo"
+}
+
+# assert_ac_surfaced <label> <repo> <issue> <reason_substr>
+# Asserts the auto-close pass did NOT close <issue> this tick and surfaced
+# it with the given reason substring; index.json state stays non-CLOSED.
+# T5: issue AND reason must appear on the SAME rendered TRACKER.md line (a
+# table row or a steady-state summary line) -- two independent whole-file
+# greps could vacuously pass off two unrelated rows.
+assert_ac_surfaced() {
+  local label="$1" repo="$2" issue="$3" reason="$4"
+  local state
+  state="$(issue_state_in_index "$repo" "$issue")"
+  assert_true "$label: exit 0" bash -c '[[ "$1" == "0" ]]' _ "$TR_RC"
+  assert_true "$label: issue state is NOT CLOSED (got '$state')" \
+    bash -c '[[ "$1" != "CLOSED" ]]' _ "$state"
+  assert_true "$label: surfaced on one TRACKER.md row: '$issue' + '$reason'" \
+    bash -c 'grep -- "$3" "$2/TRACKER.md" | grep -q -- "$1"' _ "$issue" "$repo" "$reason"
 }
 
 section_surface_missing_metadata() {
@@ -831,6 +1014,66 @@ section_surface_branch_issue_mismatch() {
 }
 
 # ---------------------------------------------------------------------------
+# 12b. F1 (Codex-sparred, round 3 -- the LAST remaining second-raw-log-parser):
+# an EARLIER-in-file poisoned `dispatch_new` line for D-601 with a duplicate
+# `i=` key (`i=I-601 ... i=I-602`) is grammar-invalid (parse_line rejects the
+# duplicate key), so fold_lines quarantines it -- it never registers D-601 in
+# the fold at all. The REAL dispatch_new for D-601 (legitimately linked to
+# I-601) follows afterward and registers normally. The now-deleted
+# `tr_find_issue_for_dispatch` used to re-scan the raw log itself with a
+# naive first-match parser and would have returned the POISONED line's last
+# `i=` (I-602) for D-601 -- a false branch-issue-mismatch surface (branch
+# i601-x names I-601, but the poisoned raw scan derived I-602), blocking
+# legitimate intake. STAGE 1 now reads the fold's authoritative
+# `dispatch_issue_map` (built ONLY from validated, non-quarantined
+# dispatch_new lines) instead -- the poison line is simply absent from it,
+# D-601 correctly maps to I-601, F1 sees a MATCH, and intake proceeds
+# normally (RETURNED recorded, no mismatch surfaced).
+section_surface_branch_issue_mismatch_stage1_poison_resists() {
+  local repo gitrepo base_sha
+  repo="$(new_tmp_repo_with_git)"
+  gitrepo="$repo/target-repo"
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+
+  git_or_die "stage1-poison: branch i601-x" -C "$gitrepo" branch i601-x
+  git_or_die "stage1-poison: worktree add wt-601" -C "$gitrepo" worktree add -q "$repo/wt-601" i601-x
+  (
+    set -e
+    cd "$repo/wt-601" || exit 1
+    printf 'more\n' >>README.md
+    git add README.md
+    git commit -q -m 'i601 work'
+  ) >&2 || { echo "FATAL: fixture git setup failed (stage1-poison: i601 commit)" >&2; exit 1; }
+
+  # Poisoned line FIRST, in raw-file order, ahead of D-601's real
+  # registration -- exploits the deleted parser's early-return-on-first-match.
+  PM_ROOT="$repo" pm_raw_append_literal \
+    "EVENT dispatch_new d=D-601 i=I-601 at=$(now_iso) i=I-602"
+  # The REAL dispatch registration for D-601, legitimately linked to I-601.
+  seed_acked_dispatch "$repo" D-601 I-601 zzz-test-tab-601 i601-x "$base_sha"
+
+  run_track "$repo" "$(snapshot_json zzz-test-tab-601 "done" "i601-x")"
+  assert_eq "stage1-poison: exit 0" "0" "$TR_RC"
+  assert_true "stage1-poison: NOT surfaced as branch-issue-mismatch" \
+    bash -c '! grep -q "branch-issue-mismatch" "$1/TRACKER.md"' _ "$repo"
+  assert_eq "stage1-poison: dispatch D-601 state is RETURNED (intake succeeded, not blocked)" \
+    "RETURNED" "$(python3 -c "
+import json
+idx = json.load(open('$repo/.pm/index.json'))
+print(idx['dispatches']['D-601']['state'])
+")"
+  assert_eq "stage1-poison: authoritative map D-601 -> I-601 (unpoisoned)" \
+    "I-601" "$(python3 -c "
+import json
+idx = json.load(open('$repo/.pm/index.json'))
+print(idx.get('dispatch_issue_map', {}).get('D-601', ''))
+")"
+
+  git -C "$gitrepo" worktree remove --force "$repo/wt-601" >/dev/null 2>&1 || true
+  rm -rf "$repo"
+}
+
+# ---------------------------------------------------------------------------
 # 13. F3: base_sha must be FULL-LENGTH hex -- a short hex PREFIX is also a
 # valid git ref name (ref-name ambiguity risk: `<short>^{commit}` could
 # resolve a moving branch/tag instead of an immutable object) and must be
@@ -994,6 +1237,1755 @@ JSON
   rm -rf "$repo"
 }
 
+# ===========================================================================
+# B2.1 auto-close pass (STRICT merged-path only, STAGE 2.5).
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# AC.0 Non-vacuous end-to-end: sole non-superseded VERIFIED dispatch,
+# result_sha strictly merged into the configured local mainline ref, no
+# open questions, automation.auto_close=true -> the tick CLOSES the issue.
+# ---------------------------------------------------------------------------
+section_ac_end_to_end_closes() {
+  local repo gitrepo base_sha tip
+  repo="$(new_tmp_repo_with_git_ac true)"
+  gitrepo="$repo/target-repo"
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+  tip="$(ac_make_worker_commit "$gitrepo" "$repo" i960-x)"
+
+  seed_verified_dispatch "$repo" D-960 I-960 zzz-test-tab-960 i960-x "$base_sha" "$tip"
+  seed_issue_state "$repo" I-960 OPEN ACTIVE
+  ac_merge_worker_tip_to_mainline "$gitrepo" "$tip"
+
+  run_track "$repo"
+  assert_ac_closed "ac end-to-end" "$repo" "I-960"
+  assert_true "ac end-to-end: exactly one issue_state ...to=CLOSED for I-960" \
+    bash -c '[[ "$(grep -c "^EVENT issue_state i=I-960 .*to=CLOSED" "$1/.pm/events.log")" == "1" ]]' \
+    _ "$repo"
+  assert_true "ac end-to-end: dispatch D-960 remains VERIFIED (close never mutates dispatches)" \
+    bash -c '
+      python3 -c "
+import json
+idx = json.load(open(\"$1/.pm/index.json\"))
+print(idx[\"dispatches\"][\"D-960\"][\"state\"])
+" | grep -qx VERIFIED
+    ' _ "$repo"
+
+  git -C "$gitrepo" worktree remove --force "$repo/wt-i960-x" >/dev/null 2>&1 || true
+  rm -rf "$repo"
+}
+
+# ---------------------------------------------------------------------------
+# AC.G1 wrong-state variants: NEEDS-USER / BLOCKED / paused-non-active.
+# ---------------------------------------------------------------------------
+section_ac_g1_needs_user() {
+  local repo gitrepo base_sha tip
+  repo="$(new_tmp_repo_with_git_ac true)"
+  gitrepo="$repo/target-repo"
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+  tip="$(ac_make_worker_commit "$gitrepo" "$repo" i961-x)"
+
+  seed_verified_dispatch "$repo" D-961 I-961 zzz-test-tab-961 i961-x "$base_sha" "$tip"
+  seed_issue_state "$repo" I-961 OPEN ACTIVE
+  seed_issue_state "$repo" I-961 ACTIVE NEEDS-USER
+  ac_merge_worker_tip_to_mainline "$gitrepo" "$tip"
+
+  run_track "$repo"
+  assert_ac_surfaced "ac g1 NEEDS-USER" "$repo" "I-961" "NEEDS-USER"
+
+  git -C "$gitrepo" worktree remove --force "$repo/wt-i961-x" >/dev/null 2>&1 || true
+  rm -rf "$repo"
+}
+
+section_ac_g1_blocked() {
+  local repo gitrepo base_sha tip
+  repo="$(new_tmp_repo_with_git_ac true)"
+  gitrepo="$repo/target-repo"
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+  tip="$(ac_make_worker_commit "$gitrepo" "$repo" i962-x)"
+
+  seed_verified_dispatch "$repo" D-962 I-962 zzz-test-tab-962 i962-x "$base_sha" "$tip"
+  seed_issue_state "$repo" I-962 OPEN ACTIVE
+  seed_issue_state "$repo" I-962 ACTIVE BLOCKED
+  ac_merge_worker_tip_to_mainline "$gitrepo" "$tip"
+
+  run_track "$repo"
+  assert_ac_surfaced "ac g1 BLOCKED" "$repo" "I-962" "BLOCKED"
+
+  git -C "$gitrepo" worktree remove --force "$repo/wt-i962-x" >/dev/null 2>&1 || true
+  rm -rf "$repo"
+}
+
+section_ac_g1_paused_non_active() {
+  local repo gitrepo base_sha tip
+  repo="$(new_tmp_repo_with_git_ac true)"
+  gitrepo="$repo/target-repo"
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+  tip="$(ac_make_worker_commit "$gitrepo" "$repo" i963-x)"
+
+  seed_verified_dispatch "$repo" D-963 I-963 zzz-test-tab-963 i963-x "$base_sha" "$tip"
+  seed_issue_state "$repo" I-963 OPEN PARKED
+  ac_merge_worker_tip_to_mainline "$gitrepo" "$tip"
+
+  run_track "$repo"
+  assert_ac_surfaced "ac g1 paused/non-active" "$repo" "I-963" "paused/non-active"
+
+  git -C "$gitrepo" worktree remove --force "$repo/wt-i963-x" >/dev/null 2>&1 || true
+  rm -rf "$repo"
+}
+
+# ---------------------------------------------------------------------------
+# AC.G1 crash recovery: a CLOSED issue with leftover prompts/messages files
+# is re-archived REGARDLESS of automation.auto_close (crash recovery finishes
+# an already-decided close, it is not a new close decision).
+# ---------------------------------------------------------------------------
+section_ac_crash_recovery_rearchive() {
+  local repo
+  repo="$(new_tmp_repo_with_git_ac false)"
+  seed_issue_state "$repo" I-964 OPEN CLOSED
+  mkdir -p "$repo/prompts" "$repo/messages"
+  printf 'leftover prompt\n' >"$repo/prompts/I-964_dispatch.md"
+  printf 'leftover message\n' >"$repo/messages/I-964_note.md"
+
+  run_track "$repo"
+  assert_eq "ac crash-recovery: exit 0" "0" "$TR_RC"
+  assert_true "ac crash-recovery: prompts leftover archived" \
+    bash -c '[[ -f "$1/archive/prompts/I-964_dispatch.md" && ! -e "$1/prompts/I-964_dispatch.md" ]]' _ "$repo"
+  assert_true "ac crash-recovery: messages leftover archived" \
+    bash -c '[[ -f "$1/archive/messages/I-964_note.md" && ! -e "$1/messages/I-964_note.md" ]]' _ "$repo"
+  assert_true "ac crash-recovery: reported as rearchive/CLOSED-but-archive-leftovers in TRACKER.md" \
+    bash -c 'grep -q "I-964" "$1/TRACKER.md" && grep -q "CLOSED-but-archive-leftovers" "$1/TRACKER.md"' _ "$repo"
+
+  rm -rf "$repo"
+}
+
+# ---------------------------------------------------------------------------
+# AC.G1.5 quarantined-events gates (Codex-sparred defect #1, Critical).
+#
+# A raw line that fails the rule engine's *legality* checks at fold time is
+# quarantined (never silently dropped), but until now `evaluate_issue` never
+# consulted the quarantine at all -- an issue with a quarantined line naming
+# it could still sail through every other gate and get auto-closed, even
+# though the quarantined line names real, un-adjudicated semantic content
+# (an invalid question state, a corrupt issue_state/dispatch_state/result
+# touching the issue or one of its dispatches). `pm_raw_append` is the
+# grammar-only, rule-engine-bypassing seeder (test/_seed.sh) used here to
+# plant a grammar-VALID but rule-ILLEGAL line, so fold_lines quarantines it
+# for the reason under test rather than rejecting it outright as malformed.
+# ---------------------------------------------------------------------------
+
+# Scoped (i=) question with a bogus state -- grammar-valid (BOGUS passes the
+# token charset), rule-illegal (not a recognized question state) -> quarantined
+# and attributed to I-981 via write_outputs' quarantine_by_issue. Must surface
+# invalid-question-state and MUST NOT close, even though the issue is
+# otherwise fully closeable (no other dispatches, ACTIVE state).
+section_ac_g1p5_quarantined_question_for_issue() {
+  local repo
+  repo="$(new_tmp_repo_with_git_ac true)"
+  seed_issue_state "$repo" I-981 OPEN ACTIVE
+  PM_ROOT="$repo" pm_raw_append question q=Q-981 state=BOGUS at="$(now_iso)" i=I-981
+
+  run_track "$repo"
+  assert_ac_surfaced "ac g1.5 quarantined scoped question -> invalid-question-state" \
+    "$repo" "I-981" "invalid-question-state"
+
+  rm -rf "$repo"
+}
+
+# A quarantined issue_state line (illegal `to=`) touching I-982 directly --
+# distinct code path from the question case, must surface the more general
+# issue-related-quarantine reason (not invalid-question-state) and MUST NOT
+# close.
+section_ac_g1p5_quarantined_issue_state() {
+  local repo
+  repo="$(new_tmp_repo_with_git_ac true)"
+  seed_issue_state "$repo" I-982 OPEN ACTIVE
+  PM_ROOT="$repo" pm_raw_append issue_state i=I-982 from=ACTIVE to=BOGUS at="$(now_iso)"
+
+  run_track "$repo"
+  assert_ac_surfaced "ac g1.5 quarantined issue_state -> issue-related-quarantine" \
+    "$repo" "I-982" "issue-related-quarantine"
+
+  rm -rf "$repo"
+}
+
+# ---------------------------------------------------------------------------
+# AC.G1.5 round-2 (Codex-sparred, Critical A + Critical B): the fold is the
+# SINGLE source of truth for dispatch<->issue linkage and for quarantine
+# attribution -- track's auto-close pass must never re-parse the raw event
+# log itself. `pm_raw_append_literal` (test/_seed.sh) writes an exact,
+# genuinely grammar-INVALID raw line (duplicate keys, quoted/trailing
+# tokens, malformed key=value) that `pm_raw_append`'s own grammar checks
+# would refuse to write -- reproducing exactly the adversarial lines
+# `parse_line()` rejects and `fold_lines` quarantines with NO attribution
+# (etype/kv never resolved), setting the global `quarantine_unattributable`
+# flag that blocks every closeable issue that tick.
+# ---------------------------------------------------------------------------
+
+# Critical A: a quarantined `dispatch_new` line carries a DUPLICATE `i=`
+# key (i=I-501 ... i=I-502) -- grammar-invalid (parse_line raises on the
+# duplicate key), so fold_lines quarantines it unattributed. The now-DELETED
+# `tr_build_dispatch_issue_map` used to re-scan the raw log with its own
+# naive last-value-wins parser and would have reassigned D-501 (legitimately
+# registered to, and VERIFIED+merged for, I-501) to I-502 -- closing I-502
+# using I-501's verified work. track now reads index.json's fold-built
+# `dispatch_issue_map` (built ONLY from validated, non-quarantined
+# dispatch_new lines) instead, so the poisoned line is simply absent from
+# it; the resulting global `quarantine_unattributable` flag additionally
+# blocks EVERY closeable issue this tick (belt-and-suspenders), so neither
+# I-501 nor I-502 auto-closes, and the map is proven unpoisoned directly.
+section_ac_g1p5_dispatch_new_duplicate_i_poison() {
+  local repo gitrepo base_sha tip
+  repo="$(new_tmp_repo_with_git_ac true)"
+  gitrepo="$repo/target-repo"
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+  tip="$(ac_make_worker_commit "$gitrepo" "$repo" i501-x)"
+
+  seed_verified_dispatch "$repo" D-501 I-501 zzz-test-tab-501 i501-x "$base_sha" "$tip"
+  seed_issue_state "$repo" I-501 OPEN ACTIVE
+  ac_merge_worker_tip_to_mainline "$gitrepo" "$tip"
+  seed_issue_state "$repo" I-502 OPEN ACTIVE
+
+  PM_ROOT="$repo" pm_raw_append_literal \
+    "EVENT dispatch_new d=D-501 i=I-501 at=$(now_iso) i=I-502"
+
+  run_track "$repo"
+  assert_ac_surfaced "ac g1.5 dispatch_new dup-i= poison: I-502 does NOT false-close" \
+    "$repo" "I-502" "quarantine-unattributable-blocks-autoclose"
+  assert_ac_surfaced "ac g1.5 dispatch_new dup-i= poison: I-501 evaluated on its own merits (globally blocked, not wrongly closed)" \
+    "$repo" "I-501" "quarantine-unattributable-blocks-autoclose"
+  assert_eq "ac g1.5 dispatch_new dup-i= poison: authoritative map D-501 -> I-501 (unpoisoned)" \
+    "I-501" "$(python3 -c "
+import json
+idx = json.load(open('$repo/.pm/index.json'))
+print(idx.get('dispatch_issue_map', {}).get('D-501', ''))
+")"
+
+  git -C "$gitrepo" worktree remove --force "$repo/wt-i501-x" >/dev/null 2>&1 || true
+  rm -rf "$repo"
+}
+
+# Critical B: 4 malformed-question variants, each a hard `parse_line`
+# grammar failure that a naive reparse (the OLD quarantine_by_issue
+# projection, which re-parsed entry["raw"] and silently `continue`d on
+# ValueError) would have let slip through as unattributed -- allowing the
+# issue it names to auto-close anyway. Each MUST now surface the global
+# `quarantine-unattributable-blocks-autoclose` reason and MUST NOT close.
+_ac_g1p5_unattributable_variant() {
+  local label="$1" issue="$2" raw_line="$3"
+  local repo
+  repo="$(new_tmp_repo_with_git_ac true)"
+  seed_issue_state "$repo" "$issue" OPEN ACTIVE
+  PM_ROOT="$repo" pm_raw_append_literal "$raw_line"
+
+  run_track "$repo"
+  assert_ac_surfaced "ac g1.5 quarantine-unattributable ($label)" \
+    "$repo" "$issue" "quarantine-unattributable-blocks-autoclose"
+
+  rm -rf "$repo"
+}
+
+section_ac_g1p5_malformed_question_duplicate_i() {
+  _ac_g1p5_unattributable_variant "duplicate i=" I-401 \
+    "EVENT question q=Q-1 state=BOGUS at=$(now_iso) i=I-X i=I-401"
+}
+
+section_ac_g1p5_malformed_question_quoted_i() {
+  _ac_g1p5_unattributable_variant "quoted i=" I-402 \
+    "EVENT question q=Q-1 state=BOGUS at=$(now_iso) i=\"I-402\""
+}
+
+section_ac_g1p5_malformed_question_trailing_token() {
+  _ac_g1p5_unattributable_variant "trailing token" I-403 \
+    "EVENT question q=Q-1 state=BOGUS at=$(now_iso) i=I-403 trailing"
+}
+
+section_ac_g1p5_malformed_question_bad_q() {
+  _ac_g1p5_unattributable_variant "malformed q=" I-404 \
+    "EVENT question q=\"Q 4\" state=BOGUS at=$(now_iso) i=I-404"
+}
+
+# Regression guard: a CLEAN, otherwise-closeable issue with an EMPTY
+# quarantine (no quarantined lines at all) must still close normally --
+# `quarantine_unattributable` must NOT be set, and G1.5 must be a no-op.
+section_ac_g1p5_no_regression_clean_quarantine_still_closes() {
+  local repo gitrepo base_sha tip
+  repo="$(new_tmp_repo_with_git_ac true)"
+  gitrepo="$repo/target-repo"
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+  tip="$(ac_make_worker_commit "$gitrepo" "$repo" i995-x)"
+
+  seed_verified_dispatch "$repo" D-995 I-995 zzz-test-tab-995 i995-x "$base_sha" "$tip"
+  seed_issue_state "$repo" I-995 OPEN ACTIVE
+  ac_merge_worker_tip_to_mainline "$gitrepo" "$tip"
+
+  run_track "$repo"
+  assert_ac_closed "ac g1.5 no-regression: clean quarantine still closes" "$repo" "I-995"
+  assert_eq "ac g1.5 no-regression: quarantine_unattributable is false/absent" \
+    "False" "$(python3 -c "
+import json
+idx = json.load(open('$repo/.pm/index.json'))
+print(bool(idx.get('quarantine_unattributable')))
+")"
+
+  git -C "$gitrepo" worktree remove --force "$repo/wt-i995-x" >/dev/null 2>&1 || true
+  rm -rf "$repo"
+}
+
+# ---------------------------------------------------------------------------
+# AC.G1.5 round-3 (Codex-sparred, round 25): the misattribution variant.
+# Quarantine attribution must resolve a quarantined entry's blast radius
+# through the fold's OWN authoritative maps (dispatch_issue_raw / questions),
+# not the offending line's own forged `i=`. A bad line can carry a d=/q=
+# whose REAL owner is issue A while forging i=B -- the fix must still block
+# A (the real owner), not just B (whatever the forgery names), even though
+# B is additively blocked too since B is itself a registered issue.
+# ---------------------------------------------------------------------------
+
+# Case 1: D-501 is VERIFIED+merged, authoritatively registered to I-501 (its
+# real owner via dispatch_issue_raw, set at D-501's FIRST valid dispatch_new).
+# A second, grammar-VALID dispatch_new for the SAME d= (a business-rule
+# duplicate, not a grammar failure) forges i=I-502 -- fold quarantines it as
+# a duplicate registration. Pre-fix, attribution trusted the forged i=I-502
+# alone, leaving I-501 unblocked and free to auto-close on D-501's real
+# VERIFIED+merged work despite the poisoned line right there in the log.
+section_ac_g1p5_misattribution_dispatch_new() {
+  local repo gitrepo base_sha tip
+  repo="$(new_tmp_repo_with_git_ac true)"
+  gitrepo="$repo/target-repo"
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+  tip="$(ac_make_worker_commit "$gitrepo" "$repo" i5011-x)"
+
+  seed_verified_dispatch "$repo" D-501 I-501 zzz-test-tab-5011 i5011-x "$base_sha" "$tip"
+  seed_issue_state "$repo" I-501 OPEN ACTIVE
+  ac_merge_worker_tip_to_mainline "$gitrepo" "$tip"
+  seed_issue_state "$repo" I-502 OPEN ACTIVE
+
+  # Grammar-valid duplicate dispatch_new for D-501 forging i=I-502 (D-501's
+  # real owner is I-501, per the first valid dispatch_new above).
+  PM_ROOT="$repo" pm_raw_append dispatch_new d=D-501 i=I-502 at="$(now_iso)"
+
+  run_track "$repo"
+  assert_ac_surfaced "ac g1.5 misattribution (dispatch_new): I-501 (real owner of D-501) must NOT false-close" \
+    "$repo" "I-501" "issue-related-quarantine"
+  assert_true "ac g1.5 misattribution (dispatch_new): quarantine_by_issue contains I-501" \
+    bash -c "python3 -c \"
+import json
+idx = json.load(open('$repo/.pm/index.json'))
+assert 'I-501' in idx.get('quarantine_by_issue', {}), idx.get('quarantine_by_issue')
+\""
+  assert_eq "ac g1.5 misattribution (dispatch_new): authoritative dispatch_issue_map D-501 -> I-501 (unpoisoned)" \
+    "I-501" "$(python3 -c "
+import json
+idx = json.load(open('$repo/.pm/index.json'))
+print(idx.get('dispatch_issue_map', {}).get('D-501', ''))
+")"
+
+  git -C "$gitrepo" worktree remove --force "$repo/wt-i5011-x" >/dev/null 2>&1 || true
+  rm -rf "$repo"
+}
+
+# Companion to section_ac_g1p5_dispatch_new_duplicate_i_poison (grammar-
+# INVALID double-`i=`-key line -> global quarantine_unattributable) and
+# to section_ac_g1p5_misattribution_dispatch_new above: this variant is
+# grammar-VALID (single `i=` key), so the duplicate `d=D-501` is quarantined
+# only by apply_event's business-rule duplicate-registration check, exercising
+# the authoritative-owner attribution path directly (not the parse-failure
+# fallback). Asserts BOTH the authoritative owner (I-501, via
+# dispatch_issue_raw) AND the forged-but-registered `i=I-502` are additively
+# present in quarantine_by_issue, the map stays unpoisoned, the global
+# unattributable flag is NOT set (this entry resolved cleanly), and the real
+# owner I-501 -- otherwise fully closeable (VERIFIED + strict-merged) -- is
+# blocked from auto-close with the scoped 'issue-related-quarantine' reason.
+section_ac_g1p5_dispatch_new_duplicate_valid_grammar_attribution() {
+  local repo gitrepo base_sha tip
+  repo="$(new_tmp_repo_with_git_ac true)"
+  gitrepo="$repo/target-repo"
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+  tip="$(ac_make_worker_commit "$gitrepo" "$repo" i5021-x)"
+
+  seed_issue_state "$repo" I-501 OPEN ACTIVE
+  seed_issue_state "$repo" I-502 OPEN ACTIVE
+  seed_verified_dispatch "$repo" D-501 I-501 zzz-test-tab-5021 i5021-x "$base_sha" "$tip"
+  ac_merge_worker_tip_to_mainline "$gitrepo" "$tip"
+
+  # Grammar-VALID duplicate dispatch_new for D-501 (single i= key) -- quarantined
+  # only as a business-rule duplicate registration by apply_event, forging i=I-502.
+  PM_ROOT="$repo" pm_raw_append dispatch_new d=D-501 i=I-502 at="$(now_iso)"
+
+  run_track "$repo"
+
+  assert_eq "ac g1.5 dispatch_new dup (valid grammar): quarantine_by_issue[I-501] reason" \
+    "issue-related-quarantine" "$(python3 -c "
+import json
+idx = json.load(open('$repo/.pm/index.json'))
+reasons = idx.get('quarantine_by_issue', {}).get('I-501', [])
+print(reasons[0] if reasons else '')
+")"
+  assert_eq "ac g1.5 dispatch_new dup (valid grammar): quarantine_by_issue[I-502] reason (additive forged i=)" \
+    "issue-related-quarantine" "$(python3 -c "
+import json
+idx = json.load(open('$repo/.pm/index.json'))
+reasons = idx.get('quarantine_by_issue', {}).get('I-502', [])
+print(reasons[0] if reasons else '')
+")"
+  assert_eq "ac g1.5 dispatch_new dup (valid grammar): authoritative dispatch_issue_map D-501 -> I-501 (unpoisoned)" \
+    "I-501" "$(python3 -c "
+import json
+idx = json.load(open('$repo/.pm/index.json'))
+print(idx.get('dispatch_issue_map', {}).get('D-501', ''))
+")"
+  assert_eq "ac g1.5 dispatch_new dup (valid grammar): quarantine_unattributable is NOT set (entry resolved cleanly)" \
+    "False" "$(python3 -c "
+import json
+idx = json.load(open('$repo/.pm/index.json'))
+print(bool(idx.get('quarantine_unattributable')))
+")"
+  assert_ac_surfaced "ac g1.5 dispatch_new dup (valid grammar): I-501 (real owner of D-501) must NOT false-close" \
+    "$repo" "I-501" "issue-related-quarantine"
+
+  git -C "$gitrepo" worktree remove --force "$repo/wt-i5021-x" >/dev/null 2>&1 || true
+  rm -rf "$repo"
+}
+
+# Case 2: Q-601 is validly, authoritatively linked to I-601 via a PRIOR
+# successfully-applied `question` event (state["questions"]["Q-601"]["i"] ==
+# I-601). A subsequent line reusing q=Q-601 with an illegal state=BOGUS
+# forges i=I-602 -- fold quarantines it (invalid question state). Pre-fix,
+# attribution trusted the forged i=I-602 alone, leaving I-601 (Q-601's real
+# owner) unblocked and free to auto-close.
+section_ac_g1p5_misattribution_question() {
+  local repo gitrepo base_sha tip
+  repo="$(new_tmp_repo_with_git_ac true)"
+  gitrepo="$repo/target-repo"
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+  tip="$(ac_make_worker_commit "$gitrepo" "$repo" i601-x)"
+
+  # T6: I-601 is OTHERWISE FULLY CLOSEABLE (VERIFIED + strictly merged) --
+  # so an attribution regression (trusting the forged i=I-602 alone and
+  # leaving Q-601's real owner unblocked) would ACTUALLY close it, not
+  # just coincidentally leave it open for want of a dispatch.
+  seed_verified_dispatch "$repo" D-601 I-601 zzz-test-tab-601 i601-x "$base_sha" "$tip"
+  seed_issue_state "$repo" I-601 OPEN ACTIVE
+  ac_merge_worker_tip_to_mainline "$gitrepo" "$tip"
+  seed_issue_state "$repo" I-602 OPEN ACTIVE
+  seed_question "$repo" Q-601 ANSWERED I-601
+
+  PM_ROOT="$repo" pm_raw_append question q=Q-601 state=BOGUS at="$(now_iso)" i=I-602
+
+  run_track "$repo"
+  assert_ac_surfaced "ac g1.5 misattribution (question): I-601 (real owner of Q-601) must NOT false-close" \
+    "$repo" "I-601" "invalid-question-state"
+  assert_true "ac g1.5 misattribution (question): quarantine_by_issue contains I-601" \
+    bash -c "python3 -c \"
+import json
+idx = json.load(open('$repo/.pm/index.json'))
+assert 'I-601' in idx.get('quarantine_by_issue', {}), idx.get('quarantine_by_issue')
+\""
+
+  git -C "$gitrepo" worktree remove --force "$repo/wt-i601-x" >/dev/null 2>&1 || true
+  rm -rf "$repo"
+}
+
+# Unknown-entity variant: a quarantined `question` event names a BRAND-NEW
+# q= (never validly registered to any issue) and forges an i= that does not
+# name any REGISTERED issue either. Neither q nor the forged i= resolves to
+# anything authoritative or corroborated -- the entry must fall through to
+# the global `quarantine_unattributable` flag (conservative), blocking every
+# otherwise-closeable issue for the tick, rather than being scoped to the
+# unregistered forged i=.
+section_ac_g1p5_misattribution_unknown_entity() {
+  local repo gitrepo base_sha tip
+  repo="$(new_tmp_repo_with_git_ac true)"
+  gitrepo="$repo/target-repo"
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+  tip="$(ac_make_worker_commit "$gitrepo" "$repo" i701-x)"
+
+  # An unrelated, otherwise-fully-closeable issue that must be blocked ONLY
+  # because the global flag fires (not because it is itself implicated).
+  seed_verified_dispatch "$repo" D-701 I-701 zzz-test-tab-701 i701-x "$base_sha" "$tip"
+  seed_issue_state "$repo" I-701 OPEN ACTIVE
+  ac_merge_worker_tip_to_mainline "$gitrepo" "$tip"
+
+  # Brand-new q=Q-702 (never seen before) with a forged i=I-999 that was
+  # NEVER registered via issue_state -- no corroboration for either token.
+  PM_ROOT="$repo" pm_raw_append question q=Q-702 state=BOGUS at="$(now_iso)" i=I-999
+
+  run_track "$repo"
+  assert_ac_surfaced "ac g1.5 misattribution unknown-entity: unrelated closeable I-701 blocked by global flag" \
+    "$repo" "I-701" "quarantine-unattributable-blocks-autoclose"
+  assert_eq "ac g1.5 misattribution unknown-entity: quarantine_unattributable is true" \
+    "True" "$(python3 -c "
+import json
+idx = json.load(open('$repo/.pm/index.json'))
+print(bool(idx.get('quarantine_unattributable')))
+")"
+
+  git -C "$gitrepo" worktree remove --force "$repo/wt-i701-x" >/dev/null 2>&1 || true
+  rm -rf "$repo"
+}
+
+# ---------------------------------------------------------------------------
+# AC.G2 open-question gates.
+# ---------------------------------------------------------------------------
+section_ac_g2_open_question_for_issue() {
+  local repo gitrepo base_sha tip
+  repo="$(new_tmp_repo_with_git_ac true)"
+  gitrepo="$repo/target-repo"
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+  tip="$(ac_make_worker_commit "$gitrepo" "$repo" i965-x)"
+
+  seed_verified_dispatch "$repo" D-965 I-965 zzz-test-tab-965 i965-x "$base_sha" "$tip"
+  seed_issue_state "$repo" I-965 OPEN ACTIVE
+  seed_question "$repo" Q-965 OPEN I-965
+  ac_merge_worker_tip_to_mainline "$gitrepo" "$tip"
+
+  run_track "$repo"
+  assert_ac_surfaced "ac g2 open-question-for-issue" "$repo" "I-965" "open-question-for-issue"
+
+  git -C "$gitrepo" worktree remove --force "$repo/wt-i965-x" >/dev/null 2>&1 || true
+  rm -rf "$repo"
+}
+
+section_ac_g2_open_question_unscoped() {
+  local repo gitrepo base_sha tip
+  repo="$(new_tmp_repo_with_git_ac true)"
+  gitrepo="$repo/target-repo"
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+  tip="$(ac_make_worker_commit "$gitrepo" "$repo" i966-x)"
+
+  seed_verified_dispatch "$repo" D-966 I-966 zzz-test-tab-966 i966-x "$base_sha" "$tip"
+  seed_issue_state "$repo" I-966 OPEN ACTIVE
+  seed_question "$repo" Q-966 OPEN
+  ac_merge_worker_tip_to_mainline "$gitrepo" "$tip"
+
+  run_track "$repo"
+  assert_ac_surfaced "ac g2 open-question-unscoped" "$repo" "I-966" "open-question-unscoped"
+
+  git -C "$gitrepo" worktree remove --force "$repo/wt-i966-x" >/dev/null 2>&1 || true
+  rm -rf "$repo"
+}
+
+# ---------------------------------------------------------------------------
+# AC.G3 dispatch-graph gates.
+# ---------------------------------------------------------------------------
+section_ac_g3_dispatch_not_verified() {
+  local repo
+  repo="$(new_tmp_repo_with_git_ac true)"
+  seed_acked_dispatch "$repo" D-967 I-967 zzz-test-tab-967
+  seed_issue_state "$repo" I-967 OPEN ACTIVE
+
+  run_track "$repo"
+  assert_ac_surfaced "ac g3 dispatch-not-VERIFIED" "$repo" "I-967" "dispatch-not-VERIFIED"
+
+  rm -rf "$repo"
+}
+
+# Cross-issue child_of roll-up: I-968's own dispatch D-968 is fully
+# closeable, but a SEPARATE, still-active dispatch D-969 (belonging to a
+# DIFFERENT issue I-969x) is child_of=D-968 -> blocks I-968's close.
+section_ac_g3_parent_child_rollup() {
+  local repo gitrepo base_sha tip
+  repo="$(new_tmp_repo_with_git_ac true)"
+  gitrepo="$repo/target-repo"
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+  tip="$(ac_make_worker_commit "$gitrepo" "$repo" i968-x)"
+
+  seed_verified_dispatch "$repo" D-968 I-968 zzz-test-tab-968 i968-x "$base_sha" "$tip"
+  seed_issue_state "$repo" I-968 OPEN ACTIVE
+  ac_merge_worker_tip_to_mainline "$gitrepo" "$tip"
+  seed_issue_state "$repo" I-969x OPEN ACTIVE
+  PM_ROOT="$repo" pm_apply dispatch_new d=D-969 i=I-969x at="$(now_iso)" child_of=D-968 >/dev/null
+
+  run_track "$repo"
+  assert_ac_surfaced "ac g3 parent/child-roll-up-violation" "$repo" "I-968" "parent/child-roll-up-violation"
+
+  git -C "$gitrepo" worktree remove --force "$repo/wt-i968-x" >/dev/null 2>&1 || true
+  rm -rf "$repo"
+}
+
+# Transitive child_of roll-up (Codex-sparred defect #2, Critical): a
+# THREE-level chain where the middle dispatch is itself terminal but its own
+# child (the grandchild, two hops from I-983's own dispatch) is still
+# active. A direct-children-only walk would check D-984 (terminal ->
+# "safe"), stop there, and never look past it -- falsely closing I-983
+# while a live grandchild dispatch is still outstanding. Only a walk of the
+# FULL descendant graph (any depth) catches this.
+section_ac_g3_transitive_child_of_rollup() {
+  local repo gitrepo base_sha tip
+  repo="$(new_tmp_repo_with_git_ac true)"
+  gitrepo="$repo/target-repo"
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+  tip="$(ac_make_worker_commit "$gitrepo" "$repo" i983-x)"
+
+  seed_verified_dispatch "$repo" D-983 I-983 zzz-test-tab-983 i983-x "$base_sha" "$tip"
+  seed_issue_state "$repo" I-983 OPEN ACTIVE
+  ac_merge_worker_tip_to_mainline "$gitrepo" "$tip"
+
+  # D-984 (different issue I-984x): child_of=D-983, itself TERMINAL
+  # (ABANDONED).
+  seed_issue_state "$repo" I-984x OPEN ACTIVE
+  PM_ROOT="$repo" pm_apply dispatch_new d=D-984 i=I-984x at="$(now_iso)" child_of=D-983 >/dev/null
+  PM_ROOT="$repo" pm_apply dispatch_state d=D-984 from=READY to=ABANDONED lane=human \
+    at="$(now_iso)" >/dev/null
+  # D-985 (yet another issue I-985x): child_of=D-984, left READY --
+  # non-terminal, still active, and only reachable via a transitive walk.
+  seed_issue_state "$repo" I-985x OPEN ACTIVE
+  PM_ROOT="$repo" pm_apply dispatch_new d=D-985 i=I-985x at="$(now_iso)" child_of=D-984 >/dev/null
+
+  run_track "$repo"
+  assert_ac_surfaced "ac g3 transitive parent/child-roll-up-violation (active grandchild)" \
+    "$repo" "I-983" "parent/child-roll-up-violation"
+
+  git -C "$gitrepo" worktree remove --force "$repo/wt-i983-x" >/dev/null 2>&1 || true
+  rm -rf "$repo"
+}
+
+# Control: same 3-level chain, but the grandchild D-987b is ALSO terminal --
+# every descendant anywhere in the graph is terminal, so I-986 closes
+# normally. Guards against an over-broad fix that surfaces on the mere
+# EXISTENCE of a child_of edge regardless of descendant state.
+section_ac_g3_transitive_child_of_rollup_all_terminal() {
+  local repo gitrepo base_sha tip
+  repo="$(new_tmp_repo_with_git_ac true)"
+  gitrepo="$repo/target-repo"
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+  tip="$(ac_make_worker_commit "$gitrepo" "$repo" i986-x)"
+
+  seed_verified_dispatch "$repo" D-986 I-986 zzz-test-tab-986 i986-x "$base_sha" "$tip"
+  seed_issue_state "$repo" I-986 OPEN ACTIVE
+  ac_merge_worker_tip_to_mainline "$gitrepo" "$tip"
+
+  seed_issue_state "$repo" I-987ax OPEN ACTIVE
+  PM_ROOT="$repo" pm_apply dispatch_new d=D-987a i=I-987ax at="$(now_iso)" child_of=D-986 >/dev/null
+  PM_ROOT="$repo" pm_apply dispatch_state d=D-987a from=READY to=ABANDONED lane=human \
+    at="$(now_iso)" >/dev/null
+  seed_issue_state "$repo" I-987bx OPEN ACTIVE
+  PM_ROOT="$repo" pm_apply dispatch_new d=D-987b i=I-987bx at="$(now_iso)" child_of=D-987a >/dev/null
+  PM_ROOT="$repo" pm_apply dispatch_state d=D-987b from=READY to=ABANDONED lane=human \
+    at="$(now_iso)" >/dev/null
+
+  run_track "$repo"
+  assert_ac_closed "ac g3 transitive control: all descendants terminal -> closes" "$repo" "I-986"
+
+  git -C "$gitrepo" worktree remove --force "$repo/wt-i986-x" >/dev/null 2>&1 || true
+  rm -rf "$repo"
+}
+
+# Superseded-by-other-issue: I-970 has TWO dispatches -- D-970 (non-superseded,
+# keeps G3's first non-empty check alive) and D-971 (superseded by D-972,
+# which belongs to a DIFFERENT issue I-973x) -> blocks I-970's close.
+section_ac_g3_superseded_by_other_issue() {
+  local repo
+  repo="$(new_tmp_repo_with_git_ac true)"
+  seed_issue_state "$repo" I-970 OPEN ACTIVE
+  seed_acked_dispatch "$repo" D-970 I-970 zzz-test-tab-970
+  PM_ROOT="$repo" pm_apply dispatch_new d=D-971 i=I-970 at="$(now_iso)" >/dev/null
+  seed_issue_state "$repo" I-973x OPEN ACTIVE
+  PM_ROOT="$repo" pm_apply dispatch_new d=D-972 i=I-973x at="$(now_iso)" supersedes=D-971 >/dev/null
+
+  run_track "$repo"
+  assert_ac_surfaced "ac g3 superseded-by-other-issue" "$repo" "I-970" "superseded-by-other-issue"
+
+  rm -rf "$repo"
+}
+
+# ---------------------------------------------------------------------------
+# AC.G4 STRICT git corroboration gates.
+# ---------------------------------------------------------------------------
+
+section_ac_g4_result_equals_base() {
+  local repo gitrepo base_sha
+  repo="$(new_tmp_repo_with_git_ac true)"
+  gitrepo="$repo/target-repo"
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+
+  seed_verified_dispatch "$repo" D-974 I-974 zzz-test-tab-974 i974-noop-branch "$base_sha" "$base_sha"
+  seed_issue_state "$repo" I-974 OPEN ACTIVE
+
+  run_track "$repo"
+  assert_ac_surfaced "ac g4 result==base" "$repo" "I-974" "result==base"
+
+  rm -rf "$repo"
+}
+
+section_ac_g4_not_descendant() {
+  local repo gitrepo base_sha
+  repo="$(new_tmp_repo_with_git_ac true)"
+  gitrepo="$repo/target-repo"
+
+  git_or_die "ac g4 not-descendant: worktree add -b i975-sibling" \
+    -C "$gitrepo" worktree add -q -b i975-sibling "$repo/wt-975-sibling" main
+  (
+    set -e
+    cd "$repo/wt-975-sibling" || exit 1
+    printf 'sibling\n' >>README.md
+    git add README.md
+    git commit -q -m 'sibling commit'
+  ) >&2 || { echo "FATAL: fixture git setup failed (ac g4 not-descendant: sibling commit)" >&2; exit 1; }
+  base_sha="$(git -C "$gitrepo" rev-parse i975-sibling)"
+
+  git_or_die "ac g4 not-descendant: worktree add -b i975-worker" \
+    -C "$gitrepo" worktree add -q -b i975-worker "$repo/wt-975" main
+  (
+    set -e
+    cd "$repo/wt-975" || exit 1
+    printf 'unrelated\n' >>README.md
+    git add README.md
+    git commit -q -m 'unrelated work, not based on i975-sibling'
+  ) >&2 || { echo "FATAL: fixture git setup failed (ac g4 not-descendant: worker commit)" >&2; exit 1; }
+  local tip
+  tip="$(git -C "$repo/wt-975" rev-parse HEAD)"
+
+  seed_verified_dispatch "$repo" D-975 I-975 zzz-test-tab-975 i975-worker "$base_sha" "$tip"
+  seed_issue_state "$repo" I-975 OPEN ACTIVE
+
+  run_track "$repo"
+  assert_ac_surfaced "ac g4 result-not-descendant-of-base" "$repo" "I-975" "result-not-descendant-of-base"
+
+  git -C "$gitrepo" worktree remove --force "$repo/wt-975" >/dev/null 2>&1 || true
+  git -C "$gitrepo" worktree remove --force "$repo/wt-975-sibling" >/dev/null 2>&1 || true
+  rm -rf "$repo"
+}
+
+section_ac_g4_mainline_ref_not_configured() {
+  local repo gitrepo base_sha tip
+  repo="$(new_tmp_repo_with_git_ac true)"
+  gitrepo="$repo/target-repo"
+  cat >"$repo/.pm/config.json" <<JSON
+{"repos": {"demo-repo": {"path": "$gitrepo", "mainline": "main"}}, "herdr_workspace": "zzz-test-ws", "automation": {"auto_close": true}}
+JSON
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+  tip="$(ac_make_worker_commit "$gitrepo" "$repo" i976-x)"
+
+  seed_verified_dispatch "$repo" D-976 I-976 zzz-test-tab-976 i976-x "$base_sha" "$tip"
+  seed_issue_state "$repo" I-976 OPEN ACTIVE
+
+  run_track "$repo"
+  assert_ac_surfaced "ac g4 mainline-ref-not-configured" "$repo" "I-976" "mainline-ref-not-configured"
+
+  git -C "$gitrepo" worktree remove --force "$repo/wt-i976-x" >/dev/null 2>&1 || true
+  rm -rf "$repo"
+}
+
+section_ac_g4_mainline_ref_missing() {
+  local repo gitrepo base_sha tip
+  repo="$(new_tmp_repo_with_git_ac true)"
+  gitrepo="$repo/target-repo"
+  # A short/unqualified ref value (not a full refs/... path, and also not an
+  # existing ref) -- covers both the "doesn't start with refs/" shape check
+  # and the "doesn't resolve" reachability check, which share this reason.
+  cat >"$repo/.pm/config.json" <<JSON
+{"repos": {"demo-repo": {"path": "$gitrepo", "mainline": "main", "mainline_ref": "main", "fetch_policy": "local-only"}}, "herdr_workspace": "zzz-test-ws", "automation": {"auto_close": true}}
+JSON
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+  tip="$(ac_make_worker_commit "$gitrepo" "$repo" i977-x)"
+
+  seed_verified_dispatch "$repo" D-977 I-977 zzz-test-tab-977 i977-x "$base_sha" "$tip"
+  seed_issue_state "$repo" I-977 OPEN ACTIVE
+
+  run_track "$repo"
+  assert_ac_surfaced "ac g4 mainline-ref-missing" "$repo" "I-977" "mainline-ref-missing"
+
+  git -C "$gitrepo" worktree remove --force "$repo/wt-i977-x" >/dev/null 2>&1 || true
+  rm -rf "$repo"
+}
+
+# AC.G4 non-string `mainline` + fetch_policy=fetch (Codex-sparred defect #3,
+# High, fix (c)): `mainline_ref` is well-formed (refs/remotes/origin/main,
+# so the earlier shape checks pass and the fetch_policy=="fetch" branch is
+# reached), but `mainline` itself is a JSON NUMBER, not a string. Pre-fix,
+# `"+refs/heads/" + mainline + ...` raises TypeError deep inside
+# tr_g4_check (string + int) -- this is the exact crash the per-issue
+# try/except (fix 3b) and the driver-level belt-and-suspenders (fix 3a)
+# exist to catch instead of vanishing silently. The type-guard (fix c)
+# catches it earliest and most precisely (surfaces mainline-ref-missing
+# WITHOUT ever needing a real "origin" remote -- the guard short-circuits
+# before any fetch subprocess is attempted), so this is the first line of
+# defense; the other two are the safety net behind it (see the red/green
+# notes in the final report for how a staged revert of (c) then (b)
+# exercises all three sub-fixes with this one scenario).
+section_ac_g4_mainline_non_string_type_guard() {
+  local repo gitrepo base_sha tip
+  repo="$(new_tmp_repo_with_git_ac true)"
+  gitrepo="$repo/target-repo"
+  cat >"$repo/.pm/config.json" <<JSON
+{"repos": {"demo-repo": {"path": "$gitrepo", "mainline": 123, "mainline_ref": "refs/remotes/origin/main", "fetch_policy": "fetch"}}, "herdr_workspace": "zzz-test-ws", "automation": {"auto_close": true}}
+JSON
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+  tip="$(ac_make_worker_commit "$gitrepo" "$repo" i990-x)"
+
+  seed_verified_dispatch "$repo" D-990 I-990 zzz-test-tab-990 i990-x "$base_sha" "$tip"
+  seed_issue_state "$repo" I-990 OPEN ACTIVE
+
+  run_track "$repo"
+  assert_ac_surfaced "ac g4 non-string mainline + fetch_policy=fetch -> mainline-ref-missing (no crash)" \
+    "$repo" "I-990" "mainline-ref-missing"
+
+  git -C "$gitrepo" worktree remove --force "$repo/wt-i990-x" >/dev/null 2>&1 || true
+  rm -rf "$repo"
+}
+
+# no-strict-ancestry-and-no-valid-marker: result_sha is a real, valid,
+# base-descendant commit, but was simply never merged to mainline (main
+# stays put) -- the default, un-merged state of ac_make_worker_commit's
+# output. STRICT topology alone (never patch-id/cherry/content-equivalence)
+# refuses to call this "merged".
+section_ac_g4_not_on_mainline() {
+  local repo gitrepo base_sha tip
+  repo="$(new_tmp_repo_with_git_ac true)"
+  gitrepo="$repo/target-repo"
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+  tip="$(ac_make_worker_commit "$gitrepo" "$repo" i978-x)"
+
+  seed_verified_dispatch "$repo" D-978 I-978 zzz-test-tab-978 i978-x "$base_sha" "$tip"
+  seed_issue_state "$repo" I-978 OPEN ACTIVE
+  # deliberately no ac_merge_worker_tip_to_mainline call -- main is untouched.
+
+  run_track "$repo"
+  assert_ac_surfaced "ac g4 no-strict-ancestry-and-no-valid-marker" "$repo" "I-978" \
+    "no-strict-ancestry-and-no-valid-marker"
+
+  git -C "$gitrepo" worktree remove --force "$repo/wt-i978-x" >/dev/null 2>&1 || true
+  rm -rf "$repo"
+}
+
+# AC.G4 GIT_NO_REPLACE_OBJECTS=1 on EVERY git call (Codex-sparred defect #4,
+# Medium) -- not just the ones inside tr_g4_check's own local run() closure.
+# Runs a normal closing tick with a `git` shim (make_git_env_wrapper) on
+# PATH and asserts: (1) the tick still closes normally (control -- the
+# wrapper is transparent/exec's through to the real git); (2) EVERY logged
+# git invocation carried GIT_NO_REPLACE_OBJECTS=1; (3) the specific graft
+# probe (tr_repo_has_grafts: `rev-parse --git-path info/grafts`) and
+# identity-anchor (tr_verify_commit: `rev-parse --verify --end-of-options
+# <sha>^{commit}`) calls were both actually observed carrying it.
+section_ac_g4_replace_objects_env_on_every_git_call() {
+  local repo gitrepo base_sha tip wrapper_dir log_file
+  repo="$(new_tmp_repo_with_git_ac true)"
+  gitrepo="$repo/target-repo"
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+  tip="$(ac_make_worker_commit "$gitrepo" "$repo" i992-x)"
+
+  seed_verified_dispatch "$repo" D-992 I-992 zzz-test-tab-992 i992-x "$base_sha" "$tip"
+  seed_issue_state "$repo" I-992 OPEN ACTIVE
+  ac_merge_worker_tip_to_mainline "$gitrepo" "$tip"
+
+  wrapper_dir="$(mktemp -d "${TMPDIR:-/tmp}/pm-creator-git-wrapper.XXXXXX")"
+  log_file="$(mktemp "${TMPDIR:-/tmp}/pm-creator-git-wrapper-log.XXXXXX")"
+  make_git_env_wrapper "$wrapper_dir" "$log_file"
+
+  run_track_with_git_wrapper "$repo" "$wrapper_dir"
+  assert_ac_closed "ac g4 git-env-wrapper control: still closes with wrapper on PATH" "$repo" "I-992"
+
+  if [[ ! -s "$log_file" ]]; then
+    fail "ac g4 git-env-wrapper: git calls were logged" "wrapper never invoked -- $log_file is empty"
+  else
+    local missing_env
+    missing_env="$(grep -vc '^1|' "$log_file")"
+    if [[ "$missing_env" == "0" ]]; then
+      ok "ac g4 git-env-wrapper: all logged git calls carried GIT_NO_REPLACE_OBJECTS=1"
+    else
+      fail "ac g4 git-env-wrapper: all logged git calls carried GIT_NO_REPLACE_OBJECTS=1" \
+        "$missing_env call(s) missing it: $(grep -v '^1|' "$log_file" | tr '\n' ';')"
+    fi
+    if grep -q 'rev-parse --git-path info/grafts' "$log_file"; then
+      ok "ac g4 git-env-wrapper: graft-probe call observed"
+    else
+      fail "ac g4 git-env-wrapper: graft-probe call observed" "no matching line in $log_file"
+    fi
+    if grep -q 'rev-parse --verify --end-of-options' "$log_file"; then
+      ok "ac g4 git-env-wrapper: identity-anchor call observed"
+    else
+      fail "ac g4 git-env-wrapper: identity-anchor call observed" "no matching line in $log_file"
+    fi
+    if grep -q 'rev-parse --git-path info/grafts' "$log_file" && ! grep '^<unset>|' "$log_file" | grep -q 'rev-parse --git-path info/grafts'; then
+      ok "ac g4 git-env-wrapper: graft-probe call carried GIT_NO_REPLACE_OBJECTS=1"
+    else
+      fail "ac g4 git-env-wrapper: graft-probe call carried GIT_NO_REPLACE_OBJECTS=1" \
+        "grafts call missing or unset in $log_file"
+    fi
+    if grep -q 'rev-parse --verify --end-of-options' "$log_file" && ! grep '^<unset>|' "$log_file" | grep -q 'rev-parse --verify --end-of-options'; then
+      ok "ac g4 git-env-wrapper: identity-anchor call carried GIT_NO_REPLACE_OBJECTS=1"
+    else
+      fail "ac g4 git-env-wrapper: identity-anchor call carried GIT_NO_REPLACE_OBJECTS=1" \
+        "identity-anchor call missing or unset in $log_file"
+    fi
+  fi
+
+  git -C "$gitrepo" worktree remove --force "$repo/wt-i992-x" >/dev/null 2>&1 || true
+  rm -rf "$repo" "$wrapper_dir"
+  rm -f "$log_file"
+}
+
+# ---------------------------------------------------------------------------
+# AC.G4 fetch_policy=fetch (Codex-sparred defect #5, Low) -- previously
+# untested; every other G4 fixture in this file uses fetch_policy=local-only.
+# Uses a local BARE repo as "origin" (never a real network remote) so the
+# real `git fetch` codepath in tr_g4_check actually runs, herdr-shadowed +
+# zzz-test-* only, matching every other fixture here.
+# ---------------------------------------------------------------------------
+section_ac_g4_fetch_policy_success() {
+  local repo gitrepo origin_bare base_sha tip
+  repo="$(new_tmp_repo_with_git_ac true)"
+  gitrepo="$repo/target-repo"
+  origin_bare="$repo/origin.git"
+
+  git_or_die "fetch-success: init bare origin" init -q --bare "$origin_bare"
+  git_or_die "fetch-success: add origin remote" -C "$gitrepo" remote add origin "$origin_bare"
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+  git_or_die "fetch-success: push initial main to origin" -C "$gitrepo" push -q origin main
+
+  tip="$(ac_make_worker_commit "$gitrepo" "$repo" i993-x)"
+  ac_merge_worker_tip_to_mainline "$gitrepo" "$tip"
+  git_or_die "fetch-success: push merged main to origin" -C "$gitrepo" push -q origin main
+
+  cat >"$repo/.pm/config.json" <<JSON
+{"repos": {"demo-repo": {"path": "$gitrepo", "mainline": "main", "mainline_ref": "refs/remotes/origin/main", "fetch_policy": "fetch"}}, "herdr_workspace": "zzz-test-ws", "automation": {"auto_close": true}}
+JSON
+
+  seed_verified_dispatch "$repo" D-993 I-993 zzz-test-tab-993 i993-x "$base_sha" "$tip"
+  seed_issue_state "$repo" I-993 OPEN ACTIVE
+
+  run_track "$repo"
+  assert_ac_closed "ac g4 fetch_policy=fetch: successful fetch+close" "$repo" "I-993"
+
+  git -C "$gitrepo" worktree remove --force "$repo/wt-i993-x" >/dev/null 2>&1 || true
+  rm -rf "$repo"
+}
+
+section_ac_g4_fetch_policy_failed() {
+  local repo gitrepo unreachable base_sha tip
+  repo="$(new_tmp_repo_with_git_ac true)"
+  gitrepo="$repo/target-repo"
+  unreachable="$repo/does-not-exist-origin.git"
+
+  git_or_die "fetch-failed: add origin remote (unreachable path)" \
+    -C "$gitrepo" remote add origin "$unreachable"
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+  tip="$(ac_make_worker_commit "$gitrepo" "$repo" i994-x)"
+  ac_merge_worker_tip_to_mainline "$gitrepo" "$tip"
+
+  cat >"$repo/.pm/config.json" <<JSON
+{"repos": {"demo-repo": {"path": "$gitrepo", "mainline": "main", "mainline_ref": "refs/remotes/origin/main", "fetch_policy": "fetch"}}, "herdr_workspace": "zzz-test-ws", "automation": {"auto_close": true}}
+JSON
+
+  seed_verified_dispatch "$repo" D-994 I-994 zzz-test-tab-994 i994-x "$base_sha" "$tip"
+  seed_issue_state "$repo" I-994 OPEN ACTIVE
+
+  run_track "$repo"
+  assert_ac_surfaced "ac g4 fetch_policy=fetch: unreachable origin -> fetch-failed" \
+    "$repo" "I-994" "fetch-failed"
+
+  git -C "$gitrepo" worktree remove --force "$repo/wt-i994-x" >/dev/null 2>&1 || true
+  rm -rf "$repo"
+}
+
+# ---------------------------------------------------------------------------
+# AC.OFF automation.auto_close=false (default) -- an otherwise fully
+# closeable issue is surfaced, never closed.
+# ---------------------------------------------------------------------------
+section_ac_auto_close_disabled() {
+  local repo gitrepo base_sha tip
+  repo="$(new_tmp_repo_with_git_ac false)"
+  gitrepo="$repo/target-repo"
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+  tip="$(ac_make_worker_commit "$gitrepo" "$repo" i979-x)"
+
+  seed_verified_dispatch "$repo" D-979 I-979 zzz-test-tab-979 i979-x "$base_sha" "$tip"
+  seed_issue_state "$repo" I-979 OPEN ACTIVE
+  ac_merge_worker_tip_to_mainline "$gitrepo" "$tip"
+
+  run_track "$repo"
+  assert_ac_surfaced "ac auto_close OFF" "$repo" "I-979" "auto-close-disabled"
+
+  git -C "$gitrepo" worktree remove --force "$repo/wt-i979-x" >/dev/null 2>&1 || true
+  rm -rf "$repo"
+}
+
+# ---------------------------------------------------------------------------
+# AC.SAMETICK same-tick safety: a `done` tab RECORDED as RETURNED by THIS
+# SAME tick's intake pass is not yet VERIFIED (human gate not yet applied),
+# so G3 naturally blocks its issue from auto-closing in the same tick --
+# no auto-record -> auto-close cascade in one tick.
+# ---------------------------------------------------------------------------
+section_ac_same_tick_safety() {
+  local repo gitrepo base_sha tip
+  repo="$(new_tmp_repo_with_git_ac true)"
+  gitrepo="$repo/target-repo"
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+  tip="$(ac_make_worker_commit "$gitrepo" "$repo" i980-x)"
+
+  seed_acked_dispatch "$repo" D-980 I-980 zzz-test-tab-980 i980-x "$base_sha"
+  seed_issue_state "$repo" I-980 OPEN ACTIVE
+  ac_merge_worker_tip_to_mainline "$gitrepo" "$tip"
+
+  run_track "$repo" "$(snapshot_json zzz-test-tab-980 "done" "i980-x")"
+  assert_eq "ac same-tick: exit 0" "0" "$TR_RC"
+  assert_true "ac same-tick: dispatch D-980 recorded RETURNED this tick" \
+    bash -c '
+      python3 -c "
+import json
+idx = json.load(open(\"$1/.pm/index.json\"))
+print(idx[\"dispatches\"][\"D-980\"][\"state\"])
+" | grep -qx RETURNED
+    ' _ "$repo"
+  assert_ac_surfaced "ac same-tick: I-980 NOT auto-closed this same tick" "$repo" "I-980" "dispatch-not-VERIFIED"
+
+  git -C "$gitrepo" worktree remove --force "$repo/wt-i980-x" >/dev/null 2>&1 || true
+  rm -rf "$repo"
+}
+
+# ---------------------------------------------------------------------------
+# AC P2-1: G4's network fetch must never run in an OFF tick (zero git fetch
+# invocations at all), and an ON tick fetches each configured (repo,ref) at
+# most ONCE per tick (pre-fetch phase), not once per closeable issue.
+# ---------------------------------------------------------------------------
+section_ac_p21_off_mode_zero_network() {
+  local repo gitrepo base_sha tip wrapper_dir log_file
+  repo="$(new_tmp_repo_with_git_ac false)"
+  gitrepo="$repo/target-repo"
+  ac_add_local_origin "$repo" "$gitrepo"
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+  tip="$(ac_make_worker_commit "$gitrepo" "$repo" i201-x)"
+  ac_merge_worker_tip_to_mainline "$gitrepo" "$tip"
+  git_or_die "p21 off: push merged main" -C "$gitrepo" push -q origin main
+  ac_fetch_policy_config "$repo" "$gitrepo" false
+
+  seed_verified_dispatch "$repo" D-201 I-201 zzz-test-tab-201 i201-x "$base_sha" "$tip"
+  seed_issue_state "$repo" I-201 OPEN ACTIVE
+
+  wrapper_dir="$(mktemp -d "${TMPDIR:-/tmp}/pm-creator-git-wrapper.XXXXXX")"
+  log_file="$(mktemp "${TMPDIR:-/tmp}/pm-creator-git-wrapper-log.XXXXXX")"
+  make_git_env_wrapper "$wrapper_dir" "$log_file"
+  run_track_with_git_wrapper "$repo" "$wrapper_dir"
+
+  assert_ac_surfaced "ac p2-1 OFF-mode" "$repo" "I-201" "auto-close-disabled"
+  assert_eq "ac p2-1 OFF-mode: zero 'git fetch' invocations in an OFF tick" \
+    "0" "$(grep -c '|fetch ' "$log_file")"
+
+  git -C "$gitrepo" worktree remove --force "$repo/wt-i201-x" >/dev/null 2>&1 || true
+  rm -rf "$repo" "$wrapper_dir"
+  rm -f "$log_file"
+}
+
+section_ac_p21_one_fetch_per_repo_ref_per_tick() {
+  local repo gitrepo base_sha tip2 tip3 wrapper_dir log_file
+  repo="$(new_tmp_repo_with_git_ac true)"
+  gitrepo="$repo/target-repo"
+  ac_add_local_origin "$repo" "$gitrepo"
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+
+  # Two closeable issues sharing the SAME repo -- worker commits touch
+  # DIFFERENT files so both merge cleanly into main.
+  tip2="$(ac_make_worker_commit "$gitrepo" "$repo" i202-x)"
+  git_or_die "p21 on: branch i203-x" -C "$gitrepo" branch i203-x main
+  git_or_die "p21 on: worktree add wt-i203-x" -C "$gitrepo" worktree add -q "$repo/wt-i203-x" i203-x
+  (
+    set -e
+    cd "$repo/wt-i203-x" || exit 1
+    printf 'other work\n' >second.txt
+    git add second.txt
+    git commit -q -m 'other work'
+  ) >&2 || { echo "FATAL: fixture git setup failed (p21 on: i203-x commit)" >&2; exit 1; }
+  tip3="$(git -C "$repo/wt-i203-x" rev-parse HEAD)"
+
+  # Merge BOTH branches into main (real merge commits, main checked out in
+  # the primary worktree) and push, so both tips are strict main ancestors.
+  git_or_die "p21 on: merge i202-x" -C "$gitrepo" merge -q -m 'merge i202-x' "$tip2"
+  git_or_die "p21 on: merge i203-x" -C "$gitrepo" merge -q -m 'merge i203-x' "$tip3"
+  git_or_die "p21 on: push merged main" -C "$gitrepo" push -q origin main
+  ac_fetch_policy_config "$repo" "$gitrepo" true
+
+  seed_verified_dispatch "$repo" D-202 I-202 zzz-test-tab-202 i202-x "$base_sha" "$tip2"
+  seed_issue_state "$repo" I-202 OPEN ACTIVE
+  seed_verified_dispatch "$repo" D-203 I-203 zzz-test-tab-203 i203-x "$base_sha" "$tip3"
+  seed_issue_state "$repo" I-203 OPEN ACTIVE
+
+  wrapper_dir="$(mktemp -d "${TMPDIR:-/tmp}/pm-creator-git-wrapper.XXXXXX")"
+  log_file="$(mktemp "${TMPDIR:-/tmp}/pm-creator-git-wrapper-log.XXXXXX")"
+  make_git_env_wrapper "$wrapper_dir" "$log_file"
+  run_track_with_git_wrapper "$repo" "$wrapper_dir"
+
+  assert_ac_closed "ac p2-1 ON single-fetch: I-202 closes" "$repo" "I-202"
+  assert_ac_closed "ac p2-1 ON single-fetch: I-203 closes" "$repo" "I-203"
+  assert_eq "ac p2-1 ON: exactly 1 'git fetch' for the shared (repo,ref) with 2 closeable issues" \
+    "1" "$(grep -c '|fetch ' "$log_file")"
+
+  git -C "$gitrepo" worktree remove --force "$repo/wt-i202-x" >/dev/null 2>&1 || true
+  git -C "$gitrepo" worktree remove --force "$repo/wt-i203-x" >/dev/null 2>&1 || true
+  rm -rf "$repo" "$wrapper_dir"
+  rm -f "$log_file"
+}
+
+# ---------------------------------------------------------------------------
+# AC P2-2: G4 must bind result_sha to the dispatch's OWN recorded branch
+# (branch tip == result_sha, or result_sha ancestor-of branch tip). A forged
+# `result` naming ANY already-merged commit (e.g. the mainline tip itself)
+# that never lived on the dispatch's branch must SURFACE, never close; a
+# missing/deleted/unresolvable branch is fail-closed the same way.
+# ---------------------------------------------------------------------------
+section_ac_p22_forged_result_sha_mainline_tip() {
+  local repo gitrepo base_sha main_tip
+  repo="$(new_tmp_repo_with_git_ac true)"
+  gitrepo="$repo/target-repo"
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+  # Real worker branch with a real (un-merged) commit; its tip itself is
+  # not needed -- the forged result below deliberately names main's tip.
+  ac_make_worker_commit "$gitrepo" "$repo" i211-x >/dev/null
+  # Advance mainline by an UNRELATED commit (descends from base, never on
+  # the dispatch's branch) -- the forged result_sha.
+  (
+    set -e
+    cd "$gitrepo" || exit 1
+    printf 'unrelated mainline work\n' >>README.md
+    git add README.md
+    git commit -q -m 'unrelated mainline work'
+  ) >&2 || { echo "FATAL: fixture git setup failed (p22 forged: mainline commit)" >&2; exit 1; }
+  main_tip="$(git -C "$gitrepo" rev-parse HEAD)"
+
+  # Forged result: result_sha = mainline tip, NOT on branch i211-x.
+  seed_verified_dispatch "$repo" D-211 I-211 zzz-test-tab-211 i211-x "$base_sha" "$main_tip"
+  seed_issue_state "$repo" I-211 OPEN ACTIVE
+
+  run_track "$repo"
+  assert_ac_surfaced "ac p2-2 forged result_sha=mainline-tip" "$repo" "I-211" "result-not-bound-to-branch"
+
+  git -C "$gitrepo" worktree remove --force "$repo/wt-i211-x" >/dev/null 2>&1 || true
+  rm -rf "$repo"
+}
+
+section_ac_p22_branch_deleted() {
+  local repo gitrepo base_sha tip
+  repo="$(new_tmp_repo_with_git_ac true)"
+  gitrepo="$repo/target-repo"
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+  tip="$(ac_make_worker_commit "$gitrepo" "$repo" i212-x)"
+
+  seed_verified_dispatch "$repo" D-212 I-212 zzz-test-tab-212 i212-x "$base_sha" "$tip"
+  seed_issue_state "$repo" I-212 OPEN ACTIVE
+  ac_merge_worker_tip_to_mainline "$gitrepo" "$tip"
+
+  # Post-merge branch cleanup happened before the tick: worktree + branch
+  # are gone. The binding gate can no longer corroborate result_sha against
+  # the branch -> fail-closed surface, never close.
+  git_or_die "p22 branch-deleted: worktree remove" -C "$gitrepo" worktree remove --force "$repo/wt-i212-x"
+  git_or_die "p22 branch-deleted: branch -D i212-x" -C "$gitrepo" branch -q -D i212-x
+
+  run_track "$repo"
+  assert_ac_surfaced "ac p2-2 branch-deleted" "$repo" "I-212" "result-not-bound-to-branch"
+
+  rm -rf "$repo"
+}
+
+# AC fix-pass-5b item 1: dispatch's own `branch` field (index-sourced, read
+# straight from disp.get("branch") in G4) is unvalidated -- it is used to
+# build `refs/heads/<branch>` for the P2-2 binding check with NO shape/
+# ticket-convention check applied at G4 time (stage-1's F1 gate only runs
+# at ACK-recording time; a corrupted/forged index `branch` field never
+# passes back through F1). A REAL, non-ticket-convention branch ("evil",
+# never matching TICKET_RE's `i<digits>-` prefix) with an otherwise fully
+# satisfiable binding (its own tip == result_sha) must still be REJECTED
+# at G4 -- reusing/mirroring F1's own TICKET_RE branch-shape check --
+# rather than being allowed to silently satisfy the P2-2 binding predicate
+# and close.
+section_ac_p22_branch_not_ticket_convention() {
+  local repo gitrepo base_sha tip
+  repo="$(new_tmp_repo_with_git_ac true)"
+  gitrepo="$repo/target-repo"
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+  tip="$(ac_make_worker_commit "$gitrepo" "$repo" evil)"
+
+  seed_verified_dispatch "$repo" D-213 I-213 zzz-test-tab-213 evil "$base_sha" "$tip"
+  seed_issue_state "$repo" I-213 OPEN ACTIVE
+  ac_merge_worker_tip_to_mainline "$gitrepo" "$tip"
+
+  run_track "$repo"
+  assert_ac_surfaced "ac fix-pass-5b#1 non-ticket-convention branch 'evil' rejected at G4" \
+    "$repo" "I-213" "result-not-bound-to-branch"
+
+  git -C "$gitrepo" worktree remove --force "$repo/wt-evil" >/dev/null 2>&1 || true
+  rm -rf "$repo"
+}
+
+# AC fix-pass-5b item 2: the close-outcome classifier
+# (tr_ac_classify_close_failure, defined in templates/bin/track) must key
+# on WHOLE stderr LINES that _lib.sh itself emits with a `<token>: ...`
+# prefix (P3-4) -- never a bare substring match over the captured blob,
+# which embeds pm_apply's own output and could let attacker/data-controlled
+# text (e.g. an echoed detail or filename) containing a token mid-line
+# forge a classification. Extracts and sources ONLY the function
+# definition (never the whole `track` script, which has no main-guard and
+# would run real side effects) so this is a true unit-level test.
+section_ac_close_classifier_line_anchored() {
+  local track_bin="$TRACK" fn_file got
+  fn_file="$(mktemp)"
+
+  awk '/^tr_ac_classify_close_failure\(\) \{/,/^}/' "$track_bin" > "$fn_file"
+  assert_true "fix-pass-5b#2: extracted classifier function is non-empty" \
+    bash -c '[[ -s "$1" ]]' _ "$fn_file"
+  # shellcheck disable=SC1090
+  source "$fn_file"
+
+  # A token forged MID-LINE (embedded inside an unrelated message, as a
+  # real pm_apply detail or filename could be) must NOT classify.
+  got="$(tr_ac_classify_close_failure "close: refusing note ref=archived:I-1 (detail mentions close-transition-durable in passing). No event was emitted.")"
+  assert_true "fix-pass-5b#2: token embedded mid-line does NOT classify as closed-with-pending-archive" \
+    bash -c '[[ "$1" != "closed-with-pending-archive" ]]' _ "$got"
+
+  got="$(tr_ac_classify_close_failure "close: failed to archive prompts/I-1_close-refused-state-race-note.md (mv: some other real error)")"
+  assert_true "fix-pass-5b#2: token embedded mid-line (filename) does NOT classify as close-race/refusal" \
+    bash -c '[[ "$1" != "close-race/refusal" ]]' _ "$got"
+
+  # A token on its OWN, properly-prefixed line still classifies correctly.
+  got="$(tr_ac_classify_close_failure "$(printf 'close: some preamble\nclose-transition-durable: I-1 is durably CLOSED on the log; a later archive/note step failed\n')")"
+  assert_true "fix-pass-5b#2: genuine line-anchored token still classifies as closed-with-pending-archive" \
+    bash -c '[[ "$1" == "closed-with-pending-archive" ]]' _ "$got"
+
+  got="$(tr_ac_classify_close_failure "$(printf 'close-refused-state-race: refusing to close I-1: current=ACTIVE requested=CLOSED. No event was emitted.\n')")"
+  assert_true "fix-pass-5b#2: genuine line-anchored token still classifies as close-race/refusal" \
+    bash -c '[[ "$1" == "close-race/refusal" ]]' _ "$got"
+
+  rm -f "$fn_file"
+}
+
+# AC fix-pass-5b item 3: the AC driver (`_tr_ac_driver`, concatenated with
+# _TR_CORROB_PY + _TR_CLOSE_PY at its real call site so REASONS is in
+# scope) must enforce that every surfaced/rearchive verdict's `reason` is a
+# REGISTERED token in the REASONS frozenset -- an unregistered token must
+# NEVER be written verbatim into a verdict row (silent registry drift);
+# it must instead fail LOUD as `auto-close-driver-error`. This is exercised
+# by running the REAL, unmodified driver source (extracted verbatim from
+# track by line range, not reproduced/rewritten) through python3 with
+# `evaluate_issue` monkeypatched -- inserted as its own script segment
+# AFTER _TR_CLOSE_PY defines the real one, BEFORE the driver's loop calls
+# it -- to return a deliberately made-up, unregistered reason token. No
+# test-only hook is added to track itself.
+section_ac_reasons_registry_enforced() {
+  local corrob_f close_f driver_f override_f index_f out_f prefetch_f repos_f root_d reason
+
+  corrob_f="$(mktemp)"; close_f="$(mktemp)"; driver_f="$(mktemp)"
+  override_f="$(mktemp)"; index_f="$(mktemp)"; out_f="$(mktemp)"
+  prefetch_f="$(mktemp)"; repos_f="$(mktemp)"
+  root_d="$(mktemp -d)"
+
+  sed -n '383,532p' "$TRACK" > "$corrob_f"
+  sed -n '543,995p' "$TRACK" > "$close_f"
+  sed -n '1334,1422p' "$TRACK" > "$driver_f"
+  assert_true "fix-pass-5b#3: all three extracted driver segments are non-empty" \
+    bash -c '[[ -s "$1" && -s "$2" && -s "$3" ]]' _ "$corrob_f" "$close_f" "$driver_f"
+
+  cat > "$override_f" <<'PYEOF'
+def evaluate_issue(issue_id, *a, **kw):
+    return "surface", "totally-made-up-reason-xyz"
+PYEOF
+
+  printf '{"issues": {"I-777": {}}, "dispatch_issue_map": {}}' > "$index_f"
+  printf '{}' > "$prefetch_f"
+  printf '{}' > "$repos_f"
+
+  PM_TR_INDEX="$index_f" PM_TR_ROOT="$root_d" PM_TR_AUTO_CLOSE=1 \
+    PM_TR_AC_OUT="$out_f" PM_TR_REPOS="$(cat "$repos_f")" PM_TR_PREFETCH="$prefetch_f" \
+    bash -c 'cat "$1" "$2" "$3" "$4" | python3 -' _ "$corrob_f" "$close_f" "$override_f" "$driver_f"
+  assert_true "fix-pass-5b#3: monkeypatched driver run exits 0" \
+    bash -c '[[ -s "$1" ]]' _ "$out_f"
+
+  reason="$(python3 -c 'import json,sys; rows=json.load(open(sys.argv[1])); print(rows[0]["reason"])' "$out_f")"
+  assert_true "fix-pass-5b#3: unregistered reason token 'totally-made-up-reason-xyz' does NOT reach the verdict row -- surfaces as auto-close-driver-error instead" \
+    bash -c '[[ "$1" == "auto-close-driver-error" ]]' _ "$reason"
+
+  rm -f "$corrob_f" "$close_f" "$driver_f" "$override_f" "$index_f" "$out_f" "$prefetch_f" "$repos_f"
+  rm -rf "$root_d"
+}
+
+# ---------------------------------------------------------------------------
+# AC P3-1: git argv hygiene -- a leading-dash remote segment parsed out of
+# mainline_ref must be rejected outright (mainline-ref-missing) and must
+# never reach a git fetch invocation's argv.
+# ---------------------------------------------------------------------------
+section_ac_p31_leading_dash_remote() {
+  local repo gitrepo base_sha tip wrapper_dir log_file
+  repo="$(new_tmp_repo_with_git_ac true)"
+  gitrepo="$repo/target-repo"
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+  tip="$(ac_make_worker_commit "$gitrepo" "$repo" i221-x)"
+  ac_merge_worker_tip_to_mainline "$gitrepo" "$tip"
+  cat >"$repo/.pm/config.json" <<JSON
+{"repos": {"demo-repo": {"path": "$gitrepo", "mainline": "main", "mainline_ref": "refs/remotes/-evil/main", "fetch_policy": "fetch"}}, "herdr_workspace": "zzz-test-ws", "automation": {"auto_close": true}}
+JSON
+
+  seed_verified_dispatch "$repo" D-221 I-221 zzz-test-tab-221 i221-x "$base_sha" "$tip"
+  seed_issue_state "$repo" I-221 OPEN ACTIVE
+
+  wrapper_dir="$(mktemp -d "${TMPDIR:-/tmp}/pm-creator-git-wrapper.XXXXXX")"
+  log_file="$(mktemp "${TMPDIR:-/tmp}/pm-creator-git-wrapper-log.XXXXXX")"
+  make_git_env_wrapper "$wrapper_dir" "$log_file"
+  run_track_with_git_wrapper "$repo" "$wrapper_dir"
+
+  assert_ac_surfaced "ac p3-1 leading-dash remote" "$repo" "I-221" "mainline-ref-missing"
+  assert_eq "ac p3-1 leading-dash remote: no fetch invocation ever attempted" \
+    "0" "$(grep -c '|fetch ' "$log_file")"
+
+  git -C "$gitrepo" worktree remove --force "$repo/wt-i221-x" >/dev/null 2>&1 || true
+  rm -rf "$repo" "$wrapper_dir"
+  rm -f "$log_file"
+}
+
+# ---------------------------------------------------------------------------
+# AC P3-2: repo-redirecting git env (GIT_DIR & friends) inherited by track
+# must be scrubbed before every corroboration git call -- otherwise a decoy
+# repository in the caller's environment silently substitutes for the
+# configured repo and a NOT-merged result false-closes.
+# ---------------------------------------------------------------------------
+section_ac_p32_git_dir_decoy_scrubbed() {
+  local repo gitrepo decoy base_sha tip
+  repo="$(new_tmp_repo_with_git_ac true)"
+  gitrepo="$repo/target-repo"
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+  tip="$(ac_make_worker_commit "$gitrepo" "$repo" i222-x)"
+
+  # Build the DECOY: a full copy of the repo in its merged state...
+  ac_merge_worker_tip_to_mainline "$gitrepo" "$tip"
+  decoy="$repo/decoy-repo"
+  cp -a "$gitrepo" "$decoy"
+  # ...then WIND BACK the real repo to the un-merged state. Truth: result
+  # was never merged to mainline -> must surface, never close.
+  git_or_die "p3-2 decoy: unmerge real main" -C "$gitrepo" update-ref refs/heads/main "$base_sha"
+
+  seed_verified_dispatch "$repo" D-222 I-222 zzz-test-tab-222 i222-x "$base_sha" "$tip"
+  seed_issue_state "$repo" I-222 OPEN ACTIVE
+
+  # shellcheck disable=SC2034
+  TR_OUT="$(cd "$repo" && GIT_DIR="$decoy/.git" PATH="/usr/bin:/bin" bash bin/track --once 2>&1)"
+  TR_RC=$?
+
+  assert_ac_surfaced "ac p3-2 GIT_DIR decoy scrubbed" "$repo" "I-222" \
+    "no-strict-ancestry-and-no-valid-marker"
+
+  git -C "$gitrepo" worktree remove --force "$repo/wt-i222-x" >/dev/null 2>&1 || true
+  rm -rf "$repo"
+}
+
+# ---------------------------------------------------------------------------
+# AC P3-3(b): a WHOLE-driver crash (driver process dies before writing its
+# verdict) must degrade to the loud sentinel row WITH the driver's stderr
+# tail embedded as detail, and echo that tail to track's own stderr --
+# never silently swallow it (pre-fix the stderr temp file was rm'd unread).
+# Simulated via a python3 shim that dies ONLY for the auto-close driver
+# invocation (keyed on PM_TR_AC_OUT in its env).
+# ---------------------------------------------------------------------------
+section_ac_p33_whole_driver_crash() {
+  local repo shim real_python
+  repo="$(new_tmp_repo_with_git_ac true)"
+  seed_issue_state "$repo" I-232 OPEN ACTIVE
+
+  shim="$(mktemp -d "${TMPDIR:-/tmp}/pm-creator-python-shim.XXXXXX")"
+  real_python="$(command -v python3)"
+  cat >"$shim/python3" <<EOF
+#!/usr/bin/env bash
+if [[ -n "\${PM_TR_AC_OUT:-}" ]]; then
+  echo "zzz-test-simulated-driver-crash" >&2
+  exit 1
+fi
+exec "$real_python" "\$@"
+EOF
+  chmod +x "$shim/python3"
+
+  # shellcheck disable=SC2034
+  TR_OUT="$(cd "$repo" && PATH="$shim:/usr/bin:/bin" bash bin/track --once 2>&1)"
+  TR_RC=$?
+
+  assert_eq "ac p3-3b whole-driver crash: exit 0 (degrade, not fatal)" "0" "$TR_RC"
+  assert_true "ac p3-3b whole-driver crash: sentinel degradation row rendered" \
+    bash -c 'grep -q "auto-close-driver-error" "$1/TRACKER.md"' _ "$repo"
+  assert_true "ac p3-3b whole-driver crash: driver stderr tail echoed to track stderr" \
+    bash -c '[[ "$1" == *zzz-test-simulated-driver-crash* ]]' _ "$TR_OUT"
+  assert_true "ac p3-3b whole-driver crash: stderr tail embedded as detail in the fallback row" \
+    bash -c 'grep "auto-close-driver-error" "$1/TRACKER.md" | grep -q "zzz-test-simulated-driver-crash"' _ "$repo"
+
+  rm -rf "$repo" "$shim"
+}
+
+# ---------------------------------------------------------------------------
+# AC P3-6 (+ P3-3(a) detail): an OSError from _ac_has_leftovers' listdir
+# (unreadable prompts/ dir) must SURFACE for that issue -- pre-fix it was
+# swallowed and read as "no leftovers", silently skipping crash-recovery
+# re-archiving. Post-fix it propagates to the per-issue handler and surfaces
+# auto-close-driver-error WITH a bounded traceback as detail.
+# ---------------------------------------------------------------------------
+section_ac_p36_leftover_listdir_error() {
+  local repo
+  repo="$(new_tmp_repo_with_git_ac true)"
+  seed_issue_state "$repo" I-233 OPEN CLOSED
+  mkdir -p "$repo/prompts"
+  printf 'leftover\n' >"$repo/prompts/I-233_dispatch.md"
+  chmod 000 "$repo/prompts"
+
+  run_track "$repo"
+  chmod 755 "$repo/prompts"
+
+  assert_eq "ac p3-6 unreadable prompts/: exit 0" "0" "$TR_RC"
+  assert_true "ac p3-6 unreadable prompts/: I-233 surfaced auto-close-driver-error (not silent no-leftovers skip)" \
+    bash -c 'grep -q "I-233" "$1/TRACKER.md" && grep -q "auto-close-driver-error" "$1/TRACKER.md"' _ "$repo"
+  assert_true "ac p3-6 unreadable prompts/: bounded traceback detail present (PermissionError)" \
+    bash -c 'grep -q "PermissionError" "$1/TRACKER.md"' _ "$repo"
+
+  rm -rf "$repo"
+}
+
+# ---------------------------------------------------------------------------
+# P3-4: machine-readable close-refusal classes from pm_close_issue -- stable
+# one-token stderr prefixes (unit level, direct in-process call).
+# ---------------------------------------------------------------------------
+section_p34_close_refusal_tokens() {
+  local repo out rc
+  # (ii) never-registered
+  repo="$(new_tmp_repo)"
+  out="$(pm_close_issue "$repo" I-777 2>&1)"
+  rc=$?
+  assert_true "p3-4 never-registered: nonzero rc" bash -c '[[ "$1" != "0" ]]' _ "$rc"
+  assert_true "p3-4 never-registered: stable token close-refused-never-registered on stderr" \
+    bash -c '[[ "$1" == *close-refused-never-registered* ]]' _ "$out"
+  rm -rf "$repo"
+
+  # (iii) unfoldable log -- pm_fold cannot rewrite a read-only index.json.
+  repo="$(new_tmp_repo)"
+  seed_issue_state "$repo" I-778 OPEN ACTIVE
+  chmod 444 "$repo/.pm/index.json"
+  out="$(pm_close_issue "$repo" I-778 2>&1)"
+  rc=$?
+  chmod 644 "$repo/.pm/index.json"
+  assert_true "p3-4 unfoldable-log: nonzero rc" bash -c '[[ "$1" != "0" ]]' _ "$rc"
+  assert_true "p3-4 unfoldable-log: refusal branch actually hit" \
+    bash -c '[[ "$1" == *unfoldable* ]]' _ "$out"
+  assert_true "p3-4 unfoldable-log: stable token close-refused-unfoldable-log on stderr" \
+    bash -c '[[ "$1" == *close-refused-unfoldable-log* ]]' _ "$out"
+  rm -rf "$repo"
+}
+
+# ---------------------------------------------------------------------------
+# AC P3-4: durable CLOSED transition + archive failure in the same close ->
+# the issue IS closed (event durably on the log); track must render it as
+# closed-with-pending-archive in the Auto-closed section (counted closed,
+# flagged), NOT as a "not auto-closed" refusal.
+# ---------------------------------------------------------------------------
+section_ac_p34_closed_with_pending_archive() {
+  local repo gitrepo base_sha tip
+  repo="$(new_tmp_repo_with_git_ac true)"
+  gitrepo="$repo/target-repo"
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+  tip="$(ac_make_worker_commit "$gitrepo" "$repo" i241-x)"
+
+  seed_verified_dispatch "$repo" D-241 I-241 zzz-test-tab-241 i241-x "$base_sha" "$tip"
+  seed_issue_state "$repo" I-241 OPEN ACTIVE
+  ac_merge_worker_tip_to_mainline "$gitrepo" "$tip"
+  # Sabotage the archive step ONLY: archive path exists as a FILE, so
+  # mkdir -p archive/prompts fails AFTER the CLOSED transition landed.
+  printf 'not a dir\n' >"$repo/archive"
+
+  run_track "$repo"
+
+  assert_eq "ac p3-4 durable-close+archive-fail: exit 0" "0" "$TR_RC"
+  assert_eq "ac p3-4 durable-close+archive-fail: CLOSED transition durably emitted" \
+    "CLOSED" "$(issue_state_in_index "$repo" "I-241")"
+  assert_true "ac p3-4 durable-close+archive-fail: rendered closed-with-pending-archive" \
+    bash -c 'grep "closed-with-pending-archive" "$1/TRACKER.md" | grep -q "I-241"' _ "$repo"
+  assert_true "ac p3-4 durable-close+archive-fail: counted closed (stdout AUTO-CLOSED line)" \
+    bash -c '[[ "$1" == *"AUTO-CLOSED I-241"* ]]' _ "$TR_OUT"
+  assert_true "ac p3-4 durable-close+archive-fail: NOT misclassified close/archive-failure" \
+    bash -c '! grep -q "close/archive-failure" "$1/TRACKER.md"' _ "$repo"
+
+  git -C "$gitrepo" worktree remove --force "$repo/wt-i241-x" >/dev/null 2>&1 || true
+  rm -rf "$repo"
+}
+
+# ---------------------------------------------------------------------------
+# AC P3-7: surfaced-output signal partition -- actionable/anomalous reasons
+# render individually; steady-state reasons (paused/non-active,
+# dispatch-not-VERIFIED, auto-close-disabled, issue-unregistered) collapse
+# to one summary line each with a (truncated) id list.
+# ---------------------------------------------------------------------------
+section_ac_p37_output_partition() {
+  local repo
+  repo="$(new_tmp_repo_with_git_ac true)"
+  # 2x steady-state noise
+  seed_issue_state "$repo" I-251 OPEN PARKED
+  seed_issue_state "$repo" I-252 OPEN PARKED
+  # 2x phantom ids: dispatches to never-registered issues
+  PM_ROOT="$repo" pm_apply dispatch_new d=D-253 i=I-253x at="$(now_iso)" >/dev/null
+  PM_ROOT="$repo" pm_apply dispatch_new d=D-254 i=I-254x at="$(now_iso)" >/dev/null
+  # 1x actionable signal
+  seed_issue_state "$repo" I-255 OPEN ACTIVE
+  PM_ROOT="$repo" pm_raw_append question q=Q-255 state=BOGUS at="$(now_iso)" i=I-255
+
+  run_track "$repo"
+
+  assert_eq "ac p3-7: exit 0" "0" "$TR_RC"
+  assert_true "ac p3-7: actionable reason rendered individually (issue+reason same line)" \
+    bash -c 'grep "invalid-question-state" "$1/TRACKER.md" | grep -q "I-255"' _ "$repo"
+  assert_eq "ac p3-7: paused/non-active collapsed to ONE summary line" \
+    "1" "$(grep -c "paused/non-active" "$repo/TRACKER.md")"
+  assert_true "ac p3-7: paused summary line carries both ids" \
+    bash -c 'grep "paused/non-active" "$1/TRACKER.md" | grep "I-251" | grep -q "I-252"' _ "$repo"
+  assert_eq "ac p3-7: issue-unregistered collapsed to ONE aggregated row" \
+    "1" "$(grep -c "issue-unregistered" "$repo/TRACKER.md")"
+  assert_true "ac p3-7: aggregated unregistered row lists the phantom ids" \
+    bash -c 'grep "issue-unregistered" "$1/TRACKER.md" | grep "I-253x" | grep -q "I-254x"' _ "$repo"
+
+  rm -rf "$repo"
+}
+
+# ---------------------------------------------------------------------------
+# T2: AC.G3 negative variants -- each dispatch-graph shape must surface its
+# specific reason and never close. All four cases live in one repo/tick
+# (independent issues).
+# ---------------------------------------------------------------------------
+section_ac_t2_g3_negative_variants() {
+  local repo
+  repo="$(new_tmp_repo_with_git_ac true)"
+
+  # (a) ABANDONED without a successor.
+  seed_issue_state "$repo" I-261 OPEN ACTIVE
+  PM_ROOT="$repo" pm_apply dispatch_new d=D-261 i=I-261 at="$(now_iso)" >/dev/null
+  PM_ROOT="$repo" pm_apply dispatch_state d=D-261 from=READY to=ABANDONED lane=human at="$(now_iso)" >/dev/null
+
+  # (b) FAILED dispatch.
+  seed_issue_state "$repo" I-262 OPEN ACTIVE
+  PM_ROOT="$repo" pm_apply dispatch_new d=D-262 i=I-262 at="$(now_iso)" >/dev/null
+  PM_ROOT="$repo" pm_apply dispatch_state d=D-262 from=READY to=DISPATCHED lane=human at="$(now_iso)" >/dev/null
+  PM_ROOT="$repo" pm_apply dispatch_state d=D-262 a=A-01 from=DISPATCHED to=FAILED lane=human at="$(now_iso)" >/dev/null
+
+  # (c) QUARANTINED dispatch STATE via a LEGAL human transition
+  # (READY->QUARANTINED through pm_apply) -- no quarantined LINE exists, so
+  # G1.5's quarantine_by_issue is empty and G3's own QUARANTINED branch is
+  # what must fire.
+  seed_issue_state "$repo" I-263 OPEN ACTIVE
+  PM_ROOT="$repo" pm_apply dispatch_new d=D-263 i=I-263 at="$(now_iso)" >/dev/null
+  PM_ROOT="$repo" pm_apply dispatch_state d=D-263 from=READY to=QUARANTINED lane=human at="$(now_iso)" >/dev/null
+
+  # (d) sole dispatch superseded (by another issue's dispatch) -> no
+  # non-superseded dispatch left at all.
+  seed_issue_state "$repo" I-264 OPEN ACTIVE
+  PM_ROOT="$repo" pm_apply dispatch_new d=D-264 i=I-264 at="$(now_iso)" >/dev/null
+  seed_issue_state "$repo" I-265x OPEN ACTIVE
+  PM_ROOT="$repo" pm_apply dispatch_new d=D-265 i=I-265x at="$(now_iso)" supersedes=D-264 >/dev/null
+
+  run_track "$repo"
+  assert_ac_surfaced "ac t2 g3 ABANDONED-without-successor" "$repo" "I-261" "ABANDONED-without-same-issue-successor"
+  assert_ac_surfaced "ac t2 g3 FAILED dispatch" "$repo" "I-262" "FAILED"
+  assert_ac_surfaced "ac t2 g3 QUARANTINED dispatch state" "$repo" "I-263" "QUARANTINED"
+  assert_ac_surfaced "ac t2 g3 no-non-superseded-dispatch" "$repo" "I-264" "no-non-superseded-dispatch"
+
+  rm -rf "$repo"
+}
+
+# ---------------------------------------------------------------------------
+# T3: graft/replace gates behaviorally -- history-rewriting mechanisms that
+# FAKE the merged topology must never produce a close.
+# ---------------------------------------------------------------------------
+
+# (a) old-style .git/info/grafts faking "worker tip is a parent of main's
+# tip": GIT_NO_REPLACE_OBJECTS does NOT neutralize grafts, so the explicit
+# graft probe must refuse the whole repo (replace-affected). Inverting
+# tr_repo_has_grafts makes the faked ancestry hold and this test close ->
+# red.
+section_ac_t3_graft_file_fakes_ancestry() {
+  local repo gitrepo base_sha tip main_tip main_parent
+  repo="$(new_tmp_repo_with_git_ac true)"
+  gitrepo="$repo/target-repo"
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+  tip="$(ac_make_worker_commit "$gitrepo" "$repo" i271-x)"
+  # Advance main so it has a graftable parent slot; worker tip NOT merged.
+  (
+    set -e
+    cd "$gitrepo" || exit 1
+    printf 'mainline drift\n' >>README.md
+    git add README.md
+    git commit -q -m 'mainline drift'
+  ) >&2 || { echo "FATAL: fixture git setup failed (t3 grafts: mainline commit)" >&2; exit 1; }
+  main_tip="$(git -C "$gitrepo" rev-parse HEAD)"
+  main_parent="$(git -C "$gitrepo" rev-parse HEAD^)"
+
+  seed_verified_dispatch "$repo" D-271 I-271 zzz-test-tab-271 i271-x "$base_sha" "$tip"
+  seed_issue_state "$repo" I-271 OPEN ACTIVE
+
+  # Graft: pretend main's tip ALSO has the worker tip as a parent -- faked
+  # "merged" ancestry via .git/info/grafts.
+  mkdir -p "$gitrepo/.git/info"
+  printf '%s %s %s\n' "$main_tip" "$main_parent" "$tip" >"$gitrepo/.git/info/grafts"
+
+  run_track "$repo"
+  assert_ac_surfaced "ac t3 grafts file fakes ancestry -> replace-affected" \
+    "$repo" "I-271" "replace-affected"
+
+  git -C "$gitrepo" worktree remove --force "$repo/wt-i271-x" >/dev/null 2>&1 || true
+  rm -rf "$repo"
+}
+
+# (b) modern `git replace --graft` faking the same ancestry: neutralized by
+# GIT_NO_REPLACE_OBJECTS=1 on every corroboration call, so the un-merged
+# truth prevails (no-strict-ancestry surface) -- behavioral proof the env
+# var actually bites, beyond the env-presence wrapper test above.
+section_ac_t3_replace_ref_fakes_ancestry() {
+  local repo gitrepo base_sha tip main_tip main_parent
+  repo="$(new_tmp_repo_with_git_ac true)"
+  gitrepo="$repo/target-repo"
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+  tip="$(ac_make_worker_commit "$gitrepo" "$repo" i272-x)"
+  (
+    set -e
+    cd "$gitrepo" || exit 1
+    printf 'mainline drift\n' >>README.md
+    git add README.md
+    git commit -q -m 'mainline drift'
+  ) >&2 || { echo "FATAL: fixture git setup failed (t3 replace: mainline commit)" >&2; exit 1; }
+  main_tip="$(git -C "$gitrepo" rev-parse HEAD)"
+  main_parent="$(git -C "$gitrepo" rev-parse HEAD^)"
+
+  seed_verified_dispatch "$repo" D-272 I-272 zzz-test-tab-272 i272-x "$base_sha" "$tip"
+  seed_issue_state "$repo" I-272 OPEN ACTIVE
+
+  git_or_die "t3 replace --graft" -C "$gitrepo" replace --graft "$main_tip" "$main_parent" "$tip"
+  # Sanity: the replace ref DOES fake the ancestry when replace objects are
+  # honored -- the fixture is genuinely adversarial.
+  if git -C "$gitrepo" merge-base --is-ancestor "$tip" "$main_tip"; then
+    ok "ac t3 replace-ref fixture: faked ancestry holds without the guard"
+  else
+    fail "ac t3 replace-ref fixture: faked ancestry holds without the guard" "replace --graft had no effect"
+  fi
+
+  run_track "$repo"
+  assert_ac_surfaced "ac t3 replace ref neutralized -> no-strict-ancestry surfaces" \
+    "$repo" "I-272" "no-strict-ancestry-and-no-valid-marker"
+
+  git -C "$gitrepo" worktree remove --force "$repo/wt-i272-x" >/dev/null 2>&1 || true
+  rm -rf "$repo"
+}
+
+# ---------------------------------------------------------------------------
+# T4: G4 per-issue surface coverage -- repo-not-configured, repo-not-on-disk,
+# missing-repo-metadata, unreachable (garbage sha), all in one tick.
+# ---------------------------------------------------------------------------
+_t4_seed_verified() {
+  # _t4_seed_verified <repo> <d> <issue> <repo_name> <branch> <base_sha|""> <result_sha>
+  local repo="$1" d="$2" issue="$3" rname="$4" branch="$5" base="$6" rsha="$7"
+  PM_ROOT="$repo" pm_apply dispatch_new d="$d" i="$issue" at="$(now_iso)" >/dev/null
+  if [[ -n "$base" ]]; then
+    PM_ROOT="$repo" pm_apply dispatch_state d="$d" from=READY to=DISPATCHED lane=human \
+      at="$(now_iso)" repo="$rname" branch="$branch" base_sha="$base" >/dev/null
+  else
+    PM_ROOT="$repo" pm_apply dispatch_state d="$d" from=READY to=DISPATCHED lane=human \
+      at="$(now_iso)" repo="$rname" branch="$branch" >/dev/null
+  fi
+  PM_ROOT="$repo" pm_apply dispatch_state d="$d" a=A-01 from=DISPATCHED to=ACKED lane=human \
+    at="$(now_iso)" tab="zzz-test-tab-$d" >/dev/null
+  PM_ROOT="$repo" pm_apply result d="$d" a=A-01 status=RETURNED result_sha="$rsha" \
+    at="$(now_iso)" >/dev/null
+  PM_ROOT="$repo" pm_apply dispatch_state d="$d" a=A-01 from=RETURNED to=VERIFIED lane=human \
+    at="$(now_iso)" >/dev/null
+}
+
+section_ac_t4_g4_surface_coverage() {
+  local repo gitrepo head_sha garbage
+  repo="$(new_tmp_repo_with_git_ac true)"
+  gitrepo="$repo/target-repo"
+  head_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+  garbage="deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+  cat >"$repo/.pm/config.json" <<JSON
+{"repos": {"demo-repo": {"path": "$gitrepo", "mainline": "main", "mainline_ref": "refs/heads/main", "fetch_policy": "local-only"}, "gone-repo": {"path": "$repo/no-such-dir", "mainline": "main", "mainline_ref": "refs/heads/main", "fetch_policy": "local-only"}}, "herdr_workspace": "zzz-test-ws", "automation": {"auto_close": true}}
+JSON
+
+  seed_issue_state "$repo" I-281 OPEN ACTIVE
+  _t4_seed_verified "$repo" D-281 I-281 gone-repo i281-x "$head_sha" "$head_sha"
+  seed_issue_state "$repo" I-282 OPEN ACTIVE
+  _t4_seed_verified "$repo" D-282 I-282 demo-repo i282-x "" "$head_sha"
+  seed_issue_state "$repo" I-283 OPEN ACTIVE
+  _t4_seed_verified "$repo" D-283 I-283 demo-repo i283-x "$head_sha" "$garbage"
+  seed_issue_state "$repo" I-284 OPEN ACTIVE
+  _t4_seed_verified "$repo" D-284 I-284 zzz-unconfigured-repo i284-x "$head_sha" "$head_sha"
+
+  run_track "$repo"
+  assert_ac_surfaced "ac t4 repo-not-on-disk" "$repo" "I-281" "repo-not-on-disk"
+  assert_ac_surfaced "ac t4 missing-repo-metadata" "$repo" "I-282" "missing-repo-metadata"
+  assert_ac_surfaced "ac t4 unreachable garbage sha" "$repo" "I-283" "unreachable"
+  assert_ac_surfaced "ac t4 repo-not-configured" "$repo" "I-284" "repo-not-configured"
+
+  rm -rf "$repo"
+}
+
+# ---------------------------------------------------------------------------
+# T7: idempotence -- a second tick after a successful auto-close closes
+# nothing new, emits no duplicate events, renders no duplicate rows.
+# ---------------------------------------------------------------------------
+section_ac_t7_idempotent_second_tick() {
+  local repo gitrepo base_sha tip
+  repo="$(new_tmp_repo_with_git_ac true)"
+  gitrepo="$repo/target-repo"
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+  tip="$(ac_make_worker_commit "$gitrepo" "$repo" i291-x)"
+
+  seed_verified_dispatch "$repo" D-291 I-291 zzz-test-tab-291 i291-x "$base_sha" "$tip"
+  seed_issue_state "$repo" I-291 OPEN ACTIVE
+  ac_merge_worker_tip_to_mainline "$gitrepo" "$tip"
+
+  run_track "$repo"
+  assert_ac_closed "ac t7 tick 1 closes" "$repo" "I-291"
+
+  run_track "$repo"
+  assert_eq "ac t7 tick 2: exit 0" "0" "$TR_RC"
+  assert_true "ac t7 tick 2: closes nothing new (auto-closed: 0)" \
+    bash -c '[[ "$1" == *"auto-closed: 0"* ]]' _ "$TR_OUT"
+  assert_true "ac t7 tick 2: exactly one issue_state ...to=CLOSED event total" \
+    bash -c '[[ "$(grep -c "^EVENT issue_state i=I-291 .*to=CLOSED" "$1/.pm/events.log")" == "1" ]]' _ "$repo"
+  assert_true "ac t7 tick 2: exactly one archived note event total" \
+    bash -c '[[ "$(grep -c "ref=archived:I-291" "$1/.pm/events.log")" == "1" ]]' _ "$repo"
+  assert_true "ac t7 tick 2: steady-state CLOSED renders NO row at all" \
+    bash -c '! grep -q "I-291" "$1/TRACKER.md"' _ "$repo"
+
+  git -C "$gitrepo" worktree remove --force "$repo/wt-i291-x" >/dev/null 2>&1 || true
+  rm -rf "$repo"
+}
+
+# ---------------------------------------------------------------------------
+# T8: G1 config variants -- absent automation key, and the STRING "true"
+# (not boolean) -- must BOTH read as disabled: surface auto-close-disabled,
+# never close, zero fetches.
+# ---------------------------------------------------------------------------
+_t8_config_variant() {
+  # _t8_config_variant <label> <automation_json_suffix>
+  local label="$1" automation="$2"
+  local repo gitrepo base_sha tip wrapper_dir log_file
+  repo="$(new_tmp_repo_with_git_ac true)"
+  gitrepo="$repo/target-repo"
+  ac_add_local_origin "$repo" "$gitrepo"
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+  tip="$(ac_make_worker_commit "$gitrepo" "$repo" i295-x)"
+  ac_merge_worker_tip_to_mainline "$gitrepo" "$tip"
+  git_or_die "t8 ($label): push merged main" -C "$gitrepo" push -q origin main
+  cat >"$repo/.pm/config.json" <<JSON
+{"repos": {"demo-repo": {"path": "$gitrepo", "mainline": "main", "mainline_ref": "refs/remotes/origin/main", "fetch_policy": "fetch"}}, "herdr_workspace": "zzz-test-ws"${automation}}
+JSON
+
+  seed_verified_dispatch "$repo" D-295 I-295 zzz-test-tab-295 i295-x "$base_sha" "$tip"
+  seed_issue_state "$repo" I-295 OPEN ACTIVE
+
+  wrapper_dir="$(mktemp -d "${TMPDIR:-/tmp}/pm-creator-git-wrapper.XXXXXX")"
+  log_file="$(mktemp "${TMPDIR:-/tmp}/pm-creator-git-wrapper-log.XXXXXX")"
+  make_git_env_wrapper "$wrapper_dir" "$log_file"
+  run_track_with_git_wrapper "$repo" "$wrapper_dir"
+
+  assert_ac_surfaced "ac t8 ($label): disabled" "$repo" "I-295" "auto-close-disabled"
+  assert_eq "ac t8 ($label): zero fetches" "0" "$(grep -c '|fetch ' "$log_file")"
+
+  git -C "$gitrepo" worktree remove --force "$repo/wt-i295-x" >/dev/null 2>&1 || true
+  rm -rf "$repo" "$wrapper_dir"
+  rm -f "$log_file"
+}
+
+section_ac_t8_g1_config_variants() {
+  _t8_config_variant "absent automation key" ""
+  _t8_config_variant "string \"true\"" ', "automation": {"auto_close": "true"}'
+}
+
 # ---------------------------------------------------------------------------
 echo "== track: fully corroborated done tab records RETURNED intake =="
 section_fully_corroborated_records_returned
@@ -1041,6 +3033,8 @@ echo "== track: surface -- corroboration-changed-under-lock =="
 section_surface_corroboration_changed_under_lock
 echo "== track: surface -- branch-issue-mismatch =="
 section_surface_branch_issue_mismatch
+echo "== track: STAGE 1 resists earlier-in-file duplicate-key poison (dispatch_issue_map, not raw re-scan) =="
+section_surface_branch_issue_mismatch_stage1_poison_resists
 echo "== track: surface -- base_sha-not-a-sha (short hex) =="
 section_surface_base_sha_not_a_sha_short_hex
 echo "== track: fully corroborated done tab on a sha256-object-format repo =="
@@ -1049,6 +3043,117 @@ echo "== track: surface -- 64-hex ref-name dynamic-bypass attempt in a sha1 repo
 section_surface_ref_name_dynamic_bypass_sha1_repo
 echo "== track: surface -- 40-hex ref-name dynamic-bypass attempt in a sha256 repo =="
 section_surface_ref_name_dynamic_bypass_sha256_repo
+
+echo "== track: B2.1 auto-close -- non-vacuous end-to-end close =="
+section_ac_end_to_end_closes
+echo "== track: B2.1 auto-close -- G1 surface NEEDS-USER =="
+section_ac_g1_needs_user
+echo "== track: B2.1 auto-close -- G1 surface BLOCKED =="
+section_ac_g1_blocked
+echo "== track: B2.1 auto-close -- G1 surface paused/non-active =="
+section_ac_g1_paused_non_active
+echo "== track: B2.1 auto-close -- crash recovery re-archive (regardless of auto_close) =="
+section_ac_crash_recovery_rearchive
+echo "== track: B2.1 auto-close -- G1.5 quarantined question-for-issue must surface, not silently pass (Codex-sparred defect #1) =="
+section_ac_g1p5_quarantined_question_for_issue
+echo "== track: B2.1 auto-close -- G1.5 quarantined issue-state event must surface, not silently pass (Codex-sparred defect #1) =="
+section_ac_g1p5_quarantined_issue_state
+echo "== track: B2.1 auto-close -- G1.5 quarantined dispatch_new dup-i= poison must not false-close wrong issue (Codex-sparred defect, round 2, Critical A) =="
+section_ac_g1p5_dispatch_new_duplicate_i_poison
+echo "== track: B2.1 auto-close -- G1.5 malformed quarantined question (duplicate i=) must not false-close (Codex-sparred defect, round 2, Critical B) =="
+section_ac_g1p5_malformed_question_duplicate_i
+echo "== track: B2.1 auto-close -- G1.5 malformed quarantined question (quoted i=) must not false-close (Codex-sparred defect, round 2, Critical B) =="
+section_ac_g1p5_malformed_question_quoted_i
+echo "== track: B2.1 auto-close -- G1.5 malformed quarantined question (trailing token) must not false-close (Codex-sparred defect, round 2, Critical B) =="
+section_ac_g1p5_malformed_question_trailing_token
+echo "== track: B2.1 auto-close -- G1.5 malformed quarantined question (malformed q=) must not false-close (Codex-sparred defect, round 2, Critical B) =="
+section_ac_g1p5_malformed_question_bad_q
+echo "== track: B2.1 auto-close -- G1.5 no-regression: clean quarantine still closes normally =="
+section_ac_g1p5_no_regression_clean_quarantine_still_closes
+echo "== track: B2.1 auto-close -- G1.5 misattribution: dispatch_new forged i= must not shield real owner (Codex-sparred defect, round 25) =="
+section_ac_g1p5_misattribution_dispatch_new
+echo "== track: B2.1 auto-close -- G1.5 misattribution: grammar-VALID duplicate dispatch_new exercises authoritative-owner attribution path (not parse-failure fallback) (Codex-sparred defect, round 25 hardening) =="
+section_ac_g1p5_dispatch_new_duplicate_valid_grammar_attribution
+echo "== track: B2.1 auto-close -- G1.5 misattribution: question forged i= must not shield real owner (Codex-sparred defect, round 25) =="
+section_ac_g1p5_misattribution_question
+echo "== track: B2.1 auto-close -- G1.5 misattribution: unknown entity + unregistered forged i= is globally unattributable (Codex-sparred defect, round 25) =="
+section_ac_g1p5_misattribution_unknown_entity
+echo "== track: B2.1 auto-close -- G2 surface open-question-for-issue =="
+section_ac_g2_open_question_for_issue
+echo "== track: B2.1 auto-close -- G2 surface open-question-unscoped =="
+section_ac_g2_open_question_unscoped
+echo "== track: B2.1 auto-close -- G3 surface dispatch-not-VERIFIED =="
+section_ac_g3_dispatch_not_verified
+echo "== track: B2.1 auto-close -- G3 surface parent/child-roll-up-violation =="
+section_ac_g3_parent_child_rollup
+echo "== track: B2.1 auto-close -- G3 surface superseded-by-other-issue =="
+section_ac_g3_superseded_by_other_issue
+echo "== track: B2.1 auto-close -- G3 child_of roll-up must be transitive across the full descendant graph (Codex-sparred defect #2) =="
+section_ac_g3_transitive_child_of_rollup
+echo "== track: B2.1 auto-close -- G3 transitive roll-up control: all-terminal descendants close cleanly =="
+section_ac_g3_transitive_child_of_rollup_all_terminal
+echo "== track: B2.1 auto-close -- G4 surface result==base =="
+section_ac_g4_result_equals_base
+echo "== track: B2.1 auto-close -- G4 surface result-not-descendant-of-base =="
+section_ac_g4_not_descendant
+echo "== track: B2.1 auto-close -- G4 surface mainline-ref-not-configured =="
+section_ac_g4_mainline_ref_not_configured
+echo "== track: B2.1 auto-close -- G4 surface mainline-ref-missing =="
+section_ac_g4_mainline_ref_missing
+echo "== track: B2.1 auto-close -- G4 surface no-strict-ancestry-and-no-valid-marker =="
+section_ac_g4_not_on_mainline
+echo "== track: B2.1 auto-close -- G4 non-string mainline + fetch_policy=fetch must not crash (Codex-sparred defect #3) =="
+section_ac_g4_mainline_non_string_type_guard
+echo "== track: B2.1 auto-close -- G4 GIT_NO_REPLACE_OBJECTS=1 on every git call, incl. identity-anchor + graft probe (Codex-sparred defect #4) =="
+section_ac_g4_replace_objects_env_on_every_git_call
+echo "== track: B2.1 auto-close -- G4 fetch_policy=fetch successful fetch+close (Codex-sparred defect #5) =="
+section_ac_g4_fetch_policy_success
+echo "== track: B2.1 auto-close -- G4 fetch_policy=fetch unreachable origin surfaces fetch-failed (Codex-sparred defect #5) =="
+section_ac_g4_fetch_policy_failed
+echo "== track: B2.1 auto-close -- automation.auto_close OFF surfaces auto-close-disabled =="
+section_ac_auto_close_disabled
+echo "== track: B2.1 auto-close -- same-tick safety (RETURNED this tick != VERIFIED) =="
+section_ac_same_tick_safety
+echo "== track: B2.1 auto-close -- P2-1 OFF tick performs zero network fetches =="
+section_ac_p21_off_mode_zero_network
+echo "== track: B2.1 auto-close -- P2-1 ON tick fetches once per (repo,ref), pre-lock =="
+section_ac_p21_one_fetch_per_repo_ref_per_tick
+echo "== track: B2.1 auto-close -- P2-2 forged result_sha=mainline-tip must not close =="
+section_ac_p22_forged_result_sha_mainline_tip
+echo "== track: B2.1 auto-close -- P2-2 deleted dispatch branch is fail-closed =="
+section_ac_p22_branch_deleted
+echo "== track: B2.1 auto-close -- fix-pass-5b#1 non-ticket-convention branch rejected at G4 =="
+section_ac_p22_branch_not_ticket_convention
+echo "== track: B2.1 auto-close -- fix-pass-5b#2 close-outcome classifier is line-anchored =="
+section_ac_close_classifier_line_anchored
+echo "== track: B2.1 auto-close -- fix-pass-5b#3 REASONS registry is enforced =="
+section_ac_reasons_registry_enforced
+echo "== track: B2.1 auto-close -- P3-1 leading-dash remote never reaches git argv =="
+section_ac_p31_leading_dash_remote
+echo "== track: B2.1 auto-close -- P3-2 GIT_DIR decoy env is scrubbed =="
+section_ac_p32_git_dir_decoy_scrubbed
+echo "== track: B2.1 auto-close -- P3-3b whole-driver crash degrades loudly with detail =="
+section_ac_p33_whole_driver_crash
+echo "== track: B2.1 auto-close -- P3-6 unreadable prompts/ surfaces, never 'no leftovers' =="
+section_ac_p36_leftover_listdir_error
+echo "== close: P3-4 stable close-refusal stderr tokens (unit) =="
+section_p34_close_refusal_tokens
+echo "== track: B2.1 auto-close -- P3-4 durable close + archive failure renders closed-with-pending-archive =="
+section_ac_p34_closed_with_pending_archive
+echo "== track: B2.1 auto-close -- P3-7 surfaced-output signal partition =="
+section_ac_p37_output_partition
+echo "== track: B2.1 auto-close -- T2 G3 negative variants =="
+section_ac_t2_g3_negative_variants
+echo "== track: B2.1 auto-close -- T3 grafts file faking ancestry -> replace-affected =="
+section_ac_t3_graft_file_fakes_ancestry
+echo "== track: B2.1 auto-close -- T3 git-replace faking ancestry is neutralized =="
+section_ac_t3_replace_ref_fakes_ancestry
+echo "== track: B2.1 auto-close -- T4 G4 surface coverage (repo/metadata/sha) =="
+section_ac_t4_g4_surface_coverage
+echo "== track: B2.1 auto-close -- T7 idempotent second tick =="
+section_ac_t7_idempotent_second_tick
+echo "== track: B2.1 auto-close -- T8 G1 config variants both read disabled =="
+section_ac_t8_g1_config_variants
 
 echo
 echo "-----------------------------------------"

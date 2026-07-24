@@ -457,9 +457,103 @@ def new_state():
     }
 
 
-def quarantine_line(state, line_no, raw, reason):
-    state["quarantined"].append({"line": line_no, "reason": reason, "raw": raw})
+def quarantine_line(state, line_no, raw, reason, attributed_issues=None, category=None):
+    # attributed_issues/category are captured AT quarantine time, from the
+    # fold's own already-parsed kv (never a later reparse of `raw`) -- see
+    # _quarantine_attribution(). attributed_issues is the SET of issues the
+    # offending line's blast radius touches (an entity's line may implicate
+    # more than one issue: the entity's AUTHORITATIVE owner, resolved via
+    # the fold's own validated maps, PLUS -- additively, never in place of
+    # the authoritative owner -- the line's own (possibly forged) `i=`
+    # token). It is empty/falsy whenever the line cannot be cleanly and
+    # unambiguously tied to ANY known issue (a bare grammar failure with no
+    # coherent etype/kv at all, or a rule violation whose q/d/i all fail to
+    # resolve to a known entity); write_outputs() treats that as globally
+    # unattributable and blocks ALL auto-close for the tick rather than
+    # risk silently missing the issue it was meant for.
+    state["quarantined"].append({
+        "line": line_no,
+        "reason": reason,
+        "raw": raw,
+        "attributed_issues": sorted(attributed_issues) if attributed_issues else [],
+        "category": category,
+    })
     state["quarantine_lines"].append(f"{raw}\t# quarantined: {reason} (line {line_no})")
+
+
+def _quarantine_attribution(state, etype, kv):
+    """Resolve (attributed_issues, category) for a quarantined event.
+
+    attributed_issues is the SET of issues this quarantined line's blast
+    radius affects, resolved through the fold's OWN authoritative,
+    already-validated state -- never by trusting the offending line's own
+    (possibly forged) `i=`/`q=`/`d=` tokens as the sole source, and never
+    by a second raw-log parse:
+
+      - `question` events: the entity is the question `q`. Its authoritative
+        owner is `state["questions"][q]["i"]`, set only by PRIOR
+        successfully-applied `question` events (a quarantined line never
+        reaches that assignment). A brand-new `q` that only ever appears on
+        bad lines has no authoritative owner and resolves to nothing here.
+      - `dispatch_new`/`dispatch_state`/`result` events: the entity is the
+        dispatch `d`. Its authoritative owner is
+        `state["dispatch_issue_raw"][d]`, built from the first ACCEPTED
+        (successfully-applied) `dispatch_new` event for that `d` (see
+        fold_lines; P3-5) -- i.e. the REAL registration, not whatever `i=`
+        the offending (e.g. duplicate) line itself forges.
+      - `issue_state` events: `i` IS the entity being addressed directly
+        (there is no separate owner to resolve), so it is used as-is.
+
+    For `question`/`dispatch_new`/`dispatch_state`/`result` events, the
+    line's own `i=` token (if present) is ADDED to the resolved set
+    defensively (a bad line naming i=X might genuinely pertain to X too) but
+    never REPLACES the authoritative resolution above -- so a forged `i=`
+    can only ever widen the blast radius, never redirect it away from the
+    entity's real owner. That widening is itself gated on `i=` naming a
+    REGISTERED issue (present in `state["issues"]`, populated only by
+    successfully-applied `issue_state` events -- never by a quarantined
+    line): a forged `i=` pointing at a real, known issue may plausibly be a
+    genuine (if sloppy) reference to it, but a forged `i=` naming an issue
+    that has never been registered at all cannot be trusted as a defensive
+    hint -- there is nothing to corroborate it against. So when the entity
+    itself (q/d) is also unresolved AND `i=` does not name a registered
+    issue, the entry resolves to nothing here and falls through to the
+    global `quarantine_unattributable` flag (conservative) rather than
+    inventing a scoped attribution out of an unregistered forged token.
+    """
+    affected = set()
+    category = None
+    known_issues = state.get("issues", {})
+    if etype == "question":
+        category = "question"
+        q = kv.get("q")
+        if q:
+            prev = state["questions"].get(q)
+            if prev is not None and prev.get("i"):
+                affected.add(prev["i"])
+    elif etype == "issue_state":
+        category = "issue"
+        # i IS the entity here; no separate owner map to resolve -- always
+        # trust it directly, no widening gate needed.
+        i = kv.get("i")
+        if i:
+            affected.add(i)
+        return affected, category
+    elif etype in ("dispatch_new", "dispatch_state", "result"):
+        category = "issue"
+        d = kv.get("d")
+        if d:
+            issue = state.get("dispatch_issue_raw", {}).get(d)
+            if issue:
+                affected.add(issue)
+    else:
+        return affected, None
+    # Additive widening: the line's own `i=` only widens the blast radius
+    # when it names a registered (known) issue -- see docstring.
+    i = kv.get("i")
+    if i and i in known_issues:
+        affected.add(i)
+    return affected, category
 
 
 def parse_line(raw):
@@ -539,7 +633,8 @@ def apply_event(state, etype, kv, line_no, raw, mode):
 
     def fail(reason):
         if mode == "quarantine":
-            quarantine_line(state, line_no, raw, reason)
+            _ai, _cat = _quarantine_attribution(state, etype, kv)
+            quarantine_line(state, line_no, raw, reason, attributed_issues=_ai, category=_cat)
             return False
         raise RuleViolation(reason)
 
@@ -626,7 +721,12 @@ def apply_event(state, etype, kv, line_no, raw, mode):
                 # can never overwrite legitimate history before being
                 # rejected.
                 disp["state"] = "QUARANTINED"
-                quarantine_line(state, line_no, raw, f"late dispatch_state after terminal for '{d}'")
+                _ai, _cat = _quarantine_attribution(state, etype, kv)
+                quarantine_line(
+                    state, line_no, raw,
+                    f"late dispatch_state after terminal for '{d}'",
+                    attributed_issues=_ai, category=_cat,
+                )
                 return False
             return fail(f"late transition for '{d}' refused: current state is terminal ({cur_state})")
 
@@ -755,11 +855,17 @@ def apply_event(state, etype, kv, line_no, raw, mode):
         if prior_line is not None:
             if mode == "quarantine":
                 disp["state"] = "QUARANTINED"
+                _ai, _cat = _quarantine_attribution(state, etype, kv)
                 quarantine_line(
                     state, prior_line, "(see original RETURNED line)",
                     f"duplicate result: superseded by line {line_no}",
+                    attributed_issues=_ai, category=_cat,
                 )
-                quarantine_line(state, line_no, raw, f"duplicate result for {d}/{a} (first at line {prior_line})")
+                quarantine_line(
+                    state, line_no, raw,
+                    f"duplicate result for {d}/{a} (first at line {prior_line})",
+                    attributed_issues=_ai, category=_cat,
+                )
                 return False
             return fail(f"duplicate result for {d}/{a} refused (first recorded at line {prior_line})")
 
@@ -767,7 +873,12 @@ def apply_event(state, etype, kv, line_no, raw, mode):
             if mode == "quarantine":
                 disp["state"] = "QUARANTINED"
                 disp["result_sha"] = kv["result_sha"]
-                quarantine_line(state, line_no, raw, f"late result after terminal for '{d}'")
+                _ai, _cat = _quarantine_attribution(state, etype, kv)
+                quarantine_line(
+                    state, line_no, raw,
+                    f"late result after terminal for '{d}'",
+                    attributed_issues=_ai, category=_cat,
+                )
                 return False
             return fail(f"result for '{d}' refused: dispatch is terminal ({disp['state']})")
 
@@ -828,6 +939,7 @@ def apply_event(state, etype, kv, line_no, raw, mode):
 def fold_lines(raw_lines):
     """Whole-log quarantine-mode fold. Never raises."""
     state = new_state()
+    state["dispatch_issue_raw"] = {}
     for line_no, raw in enumerate(raw_lines, start=1):
         if raw.strip() == "":
             continue
@@ -836,7 +948,21 @@ def fold_lines(raw_lines):
         except ValueError as e:
             quarantine_line(state, line_no, raw, str(e))
             continue
-        apply_event(state, etype, kv, line_no, raw, "quarantine")
+        # d->i attribution map, populated ONLY after apply_event ACCEPTS the
+        # dispatch_new (P3-5). It feeds both (a) later attribution of OTHER
+        # quarantined lines (dispatch_state/result) touching `d` back to an
+        # issue, and (b) index.json's exported `dispatch_issue_map`. First
+        # ACCEPTED registration wins (a later duplicate `d` is quarantined
+        # by apply_event and never reaches the setdefault); today the sole
+        # failable dispatch_new rule IS the duplicate check, so this is
+        # semantics-preserving -- but gating on acceptance kills any future
+        # divergence if dispatch_new ever grows more failable rules.
+        accepted = apply_event(state, etype, kv, line_no, raw, "quarantine")
+        if accepted and etype == "dispatch_new":
+            d = kv.get("d")
+            i = kv.get("i")
+            if d and i:
+                state["dispatch_issue_raw"].setdefault(d, i)
     return state
 
 
@@ -868,6 +994,57 @@ def write_outputs(state, index_path, quarantine_path):
         seen_refs.add(u["ref"])
         dedup_unregistered.append(u)
 
+    # Per-issue view of QUARANTINED events (B2.1 auto-close hardening,
+    # Codex-sparred defect #1, hardened further against defect #4/#5 in the
+    # next round). A quarantined line represents a rule violation the fold
+    # never accepted into standing state, but it still carries semantic
+    # weight (an invalid question state, a corrupt dispatch/issue_state/
+    # result touching an issue) that MUST block that issue's auto-close
+    # rather than being silently invisible to it.
+    #
+    # Attribution is read ENTIRELY off `attributed_issues`/`category`, which
+    # apply_event()/fold_lines() stamped onto each entry at the moment it
+    # was quarantined, from the fold's own already-parsed etype/kv resolved
+    # through the fold's OWN authoritative maps (dispatch_issue_raw /
+    # questions) -- never by re-parsing `entry["raw"]` here, and never by
+    # trusting the offending line's own (possibly forged) `i=`/`q=`/`d=`
+    # tokens as the sole source. A second, independent parse of the same
+    # line can disagree with the fold's own parse (e.g. it may accept a
+    # line the fold's strict grammar rejected as a duplicate key), and a
+    # forged `i=` on the offending line could otherwise redirect the block
+    # away from the entity's REAL owner (Codex-sparred defect: the
+    # misattribution variant) -- both are exactly the classes of divergence
+    # this schema exists to rule out by construction. attributed_issues is
+    # a SET: a quarantined line blocks EVERY issue it touches (its entity's
+    # authoritative owner, plus -- additively -- its own claimed `i=`), not
+    # just one.
+    #
+    # Any entry with an EMPTY attributed_issues (a bare grammar failure with
+    # no coherent etype/kv at all, or a rule violation whose q/d/i all fail
+    # to resolve to any known issue) is globally unattributable: it could
+    # plausibly belong to ANY issue, so `quarantine_unattributable` blocks
+    # ALL closeable issues for the tick rather than risk silently closing
+    # the one it was meant for.
+    # P3-9 cross-reference: templates/bin/track's _TR_CLOSE_PY defines these
+    # SAME two constants (same names, same values) -- its auto-close G1.5
+    # gate keys on the exact strings emitted here, so they must change in
+    # BOTH places or not at all.
+    REASON_INVALID_QUESTION_STATE = "invalid-question-state"
+    REASON_ISSUE_RELATED_QUARANTINE = "issue-related-quarantine"
+
+    quarantine_by_issue = {}
+    quarantine_unattributable = False
+    for entry in state["quarantined"]:
+        issues = entry.get("attributed_issues") or []
+        category = entry.get("category")
+        if issues:
+            reason = REASON_INVALID_QUESTION_STATE if category == "question" else REASON_ISSUE_RELATED_QUARANTINE
+            for issue in issues:
+                quarantine_by_issue.setdefault(issue, set()).add(reason)
+        else:
+            quarantine_unattributable = True
+    quarantine_by_issue = {i: sorted(r) for i, r in quarantine_by_issue.items()}
+
     index = {
         "schema_v": "1",
         "issues": state["issues"],
@@ -878,6 +1055,20 @@ def write_outputs(state, index_path, quarantine_path):
         "open_questions": open_questions,
         "open_questions_by_issue": open_questions_by_issue,
         "open_questions_unscoped": open_questions_unscoped,
+        "quarantine_by_issue": quarantine_by_issue,
+        "quarantine_unattributable": quarantine_unattributable,
+        # Authoritative dispatch_new -> issue map (Codex-sparred defect #1,
+        # round 2; tightened by P3-5): populated ONLY from ACCEPTED
+        # (successfully-applied) dispatch_new events -- fold_lines runs the
+        # setdefault strictly AFTER apply_event returns True, so a
+        # quarantined duplicate `d` (business-rule failure) never touches
+        # it, and a HARD parse failure (e.g. a duplicate-key poison line)
+        # never reaches it either. Consumers (track's B2.1 auto-close
+        # pass) MUST read this map instead of re-scanning the raw event log
+        # themselves; the fold is the single source of truth for
+        # dispatch<->issue linkage. Additive
+        # to the schema -- existing consumers of index.json are unaffected.
+        "dispatch_issue_map": dict(state.get("dispatch_issue_raw", {})),
     }
 
     with open(index_path, "w") as f:
@@ -1384,8 +1575,14 @@ _pm_close_issue_core() {
   local rc=0
   local index="${root}/.pm/index.json"
 
+  # P3-4: every refusal class below opens its stderr line with a STABLE
+  # machine-readable token (close-refused-unfoldable-log /
+  # close-refused-never-registered / close-refused-state-race), and a
+  # durable-but-incomplete close additionally emits close-transition-durable
+  # before returning -- callers (track's auto-close classifier) key on
+  # these exact tokens; change them in both places or not at all.
   pm_fold "$root" || {
-    echo "close: pm_fold failed; refusing to close against an unfoldable log" >&2
+    echo "close-refused-unfoldable-log: pm_fold failed; refusing to close $issue_id against an unfoldable log" >&2
     rc=1
   }
   if [[ "$rc" -eq 0 && ! -f "$index" ]]; then
@@ -1397,7 +1594,7 @@ _pm_close_issue_core() {
   if [[ "$rc" -eq 0 ]]; then
     from_state="$(_pm_close_issue_state "$issue_id" "$index")"
     if [[ "$from_state" == "NONE" ]]; then
-      echo "close: refusing to close $issue_id: it was never registered (no issue_state event on record). You cannot close an issue that was never opened." >&2
+      echo "close-refused-never-registered: refusing to close $issue_id: it was never registered (no issue_state event on record). You cannot close an issue that was never opened." >&2
       rc=1
     fi
   fi
@@ -1424,7 +1621,7 @@ _pm_close_issue_core() {
       if apply_out="$(pm_apply issue_state i="$issue_id" from="$from_state" to=CLOSED at="$(date -u +%Y-%m-%dT%H:%M:%SZ)" 2>&1 1>/dev/null)"; then
         did_transition=1
       else
-        echo "close: refusing to close $issue_id: current=$from_state requested=CLOSED ($apply_out). No event was emitted." >&2
+        echo "close-refused-state-race: refusing to close $issue_id: current=$from_state requested=CLOSED ($apply_out). No event was emitted." >&2
         rc=1
       fi
     fi
@@ -1516,6 +1713,16 @@ _pm_close_issue_core() {
       fi
     else
       echo "close: $issue_id already closed and nothing to archive; no-op"
+    fi
+  fi
+
+  # P3-4: durability signal -- when the CLOSED transition is durably on the
+  # log (emitted this run, or already there for the rearchive path) but a
+  # LATER step (archive/note) failed, say so with a stable token so callers
+  # can count the issue closed-with-pending-archive instead of "not closed".
+  if [[ "$dry_run" -ne 1 && "$rc" -ne 0 ]]; then
+    if [[ "$did_transition" -eq 1 || "$from_state" == "CLOSED" ]]; then
+      echo "close-transition-durable: $issue_id is durably CLOSED on the log; a later archive/note step failed" >&2
     fi
   fi
 

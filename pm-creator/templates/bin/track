@@ -165,6 +165,20 @@ with open(sys.argv[1]) as f:
 print(cfg.get("herdr_workspace") or "")
 ' "${_tr_config}")"
 
+# automation.auto_close (trust-root config, default OFF): gates whether the
+# B2.1 auto-close pass below actually CLOSES a fully-gated issue, or merely
+# surfaces it as a candidate (`auto-close-disabled`). Re-read fresh every
+# tick -- never cached across ticks, since the operator can flip this
+# between runs.
+_tr_auto_close_enabled="$(python3 -c '
+import json, sys
+with open(sys.argv[1]) as f:
+    cfg = json.load(f)
+automation = cfg.get("automation")
+val = automation.get("auto_close") if isinstance(automation, dict) else None
+print("1" if val is True else "0")
+' "${_tr_config}")"
+
 # ---------------------------------------------------------------------------
 # temp-file bookkeeping (mirrors reconcile: manifest FILE, not a bash array,
 # since array mutations inside a $(...) subshell never reach this script;
@@ -194,6 +208,32 @@ _tr_cleanup() {
 trap _tr_cleanup EXIT INT TERM
 
 _tr_tmpmanifest="$(mktemp "${TMPDIR:-/tmp}/pm-track-tmpmanifest.XXXXXX")"
+
+# fix-pass-5b#2: classify pm_close_issue's captured stderr into one of the
+# stable P3-4 reason tokens. Matches ONLY whole stderr LINES that _lib.sh
+# itself emits with a `<token>: ...` prefix -- never a substring match over
+# the raw blob (which embeds pm_apply's own output and could let a token
+# forged mid-line, e.g. inside an echoed detail or filename, spoof a
+# classification). Pure function, no side effects -- unit-testable in
+# isolation by extracting just this definition.
+tr_ac_classify_close_failure() {
+  local blob="$1" reason="close/archive-failure" line
+  while IFS= read -r line; do
+    case "${line}" in
+      close-refused-state-race:*) reason="close-race/refusal"; break ;;
+      close-refused-unfoldable-log:*) reason="close-refused-unfoldable-log"; break ;;
+    esac
+  done <<<"${blob}"
+  if [[ "${reason}" == "close/archive-failure" ]]; then
+    while IFS= read -r line; do
+      if [[ "${line}" == close-transition-durable:* ]]; then
+        reason="closed-with-pending-archive"
+        break
+      fi
+    done <<<"${blob}"
+  fi
+  printf '%s\n' "${reason}"
+}
 
 # ---------------------------------------------------------------------------
 # one herdr api snapshot (defensive, centralized parse). Raw herdr stdout is
@@ -303,13 +343,26 @@ def add(name, val):
     if isinstance(val, dict):
         path = val.get("path") or ""
         mainline = val.get("mainline")
+        mainline_ref = val.get("mainline_ref")
+        fetch_policy = val.get("fetch_policy")
     elif isinstance(val, str):
         path = val
         mainline = None
+        mainline_ref = None
+        fetch_policy = None
     else:
         return
     if name and path:
-        out[name] = {"path": path, "mainline": mainline}
+        out[name] = {
+            "path": path,
+            "mainline": mainline,
+            # mainline_ref/fetch_policy are scaffold-time-normalized (B2.0b)
+            # but config.json is operator-editable post-scaffold -- B2.1s
+            # auto-close pass performs its OWN runtime fail-closed validation
+            # of these VALUES (never trusts scaffold-time validity survived).
+            "mainline_ref": mainline_ref,
+            "fetch_policy": fetch_policy,
+        }
 if isinstance(repos, dict):
     for name, val in repos.items():
         add(name, val)
@@ -347,10 +400,36 @@ ISSUE_RE = re.compile(r"^I-(\d+)$", re.IGNORECASE)
 BASE_SHA_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 
 
+# P3-2: repo-redirecting git environment variables are scrubbed from the
+# inherited environment before EVERY git invocation this module makes -- a
+# GIT_DIR/GIT_WORK_TREE/... leaking in from track's caller would silently
+# point corroboration at a DIFFERENT repository than the configured
+# repo_path (a decoy repo could then satisfy every topology check and
+# false-close). Lives here, next to GIT_NO_REPLACE_OBJECTS, so the whole
+# git env policy has exactly one home (tr_run); tr_g4_check's local run()
+# is a thin delegate to tr_run for the same reason.
+GIT_ENV_SCRUB = (
+    "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR", "GIT_GRAFT_FILE",
+)
+
+
 def tr_run(args, cwd, timeout=10):
+    # GIT_NO_REPLACE_OBJECTS=1 unconditionally on every git invocation this
+    # module makes (not just the ones inside tr_g4_check's own local `run()`)
+    # -- identity-anchoring (tr_verify_commit) and graft-probing
+    # (tr_repo_has_grafts) are called via tr_run from tr_g4_check and are
+    # just as replace-ref-sensitive as the calls tr_g4_check makes directly,
+    # so the neutralization must hold for the whole G4 code path, not just
+    # part of it.
+    env = dict(os.environ)
+    for _k in GIT_ENV_SCRUB:
+        env.pop(_k, None)
+    env["GIT_NO_REPLACE_OBJECTS"] = "1"
     try:
         r = subprocess.run(
-            ["git"] + args, cwd=cwd, capture_output=True, text=True, timeout=timeout
+            ["git"] + args, cwd=cwd, capture_output=True, text=True, timeout=timeout,
+            env=env,
         )
         return r.returncode, r.stdout.strip(), r.stderr.strip()
     except Exception:
@@ -386,30 +465,6 @@ def tr_is_dirty(path):
         # (never assume clean when the probe itself failed).
         return True
     return bool(status.strip())
-
-
-def tr_find_issue_for_dispatch(events_path, d):
-    # index.json does not persist dispatch_new's `i=` field, so
-    # independently re-derive the dispatch's own linked issue id by
-    # scanning the raw append-only event log for its `dispatch_new` line
-    # -- never guessed from the branch string alone, and un-forgeable via
-    # pm_apply the way index.json's per-dispatch fields are.
-    try:
-        with open(events_path) as f:
-            for line in f:
-                line = line.rstrip("\n")
-                if not line.startswith("EVENT dispatch_new "):
-                    continue
-                fields = {}
-                for tok in line.split(" ")[2:]:
-                    if tok and "=" in tok:
-                        k, v = tok.split("=", 1)
-                        fields[k] = v
-                if fields.get("d") == d:
-                    return fields.get("i")
-    except OSError:
-        return None
-    return None
 
 
 def tr_corroborate_git(repo_path, branch, base_sha):
@@ -478,6 +533,469 @@ def tr_corroborate_git(repo_path, branch, base_sha):
 PYEOF
 
 # ---------------------------------------------------------------------------
+# Shared B2.1 auto-close python routines (STRICT merged-path only; the
+# MARKER path is explicitly out of scope for B2.1 -- see header note above
+# the auto-close stage below). Appended to (not merged into) _TR_CORROB_PY:
+# concatenated ahead of it at call sites via `_TR_CORROB_PY`+`_TR_CLOSE_PY`,
+# so `tr_run`/`tr_worktree_list`/BASE_SHA_RE/etc are already in scope.
+# ---------------------------------------------------------------------------
+read -r -d '' _TR_CLOSE_PY <<'PYEOF' || true
+# ---------------------------------------------------------------------------
+# REASONS (P3-9) -- the single registry of every surface-reason token the
+# auto-close pass can emit, INCLUDING the ones minted by track's bash close
+# loop / driver fallback rather than by this python (marked [bash]). Any
+# new reason token MUST be added here; consumers (tests, operators grepping
+# TRACKER.md) treat these strings as a stable contract.
+# ---------------------------------------------------------------------------
+REASONS = frozenset({
+    # G1 -- issue state
+    "issue-unregistered",
+    "CLOSED-but-archive-leftovers",   # action=rearchive, not a refusal
+    "NEEDS-USER",
+    "BLOCKED",
+    "paused/non-active",
+    # G1.5 -- quarantine blast radius (constants shared with _lib.sh below)
+    "invalid-question-state",
+    "issue-related-quarantine",
+    "quarantine-unattributable-blocks-autoclose",
+    # G2 -- open questions
+    "open-question-for-issue",
+    "open-question-unscoped",
+    # G3 -- dispatch graph
+    "no-non-superseded-dispatch",
+    "superseded-by-other-issue",
+    "parent/child-roll-up-violation",
+    "ABANDONED-without-same-issue-successor",
+    "FAILED",
+    "QUARANTINED",
+    "dispatch-not-VERIFIED",
+    # gate between G3 and G4 (P2-1(a): G4 never runs when disabled)
+    "auto-close-disabled",
+    # G4 -- strict git corroboration
+    "repo-not-configured",
+    "repo-not-on-disk",
+    "missing-repo-metadata",
+    "mainline-ref-not-configured",
+    "mainline-ref-missing",
+    "fetch-failed",
+    "unreachable",
+    "sha-malformed",
+    "wrong-length",
+    "replace-affected",
+    "result==base",
+    "result-not-descendant-of-base",
+    "result-not-bound-to-branch",     # P2-2 branch-binding gate
+    "no-strict-ancestry-and-no-valid-marker",
+    # driver failure paths
+    "auto-close-driver-error",
+    # [bash] minted by track's close loop from pm_close_issue's stable
+    # stderr tokens (P3-4)
+    "close-race/refusal",
+    "close-refused-unfoldable-log",
+    "close/archive-failure",
+    "closed-with-pending-archive",   # rendered in the Auto-closed section
+    # fix-pass-5b#3: registry-completeness -- these three tokens are real,
+    # currently-emitted reason values from OTHER stages of the auto-close
+    # pipeline (the stage-2 corroboration driver's record loop, and the AC
+    # record-loop's standalone raced-write path). Neither of those call
+    # sites has REASONS in scope today (they run _TR_CORROB_PY alone, or a
+    # separate one-off python3 -c snippet, not concatenated with
+    # _TR_CLOSE_PY) so the enforcement check above never actually sees
+    # them -- they're listed here purely so REASONS stays the complete,
+    # accurate registry of every reason token the auto-close pass can
+    # surface, per P3-9's intent.
+    "already-recorded",
+    "corroboration-changed-under-lock",
+    "raced-refused",
+})
+
+# P3-9 cross-reference: templates/bin/_lib.sh's fold python defines these
+# SAME two constants (same names, same values) where quarantine_by_issue is
+# projected -- the G1.5 gate below keys on the exact strings the fold
+# emits, so they must change in BOTH places or not at all.
+REASON_INVALID_QUESTION_STATE = "invalid-question-state"
+REASON_ISSUE_RELATED_QUARANTINE = "issue-related-quarantine"
+
+CLOSEABLE_STATES = {"ACTIVE", "IN-PROGRESS"}
+# Non-terminal dispatch states -- used by the cross-issue child_of roll-up
+# gate below to decide whether a child dispatch is still "active" (anything
+# short of the two TERMINAL states counts, matching _lib.sh's own
+# TERMINAL = {VERIFIED, ABANDONED}).
+TERMINAL_DISPATCH_STATES = {"VERIFIED", "ABANDONED"}
+
+
+
+
+def tr_verify_commit(repo_path, sha, obj_format):
+    # Returns (reason, None) on failure, else (None, sha). Shape check
+    # (length-vs-object-format) BEFORE any git use of the value (mirrors
+    # tr_corroborate_git's base_sha guard), then identity-anchored
+    # `rev-parse --verify <sha>^{commit}` (a real object peels to itself; a
+    # ref name peels to whatever it points at, so this also closes the
+    # dynamic-ref bypass for a sha-shaped ref name).
+    if not BASE_SHA_RE.match(sha or ""):
+        return "sha-malformed", None
+    expected_len = {"sha1": 40, "sha256": 64}.get(obj_format)
+    if expected_len is None or len(sha) != expected_len:
+        return "wrong-length", None
+    rc, resolved, _ = tr_run(
+        ["rev-parse", "--verify", "--end-of-options", sha + "^{commit}"], repo_path
+    )
+    if rc != 0 or resolved.strip() != sha:
+        return "unreachable", None
+    return None, sha
+
+
+def tr_repo_has_grafts(repo_path):
+    # GIT_NO_REPLACE_OBJECTS=1 (set by the caller around every git
+    # invocation in this module) disables replace-REFS, but old-style
+    # `.git/info/grafts` is a *separate* mechanism it does NOT neutralize --
+    # detect it directly and refuse (fail-closed) rather than silently
+    # trusting history that could be graft-rewritten.
+    rc, path, _ = tr_run(["rev-parse", "--git-path", "info/grafts"], repo_path)
+    if rc != 0:
+        return True  # probe itself failed -- fail closed
+    path = path.strip()
+    if not path:
+        return False
+    full = path if os.path.isabs(path) else os.path.join(repo_path, path)
+    try:
+        return os.path.isfile(full) and os.path.getsize(full) > 0
+    except OSError:
+        return True
+
+
+def tr_parse_fetch_ref(mainline, mainline_ref):
+    # Shared shape validation for fetch-policy repos, used by BOTH track's
+    # pre-lock pre-fetch phase (tr_prefetch_mainline_refs) and tr_g4_check
+    # under the lock -- one predicate, so the two phases can never disagree
+    # about which repos are fetchable. Returns the remote name, or None on
+    # any shape failure. P3-1 (git argv hygiene): a leading-dash remote or
+    # mainline segment is rejected outright -- a config value must never be
+    # able to smuggle an option into git's argv -- on top of the
+    # --end-of-options guard on the fetch invocation itself.
+    if not mainline or not isinstance(mainline, str):
+        return None
+    if not isinstance(mainline_ref, str):
+        return None
+    m = re.match(r"^refs/remotes/([^/]+)/(.+)$", mainline_ref)
+    if not m:
+        return None
+    remote = m.group(1)
+    if remote.startswith("-") or mainline.startswith("-") or m.group(2).startswith("-"):
+        return None
+    return remote
+
+
+def tr_prefetch_mainline_refs(repos):
+    # P2-1(b): the pre-fetch phase, run by track BEFORE pm_lock is acquired
+    # -- the ONLY place the auto-close pass ever touches the network. Each
+    # configured fetch-policy repo's mainline ref is fetched at most once
+    # per (repo,ref) per tick; returns {repo_name: "ok"|"fetch-failed"}.
+    # Repos whose config shape fails tr_parse_fetch_ref are skipped here;
+    # tr_g4_check re-derives the same verdict locally under the lock and
+    # surfaces mainline-ref-missing for them (fail-closed either way).
+    status = {}
+    for name, entry in sorted((repos or {}).items()):
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("fetch_policy") != "fetch":
+            continue
+        repo_path = entry.get("path")
+        mainline = entry.get("mainline")
+        mainline_ref = entry.get("mainline_ref")
+        remote = tr_parse_fetch_ref(mainline, mainline_ref)
+        if not repo_path or remote is None:
+            continue
+        rc, _, _ = tr_run(
+            ["fetch", "--end-of-options", remote,
+             "+refs/heads/" + mainline + ":" + mainline_ref],
+            repo_path,
+        )
+        status[name] = "ok" if rc == 0 else "fetch-failed"
+    return status
+
+
+def tr_g4_check(repo_path, mainline, mainline_ref, fetch_policy, base_sha, result_sha, branch, prefetch_status):
+    # Returns reason string, or None on full G4 pass. STRICT topology only
+    # (B2.1) -- no patch-id / git cherry / content-equivalence, ever.
+    # LOCAL-ONLY under the lock: never fetches (P2-1(b)) -- for
+    # fetch-policy repos it consumes the pre-lock pre-fetch phase's
+    # verdict (prefetch_status) instead. `branch` is the dispatch's own
+    # recorded branch, used by the P2-2 result-binding gate below.
+    if not mainline_ref or not isinstance(mainline_ref, str):
+        return "mainline-ref-not-configured"
+    if not mainline_ref.startswith("refs/"):
+        return "mainline-ref-missing"
+    if fetch_policy not in ("fetch", "local-only"):
+        # The design doc's surface-reason enumeration has no distinct token
+        # for "invalid fetch_policy value"; bucketed with the adjacent
+        # not-configured reason (same remediation: fix .pm/config.json).
+        return "mainline-ref-not-configured"
+
+    def run(args, timeout=10):
+        # P3-2: pure delegate to tr_run -- the single home of the git env
+        # policy (GIT_ENV_SCRUB + GIT_NO_REPLACE_OBJECTS), never a second
+        # env-building copy.
+        return tr_run(args, repo_path, timeout=timeout)
+
+    rc, obj_format, _ = run(["rev-parse", "--show-object-format"])
+    if rc != 0:
+        return "unreachable"
+    obj_format = obj_format.strip()
+
+    if tr_repo_has_grafts(repo_path):
+        return "replace-affected"
+
+    reason, _ = tr_verify_commit(repo_path, result_sha, obj_format)
+    if reason:
+        return reason
+    reason, _ = tr_verify_commit(repo_path, base_sha, obj_format)
+    if reason:
+        return reason
+
+    if result_sha == base_sha:
+        return "result==base"
+
+    rc, _, _ = run(["merge-base", "--is-ancestor", base_sha, result_sha])
+    if rc != 0:
+        return "result-not-descendant-of-base"
+
+    # P2-2: bind result_sha to the dispatch's OWN recorded branch -- the
+    # same strict binding stage-1 intake's tr_corroborate_git enforces
+    # (there: result_sha IS the branch tip by construction; here: branch
+    # tip == result_sha, or result_sha is an ancestor of the branch tip,
+    # i.e. the commit actually lived on that branch). Without this, ANY
+    # already-merged commit descending from base (e.g. the mainline tip
+    # itself) satisfies pure topology and a forged `result` + human VERIFY
+    # would false-close. A missing/deleted/unresolvable branch is
+    # fail-closed the same way -- surface, never close. refs/heads/ +
+    # --end-of-options keep the index-sourced branch name inert in argv.
+    if not branch or not isinstance(branch, str):
+        return "result-not-bound-to-branch"
+    rc, branch_tip, _ = run(
+        ["rev-parse", "--verify", "--end-of-options", "refs/heads/" + branch + "^{commit}"]
+    )
+    if rc != 0:
+        return "result-not-bound-to-branch"
+    branch_tip = branch_tip.strip()
+    if branch_tip != result_sha:
+        rc, _, _ = run(["merge-base", "--is-ancestor", result_sha, branch_tip])
+        if rc != 0:
+            return "result-not-bound-to-branch"
+
+    if fetch_policy == "fetch":
+        # P2-1(b): the network fetch already ran in track's pre-fetch phase
+        # (pre-lock, at most once per (repo,ref) per tick); here G4 only
+        # consumes its recorded verdict. A pre-fetch failure -- or a
+        # missing verdict for this repo (fail-closed) -- surfaces
+        # fetch-failed; refs below resolve locally only.
+        if tr_parse_fetch_ref(mainline, mainline_ref) is None:
+            return "mainline-ref-missing"
+        if prefetch_status != "ok":
+            return "fetch-failed"
+    rc, mainline_sha, _ = run(["rev-parse", "--verify", "--end-of-options", mainline_ref + "^{commit}"])
+    if rc != 0:
+        return "mainline-ref-missing"
+    mainline_sha = mainline_sha.strip()
+
+    rc, _, _ = run(["merge-base", "--is-ancestor", result_sha, mainline_sha])
+    if rc != 0:
+        return "no-strict-ancestry-and-no-valid-marker"
+
+    return None
+
+
+def evaluate_issue(issue_id, index, repos, dispatch_issue_map, auto_close_enabled, archive_leftovers, prefetch):
+    # Returns (action, reason): action in {"close", "rearchive", "surface",
+    # "skip"}. "skip" = steady-state CLOSED, nothing to do, no TRACKER.md
+    # row at all. "rearchive" is ALWAYS attempted regardless of
+    # auto_close_enabled (crash recovery finishes an already-decided close,
+    # it is not a new close decision). "close"/"surface" are the normal
+    # G1-G4 outcomes; when auto_close_enabled is False evaluation STOPS
+    # after G3 (P2-1(a)) and surfaces `auto-close-disabled` -- G4 (and any
+    # git work) is never run for a disabled tick. `prefetch` is the
+    # pre-lock pre-fetch phase's {repo_name: verdict} map (P2-1(b)).
+    issues = index.get("issues", {})
+    dispatches = index.get("dispatches", {})
+    issue = issues.get(issue_id)
+
+    # G1 -----------------------------------------------------------------
+    if issue is None:
+        return "surface", "issue-unregistered"
+    state = issue.get("state")
+    if state == "CLOSED":
+        if archive_leftovers:
+            return "rearchive", "CLOSED-but-archive-leftovers"
+        return "skip", None
+    if state == "NEEDS-USER":
+        return "surface", "NEEDS-USER"
+    if state == "BLOCKED":
+        return "surface", "BLOCKED"
+    if state not in CLOSEABLE_STATES:
+        # OPEN / TODO / PARKED / any other non-{ACTIVE,IN-PROGRESS} state.
+        return "surface", "paused/non-active"
+
+    # G1.5 -- quarantined events touching this issue -----------------------
+    # A quarantined line was rejected by the fold's rule engine, but it can
+    # still name real semantic content (an invalid question state on an
+    # otherwise-legit issue link, a corrupt issue_state/dispatch_*/result
+    # touching this issue or one of its dispatches) that MUST NOT be
+    # silently invisible to the close decision -- surface, never close.
+    quarantine_reasons = (index.get("quarantine_by_issue", {}) or {}).get(issue_id)
+    if quarantine_reasons:
+        if REASON_INVALID_QUESTION_STATE in quarantine_reasons:
+            return "surface", REASON_INVALID_QUESTION_STATE
+        return "surface", REASON_ISSUE_RELATED_QUARANTINE
+    if index.get("quarantine_unattributable"):
+        # A quarantined line the fold could not cleanly and unambiguously
+        # attribute to one issue (a hard grammar failure, a duplicate-key/
+        # quoted/trailing-token poison line, or any other reparse-divergent
+        # case) could plausibly belong to ANY issue, so block ALL closeable
+        # issues this tick rather than risk closing the one it was meant
+        # for -- or, worse, letting a poisoned dispatch<->issue join close
+        # the wrong issue outright (Codex-sparred defect, round 2).
+        return "surface", "quarantine-unattributable-blocks-autoclose"
+
+    # G2 -----------------------------------------------------------------
+    open_by_issue = index.get("open_questions_by_issue", {}) or {}
+    if open_by_issue.get(issue_id):
+        return "surface", "open-question-for-issue"
+    if index.get("open_questions_unscoped"):
+        return "surface", "open-question-unscoped"
+
+    # G3 -----------------------------------------------------------------
+    my_dispatch_ids = [d for d, i in dispatch_issue_map.items() if i == issue_id]
+    non_superseded = [
+        d for d in my_dispatch_ids if not (dispatches.get(d) or {}).get("superseded")
+    ]
+    if not non_superseded:
+        return "surface", "no-non-superseded-dispatch"
+
+    # successor_of[d] = the dispatch that named `d` via `supersedes=`.
+    successor_of = {}
+    for d, disp in dispatches.items():
+        sup = disp.get("supersedes")
+        if sup:
+            successor_of[sup] = d
+
+    for d in my_dispatch_ids:
+        disp = dispatches.get(d) or {}
+        if not disp.get("superseded"):
+            continue
+        succ = successor_of.get(d)
+        succ_issue = dispatch_issue_map.get(succ) if succ else None
+        if succ_issue is not None and succ_issue != issue_id:
+            return "surface", "superseded-by-other-issue"
+
+    # Cross-issue child_of roll-up: ANY dispatch ANYWHERE in the full
+    # descendant graph of one of I's dispatches (not just direct children --
+    # grandchildren, great-grandchildren, ...) that is still active
+    # (non-terminal) blocks I's close, regardless of which issue that
+    # descendant dispatch itself belongs to (ledger-check enforces this
+    # roll-up globally, not per-issue). Walk the transitive closure via a
+    # children_of adjacency built from the WHOLE dispatch set, with a
+    # visited-set guard against cycles.
+    children_of = {}
+    for d, disp in dispatches.items():
+        parent = disp.get("child_of")
+        if parent:
+            children_of.setdefault(parent, []).append(d)
+
+    visited = set()
+    stack = list(my_dispatch_ids)
+    while stack:
+        cur = stack.pop()
+        for child in children_of.get(cur, []):
+            if child in visited:
+                continue
+            visited.add(child)
+            child_disp = dispatches.get(child) or {}
+            if child_disp.get("state") not in TERMINAL_DISPATCH_STATES:
+                return "surface", "parent/child-roll-up-violation"
+            stack.append(child)
+
+    verified = []
+    for d in non_superseded:
+        disp = dispatches.get(d) or {}
+        dstate = disp.get("state")
+        if dstate == "VERIFIED":
+            verified.append(d)
+            continue
+        if dstate == "ABANDONED":
+            succ = successor_of.get(d)
+            succ_issue = dispatch_issue_map.get(succ) if succ else None
+            has_same_issue_successor = False
+            if succ_issue == issue_id:
+                has_same_issue_successor = True
+            else:
+                for d2, disp2 in dispatches.items():
+                    if disp2.get("child_of") == d and dispatch_issue_map.get(d2) == issue_id:
+                        has_same_issue_successor = True
+                        break
+            if not has_same_issue_successor:
+                return "surface", "ABANDONED-without-same-issue-successor"
+            continue
+        if dstate == "FAILED":
+            return "surface", "FAILED"
+        if dstate == "QUARANTINED":
+            return "surface", "QUARANTINED"
+        return "surface", "dispatch-not-VERIFIED"
+
+    if not verified:
+        # Every non-superseded dispatch was ABANDONED-with-successor; none
+        # left to G4-corroborate. Treat as "no work to corroborate a close
+        # against" -- conservatively surface rather than close on nothing.
+        return "surface", "no-non-superseded-dispatch"
+
+    # P2-1(a): with automation.auto_close OFF, stop HERE -- before G4.
+    # `auto-close-disabled` means "G1-G3 passed; G4 corroboration was NOT
+    # run because the flag is off" (an informative candidate list, not a
+    # fully-corroborated one). An OFF tick performs zero git/network work
+    # for its candidates by construction.
+    if not auto_close_enabled:
+        return "surface", "auto-close-disabled"
+
+    # G4 -----------------------------------------------------------------
+    for d in verified:
+        disp = dispatches.get(d) or {}
+        repo_name = disp.get("repo")
+        branch = disp.get("branch")
+        # fix-pass-5b#1: `branch` here is read straight from the index
+        # (disp.get("branch")), not re-derived from anything F1 already
+        # validated at ACK-recording time. A corrupted/forged index entry
+        # would otherwise let an arbitrary, non-ticket-convention branch
+        # name build refs/heads/<branch> and silently satisfy the P2-2
+        # binding check below. Mirror F1's own TICKET_RE shape gate here,
+        # fail-closed, before that ref is ever built.
+        if not branch or not TICKET_RE.match(branch):
+            return "surface", "result-not-bound-to-branch"
+        repo_entry = repos.get(repo_name) if repo_name else None
+        repo_path = repo_entry.get("path") if repo_entry else None
+        if not repo_path:
+            return "surface", "repo-not-configured"
+        rc, _, _ = tr_run(["rev-parse", "--is-inside-work-tree"], repo_path)
+        if rc != 0:
+            return "surface", "repo-not-on-disk"
+
+        attempt = disp.get("attempt")
+        base_sha = (disp.get("attempts") or {}).get(attempt, {}).get("base_sha")
+        result_sha = disp.get("result_sha")
+        if not base_sha or not result_sha:
+            return "surface", "missing-repo-metadata"
+
+        mainline = repo_entry.get("mainline")
+        mainline_ref = repo_entry.get("mainline_ref")
+        fetch_policy = repo_entry.get("fetch_policy")
+        reason = tr_g4_check(repo_path, mainline, mainline_ref, fetch_policy,
+                             base_sha, result_sha, branch, prefetch.get(repo_name))
+        if reason:
+            return "surface", reason
+
+    return "close", None
+PYEOF
+
+# ---------------------------------------------------------------------------
 # STAGE 1 (outside any lock, read-only): identify candidate dispatches (ACKED
 # + recorded tab shows "done" in the snapshot) against the fold taken above,
 # and evaluate the strict corroboration predicate for each — independent
@@ -495,13 +1013,21 @@ index_path = os.environ["PM_TR_INDEX"]
 snapshot_path = os.environ["PM_TR_SNAPSHOT"]
 repos = json.loads(os.environ["PM_TR_REPOS"])
 herdr_ok = os.environ["PM_TR_HERDR_OK"] == "1"
-events_path = os.environ["PM_TR_EVENTS"]
 out_path = os.environ["PM_TR_OUT"]
 
 with open(index_path) as f:
     index = json.load(f)
 with open(snapshot_path) as f:
     snapshot = json.load(f)
+
+# Authoritative dispatch_new -> issue map, fold-derived (index.json key
+# "dispatch_issue_map", built ONLY from ACCEPTED -- successfully-applied,
+# never quarantined -- dispatch_new events; P3-5). STAGE 1's F1
+# branch-issue-mismatch check below reads this map instead of re-parsing
+# the raw event log itself -- a second raw-log parser here would diverge
+# from the fold's strict grammar (e.g. accepting a duplicate-key line the
+# fold quarantines) and could mis-join a dispatch to the wrong issue.
+dispatch_issue_map = dict(index.get("dispatch_issue_map") or {})
 
 results = []  # list of dicts: d, a, tab, branch, verdict("pass"/"surface"), reason/result_sha
 
@@ -573,11 +1099,13 @@ for d, disp in sorted(dispatches.items()):
         surface("branch-not-a-ticket-branch")
         continue
     # F1: the branch's ticket number must EQUAL the dispatch's own linked
-    # issue number, re-derived from the raw event log (never guessed from
-    # the branch string alone). issue is persisted as `I-<digits>` (see
-    # dispatch_new's `i=` field) -- if it can't be resolved to that literal
-    # form at all, or the numbers don't match, surface and never record.
-    issue = tr_find_issue_for_dispatch(events_path, d)
+    # issue number, looked up from the fold's authoritative
+    # dispatch_issue_map (never guessed from the branch string alone, and
+    # never re-derived by a second raw-log parse). issue is persisted as
+    # `I-<digits>` (see dispatch_new's `i=` field) -- if it can't be
+    # resolved to that literal form at all, or the numbers don't match,
+    # surface and never record.
+    issue = dispatch_issue_map.get(d)
     im = ISSUE_RE.match(issue) if issue else None
     if not im or bm.group(1).lower() != ("i" + im.group(1)).lower():
         surface("branch-issue-mismatch")
@@ -609,7 +1137,6 @@ PM_TR_INDEX="${_tr_index}" \
   PM_TR_SNAPSHOT="${_tr_snapshot_file}" \
   PM_TR_REPOS="${_tr_repos_json}" \
   PM_TR_HERDR_OK="${_tr_herdr_ok}" \
-  PM_TR_EVENTS="${_tr_events}" \
   PM_TR_OUT="${_tr_verdict_file}" \
   bash -c 'printf "%s\n%s\n" "$1" "$2" | python3 -' _ "${_TR_CORROB_PY}" "${_tr_stage1_driver}"
 _tr_stage1_rc=$?
@@ -627,6 +1154,37 @@ fi
 # error) rather than trusting a stale read. -> pm_unlock.
 # ---------------------------------------------------------------------------
 _tr_final_file="$(_tr_mktemp "${TMPDIR:-/tmp}/pm-track-final.XXXXXX")"
+
+# ---------------------------------------------------------------------------
+# Auto-close pre-fetch phase (P2-1(b)) -- STILL OUTSIDE the lock, right
+# before acquiring it: the ONLY network work the auto-close pass ever does.
+# Fetches each configured fetch-policy repo's mainline ref at most once per
+# (repo,ref) per tick and records a per-repo verdict; stage 2.5's G4 then
+# resolves refs LOCALLY under the lock and consumes the verdict (a
+# pre-fetch failure surfaces `fetch-failed` for the issues that need that
+# repo). Skipped entirely when automation.auto_close is OFF -- a disabled
+# tick performs zero fetches (P2-1(a)). A driver failure degrades to an
+# empty verdict map, which G4 reads as fetch-failed for every fetch-policy
+# repo (fail-closed, never fail-open).
+# ---------------------------------------------------------------------------
+_tr_prefetch_file="$(_tr_mktemp "${TMPDIR:-/tmp}/pm-track-ac-prefetch.XXXXXX")"
+printf '{}' >"${_tr_prefetch_file}"
+if [[ "${_tr_auto_close_enabled}" == "1" ]]; then
+  _tr_prefetch_driver='
+import json, os
+
+_pf_repos = json.loads(os.environ["PM_TR_REPOS"])
+_pf_out = os.environ["PM_TR_PREFETCH_OUT"]
+_pf_status = tr_prefetch_mainline_refs(_pf_repos)
+with open(_pf_out, "w") as f:
+    json.dump(_pf_status, f)
+'
+  if ! PM_TR_REPOS="${_tr_repos_json}" \
+    PM_TR_PREFETCH_OUT="${_tr_prefetch_file}" \
+    bash -c 'printf "%s\n%s\n%s\n" "$1" "$2" "$3" | python3 -' _ "${_TR_CORROB_PY}" "${_TR_CLOSE_PY}" "${_tr_prefetch_driver}"; then
+    printf '{}' >"${_tr_prefetch_file}"
+  fi
+fi
 
 if ! pm_lock "${_tr_root}"; then
   echo "track: failed to acquire repo lock" >&2
@@ -752,6 +1310,256 @@ with open(path, "w") as f:
   done
 }
 
+# ---------------------------------------------------------------------------
+# STAGE 2.5 (still under the SAME pm_lock hold, after the RETURNED-intake
+# apply loop above): B2.1 auto-close pass, STRICT merged-path only (the
+# MARKER path is B2.2, not built here). index.json is already fresh here --
+# pm_apply/pm_apply_batch refolds it on every successful write above, so no
+# extra pm_fold call is needed. Config-gated on automation.auto_close
+# (_tr_auto_close_enabled, default OFF): when OFF, every issue that passes
+# G1-G3 is surfaced as `auto-close-disabled` -- meaning "G1-G3 passed; G4
+# corroboration was NOT run because the flag is off" (P2-1(a)) -- an
+# informative candidate list; nothing is ever closed, and no git/network
+# work runs, with the flag off.
+# Crash-recovery re-archiving (CLOSED issue with leftover prompts/messages
+# files) is ALWAYS attempted regardless of the flag: it completes an
+# already-decided close, not a new close decision.
+#
+# This pass is a pure function of index.json + .pm/config.json + live git --
+# the herdr snapshot (_tr_snapshot_file / _tr_herdr_ok) is NEVER read here,
+# by construction, so a herdr-unavailable tick still auto-closes normally.
+# ---------------------------------------------------------------------------
+_tr_ac_verdict_file="$(_tr_mktemp "${TMPDIR:-/tmp}/pm-track-ac-verdict.XXXXXX")"
+_tr_ac_driver='
+import json, os, traceback
+
+_ac_index_path = os.environ["PM_TR_INDEX"]
+_ac_root = os.environ["PM_TR_ROOT"]
+_ac_auto_close = os.environ["PM_TR_AUTO_CLOSE"] == "1"
+_ac_out_path = os.environ["PM_TR_AC_OUT"]
+
+with open(_ac_index_path) as f:
+    _ac_index = json.load(f)
+_ac_repos = json.loads(os.environ["PM_TR_REPOS"])
+# Pre-lock pre-fetch verdicts (P2-1(b)); unreadable/absent degrades to {}
+# -> G4 treats every fetch-policy repo as fetch-failed (fail-closed).
+try:
+    with open(os.environ["PM_TR_PREFETCH"]) as f:
+        _ac_prefetch = json.load(f)
+except Exception:
+    _ac_prefetch = {}
+if not isinstance(_ac_prefetch, dict):
+    _ac_prefetch = {}
+
+# Authoritative dispatch_new -> issue map, fold-derived (index.json key
+# "dispatch_issue_map", built ONLY from ACCEPTED -- successfully-applied,
+# never quarantined -- dispatch_new events; P3-5). NEVER a second raw-log
+# re-scan of the event log.
+# A raw re-parse here would diverge from the strict grammar the fold
+# itself uses (e.g. accepting a duplicate-key line the fold quarantined)
+# and could misattribute a dispatch to the wrong issue, closing it in
+# error.
+_ac_dispatch_issue_map = dict(_ac_index.get("dispatch_issue_map") or {})
+
+_ac_issue_ids = set(_ac_index.get("issues", {}).keys())
+_ac_issue_ids.update(_ac_dispatch_issue_map.values())
+
+def _ac_has_leftovers(issue_id):
+    # P3-6: an OSError here (unreadable prompts/ or messages/) must NOT be
+    # read as "no leftovers" -- it deliberately PROPAGATES to the per-issue
+    # handler below and surfaces auto-close-driver-error with the traceback
+    # as detail. A silently-swallowed False would skip crash-recovery
+    # re-archiving for a CLOSED issue forever, with no trace anywhere.
+    for sub in ("prompts", "messages"):
+        d = os.path.join(_ac_root, sub)
+        if not os.path.isdir(d):
+            continue
+        prefix = issue_id + "_"
+        for name in os.listdir(d):
+            if name.startswith(prefix):
+                return True
+    return False
+
+_ac_results = []
+for _ac_i in sorted(_ac_issue_ids):
+    # Never let a single unexpected exception on this issue (bad/malformed
+    # config values, corrupt index data, ...) crash the WHOLE auto-close
+    # pass -- that would silently leave every OTHER issue with no verdict
+    # at all (Codex-sparred defect #3). Surface a loud, attributable
+    # reason for just this issue and keep going.
+    try:
+        _ac_action, _ac_reason = evaluate_issue(
+            _ac_i, _ac_index, _ac_repos, _ac_dispatch_issue_map,
+            _ac_auto_close, _ac_has_leftovers(_ac_i), _ac_prefetch,
+        )
+        # fix-pass-5b#3: REASONS is the single registry of every surface
+        # reason token this pass may emit. Enforce it here rather than let
+        # it silently drift from what evaluate_issue actually returns --
+        # an unregistered token would otherwise flow straight into the
+        # verdict row unexamined. Reuses the existing per-issue
+        # crash-isolation path below (loud, attributable, never crashes
+        # the whole pass).
+        if _ac_reason is not None and _ac_reason not in REASONS:
+            raise ValueError(
+                f"unregistered auto-close reason token: {_ac_reason!r} "
+                f"(action={_ac_action!r}) -- REASONS registry has drifted; "
+                "add it to REASONS in track"
+            )
+        _ac_detail = None
+    except Exception:
+        _ac_action, _ac_reason = "surface", "auto-close-driver-error"
+        # P3-3(a): the surfaced row carries a bounded traceback as detail
+        # -- attributable diagnostics, never a bare opaque reason.
+        _ac_detail = traceback.format_exc()[-2000:]
+    if _ac_action == "skip":
+        continue
+    _ac_row = {"i": _ac_i, "action": _ac_action, "reason": _ac_reason}
+    if _ac_detail:
+        _ac_row["detail"] = _ac_detail
+    _ac_results.append(_ac_row)
+
+with open(_ac_out_path, "w") as f:
+    json.dump(_ac_results, f)
+'
+# Default to a valid-but-empty verdict file BEFORE invoking the driver, so
+# a total driver crash (before it ever gets to write PM_TR_AC_OUT itself --
+# e.g. an exception outside the per-issue try/except above) still leaves
+# behind parseable JSON rather than a missing/truncated file.
+printf '[]' >"${_tr_ac_verdict_file}"
+_tr_ac_driver_stderr_file="$(_tr_mktemp "${TMPDIR:-/tmp}/pm-track-ac-driver-err.XXXXXX")"
+_tr_ac_driver_ok=1
+if ! PM_TR_INDEX="${_tr_index}" \
+  PM_TR_REPOS="${_tr_repos_json}" \
+  PM_TR_ROOT="${_tr_root}" \
+  PM_TR_AUTO_CLOSE="${_tr_auto_close_enabled}" \
+  PM_TR_PREFETCH="${_tr_prefetch_file}" \
+  PM_TR_AC_OUT="${_tr_ac_verdict_file}" \
+  bash -c 'printf "%s\n%s\n%s\n" "$1" "$2" "$3" | python3 -' _ "${_TR_CORROB_PY}" "${_TR_CLOSE_PY}" "${_tr_ac_driver}" \
+  2>"${_tr_ac_driver_stderr_file}"; then
+  _tr_ac_driver_ok=0
+fi
+# Belt-and-suspenders on top of the per-issue try/except above (defect #3):
+# even a nonzero exit AND/OR an unparseable verdict file must never be a
+# silent no-op -- degrade to one loud, unmistakable surfaced row rather
+# than leaving ac_closed/ac_surfaced both empty with no trace anywhere.
+if [[ "${_tr_ac_driver_ok}" -eq 1 ]]; then
+  if ! python3 -c '
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        json.load(f)
+except Exception:
+    sys.exit(1)
+' "${_tr_ac_verdict_file}"; then
+    _tr_ac_driver_ok=0
+  fi
+fi
+if [[ "${_tr_ac_driver_ok}" -eq 0 ]]; then
+  # P3-3(b): a whole-driver crash must never discard its only diagnostics
+  # -- the driver's bounded stderr tail is (1) echoed to track's own
+  # stderr and (2) embedded as the fallback row's detail, BEFORE the temp
+  # stderr file is removed below.
+  _tr_ac_err_tail="$(tail -c 2000 "${_tr_ac_driver_stderr_file}" 2>/dev/null || true)"
+  if [[ -n "${_tr_ac_err_tail}" ]]; then
+    {
+      echo "track: auto-close driver failed; stderr tail:"
+      printf '%s\n' "${_tr_ac_err_tail}"
+    } >&2
+  fi
+  if ! python3 -c '
+import json, sys
+row = {"i": "(auto-close)", "action": "surface", "reason": "auto-close-driver-error"}
+if sys.argv[2]:
+    row["detail"] = sys.argv[2]
+with open(sys.argv[1], "w") as f:
+    json.dump([row], f)
+' "${_tr_ac_verdict_file}" "${_tr_ac_err_tail}"; then
+    printf '[{"i": "(auto-close)", "action": "surface", "reason": "auto-close-driver-error"}]' >"${_tr_ac_verdict_file}"
+  fi
+fi
+rm -f "${_tr_ac_driver_stderr_file}"
+
+_tr_ac_closed_file="$(_tr_mktemp "${TMPDIR:-/tmp}/pm-track-ac-closed.XXXXXX")"
+_tr_ac_surfaced_file="$(_tr_mktemp "${TMPDIR:-/tmp}/pm-track-ac-surfaced.XXXXXX")"
+printf '[]' >"${_tr_ac_closed_file}"
+printf '[]' >"${_tr_ac_surfaced_file}"
+
+python3 -c '
+import json, sys
+with open(sys.argv[1]) as f:
+    rows = json.load(f)
+for row in rows:
+    print(json.dumps(row))
+' "${_tr_ac_verdict_file}" | {
+  while IFS= read -r _tr_ac_line; do
+    [[ -z "${_tr_ac_line}" ]] && continue
+    _tr_ac_i="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["i"])' "${_tr_ac_line}")"
+    _tr_ac_action="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["action"])' "${_tr_ac_line}")"
+    if [[ "${_tr_ac_action}" == "surface" ]]; then
+      python3 -c '
+import json, sys
+path = sys.argv[1]
+row = json.loads(sys.argv[2])
+with open(path) as f:
+    rows = json.load(f)
+rows.append(row)
+with open(path, "w") as f:
+    json.dump(rows, f)
+' "${_tr_ac_surfaced_file}" "${_tr_ac_line}"
+      continue
+    fi
+    # action in {close, rearchive}: both invoke pm_close_issue IN-PROCESS
+    # (never `bin/close` -- a subprocess acquiring pm_lock while this shell
+    # already holds it would deadlock; pm_lock's reentrancy is in-process
+    # only). Failures are classified via pm_close_issue's STABLE stderr
+    # tokens (P3-4), never by prose matching:
+    #   close-refused-state-race     -> close-race/refusal (BENIGN: the
+    #                                   issue's state changed under us)
+    #   close-refused-unfoldable-log -> close-refused-unfoldable-log
+    #                                   (LOUD -- the log itself is sick)
+    #   close-transition-durable     -> the CLOSED event IS durably on the
+    #                                   log; only archive/note failed ->
+    #                                   counted closed, rendered
+    #                                   closed-with-pending-archive
+    #   anything else                -> close/archive-failure
+    _tr_ac_out="$(pm_close_issue "${_tr_root}" "${_tr_ac_i}" 2>&1)"
+    _tr_ac_rc=$?
+    if [[ "${_tr_ac_rc}" -eq 0 ]]; then
+      python3 -c '
+import json, sys
+path = sys.argv[1]
+row = json.loads(sys.argv[2])
+with open(path) as f:
+    rows = json.load(f)
+rows.append(row)
+with open(path, "w") as f:
+    json.dump(rows, f)
+' "${_tr_ac_closed_file}" "${_tr_ac_line}"
+    else
+      _tr_ac_reason="$(tr_ac_classify_close_failure "${_tr_ac_out}")"
+      _tr_ac_dest_file="${_tr_ac_surfaced_file}"
+      if [[ "${_tr_ac_reason}" == "closed-with-pending-archive" ]]; then
+        # P3-4: the CLOSED transition durably landed; only a later
+        # archive/note step failed -> the issue IS closed. Count it in the
+        # closed set, flagged, instead of misreporting "not auto-closed".
+        _tr_ac_dest_file="${_tr_ac_closed_file}"
+      fi
+      python3 -c '
+import json, sys
+path = sys.argv[1]
+row = json.loads(sys.argv[2])
+row["reason"] = sys.argv[3]
+row["detail"] = sys.argv[4]
+with open(path) as f:
+    rows = json.load(f)
+rows.append(row)
+with open(path, "w") as f:
+    json.dump(rows, f)
+' "${_tr_ac_dest_file}" "${_tr_ac_line}" "${_tr_ac_reason}" "${_tr_ac_out}"
+    fi
+  done
+}
+
 pm_unlock
 trap _tr_cleanup EXIT INT TERM
 
@@ -766,6 +1574,8 @@ PM_TR_ROOT="${_tr_root}" \
   PM_TR_VERDICT="${_tr_verdict_file}" \
   PM_TR_FINAL="${_tr_final_file}" \
   PM_TR_RECORDED="${_tr_recorded_file}" \
+  PM_TR_AC_CLOSED="${_tr_ac_closed_file}" \
+  PM_TR_AC_SURFACED="${_tr_ac_surfaced_file}" \
   PM_TR_TRACKER_MD="${_tr_tracker_md}" \
   PM_TR_NOW="${_tr_now}" \
   PM_TR_HERDR_OK="${_tr_herdr_ok}" \
@@ -778,6 +1588,8 @@ root = os.environ["PM_TR_ROOT"]
 verdict_path = os.environ["PM_TR_VERDICT"]
 final_path = os.environ["PM_TR_FINAL"]
 recorded_path = os.environ["PM_TR_RECORDED"]
+ac_closed_path = os.environ["PM_TR_AC_CLOSED"]
+ac_surfaced_path = os.environ["PM_TR_AC_SURFACED"]
 tracker_md = os.environ["PM_TR_TRACKER_MD"]
 now = os.environ["PM_TR_NOW"]
 herdr_ok = os.environ["PM_TR_HERDR_OK"] == "1"
@@ -788,6 +1600,10 @@ with open(final_path) as f:
     stage2 = json.load(f)
 with open(recorded_path) as f:
     recorded = json.load(f)
+with open(ac_closed_path) as f:
+    ac_closed = json.load(f)
+with open(ac_surfaced_path) as f:
+    ac_surfaced = json.load(f)
 
 recorded_ds = {r["d"] for r in recorded}
 
@@ -875,6 +1691,85 @@ else:
     lines.append("(none)")
     lines.append("")
 
+if ac_closed:
+    lines.append("### Auto-closed this tick")
+    lines.append("")
+    lines.append("| issue | action | reason |")
+    lines.append("| --- | --- | --- |")
+    for r in sorted(ac_closed, key=lambda r: r["i"]):
+        lines.append(
+            "| {} | {} | {} |".format(
+                esc_md_cell(r["i"]),
+                esc_md_cell(r.get("action")),
+                esc_md_cell(r.get("reason")),
+            )
+        )
+    lines.append("")
+else:
+    lines.append("### Auto-closed this tick")
+    lines.append("")
+    lines.append("(none)")
+    lines.append("")
+
+# P3-7: signal partition. Steady-state reasons (expected, non-actionable
+# rows that would otherwise drown the real signal) collapse to ONE summary
+# line each with a truncated id list; every other reason is actionable/
+# anomalous and renders individually WITH its detail (P3-3).
+AC_STEADY_STATE_REASONS = (
+    "paused/non-active",
+    "dispatch-not-VERIFIED",
+    "auto-close-disabled",
+    "issue-unregistered",
+)
+
+
+def ac_summarize_ids(ids, limit=10):
+    ids = sorted(ids)
+    shown = ", ".join(ids[:limit])
+    if len(ids) > limit:
+        shown += ", +{} more".format(len(ids) - limit)
+    return shown
+
+
+ac_steady = {}
+ac_actionable = []
+for r in ac_surfaced:
+    if r.get("reason") in AC_STEADY_STATE_REASONS:
+        ac_steady.setdefault(r["reason"], []).append(r["i"])
+    else:
+        ac_actionable.append(r)
+
+lines.append("### Surfaced — issues NOT auto-closed")
+lines.append("")
+if not ac_surfaced:
+    lines.append("(none)")
+    lines.append("")
+else:
+    if ac_actionable:
+        lines.append("| issue | reason | detail |")
+        lines.append("| --- | --- | --- |")
+        for r in sorted(ac_actionable, key=lambda r: r["i"]):
+            lines.append(
+                "| {} | {} | {} |".format(
+                    esc_md_cell(r["i"]),
+                    esc_md_cell(r.get("reason")),
+                    esc_md_cell(r.get("detail") or ""),
+                )
+            )
+        lines.append("")
+    for reason in AC_STEADY_STATE_REASONS:
+        if reason in ac_steady:
+            ids = ac_steady[reason]
+            lines.append(
+                "- {}: {} issue(s) ({})".format(
+                    esc_md_inline(reason),
+                    len(ids),
+                    esc_md_inline(ac_summarize_ids(ids)),
+                )
+            )
+    if ac_steady:
+        lines.append("")
+
 lines.append("_last tick: {}_".format(esc_md_cell(now)))
 body = "\n".join(lines)
 
@@ -908,6 +1803,8 @@ render_marker(tracker_md, "tracker", body)
 print("=== track ===")
 print(f"recorded: {len(recorded)}")
 print(f"surfaced: {len(surfaced)}")
+print(f"auto-closed: {len(ac_closed)}")
+print(f"auto-close surfaced: {len(ac_surfaced)}")
 if not herdr_ok:
     print("herdr: unavailable this tick (degraded, not fatal)")
 if conflicts:
@@ -920,6 +1817,14 @@ for r in sorted(recorded, key=lambda r: r["d"]):
     print(f"  RECORDED {r['d']} a={r['a']} tab={r['tab']} result_sha={r.get('result_sha')}")
 for r in sorted(surfaced, key=lambda r: r["d"]):
     print(f"  SURFACED {r['d']} tab={r.get('tab')} reason={r.get('reason')}")
+for r in sorted(ac_closed, key=lambda r: r["i"]):
+    print(f"  AUTO-CLOSED {r['i']} action={r.get('action')}")
+for r in sorted(ac_actionable, key=lambda r: r["i"]):
+    print(f"  AUTO-CLOSE-SURFACED {r['i']} reason={r.get('reason')}")
+for reason in AC_STEADY_STATE_REASONS:
+    if reason in ac_steady:
+        ids = ac_steady[reason]
+        print(f"  AUTO-CLOSE-SURFACED ({reason}) count={len(ids)} ids={ac_summarize_ids(ids)}")
 PYEOF
 _tr_render_rc=$?
 if [[ ${_tr_render_rc} -ne 0 ]]; then

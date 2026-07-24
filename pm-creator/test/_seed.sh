@@ -106,3 +106,39 @@ pm_raw_append() {
   pm_unlock
   return $rc
 }
+
+# pm_raw_append_literal <line>
+# TEST/FIXTURE-ONLY, more primitive than pm_raw_append: appends the EXACT
+# literal string given (no "EVENT " prefixing, no grammar validation of any
+# kind -- not type/key-known-ness, not duplicate-key detection, not charset,
+# not quoting) as one line to .pm/events.log. Exists solely so tests can
+# construct genuinely grammar-INVALID adversarial raw lines (duplicate keys,
+# quoted/trailing tokens, malformed key=value pairs) that pm_raw_append's own
+# grammar checks refuse to write -- e.g. reproducing a line the fold's
+# parse_line() must reject/quarantine at fold time. Uses PM_ROOT (falls back
+# to _pm_root's normal resolution) exactly like pm_raw_append. Must NEVER
+# ship in templates/bin/_lib.sh.
+pm_raw_append_literal() {
+  local line="${1:-}"
+  if [[ -z "$line" ]]; then
+    echo "pm_raw_append_literal: missing <line>" >&2
+    return 1
+  fi
+
+  local root
+  root="$(_pm_root "")" || return 1
+  local pmdir="$root/.pm"
+  local log="$pmdir/events.log"
+  mkdir -p "$pmdir"
+
+  pm_lock "$root" || return 1
+  (
+    if [[ ! -s "$log" ]]; then
+      printf 'EVENT schema v=1\n' >> "$log"
+    fi
+    printf '%s\n' "$line" >> "$log"
+  )
+  local rc=$?
+  pm_unlock
+  return $rc
+}
