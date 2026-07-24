@@ -1,6 +1,7 @@
 ---
 name: pm-creator
-description: Use when the user wants to set up a manager/PM control-plane repo to oversee a multi-repo, multi-agent campaign — scaffolds a self-resuming <campaign>-pm repo (event-log state, dispatch identity, human-gated dispatch lane, prompt self-containment law). Triggers on "create a PM repo", "set up a manager/overseer repo", "PM control plane for a campaign", generalizing an existing manager repo, or running many worker agents across several repos.
+description: Scaffold a self-resuming <campaign>-pm control-plane repo (event-log state, dispatch identity, human-gated dispatch lane) for overseeing a multi-repo, multi-agent campaign.
+disable-model-invocation: true
 ---
 
 # pm-creator
