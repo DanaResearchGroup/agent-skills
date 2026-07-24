@@ -436,6 +436,9 @@ ISSUE_STATES = {
     "NEEDS-USER", "CLOSED",
 }
 
+# Legal question `state=` values per event-log-grammar.md (Q&A lifecycle: OPEN/ANSWERED).
+QUESTION_STATES = {"OPEN", "ANSWERED"}
+
 
 class RuleViolation(Exception):
     pass
@@ -791,7 +794,17 @@ def apply_event(state, etype, kv, line_no, raw, mode):
 
     if etype == "question":
         q = kv["q"]
-        questions[q] = kv["state"]
+        st = kv["state"]
+        if st not in QUESTION_STATES:
+            return fail(f"illegal question state='{st}': not in {sorted(QUESTION_STATES)}")
+        prev = questions.get(q)
+        # Carry the issue link forward: a later event for the same question
+        # that OMITS `i=` must NOT null out a previously-recorded link (the
+        # known B2.0b trap — naive "latest line wins" loses the join).
+        i = kv.get("i")
+        if i is None and prev is not None:
+            i = prev.get("i")
+        questions[q] = {"state": st, "i": i}
         return True
 
     if etype == "unregistered_execution":
@@ -828,7 +841,24 @@ def fold_lines(raw_lines):
 
 
 def write_outputs(state, index_path, quarantine_path):
-    open_questions = sorted([q for q, st in state["questions"].items() if st == "OPEN"])
+    questions = state["questions"]
+    open_questions = sorted([q for q, rec in questions.items() if rec["state"] == "OPEN"])
+
+    # Per-issue view of OPEN questions (B2.0b / B2.1's G2 gate) — scoped ones
+    # bucket by their carried `i`; OPEN questions with no issue link (never
+    # set, or omitted from every event) surface separately so a later gate
+    # can raise `open-question-unscoped` instead of silently missing them.
+    open_questions_by_issue = {}
+    open_questions_unscoped = []
+    for q in open_questions:
+        i = questions[q].get("i")
+        if i:
+            open_questions_by_issue.setdefault(i, []).append(q)
+        else:
+            open_questions_unscoped.append(q)
+    for i in open_questions_by_issue:
+        open_questions_by_issue[i].sort()
+    open_questions_unscoped.sort()
 
     seen_refs = set()
     dedup_unregistered = []
@@ -844,7 +874,10 @@ def write_outputs(state, index_path, quarantine_path):
         "dispatches": state["dispatches"],
         "quarantined": state["quarantined"],
         "unregistered": dedup_unregistered,
+        "questions": questions,
         "open_questions": open_questions,
+        "open_questions_by_issue": open_questions_by_issue,
+        "open_questions_unscoped": open_questions_unscoped,
     }
 
     with open(index_path, "w") as f:

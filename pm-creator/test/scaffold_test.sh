@@ -71,7 +71,10 @@ v = {
   "HARDWARE_TABLE": "| CPU | test box |",
   "CAPACITY_NOTES": "One generation at a time.",
   "CAPACITY_RULES": "1. Don't stack heavy jobs.",
-  "REPOS_JSON": json.dumps([{"name": "demo", "path": demo, "mainline": "main"}]),
+  "REPOS_JSON": json.dumps([{
+    "name": "demo", "path": demo, "mainline": "main",
+    "mainline_ref": "refs/heads/main", "fetch_policy": "local-only",
+  }]),
   "OPTIONAL_SLOTS_JSON": json.dumps({"runs": True, "machine": True}),
 }
 json.dump(v, open(sys.argv[1], "w"))
@@ -120,6 +123,23 @@ Line2'
   repo_name="$(python3 -c "import json; print(json.load(open('$out/.pm/config.json'))['repos'][0]['name'])")"
   [[ "$repo_name" == "demo" ]] && ok "REPOS_JSON interpolated raw (not double-escaped)" \
     || fail "REPOS_JSON interpolated raw (not double-escaped)" "got [$repo_name]"
+
+  # B2.0b: automation.auto_close defaults OFF (literal in the template, not
+  # operator-required) and the per-repo full mainline_ref + fetch_policy
+  # (opaque REPOS_JSON pass-through) render intact, valid JSON.
+  local auto_close
+  auto_close="$(python3 -c "import json; print(json.load(open('$out/.pm/config.json'))['automation']['auto_close'])")"
+  [[ "$auto_close" == "False" ]] && ok "config.json automation.auto_close defaults to false" \
+    || fail "config.json automation.auto_close defaults to false" "got [$auto_close]"
+
+  local mainline_ref fetch_policy
+  mainline_ref="$(python3 -c "import json; print(json.load(open('$out/.pm/config.json'))['repos'][0]['mainline_ref'])")"
+  fetch_policy="$(python3 -c "import json; print(json.load(open('$out/.pm/config.json'))['repos'][0]['fetch_policy'])")"
+  [[ "$mainline_ref" == "refs/heads/main" ]] && \
+    ok "config.json repos[0].mainline_ref == refs/heads/main (full ref, never short 'main')" \
+    || fail "config.json repos[0].mainline_ref == refs/heads/main (full ref, never short 'main')" "got [$mainline_ref]"
+  [[ "$fetch_policy" == "local-only" ]] && ok "config.json repos[0].fetch_policy == local-only" \
+    || fail "config.json repos[0].fetch_policy == local-only" "got [$fetch_policy]"
 }
 
 # ---------------------------------------------------------------------------
@@ -449,6 +469,399 @@ section_multiline_survivor() {
     || ok "no partial --out dir left behind (multi-line guard case)"
 }
 
+# ---------------------------------------------------------------------------
+# 8. B2.0b config completeness: a REPOS_JSON repo with only the legacy
+#    {name, path, mainline} shape (no mainline_ref/fetch_policy at all) must
+#    have scaffold DERIVE the full mainline_ref + a default fetch_policy --
+#    config must be complete-by-construction, not pass-through.
+# ---------------------------------------------------------------------------
+section_repos_derive_default() {
+  local demo values out
+  demo="$WORK/demo8"
+  mkdir -p "$demo"
+  (cd "$demo" && git init -q -b main && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init)
+
+  values="$WORK/values8.json"
+  write_full_values "$values" "$demo"
+  # Strip mainline_ref/fetch_policy back to the legacy minimal shape.
+  python3 - "$values" "$demo" <<'PY'
+import json, sys
+p, demo = sys.argv[1], sys.argv[2]
+v = json.load(open(p))
+v["REPOS_JSON"] = json.dumps([{"name": "demo", "path": demo, "mainline": "main"}])
+json.dump(v, open(p, "w"))
+PY
+
+  out="$WORK/out8"
+  if bash "$SCAFFOLD" --values "$values" --out "$out" >"$WORK/s8.out" 2>"$WORK/s8.err"; then
+    ok "legacy {name,path,mainline}-only REPOS_JSON still scaffolds successfully"
+  else
+    fail "legacy {name,path,mainline}-only REPOS_JSON still scaffolds successfully" "$(cat "$WORK/s8.err")"
+  fi
+
+  local mainline_ref fetch_policy
+  mainline_ref="$(python3 -c "import json; print(json.load(open('$out/.pm/config.json'))['repos'][0]['mainline_ref'])" 2>/dev/null)"
+  fetch_policy="$(python3 -c "import json; print(json.load(open('$out/.pm/config.json'))['repos'][0]['fetch_policy'])" 2>/dev/null)"
+  [[ "$mainline_ref" == "refs/remotes/origin/main" ]] && \
+    ok "config.json repos[0].mainline_ref derived as refs/remotes/origin/main when absent" \
+    || fail "config.json repos[0].mainline_ref derived as refs/remotes/origin/main when absent" "got [$mainline_ref]"
+  [[ "$fetch_policy" == "fetch" ]] && ok "config.json repos[0].fetch_policy defaults to fetch when absent" \
+    || fail "config.json repos[0].fetch_policy defaults to fetch when absent" "got [$fetch_policy]"
+
+  python3 -c "import json; json.load(open('$out/.pm/config.json'))" 2>"$WORK/s8.parse.err" \
+    && ok "config.json still valid JSON with derived repo fields" \
+    || fail "config.json still valid JSON with derived repo fields" "$(cat "$WORK/s8.parse.err")"
+}
+
+# ---------------------------------------------------------------------------
+# 9. An operator-supplied full mainline_ref (differing from a naive
+#    derivation, so a stale/pass-through implementation could not fake this)
+#    must be preserved verbatim, never recomputed from `mainline`.
+# ---------------------------------------------------------------------------
+section_repos_preserve_explicit_ref() {
+  local demo values out
+  demo="$WORK/demo9"
+  mkdir -p "$demo"
+  (cd "$demo" && git init -q -b main && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init)
+
+  values="$WORK/values9.json"
+  write_full_values "$values" "$demo"
+  python3 - "$values" "$demo" <<'PY'
+import json, sys
+p, demo = sys.argv[1], sys.argv[2]
+v = json.load(open(p))
+# mainline says "main" but the operator supplies an explicit full ref that
+# points at a *different* branch (refs/heads/release) -- proves this is
+# preserved verbatim and NOT recomputed as refs/remotes/origin/main.
+v["REPOS_JSON"] = json.dumps([{
+    "name": "demo", "path": demo, "mainline": "main",
+    "mainline_ref": "refs/heads/release",
+}])
+json.dump(v, open(p, "w"))
+PY
+
+  out="$WORK/out9"
+  bash "$SCAFFOLD" --values "$values" --out "$out" >"$WORK/s9.out" 2>"$WORK/s9.err"
+
+  local mainline_ref fetch_policy
+  mainline_ref="$(python3 -c "import json; print(json.load(open('$out/.pm/config.json'))['repos'][0]['mainline_ref'])" 2>/dev/null)"
+  fetch_policy="$(python3 -c "import json; print(json.load(open('$out/.pm/config.json'))['repos'][0]['fetch_policy'])" 2>/dev/null)"
+  [[ "$mainline_ref" == "refs/heads/release" ]] && \
+    ok "explicit repos[0].mainline_ref preserved verbatim, not recomputed from mainline" \
+    || fail "explicit repos[0].mainline_ref preserved verbatim, not recomputed from mainline" "got [$mainline_ref]"
+  [[ "$fetch_policy" == "local-only" ]] && \
+    ok "fetch_policy defaults to local-only for a refs/heads/* ref when unsupplied" \
+    || fail "fetch_policy defaults to local-only for a refs/heads/* ref when unsupplied" "got [$fetch_policy]"
+}
+
+# ---------------------------------------------------------------------------
+# 10. A repo missing 'mainline' entirely cannot have a ref derived -- scaffold
+#     must FAIL LOUD (nonzero exit, clear error) with no partial --out left.
+# ---------------------------------------------------------------------------
+section_repos_missing_mainline_fails() {
+  local demo values out
+  demo="$WORK/demo10"
+  mkdir -p "$demo"
+  (cd "$demo" && git init -q -b main && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init)
+
+  values="$WORK/values10.json"
+  write_full_values "$values" "$demo"
+  python3 - "$values" "$demo" <<'PY'
+import json, sys
+p, demo = sys.argv[1], sys.argv[2]
+v = json.load(open(p))
+v["REPOS_JSON"] = json.dumps([{"name": "demo", "path": demo}])  # no mainline at all
+json.dump(v, open(p, "w"))
+PY
+
+  out="$WORK/out10"
+  if bash "$SCAFFOLD" --values "$values" --out "$out" >"$WORK/s10.out" 2>"$WORK/s10.err"; then
+    fail "repo missing 'mainline' makes scaffold exit non-zero" "unexpectedly succeeded"
+  else
+    ok "repo missing 'mainline' makes scaffold exit non-zero"
+  fi
+
+  grep -qi "mainline" "$WORK/s10.err" && ok "failure output names the missing 'mainline' field" \
+    || fail "failure output names the missing 'mainline' field" "$(cat "$WORK/s10.err")"
+
+  [[ -e "$out" ]] && fail "no partial --out dir left behind (missing mainline case)" "found: $out" \
+    || ok "no partial --out dir left behind (missing mainline case)"
+}
+
+# ---------------------------------------------------------------------------
+# 11. A short/unqualified mainline_ref (e.g. "main", no refs/ prefix) is
+#     exactly the short-`main` trap B2.0b exists to prevent -- scaffold must
+#     FAIL LOUD rather than silently guess, with no partial --out left.
+# ---------------------------------------------------------------------------
+section_repos_short_mainline_ref_fails() {
+  local demo values out
+  demo="$WORK/demo11"
+  mkdir -p "$demo"
+  (cd "$demo" && git init -q -b main && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init)
+
+  values="$WORK/values11.json"
+  write_full_values "$values" "$demo"
+  python3 - "$values" "$demo" <<'PY'
+import json, sys
+p, demo = sys.argv[1], sys.argv[2]
+v = json.load(open(p))
+v["REPOS_JSON"] = json.dumps([{"name": "demo", "path": demo, "mainline": "main", "mainline_ref": "main"}])
+json.dump(v, open(p, "w"))
+PY
+
+  out="$WORK/out11"
+  if bash "$SCAFFOLD" --values "$values" --out "$out" >"$WORK/s11.out" 2>"$WORK/s11.err"; then
+    fail "short mainline_ref='main' makes scaffold exit non-zero" "unexpectedly succeeded"
+  else
+    ok "short mainline_ref='main' makes scaffold exit non-zero"
+  fi
+
+  grep -qi "mainline_ref" "$WORK/s11.err" && ok "failure output names the short mainline_ref" \
+    || fail "failure output names the short mainline_ref" "$(cat "$WORK/s11.err")"
+
+  [[ -e "$out" ]] && fail "no partial --out dir left behind (short mainline_ref case)" "found: $out" \
+    || ok "no partial --out dir left behind (short mainline_ref case)"
+}
+
+# ---------------------------------------------------------------------------
+# 12. Round-21 Low hardening: a non-string REPOS_JSON value (e.g. a JSON
+#     number) must clean-fail (sys.exit(3) + message), not raise an
+#     uncaught TypeError out of the scaffold's python heredoc.
+# ---------------------------------------------------------------------------
+section_repos_json_non_string_fails() {
+  local demo values out
+  demo="$WORK/demo12"
+  mkdir -p "$demo"
+  (cd "$demo" && git init -q -b main && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init)
+
+  values="$WORK/values12.json"
+  write_full_values "$values" "$demo"
+  python3 - "$values" <<'PY'
+import json, sys
+p = sys.argv[1]
+v = json.load(open(p))
+v["REPOS_JSON"] = 42  # not a string at all
+json.dump(v, open(p, "w"))
+PY
+
+  out="$WORK/out12"
+  if bash "$SCAFFOLD" --values "$values" --out "$out" >"$WORK/s12.out" 2>"$WORK/s12.err"; then
+    fail "non-string REPOS_JSON makes scaffold exit non-zero" "unexpectedly succeeded"
+  else
+    ok "non-string REPOS_JSON makes scaffold exit non-zero"
+  fi
+
+  grep -qi "traceback" "$WORK/s12.err" && fail "non-string REPOS_JSON fails cleanly (no Python traceback)" \
+    "$(cat "$WORK/s12.err")" \
+    || ok "non-string REPOS_JSON fails cleanly (no Python traceback)"
+
+  grep -qi "REPOS_JSON" "$WORK/s12.err" && ok "failure output names REPOS_JSON" \
+    || fail "failure output names REPOS_JSON" "$(cat "$WORK/s12.err")"
+
+  [[ -e "$out" ]] && fail "no partial --out dir left behind (non-string REPOS_JSON case)" "found: $out" \
+    || ok "no partial --out dir left behind (non-string REPOS_JSON case)"
+}
+
+# ---------------------------------------------------------------------------
+# 13. Round-21 Low hardening: a truthy non-string 'mainline' (e.g. ["main"])
+#     must fail loud, not get silently stringified into a bogus
+#     full-looking ref like refs/remotes/origin/['main'].
+# ---------------------------------------------------------------------------
+section_repos_mainline_non_string_fails() {
+  local demo values out
+  demo="$WORK/demo13"
+  mkdir -p "$demo"
+  (cd "$demo" && git init -q -b main && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init)
+
+  values="$WORK/values13.json"
+  write_full_values "$values" "$demo"
+  python3 - "$values" "$demo" <<'PY'
+import json, sys
+p, demo = sys.argv[1], sys.argv[2]
+v = json.load(open(p))
+v["REPOS_JSON"] = json.dumps([{"name": "demo", "path": demo, "mainline": ["main"]}])
+json.dump(v, open(p, "w"))
+PY
+
+  out="$WORK/out13"
+  if bash "$SCAFFOLD" --values "$values" --out "$out" >"$WORK/s13.out" 2>"$WORK/s13.err"; then
+    fail "non-string 'mainline' makes scaffold exit non-zero" "unexpectedly succeeded"
+  else
+    ok "non-string 'mainline' makes scaffold exit non-zero"
+  fi
+
+  grep -qi "mainline" "$WORK/s13.err" && ok "failure output names 'mainline'" \
+    || fail "failure output names 'mainline'" "$(cat "$WORK/s13.err")"
+
+  [[ -e "$out" ]] && fail "no partial --out dir left behind (non-string mainline case)" "found: $out" \
+    || ok "no partial --out dir left behind (non-string mainline case)"
+}
+
+# ---------------------------------------------------------------------------
+# 14. Round-21 Low hardening: a non-string explicit 'mainline_ref' (e.g. a
+#     number) must fail loud, not raise AttributeError out of `.startswith`.
+# ---------------------------------------------------------------------------
+section_repos_mainline_ref_non_string_fails() {
+  local demo values out
+  demo="$WORK/demo14"
+  mkdir -p "$demo"
+  (cd "$demo" && git init -q -b main && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init)
+
+  values="$WORK/values14.json"
+  write_full_values "$values" "$demo"
+  python3 - "$values" "$demo" <<'PY'
+import json, sys
+p, demo = sys.argv[1], sys.argv[2]
+v = json.load(open(p))
+v["REPOS_JSON"] = json.dumps([{"name": "demo", "path": demo, "mainline": "main", "mainline_ref": 7}])
+json.dump(v, open(p, "w"))
+PY
+
+  out="$WORK/out14"
+  if bash "$SCAFFOLD" --values "$values" --out "$out" >"$WORK/s14.out" 2>"$WORK/s14.err"; then
+    fail "non-string 'mainline_ref' makes scaffold exit non-zero" "unexpectedly succeeded"
+  else
+    ok "non-string 'mainline_ref' makes scaffold exit non-zero"
+  fi
+
+  grep -qi "traceback" "$WORK/s14.err" && fail "non-string mainline_ref fails cleanly (no Python traceback)" \
+    "$(cat "$WORK/s14.err")" \
+    || ok "non-string mainline_ref fails cleanly (no Python traceback)"
+
+  grep -qi "mainline_ref" "$WORK/s14.err" && ok "failure output names 'mainline_ref'" \
+    || fail "failure output names 'mainline_ref'" "$(cat "$WORK/s14.err")"
+
+  [[ -e "$out" ]] && fail "no partial --out dir left behind (non-string mainline_ref case)" "found: $out" \
+    || ok "no partial --out dir left behind (non-string mainline_ref case)"
+}
+
+# ---------------------------------------------------------------------------
+# 15. Round-21 Low hardening: an explicit fetch_policy outside the
+#     {fetch, local-only} enum must fail loud at scaffold time (cheap
+#     scaffold-side guard -- deeper runtime enforcement stays B2.1's job).
+# ---------------------------------------------------------------------------
+section_repos_bad_fetch_policy_fails() {
+  local demo values out
+  demo="$WORK/demo15"
+  mkdir -p "$demo"
+  (cd "$demo" && git init -q -b main && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init)
+
+  values="$WORK/values15.json"
+  write_full_values "$values" "$demo"
+  python3 - "$values" "$demo" <<'PY'
+import json, sys
+p, demo = sys.argv[1], sys.argv[2]
+v = json.load(open(p))
+v["REPOS_JSON"] = json.dumps([{
+    "name": "demo", "path": demo, "mainline": "main",
+    "mainline_ref": "refs/heads/main", "fetch_policy": "sometimes",
+}])
+json.dump(v, open(p, "w"))
+PY
+
+  out="$WORK/out15"
+  if bash "$SCAFFOLD" --values "$values" --out "$out" >"$WORK/s15.out" 2>"$WORK/s15.err"; then
+    fail "fetch_policy='sometimes' makes scaffold exit non-zero" "unexpectedly succeeded"
+  else
+    ok "fetch_policy='sometimes' makes scaffold exit non-zero"
+  fi
+
+  grep -qi "fetch_policy" "$WORK/s15.err" && ok "failure output names 'fetch_policy'" \
+    || fail "failure output names 'fetch_policy'" "$(cat "$WORK/s15.err")"
+
+  [[ -e "$out" ]] && fail "no partial --out dir left behind (bad fetch_policy case)" "found: $out" \
+    || ok "no partial --out dir left behind (bad fetch_policy case)"
+}
+
+# ---------------------------------------------------------------------------
+# 16a. Round-21 Low hardening: a repo whose string field contains hostile
+#      content (quotes, backslashes, a control char) must round-trip intact
+#      through the repos-normalization re-serialize -- proving json.dumps
+#      preserves the hardened escaping guarantee end-to-end.
+# ---------------------------------------------------------------------------
+section_repos_hostile_field_round_trips() {
+  local demo values out
+  demo="$WORK/demo16"
+  mkdir -p "$demo"
+  (cd "$demo" && git init -q -b main && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init)
+
+  values="$WORK/values16.json"
+  write_full_values "$values" "$demo"
+  local hostile_note
+  hostile_note=$'quote:" backslash:\\ ctrl:\x01 done'
+  python3 - "$values" "$demo" "$hostile_note" <<'PY'
+import json, sys
+p, demo, note = sys.argv[1], sys.argv[2], sys.argv[3]
+v = json.load(open(p))
+v["REPOS_JSON"] = json.dumps([{
+    "name": "demo", "path": demo, "mainline": "main",
+    "mainline_ref": "refs/heads/main", "fetch_policy": "local-only",
+    "note": note,
+}])
+json.dump(v, open(p, "w"))
+PY
+
+  out="$WORK/out16"
+  if bash "$SCAFFOLD" --values "$values" --out "$out" >"$WORK/s16.out" 2>"$WORK/s16.err"; then
+    ok "hostile repo field (quotes/backslash/ctrl char) still scaffolds successfully"
+  else
+    fail "hostile repo field (quotes/backslash/ctrl char) still scaffolds successfully" "$(cat "$WORK/s16.err")"
+  fi
+
+  python3 -c "import json; json.load(open('$out/.pm/config.json'))" 2>"$WORK/s16.parse.err" \
+    && ok "config.json remains valid JSON with hostile repo field" \
+    || fail "config.json remains valid JSON with hostile repo field" "$(cat "$WORK/s16.parse.err")"
+
+  local got
+  got="$(python3 -c "import json; print(json.load(open('$out/.pm/config.json'))['repos'][0]['note'])" 2>/dev/null)"
+  [[ "$got" == "$hostile_note" ]] && ok "hostile repo field round-trips byte-for-byte intact" \
+    || fail "hostile repo field round-trips byte-for-byte intact" "got [$got]"
+}
+
+# ---------------------------------------------------------------------------
+# 16b. A {{...}}-shaped literal token sitting inside repo field data (not a
+#      real template placeholder) must still be caught by the PRE-EXISTING
+#      broad survivor guard (M7 / section_broad_survivor_guard) after
+#      passing through the repos-normalization re-serialize -- proving the
+#      normalization pass doesn't accidentally smuggle a placeholder-looking
+#      token past that guard. (The guard is deliberately broad: no literal
+#      {{...}} may ever survive into shipped output, including inside data
+#      fields -- this is existing hardened behavior, not something new here.)
+# ---------------------------------------------------------------------------
+section_repos_field_placeholder_token_still_guarded() {
+  local demo values out
+  demo="$WORK/demo16b"
+  mkdir -p "$demo"
+  (cd "$demo" && git init -q -b main && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init)
+
+  values="$WORK/values16b.json"
+  write_full_values "$values" "$demo"
+  python3 - "$values" "$demo" <<'PY'
+import json, sys
+p, demo = sys.argv[1], sys.argv[2]
+v = json.load(open(p))
+v["REPOS_JSON"] = json.dumps([{
+    "name": "demo", "path": demo, "mainline": "main",
+    "mainline_ref": "refs/heads/main", "fetch_policy": "local-only",
+    "note": "token:{{FOO}}",
+}])
+json.dump(v, open(p, "w"))
+PY
+
+  out="$WORK/out16b"
+  if bash "$SCAFFOLD" --values "$values" --out "$out" >"$WORK/s16b.out" 2>"$WORK/s16b.err"; then
+    fail "{{...}}-shaped repo field data trips the broad survivor guard" "unexpectedly succeeded"
+  else
+    ok "{{...}}-shaped repo field data trips the broad survivor guard"
+  fi
+
+  grep -q '{{FOO}}' "$WORK/s16b.err" && ok "failure output names the surviving {{FOO}} token" \
+    || fail "failure output names the surviving {{FOO}} token" "$(cat "$WORK/s16b.err")"
+
+  [[ -e "$out" ]] && fail "no partial --out dir left behind ({{...}}-in-repo-field case)" "found: $out" \
+    || ok "no partial --out dir left behind ({{...}}-in-repo-field case)"
+}
+
 echo "== JSON escaping of hostile values =="
 section_json_escaping
 echo "== no partial dir left on forced failure =="
@@ -467,6 +880,26 @@ echo "== SIGTERM mid-scaffold cleans up temp dir (M6) =="
 section_signal_cleanup
 echo "== multi-line {{...}} survivor guard (M7) =="
 section_multiline_survivor
+echo "== B2.0b: legacy repo shape derives full mainline_ref + fetch_policy =="
+section_repos_derive_default
+echo "== B2.0b: explicit mainline_ref preserved verbatim =="
+section_repos_preserve_explicit_ref
+echo "== B2.0b: repo missing 'mainline' fails loud, no partial --out =="
+section_repos_missing_mainline_fails
+echo "== B2.0b: short/unqualified mainline_ref fails loud, no partial --out =="
+section_repos_short_mainline_ref_fails
+echo "== round-21: non-string REPOS_JSON fails cleanly (no TypeError) =="
+section_repos_json_non_string_fails
+echo "== round-21: non-string 'mainline' fails loud =="
+section_repos_mainline_non_string_fails
+echo "== round-21: non-string explicit 'mainline_ref' fails loud (no AttributeError) =="
+section_repos_mainline_ref_non_string_fails
+echo "== round-21: fetch_policy outside {fetch,local-only} enum fails loud =="
+section_repos_bad_fetch_policy_fails
+echo "== round-21: hostile repo field round-trips through normalization =="
+section_repos_hostile_field_round_trips
+echo "== round-21: {{...}}-shaped repo field data still trips the broad survivor guard =="
+section_repos_field_placeholder_token_still_guarded
 
 echo
 echo "-----------------------------------------"

@@ -266,6 +266,70 @@ section_fold_git_meta() {
 }
 
 # ---------------------------------------------------------------------------
+# B2.0b: pm_fold carries question<->issue -- questions[q] == {state,i},
+# last-i-wins carry-forward across a later bare (no i=) event, invalid
+# question state quarantined, open_questions_by_issue / unscoped surfaced,
+# and the flat open_questions[] list stays intact (backward compat).
+# ---------------------------------------------------------------------------
+section_fold_question_issue() {
+  local repo
+  repo="$(new_tmp_repo)"
+  {
+    echo "EVENT schema v=1"
+    # Q-001: scoped to I-001 from the start, later re-affirmed OPEN without
+    # repeating i= -- the link must be carried forward (last-i-wins trap).
+    echo "EVENT question q=Q-001 state=OPEN at=2026-07-23T18:00:00Z i=I-001"
+    echo "EVENT question q=Q-001 state=OPEN at=2026-07-23T18:05:00Z"
+    # Q-002: also scoped to I-001 -- two OPEN questions on the same issue.
+    echo "EVENT question q=Q-002 state=OPEN at=2026-07-23T18:01:00Z i=I-001"
+    # Q-003: scoped to I-002, later ANSWERED (no longer open).
+    echo "EVENT question q=Q-003 state=OPEN at=2026-07-23T18:02:00Z i=I-002"
+    echo "EVENT question q=Q-003 state=ANSWERED at=2026-07-23T18:06:00Z i=I-002 a_of=A-01"
+    # Q-004: never scoped to any issue -- unscoped OPEN question.
+    echo "EVENT question q=Q-004 state=OPEN at=2026-07-23T18:03:00Z"
+    # Q-005: invalid state value -- must be quarantined, not silently folded.
+    echo "EVENT question q=Q-005 state=BOGUS at=2026-07-23T18:04:00Z i=I-003"
+  } > "$repo/.pm/events.log"
+
+  pm_fold "$repo" >/dev/null
+
+  local q1_state q1_i
+  q1_state="$(python3 -c "import json;d=json.load(open('$repo/.pm/index.json'));print(d['questions']['Q-001']['state'])")"
+  q1_i="$(python3 -c "import json;d=json.load(open('$repo/.pm/index.json'));print(d['questions']['Q-001']['i'])")"
+  assert_eq "fold q<->i: Q-001 state == OPEN" "OPEN" "$q1_state"
+  assert_eq "fold q<->i: Q-001 i carried forward across later bare (no i=) event" "I-001" "$q1_i"
+
+  local by_issue_i1 by_issue_i2
+  by_issue_i1="$(python3 -c "import json;d=json.load(open('$repo/.pm/index.json'));print(sorted(d['open_questions_by_issue']['I-001']))")"
+  assert_eq "fold q<->i: open_questions_by_issue[I-001] == ['Q-001','Q-002']" "['Q-001', 'Q-002']" "$by_issue_i1"
+  by_issue_i2="$(python3 -c "import json;d=json.load(open('$repo/.pm/index.json'));print(d['open_questions_by_issue'].get('I-002'))")"
+  assert_eq "fold q<->i: I-002's question is ANSWERED, not in open_questions_by_issue" "None" "$by_issue_i2"
+
+  local unscoped
+  unscoped="$(python3 -c "import json;d=json.load(open('$repo/.pm/index.json'));print(sorted(d['open_questions_unscoped']))")"
+  assert_eq "fold q<->i: open_questions_unscoped == ['Q-004']" "['Q-004']" "$unscoped"
+
+  local open_qs
+  open_qs="$(python3 -c "import json;d=json.load(open('$repo/.pm/index.json'));print(sorted(d['open_questions']))")"
+  assert_eq "fold q<->i: backward-compat flat open_questions == ['Q-001','Q-002','Q-004']" \
+    "['Q-001', 'Q-002', 'Q-004']" "$open_qs"
+
+  local q5_quarantined
+  q5_quarantined="$(python3 -c "
+import json
+d = json.load(open('$repo/.pm/index.json'))
+print(any('Q-005' in e['raw'] for e in d['quarantined']))
+")"
+  assert_eq "fold q<->i: Q-005 (invalid state=BOGUS) quarantined" "True" "$q5_quarantined"
+
+  local q5_absent
+  q5_absent="$(python3 -c "import json;d=json.load(open('$repo/.pm/index.json'));print('Q-005' in d['questions'])")"
+  assert_eq "fold q<->i: Q-005 never folded into questions{} (quarantine, not silent accept)" "False" "$q5_absent"
+
+  rm -rf "$repo"
+}
+
+# ---------------------------------------------------------------------------
 # pm_git_probe on a throwaway temp git repo
 # ---------------------------------------------------------------------------
 section_git_probe() {
@@ -357,6 +421,8 @@ echo "== last-write-wins =="
 section_last_write_wins
 echo "== pm_fold: git-meta (repo/branch/base_sha) carry + preserve-on-omit =="
 section_fold_git_meta
+echo "== pm_fold: question<->issue (B2.0b) =="
+section_fold_question_issue
 echo "== pm_git_probe =="
 section_git_probe
 echo "== escapers =="

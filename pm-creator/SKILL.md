@@ -24,7 +24,10 @@ Invoke the `grill-with-docs` skill to interview the user and record the decision
 a glossary. Extract every value the templates need:
 
 - campaign name + slug
-- the repo list, each with its **mainline branch** and absolute path
+- the repo list, each with its **mainline branch** and absolute path, plus (for B2's future
+  auto-close merged-predicate) a full **mainline ref** — `refs/remotes/origin/<mainline>` for
+  a pushed/fetched workflow or `refs/heads/<mainline>` for local-only — and a **fetch policy**
+  (e.g. `fetch` or `local-only`); never a short `main`
 - worktree root (default `~/Code`), runs root (only if long-running jobs — see optional slots)
 - herdr workspace name
 - model-routing defaults (offer a Haiku/Sonnet/Opus/Fable-by-work-shape table; flag it

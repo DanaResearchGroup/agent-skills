@@ -76,6 +76,88 @@ templates = os.environ["TEMPLATES"]
 out = os.environ["OUT"]
 values = json.load(open(os.environ["VALUES"], encoding="utf-8"))
 
+# --- B2.0b: repos normalization (complete-by-construction mainline_ref) ---
+# REPOS_JSON is a caller-supplied JSON array of repo objects. Downstream
+# (B2.1's auto-close merged-predicate) needs a FULL mainline ref on every
+# repo -- never a short `main` -- so this pass makes the config
+# complete-by-construction rather than relying on the caller to have
+# supplied it: derive a default when absent, but FAIL LOUD (no silent
+# guess) on anything ambiguous. Re-serializes via json.dumps, so the
+# hardened REPOS_JSON escaping guarantee below (raw, never re-escaped)
+# still holds for the normalized value.
+if "REPOS_JSON" in values:
+    try:
+        repos = json.loads(values["REPOS_JSON"])
+    except (TypeError, json.JSONDecodeError) as e:
+        print(f"scaffold.sh: REPOS_JSON is not valid JSON: {e}", file=sys.stderr)
+        sys.exit(3)
+    if not isinstance(repos, list):
+        print("scaffold.sh: REPOS_JSON must be a JSON array of repo objects", file=sys.stderr)
+        sys.exit(3)
+    FETCH_POLICIES = {"fetch", "local-only"}
+    norm_repos = []
+    for idx, repo in enumerate(repos):
+        if not isinstance(repo, dict):
+            print(f"scaffold.sh: REPOS_JSON[{idx}] is not a JSON object", file=sys.stderr)
+            sys.exit(3)
+        name = repo.get("name", f"#{idx}")
+        mainline = repo.get("mainline")
+        if not mainline:
+            print(
+                f"scaffold.sh: repo '{name}' is missing required 'mainline' "
+                "(cannot derive a mainline_ref without it)",
+                file=sys.stderr,
+            )
+            sys.exit(3)
+        if not isinstance(mainline, str):
+            print(
+                f"scaffold.sh: repo '{name}' has a non-string 'mainline' "
+                f"({mainline!r}) -- cannot derive a mainline_ref from it",
+                file=sys.stderr,
+            )
+            sys.exit(3)
+        repo = dict(repo)
+        mainline_ref = repo.get("mainline_ref")
+        if mainline_ref is None:
+            # Default for pushed workflows (event-log-grammar.md / B2 design):
+            # fetch `origin/<mainline>` and compare against it.
+            repo["mainline_ref"] = f"refs/remotes/origin/{mainline}"
+            repo.setdefault("fetch_policy", "fetch")
+        elif not isinstance(mainline_ref, str):
+            print(
+                f"scaffold.sh: repo '{name}' has a non-string 'mainline_ref' "
+                f"({mainline_ref!r}) -- must be a full ref string",
+                file=sys.stderr,
+            )
+            sys.exit(3)
+        elif not mainline_ref.startswith("refs/"):
+            # The exact short-`main` trap B2.0b exists to prevent -- reject
+            # rather than silently treat it as a branch name.
+            print(
+                f"scaffold.sh: repo '{name}' mainline_ref='{mainline_ref}' is a short/"
+                "unqualified ref (must start with 'refs/' -- e.g. "
+                f"'refs/remotes/origin/{mainline}' for a pushed workflow or "
+                f"'refs/heads/{mainline}' for local-only; never a short branch name)",
+                file=sys.stderr,
+            )
+            sys.exit(3)
+        else:
+            # Operator-supplied full ref: preserved verbatim. Default the
+            # fetch policy from the ref's own shape only if not also given.
+            repo.setdefault(
+                "fetch_policy",
+                "fetch" if mainline_ref.startswith("refs/remotes/") else "local-only",
+            )
+        if repo.get("fetch_policy") not in FETCH_POLICIES:
+            print(
+                f"scaffold.sh: repo '{name}' has fetch_policy={repo.get('fetch_policy')!r}, "
+                f"must be one of {sorted(FETCH_POLICIES)}",
+                file=sys.stderr,
+            )
+            sys.exit(3)
+        norm_repos.append(repo)
+    values["REPOS_JSON"] = json.dumps(norm_repos)
+
 PH = re.compile(r"\{\{([A-Za-z0-9_]+)\}\}")
 missing = set()
 
