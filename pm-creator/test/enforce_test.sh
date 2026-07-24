@@ -183,6 +183,156 @@ section_wrong_lane_later_transition() {
 }
 
 # ---------------------------------------------------------------------------
+# B1.1: git-corroboration metadata (repo/branch/base_sha) -- OPTIONAL, but
+# accepted on dispatch_state; mirrors lane except absence is never an error.
+# ---------------------------------------------------------------------------
+section_git_meta_accepted_at_mint() {
+  local repo
+  repo="$(new_tmp_repo)"
+  PM_ROOT="$repo" pm_apply dispatch_new d=D-130 i=I-001 at="$(now_iso)" >/dev/null
+
+  assert_true "git-meta: mint accepts repo/branch/base_sha" \
+    bash -c 'source "$1"; PM_ROOT="$2" pm_apply dispatch_state d=D-130 from=READY to=DISPATCHED lane=human at="$3" repo=svc branch=i130-fix base_sha=abc123' \
+    _ "$LIB" "$repo" "$(now_iso)"
+
+  local d_repo d_branch d_sha
+  d_repo="$(python3 -c "import json;print(json.load(open('$repo/.pm/index.json'))['dispatches']['D-130']['repo'])")"
+  d_branch="$(python3 -c "import json;print(json.load(open('$repo/.pm/index.json'))['dispatches']['D-130']['branch'])")"
+  d_sha="$(python3 -c "import json;print(json.load(open('$repo/.pm/index.json'))['dispatches']['D-130']['attempts']['A-01']['base_sha'])")"
+  assert_eq "git-meta: index.json repo == svc" "svc" "$d_repo"
+  assert_eq "git-meta: index.json branch == i130-fix" "i130-fix" "$d_branch"
+  assert_eq "git-meta: index.json attempts.A-01.base_sha == abc123" "abc123" "$d_sha"
+
+  rm -rf "$repo"
+}
+
+# ---------------------------------------------------------------------------
+section_git_meta_malformed_base_sha_refused() {
+  local repo
+  repo="$(new_tmp_repo)"
+  PM_ROOT="$repo" pm_apply dispatch_new d=D-131 i=I-001 at="$(now_iso)" >/dev/null
+
+  # Charset validation happens generically in parse_line/render_line, which
+  # is shared by pm_raw_append (grammar-only) too -- a charset-malformed
+  # value can never reach the log via EITHER path, so (unlike the
+  # sequence/enforcement violations covered by assert_refused_and_quarantined)
+  # there is nothing to quarantine here. Assert refusal-at-write directly,
+  # mirroring lib_test.sh's "raw_append: bad charset value rejected".
+  local before after
+  before="$(line_count "$repo")"
+  assert_false "malformed base_sha (bad charset: space) refused: pm_apply refuses" \
+    bash -c 'PM_ROOT="$1"; shift; source "$1"; shift; pm_apply "$@" >/dev/null 2>&1' \
+    _ "$repo" "$LIB" dispatch_state d=D-131 from=READY to=DISPATCHED lane=human at="$(now_iso)" base_sha="bad value"
+  after="$(line_count "$repo")"
+  assert_eq "malformed base_sha (bad charset: space) refused: log line-count unchanged" "$before" "$after"
+
+  rm -rf "$repo"
+}
+
+# ---------------------------------------------------------------------------
+section_git_meta_immutable_differing_refused() {
+  local repo
+  repo="$(new_tmp_repo)"
+  PM_ROOT="$repo" pm_apply dispatch_new d=D-132 i=I-001 at="$(now_iso)" >/dev/null
+  PM_ROOT="$repo" pm_apply dispatch_state d=D-132 from=READY to=DISPATCHED lane=human at="$(now_iso)" \
+    repo=svc branch=i132-fix base_sha=abc123 >/dev/null
+
+  assert_refused_and_quarantined "git-meta: differing repo on later transition refused" "$repo" \
+    dispatch_state d=D-132 a=A-01 from=DISPATCHED to=ACKED lane=human at="$(now_iso)" repo=other-svc
+
+  rm -rf "$repo"
+}
+
+# ---------------------------------------------------------------------------
+section_git_meta_omission_inherits() {
+  local repo
+  repo="$(new_tmp_repo)"
+  PM_ROOT="$repo" pm_apply dispatch_new d=D-133 i=I-001 at="$(now_iso)" >/dev/null
+  PM_ROOT="$repo" pm_apply dispatch_state d=D-133 from=READY to=DISPATCHED lane=human at="$(now_iso)" \
+    repo=svc branch=i133-fix base_sha=abc123 >/dev/null
+
+  assert_true "git-meta: omitting repo/branch/base_sha on later transition succeeds" \
+    bash -c 'source "$1"; PM_ROOT="$2" pm_apply dispatch_state d=D-133 a=A-01 from=DISPATCHED to=ACKED lane=human at="$3"' \
+    _ "$LIB" "$repo" "$(now_iso)"
+
+  local d_repo d_branch d_sha
+  d_repo="$(python3 -c "import json;print(json.load(open('$repo/.pm/index.json'))['dispatches']['D-133']['repo'])")"
+  d_branch="$(python3 -c "import json;print(json.load(open('$repo/.pm/index.json'))['dispatches']['D-133']['branch'])")"
+  d_sha="$(python3 -c "import json;print(json.load(open('$repo/.pm/index.json'))['dispatches']['D-133']['attempts']['A-01']['base_sha'])")"
+  assert_eq "git-meta: omission inherits repo == svc" "svc" "$d_repo"
+  assert_eq "git-meta: omission inherits branch == i133-fix" "i133-fix" "$d_branch"
+  assert_eq "git-meta: omission inherits attempts.A-01.base_sha == abc123" "abc123" "$d_sha"
+
+  rm -rf "$repo"
+}
+
+# ---------------------------------------------------------------------------
+# B1.1 FIX 1: base_sha is ATTEMPT-scoped (keyed by (d, a)), not
+# dispatch-scoped. A retry (FAILED -> DISPATCHED minting a NEW attempt) must
+# be able to set its OWN base_sha even when mainline has moved since the
+# prior attempt -- that is not a conflict, and both attempts' base_sha are
+# retained in the folded state (history is not lost on retry).
+section_git_meta_base_sha_attempt_scoped_retry() {
+  local repo
+  repo="$(new_tmp_repo)"
+
+  PM_ROOT="$repo" pm_apply dispatch_new d=D-134 i=I-001 at="$(now_iso)" >/dev/null
+  PM_ROOT="$repo" pm_apply dispatch_state d=D-134 from=READY to=DISPATCHED lane=human at="$(now_iso)" \
+    repo=svc branch=i134-fix base_sha=sha1_first_attempt >/dev/null
+  PM_ROOT="$repo" pm_apply dispatch_state d=D-134 a=A-01 from=DISPATCHED to=FAILED lane=human at="$(now_iso)" >/dev/null
+
+  assert_true "git-meta retry: FAILED->DISPATCHED with a DIFFERENT base_sha than A-01's is accepted (mainline moved)" \
+    bash -c 'source "$1"; PM_ROOT="$2" pm_apply dispatch_state d=D-134 from=FAILED to=DISPATCHED lane=human at="$3" base_sha=sha2_second_attempt' \
+    _ "$LIB" "$repo" "$(now_iso)"
+
+  local a1_sha a2_sha
+  a1_sha="$(python3 -c "import json;print(json.load(open('$repo/.pm/index.json'))['dispatches']['D-134']['attempts']['A-01']['base_sha'])")"
+  a2_sha="$(python3 -c "import json;print(json.load(open('$repo/.pm/index.json'))['dispatches']['D-134']['attempts']['A-02']['base_sha'])")"
+  assert_eq "git-meta retry: attempts.A-01.base_sha retained == sha1_first_attempt" "sha1_first_attempt" "$a1_sha"
+  assert_eq "git-meta retry: attempts.A-02.base_sha == sha2_second_attempt" "sha2_second_attempt" "$a2_sha"
+
+  rm -rf "$repo"
+}
+
+# A DIFFERING base_sha for the SAME (d, a) is still refused/quarantined --
+# only a NEW attempt escapes the conflict check.
+section_git_meta_base_sha_same_attempt_conflict_refused() {
+  local repo
+  repo="$(new_tmp_repo)"
+
+  PM_ROOT="$repo" pm_apply dispatch_new d=D-135 i=I-001 at="$(now_iso)" >/dev/null
+  PM_ROOT="$repo" pm_apply dispatch_state d=D-135 from=READY to=DISPATCHED lane=human at="$(now_iso)" \
+    base_sha=sha1_fixed >/dev/null
+
+  assert_refused_and_quarantined "git-meta: differing base_sha on SAME attempt (A-01) refused" "$repo" \
+    dispatch_state d=D-135 a=A-01 from=DISPATCHED to=ACKED lane=human at="$(now_iso)" base_sha=sha1_different
+
+  rm -rf "$repo"
+}
+
+# round-10 medium #5 (same class as H1): base_sha only ever legitimately
+# rides a mint (which always sets `a` in the same event -- see
+# MINTING_EDGES handling). A hand-built/hostile event that carries
+# base_sha on a NON-minting transition with no prior attempt (attempt_id
+# resolves to None) has nowhere to scope base_sha to and must be refused
+# at write / quarantined at fold -- not silently accepted with base_sha
+# dropped, which would break write/fold parity.
+section_git_meta_base_sha_no_attempt_refused() {
+  local repo
+  repo="$(new_tmp_repo)"
+
+  PM_ROOT="$repo" pm_apply dispatch_new d=D-136 i=I-001 at="$(now_iso)" >/dev/null
+
+  # READY -> ABANDONED is a legal, non-minting edge for a never-dispatched
+  # dispatch (H1), so attempt_id is None here; base_sha has nothing to
+  # attach to.
+  assert_refused_and_quarantined "git-meta: base_sha with no attempt (READY->ABANDONED, never dispatched) refused" "$repo" \
+    dispatch_state d=D-136 from=READY to=ABANDONED lane=human at="$(now_iso)" base_sha=sha_orphan
+
+  rm -rf "$repo"
+}
+
+# ---------------------------------------------------------------------------
 section_result_mismatched_attempt() {
   local repo
   repo="$(new_tmp_repo)"
@@ -675,6 +825,20 @@ echo "== adversarial: backward/reused attempt =="
 section_backward_reused_attempt
 echo "== adversarial: wrong lane on later transition =="
 section_wrong_lane_later_transition
+echo "== git-meta: accepted at mint =="
+section_git_meta_accepted_at_mint
+echo "== git-meta: malformed base_sha refused =="
+section_git_meta_malformed_base_sha_refused
+echo "== git-meta: differing value on later transition refused =="
+section_git_meta_immutable_differing_refused
+echo "== git-meta: omission inherits =="
+section_git_meta_omission_inherits
+echo "== git-meta: base_sha is attempt-scoped (retry across moved mainline) =="
+section_git_meta_base_sha_attempt_scoped_retry
+echo "== git-meta: differing base_sha on SAME attempt still refused =="
+section_git_meta_base_sha_same_attempt_conflict_refused
+echo "== git-meta: base_sha with no attempt (write/fold parity) refused =="
+section_git_meta_base_sha_no_attempt_refused
 echo "== adversarial: result with mismatched attempt =="
 section_result_mismatched_attempt
 echo "== adversarial: result not-from-ACKED =="

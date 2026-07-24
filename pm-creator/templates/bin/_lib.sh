@@ -270,7 +270,7 @@ declare -gA _PM_OPTIONAL_KEYS=(
   [schema]=""
   [issue_state]="by"
   [dispatch_new]="child_of supersedes"
-  [dispatch_state]="a tab prompt_sha"
+  [dispatch_state]="a tab prompt_sha repo branch base_sha"
   [result]=""
   [question]="i a_of"
   [unregistered_execution]=""
@@ -284,7 +284,7 @@ declare -gA _PM_KEY_ORDER=(
   [schema]="v"
   [issue_state]="i from to at by"
   [dispatch_new]="d i at child_of supersedes"
-  [dispatch_state]="d a from to lane at tab prompt_sha"
+  [dispatch_state]="d a from to lane at tab prompt_sha repo branch base_sha"
   [result]="d a status result_sha at"
   [question]="q state at i a_of"
   [unregistered_execution]="at ref"
@@ -361,7 +361,7 @@ OPTIONAL = {
     "schema": [],
     "issue_state": ["by"],
     "dispatch_new": ["child_of", "supersedes"],
-    "dispatch_state": ["a", "tab", "prompt_sha"],
+    "dispatch_state": ["a", "tab", "prompt_sha", "repo", "branch", "base_sha"],
     "result": [],
     "question": ["i", "a_of"],
     "unregistered_execution": [],
@@ -375,7 +375,7 @@ KEY_ORDER = {
     "schema": ["v"],
     "issue_state": ["i", "from", "to", "at", "by"],
     "dispatch_new": ["d", "i", "at", "child_of", "supersedes"],
-    "dispatch_state": ["d", "a", "from", "to", "lane", "at", "tab", "prompt_sha"],
+    "dispatch_state": ["d", "a", "from", "to", "lane", "at", "tab", "prompt_sha", "repo", "branch", "base_sha"],
     "result": ["d", "a", "status", "result_sha", "at"],
     "question": ["q", "state", "at", "i", "a_of"],
     "unregistered_execution": ["at", "ref"],
@@ -556,6 +556,9 @@ def apply_event(state, etype, kv, line_no, raw, mode):
             "attempt": None,
             "lane": None,
             "tab": None,
+            "repo": None,
+            "branch": None,
+            "attempts": {},
             "result_sha": None,
             "child_of": kv.get("child_of"),
             "supersedes": kv.get("supersedes"),
@@ -646,6 +649,54 @@ def apply_event(state, etype, kv, line_no, raw, mode):
             elif kv["a"] != disp["attempt"]:
                 return fail(f"attempt mismatch for '{d}': current attempt={disp['attempt']}, got {kv['a']}")
 
+        # git-corroboration metadata (repo/branch/base_sha): OPTIONAL. repo
+        # and branch are dispatch-scoped and, once set (typically at the
+        # READY|FAILED->DISPATCHED mint), immutable per dispatch, mirroring
+        # lane (enforcement.md §6). base_sha is ATTEMPT-scoped: it is keyed
+        # by (d, a) rather than d alone, because a retry (a FAILED-
+        # >DISPATCHED mint of a new attempt) legitimately rebases onto a
+        # mainline HEAD that has moved since the prior attempt -- refusing
+        # that would make retries after mainline advances impossible. A
+        # differing base_sha for the SAME (d, a) is still refused/
+        # quarantined; a new attempt sets its own base_sha with no
+        # conflict. Omit any of the three to inherit the folded value;
+        # absence is never an error (git corroboration is best-effort
+        # metadata, not required for the dispatch lifecycle).
+        for meta_key in ("repo", "branch"):
+            if meta_key not in kv:
+                if disp.get(meta_key) is not None:
+                    kv[meta_key] = disp[meta_key]
+            elif disp.get(meta_key) is not None and kv[meta_key] != disp[meta_key]:
+                return fail(
+                    f"{meta_key} mismatch for '{d}': fixed {meta_key}={disp[meta_key]}, got {kv[meta_key]}"
+                )
+
+        attempt_id = kv["a"] if "a" in kv else disp.get("attempt")
+
+        # base_sha is ATTEMPT-scoped (keyed by (d, a)); an event that
+        # carries base_sha but has NO attempt (attempt_id is None -- a
+        # non-mint / hand-built / hostile event, since a legitimate mint
+        # always sets `a`) has nowhere to record it. Refusing/quarantining
+        # keeps write and fold in parity: silently accepting-then-dropping
+        # it here would let the write path succeed while the fold path
+        # discards it, the same class of bug as H1's dropped `a`.
+        if "base_sha" in kv and attempt_id is None:
+            return fail(f"base_sha for '{d}' refused: no attempt to scope it to")
+
+        cur_base_sha = (
+            disp["attempts"].get(attempt_id, {}).get("base_sha")
+            if attempt_id is not None
+            else None
+        )
+        if "base_sha" not in kv:
+            if cur_base_sha is not None:
+                kv["base_sha"] = cur_base_sha
+        elif cur_base_sha is not None and kv["base_sha"] != cur_base_sha:
+            return fail(
+                f"base_sha mismatch for '{d}' attempt {attempt_id}: "
+                f"fixed base_sha={cur_base_sha}, got {kv['base_sha']}"
+            )
+
         disp["state"] = to
         if kv.get("lane") is not None:
             disp["lane"] = kv["lane"]
@@ -653,6 +704,11 @@ def apply_event(state, etype, kv, line_no, raw, mode):
             disp["attempt"] = kv["a"]
         if "tab" in kv:
             disp["tab"] = kv["tab"]
+        for meta_key in ("repo", "branch"):
+            if kv.get(meta_key) is not None:
+                disp[meta_key] = kv[meta_key]
+        if kv.get("base_sha") is not None and attempt_id is not None:
+            disp["attempts"].setdefault(attempt_id, {})["base_sha"] = kv["base_sha"]
         return True
 
     if etype == "result":

@@ -98,6 +98,10 @@ section_raw_append() {
   assert_false "raw_append: bad charset value rejected" \
     pm_raw_append issue_state i=I-001 from=OPEN to='BAD STATE' at=2026-07-23T18:00:00Z
 
+  assert_false "raw_append: bad charset base_sha (git-meta optional key) rejected" \
+    pm_raw_append dispatch_state d=D-901 from=READY to=DISPATCHED lane=human \
+      at=2026-07-23T18:00:00Z base_sha='bad value'
+
   assert_false "raw_append: empty value rejected" \
     pm_raw_append issue_state i=I-001 from=OPEN to= at=2026-07-23T18:00:00Z
 
@@ -225,6 +229,43 @@ section_last_write_wins() {
 }
 
 # ---------------------------------------------------------------------------
+# B1.1: pm_fold carries per-dispatch repo/branch/base_sha into index.json,
+# and preserves them across a later dispatch_state that omits them --
+# exactly like lane/tab.
+# ---------------------------------------------------------------------------
+section_fold_git_meta() {
+  local repo
+  repo="$(new_tmp_repo)"
+  {
+    echo "EVENT schema v=1"
+    echo "EVENT dispatch_new d=D-140 i=I-001 at=2026-07-23T18:00:00Z"
+    echo "EVENT dispatch_state d=D-140 from=READY to=DISPATCHED lane=human at=2026-07-23T18:01:00Z repo=svc branch=i140-fix base_sha=abc123"
+    echo "EVENT dispatch_state d=D-140 a=A-01 from=DISPATCHED to=ACKED lane=human at=2026-07-23T18:02:00Z tab=w1.i140"
+    echo "EVENT dispatch_state d=D-140 a=A-01 from=ACKED to=FAILED lane=human at=2026-07-23T18:03:00Z"
+    echo "EVENT dispatch_state d=D-140 from=FAILED to=DISPATCHED lane=human at=2026-07-23T18:04:00Z base_sha=def456"
+  } > "$repo/.pm/events.log"
+
+  pm_fold "$repo" >/dev/null
+
+  local d_repo d_branch a1_sha a2_sha
+  d_repo="$(python3 -c "import json;d=json.load(open('$repo/.pm/index.json'));print(d['dispatches']['D-140']['repo'])")"
+  d_branch="$(python3 -c "import json;d=json.load(open('$repo/.pm/index.json'));print(d['dispatches']['D-140']['branch'])")"
+  a1_sha="$(python3 -c "import json;d=json.load(open('$repo/.pm/index.json'));print(d['dispatches']['D-140']['attempts']['A-01']['base_sha'])")"
+  a2_sha="$(python3 -c "import json;d=json.load(open('$repo/.pm/index.json'));print(d['dispatches']['D-140']['attempts']['A-02']['base_sha'])")"
+  assert_eq "fold git-meta: D-140 repo == svc" "svc" "$d_repo"
+  assert_eq "fold git-meta: D-140 branch == i140-fix" "i140-fix" "$d_branch"
+  assert_eq "fold git-meta: D-140 attempts.A-01.base_sha == abc123 (retained across retry)" "abc123" "$a1_sha"
+  assert_eq "fold git-meta: D-140 attempts.A-02.base_sha == def456 (new attempt's own base_sha)" "def456" "$a2_sha"
+
+  # preserved (not blanked/None'd) across a later event that omits them
+  local qc
+  qc="$(python3 -c "import json;d=json.load(open('$repo/.pm/index.json'));print(len(d['quarantined']))")"
+  assert_eq "fold git-meta: zero quarantined entries" "0" "$qc"
+
+  rm -rf "$repo"
+}
+
+# ---------------------------------------------------------------------------
 # pm_git_probe on a throwaway temp git repo
 # ---------------------------------------------------------------------------
 section_git_probe() {
@@ -314,6 +355,8 @@ echo "== pm_fold: corrupt.events.log =="
 section_fold_corrupt
 echo "== last-write-wins =="
 section_last_write_wins
+echo "== pm_fold: git-meta (repo/branch/base_sha) carry + preserve-on-omit =="
+section_fold_git_meta
 echo "== pm_git_probe =="
 section_git_probe
 echo "== escapers =="

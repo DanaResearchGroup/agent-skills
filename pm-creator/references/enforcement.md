@@ -155,6 +155,36 @@ preconditions as `record result D RETURNED --sha …`.
   for that dispatch MUST carry the same `lane` (or omit it and inherit). A differing `lane`
   is refused/quarantined. (This makes lane ownership immutable, per the design.)
 
+- `repo` and `branch` follow the same immutable-per-dispatch pattern as `lane`, extended to
+  these two OPTIONAL keys: whichever value is first recorded for a dispatch (on any
+  `dispatch_state`, typically the mint) is fixed for that dispatch's lifetime. A later
+  `dispatch_state` carrying a *differing* value for one of these keys is refused at write and
+  quarantined at fold; omitting the key inherits the already-folded value unchanged. Unlike
+  `lane` (required on every `dispatch_state`), these two are optional throughout — a dispatch
+  minted without them simply has no git-corroboration metadata to check later.
+
+- `base_sha` is OPTIONAL and **immutable per-attempt**, not per-dispatch — it is fixed the
+  moment it is first recorded for a given attempt `(d, a)` (any `dispatch_state` carrying that
+  attempt, typically the mint) and a later `dispatch_state` for that *same* attempt carrying a
+  *differing* `base_sha` is refused at write and quarantined at fold, identically to `lane`.
+  Because each `MINTING_EDGES` transition (`READY → DISPATCHED` or `FAILED → DISPATCHED`)
+  mints a fresh attempt number, a `FAILED → DISPATCHED` retry starts a *new* attempt with its
+  *own* `base_sha` slot — it is free to record the repo's current mainline HEAD even if that
+  HEAD has moved since the original attempt, and the original attempt's `base_sha` is
+  retained unchanged, not overwritten. This is the one respect in which `base_sha` differs
+  from `lane`/`repo`/`branch`: those three describe the dispatch as a whole and stay fixed
+  across retries, while `base_sha` describes what a *specific attempt* was based on and is
+  re-establishable per retry.
+
+- A `dispatch_state` that carries `base_sha` but has **no attempt** — i.e. it neither sets
+  `a` itself nor inherits one from an already-folded attempt (`attempt_id` resolves to
+  `None`) — is refused at write and quarantined at fold, same as an illegal transition.
+  `base_sha` is attempt-scoped by construction, so a `base_sha` with nothing to scope it to
+  has no valid slot to record it in; a legitimate mint always sets `a` in the same event, so
+  this can only arise from a non-mint, hand-built, or hostile event. Silently accepting the
+  event and dropping `base_sha` (rather than refusing/quarantining it) would let the write
+  path succeed while the fold path discarded the field, breaking write/fold parity.
+
 ## §7 Superseding
 - `dispatch_new … supersedes=D-x` marks D-x superseded. This is order-independent: if D-x's
   own `dispatch_new` has not yet been folded when the superseding event is seen, the
@@ -170,3 +200,15 @@ preconditions as `record result D RETURNED --sha …`.
 per-dispatch fields already consumed by `reconcile`/`ledger-check` (`state`, `attempt`,
 `lane`, `tab`, `result_sha`, `child_of`, `supersedes`). New enforcement may ADD fields but
 must not rename/remove these. `unregistered` entries are deduped by `ref`.
+
+Per-dispatch entries also carry `repo`, `branch` (each `None` until first set), folded
+update-when-present / preserve-on-omit / last-write-wins-in-log-order, identically to
+`lane`/`tab` (§6).
+
+Per-dispatch entries additionally carry `attempts`, a dict keyed by attempt id
+(`"A-01"`, `"A-02"`, …), each holding `{"base_sha": <sha-or-omitted>}`. A given attempt's
+`base_sha` is set the first time it is recorded for that attempt and preserved unchanged
+thereafter (§6); earlier attempts' entries are never overwritten or removed by a later
+attempt's `dispatch_state`, so `index.json` retains the full per-attempt base_sha history for
+a dispatch, e.g. `dispatches["D-030"]["attempts"]["A-01"]["base_sha"]` and
+`dispatches["D-030"]["attempts"]["A-02"]["base_sha"]` after a retry.

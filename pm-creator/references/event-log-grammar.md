@@ -40,7 +40,7 @@ the schema version; existing keys never change meaning.
 | `schema` | `v` | — | header, first line only |
 | `issue_state` | `i from to at` | `by` (D-###) | issue transitions |
 | `dispatch_new` | `d i at` | `child_of supersedes` | register a dispatch in state READY |
-| `dispatch_state` | `d from to lane at` | `a tab prompt_sha` | dispatch lifecycle transition |
+| `dispatch_state` | `d from to lane at` | `a tab prompt_sha repo branch base_sha` | dispatch lifecycle transition |
 | `result` | `d a status result_sha at` | — | a returned result artifact |
 | `question` | `q state at` | `i a_of` | Q&A lifecycle (OPEN/ANSWERED) |
 | `unregistered_execution` | `at ref` | — | reconcile found work with no dispatch |
@@ -49,6 +49,15 @@ the schema version; existing keys never change meaning.
 
 - `lane` ∈ {`human`, `automation`}. `tab` is a herdr tab id or `?` (unknown at dispatch,
   resolved at ACK). `a` is `A-##`.
+- `repo`/`branch`/`base_sha` are OPTIONAL git-corroboration metadata, set (if at all) at
+  mint time: `repo` names a configured repo, `branch` is the expected branch
+  (`i<num>-<slug>` per `CONVENTIONS.md` §7), `base_sha` is the mainline commit the dispatch
+  was cut from. `repo` and `branch` are, like `lane`, **immutable per dispatch** once first
+  set. `base_sha` is instead **immutable per attempt** (`(d, a)`): each `MINTING_EDGES`
+  transition (`READY → DISPATCHED` or a `FAILED → DISPATCHED` retry) starts a fresh attempt
+  and may record its own `base_sha` against the repo's mainline HEAD at that moment, even if
+  it differs from an earlier attempt's `base_sha`; within one attempt the value is still
+  fixed once set. See `enforcement.md` §6.
 
 ## 4. State machines
 

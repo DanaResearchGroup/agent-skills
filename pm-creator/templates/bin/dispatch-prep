@@ -168,30 +168,141 @@ if [[ -z "$herdr_workspace" ]]; then
 fi
 
 repo_path=""
+repo_mainline=""
 if [[ -n "$repo_name" ]]; then
-  repo_path="$(REPO_NAME="$repo_name" python3 -c "
+  mapfile -t _repo_info < <(REPO_NAME="$repo_name" python3 -c "
 import json, os, sys
 cfg = json.load(open(sys.argv[1]))
 repos = cfg.get('repos') or []
 want = os.environ['REPO_NAME']
 path = ''
+mainline = ''
 # Canonical config schema: repos is a LIST of {name,path,mainline}
 # (matches config.json.tmpl and bin/reconcile). Tolerate a legacy dict too.
 if isinstance(repos, list):
     for entry in repos:
         if isinstance(entry, dict) and entry.get('name') == want:
             path = entry.get('path') or ''
+            mainline = entry.get('mainline') or ''
             break
 elif isinstance(repos, dict):
     entry = repos.get(want)
     if isinstance(entry, dict):
         path = entry.get('path') or ''
+        mainline = entry.get('mainline') or ''
     elif isinstance(entry, str):
         path = entry
 print(path)
-" "$config")"
+print(mainline)
+" "$config")
+  repo_path="${_repo_info[0]:-}"
+  repo_mainline="${_repo_info[1]:-}"
   if [[ -z "$repo_path" ]]; then
     echo "dispatch-prep: warning: repo '$repo_name' not found in .pm/config.json repos; omitting --cwd" >&2
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# git-corroboration metadata (B1.1, optional + schema-additive): when --repo
+# resolved to a config entry, capture base_sha (the repo's mainline HEAD at
+# mint time) and the expected branch (CONVENTIONS.md §7: `i<num>-<slug>`).
+# Each of repo/branch/base_sha is validated LOCALLY here; a failure OMITS
+# just that one field and prints a one-line warning — it must never abort
+# the dispatch (dispatch_state's repo/branch/base_sha are OPTIONAL,
+# event-log-grammar.md §3, and pm_apply would otherwise REFUSE the whole
+# transaction on a malformed value, e.g. one containing a space/newline/`=`).
+# ---------------------------------------------------------------------------
+
+# repo: the config name, but only if it's clean of pm_apply's kv delimiters
+# (space, newline, '=') and any other char outside the safe token charset.
+repo_meta=""
+if [[ -n "$repo_name" && -n "$repo_path" ]]; then
+  if [[ "$repo_name" =~ ^[A-Za-z0-9._:+/@-]+$ ]]; then
+    repo_meta="$repo_name"
+  else
+    echo "dispatch-prep: warning: repo name '$repo_name' contains characters outside the safe token charset; omitting repo" >&2
+  fi
+fi
+
+# base_sha: resolve the repo's mainline HEAD to a single commit SHA. Reject
+# anything that isn't exactly one line of hex (SHA-1 -> 40 chars, SHA-256
+# repos -> 64 chars); a multi-line rev-parse (ambiguous revision) or a
+# non-commit ref must not leak into the log.
+base_sha=""
+if [[ -n "$repo_path" && -z "$repo_mainline" ]]; then
+  echo "dispatch-prep: warning: repo '$repo_name' has no 'mainline' field in .pm/config.json; omitting base_sha" >&2
+elif [[ -n "$repo_path" && -n "$repo_mainline" ]] && git -C "$repo_path" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  resolved="$(git -C "$repo_path" rev-parse --verify --end-of-options "${repo_mainline}^{commit}" 2>/dev/null)" || resolved=""
+  if [[ "$(printf '%s\n' "$resolved" | wc -l)" -eq 1 && "$resolved" =~ ^[0-9a-f]{40}$|^[0-9a-f]{64}$ ]]; then
+    base_sha="$resolved"
+  else
+    echo "dispatch-prep: warning: could not resolve a single commit for base_sha (repo '$repo_name' mainline '$repo_mainline'); omitting base_sha" >&2
+  fi
+fi
+
+# branch: derive `i<num>-<slug>` from the prompt filename, then validate it
+# is a legal git ref name AND that the prompt's leading I-### matches
+# --issue (a mismatch means this is the wrong prompt for this issue).
+branch=""
+if [[ -n "$repo_path" ]]; then
+  prompt_base="$(basename "$prompt_path")"
+  if [[ "$prompt_base" =~ ^I-([0-9]+)_(.+)_[0-9]{4}-[0-9]{2}-[0-9]{2}\.md$ ]]; then
+    prompt_issue_num="${BASH_REMATCH[1]}"
+    slug="${BASH_REMATCH[2]}"
+    issue_num="${issue_id#I-}"
+    if [[ "$prompt_issue_num" != "$issue_num" ]]; then
+      echo "dispatch-prep: warning: prompt '$prompt_base' is for I-$prompt_issue_num but --issue is $issue_id; omitting branch" >&2
+    else
+      candidate_branch="i${issue_num}-${slug}"
+      # Double validation (round-10 blocker): check-ref-format passing does
+      # NOT imply the pm event TOKEN charset accepts it (e.g. a comma or
+      # space is git-legal in a branch name but outside
+      # `[A-Za-z0-9._:+/@-]`, which would make pm_apply REFUSE the whole
+      # dispatch). Require BOTH the token charset AND git ref legality
+      # before emitting; on either failure, omit + warn (never abort).
+      _pm_branch_charset_ok=0
+      if printf '%s' "$candidate_branch" | grep -qE '^[A-Za-z0-9._:+/@-]+$'; then
+        _pm_branch_charset_ok=1
+      fi
+      _pm_branch_gitref_ok=0
+      if command -v git >/dev/null 2>&1; then
+        if git check-ref-format --branch "$candidate_branch" >/dev/null 2>&1; then
+          _pm_branch_gitref_ok=1
+        fi
+      else
+        # git binary absent: strict fallback. Must NOT accept names that
+        # git itself would reject (`..`, a trailing `.lock`, leading/
+        # trailing `.`/`-`) — a lax regex here would record an impossible
+        # corroboration target.
+        if [[ "$candidate_branch" =~ ^[A-Za-z0-9._-]+$ ]] \
+           && [[ "$candidate_branch" != *..* ]] \
+           && [[ "$candidate_branch" != *.lock ]] \
+           && [[ "$candidate_branch" != .* ]] \
+           && [[ "$candidate_branch" != -* ]] \
+           && [[ "$candidate_branch" != *. ]] \
+           && [[ "$candidate_branch" != *- ]]; then
+          _pm_branch_gitref_ok=1
+        fi
+      fi
+      if [[ "$_pm_branch_charset_ok" -eq 1 && "$_pm_branch_gitref_ok" -eq 1 ]]; then
+        branch="$candidate_branch"
+      else
+        echo "dispatch-prep: warning: derived branch '$candidate_branch' failed validation (pm token charset or git ref format); omitting branch" >&2
+      fi
+    fi
+  else
+    echo "dispatch-prep: warning: prompt basename '$prompt_base' does not match I-###_<slug>_YYYY-MM-DD.md; omitting branch" >&2
+  fi
+fi
+
+extra_kv=()
+if [[ -n "$repo_meta" ]]; then
+  extra_kv+=("repo=$repo_meta")
+  if [[ -n "$branch" ]]; then
+    extra_kv+=("branch=$branch")
+  fi
+  if [[ -n "$base_sha" ]]; then
+    extra_kv+=("base_sha=$base_sha")
   fi
 fi
 
@@ -257,13 +368,13 @@ now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 if [[ "$current_state" == "NONE" ]]; then
   batch_out="$(pm_apply_batch \
     -- dispatch_new d="$dispatch_id" i="$issue_id" at="$(now_iso)" \
-    -- dispatch_state d="$dispatch_id" from=READY to=DISPATCHED lane=human at="$(now_iso)" tab="?" prompt_sha="$prompt_sha" \
+    -- dispatch_state d="$dispatch_id" from=READY to=DISPATCHED lane=human at="$(now_iso)" tab="?" prompt_sha="$prompt_sha" "${extra_kv[@]}" \
   )" || {
     echo "dispatch-prep: refused to prepare $dispatch_id (dispatch_new + dispatch_state transaction failed)" >&2
     exit 1
   }
 else
-  batch_out="$(pm_apply dispatch_state d="$dispatch_id" from="$current_state" to=DISPATCHED lane=human at="$(now_iso)" tab="?" prompt_sha="$prompt_sha")" || {
+  batch_out="$(pm_apply dispatch_state d="$dispatch_id" from="$current_state" to=DISPATCHED lane=human at="$(now_iso)" tab="?" prompt_sha="$prompt_sha" "${extra_kv[@]}")" || {
     echo "dispatch-prep: refused to prepare $dispatch_id (dispatch_state from=$current_state transition failed)" >&2
     exit 1
   }
