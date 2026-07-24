@@ -7,6 +7,17 @@ is **never parsed for state**. `.pm/index.json` is a regenerable fold of this lo
 Every `bin/` script depends on this grammar. It is a FROZEN contract: additive changes bump
 the schema version; existing keys never change meaning.
 
+> **Version note.** Grammar revision **1.1** (B2.2) ADDITIVELY introduces the `merged`
+> event type (§3). The wire header stays `EVENT schema v=1`: no existing key changed
+> meaning and pre-1.1 logs remain valid unchanged. The reverse direction is NOT benign:
+> a pre-1.1 engine folding a 1.1 log quarantines every `merged` line as an unknown
+> event type, and an unknown-type quarantine is UNATTRIBUTABLE — which trips the
+> global G1.5 fail-safe and freezes auto-close REPO-WIDE (every issue, not just the
+> marker's) until the lines are removed from the log. Upgrade all engines that read a
+> log BEFORE recording any `merged` events into it. (Deliberate: quarantine
+> attribution is never narrowed for unknown event types — using a `d=` token from a
+> line the engine cannot parse to scope the blast radius would weaken the fail-safe.)
+
 ## 1. Record format
 
 - One event per line, no wrapping:
@@ -42,6 +53,7 @@ the schema version; existing keys never change meaning.
 | `dispatch_new` | `d i at` | `child_of supersedes` | register a dispatch in state READY |
 | `dispatch_state` | `d from to lane at` | `a tab prompt_sha repo branch base_sha` | dispatch lifecycle transition |
 | `result` | `d a status result_sha at` | — | a returned result artifact |
+| `merged` | `d a merge_sha result_sha at` | `repo` | human-attested mainline-merge corroboration marker (B2.2) |
 | `question` | `q state at` | `i a_of` | Q&A lifecycle (OPEN/ANSWERED) |
 | `unregistered_execution` | `at ref` | — | reconcile found work with no dispatch |
 | `adopt` | `d a at ref` | — | operator absorbs unregistered work into a dispatch |
@@ -49,6 +61,21 @@ the schema version; existing keys never change meaning.
 
 - `lane` ∈ {`human`, `automation`}. `tab` is a herdr tab id or `?` (unknown at dispatch,
   resolved at ACK). `a` is `A-##`.
+- `merged` (grammar revision 1.1, ADDITIVE — see the version note above) is a **pure
+  corroboration record** for squash/rebase workflows, emitted by the human lane only
+  (`record merged`): it attests that the result of attempt `(d, a)` landed on the
+  configured mainline as commit `merge_sha`. The fold accepts it only when `d` is a
+  registered dispatch, `a` is a real attempt of `d` with a recorded result, and
+  `result_sha` equals that exact `(d, a)` result; `repo` (optional) must equal the
+  dispatch's own recorded repo (else it is inherited). An accepted marker is stored per
+  `(d, a)` (`dispatches[d].merged[a]`) and read ONLY by `track`'s auto-close G4 marker
+  arm; it never transitions dispatch state, never touches issue state, never
+  auto-VERIFIES, never overwrites `result_sha`. Deliberately **no `i=` and no
+  `mainline_ref=` keys**: attribution comes from the fold's accepted maps and the
+  mainline ref from config only (an event-supplied value would be a forged-token trap).
+  A conflicting second marker for the same `(d, a)` (different `merge_sha`/`result_sha`)
+  is refused at write and quarantined at fold — the FIRST accepted marker stands; an
+  identical re-append is accepted idempotently.
 - `repo`/`branch`/`base_sha` are OPTIONAL git-corroboration metadata, set (if at all) at
   mint time: `repo` names a configured repo, `branch` is the expected branch
   (`i<num>-<slug>` per `CONVENTIONS.md` §7), `base_sha` is the mainline commit the dispatch

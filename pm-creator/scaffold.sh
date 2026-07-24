@@ -155,6 +155,31 @@ if "REPOS_JSON" in values:
                 file=sys.stderr,
             )
             sys.exit(3)
+        # --- B2.2: marker-path opt-ins, complete-by-construction ---
+        # merge_mode selects how track's auto-close G4 corroborates a repo:
+        # "merge" (default; strict ancestry only) or "squash" (strict first,
+        # then the human-attested `merged`-marker arm). FAIL LOUD on any
+        # other value rather than silently defaulting.
+        merge_mode = repo.setdefault("merge_mode", "merge")
+        if merge_mode not in ("merge", "squash"):
+            print(
+                f"scaffold.sh: repo '{name}' has merge_mode={merge_mode!r}, "
+                "must be one of ['merge', 'squash']",
+                file=sys.stderr,
+            )
+            sys.exit(3)
+        # allow_marker_branch_deleted (bool, default false): whether a
+        # marker-path close may proceed when the dispatch's recorded branch
+        # no longer resolves (normal post-squash cleanup). Type-checked --
+        # a truthy string like "yes" must not silently widen the gate.
+        allow_deleted = repo.setdefault("allow_marker_branch_deleted", False)
+        if not isinstance(allow_deleted, bool):
+            print(
+                f"scaffold.sh: repo '{name}' has "
+                f"allow_marker_branch_deleted={allow_deleted!r}, must be a JSON boolean",
+                file=sys.stderr,
+            )
+            sys.exit(3)
         norm_repos.append(repo)
     values["REPOS_JSON"] = json.dumps(norm_repos)
 

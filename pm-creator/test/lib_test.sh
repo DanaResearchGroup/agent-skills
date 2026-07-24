@@ -330,6 +330,216 @@ print(any('Q-005' in e['raw'] for e in d['quarantined']))
 }
 
 # ---------------------------------------------------------------------------
+# B2.2: `merged` marker events -- pure corroboration records. The fold must
+# (a) store result_sha per-attempt (attempts[a].result_sha) so a marker
+# validates against the RIGHT attempt, (b) accept a valid marker into
+# dispatches[d].merged[a] WITHOUT touching dispatch/issue state or
+# result_sha, (c) accept an identical re-append idempotently.
+# ---------------------------------------------------------------------------
+_idx_py() {
+  # _idx_py <repo> <python-expr over d(=index)>
+  python3 -c "import json;d=json.load(open('$1/.pm/index.json'));print($2)"
+}
+
+section_fold_merged_accepted() {
+  local repo
+  repo="$(new_tmp_repo)"
+  {
+    echo "EVENT schema v=1"
+    echo "EVENT issue_state i=I-001 from=OPEN to=ACTIVE at=2026-07-23T18:00:00Z"
+    echo "EVENT dispatch_new d=D-150 i=I-001 at=2026-07-23T18:00:00Z"
+    echo "EVENT dispatch_state d=D-150 from=READY to=DISPATCHED lane=human at=2026-07-23T18:01:00Z repo=svc branch=i150-fix base_sha=abc123"
+    echo "EVENT dispatch_state d=D-150 a=A-01 from=DISPATCHED to=ACKED lane=human at=2026-07-23T18:02:00Z tab=w1.i150"
+    echo "EVENT result d=D-150 a=A-01 status=RETURNED result_sha=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee at=2026-07-23T18:03:00Z"
+    echo "EVENT dispatch_state d=D-150 a=A-01 from=RETURNED to=VERIFIED lane=human at=2026-07-23T18:04:00Z"
+    echo "EVENT merged d=D-150 a=A-01 merge_sha=1111111111111111111111111111111111111111 result_sha=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee at=2026-07-23T18:05:00Z"
+  } > "$repo/.pm/events.log"
+
+  pm_fold "$repo" >/dev/null
+
+  assert_eq "fold merged: per-attempt result_sha stored (attempts.A-01.result_sha)" \
+    "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" "$(_idx_py "$repo" "d['dispatches']['D-150']['attempts']['A-01']['result_sha']")"
+  assert_eq "fold merged: marker stored per (d,a) -- merge_sha" \
+    "1111111111111111111111111111111111111111" "$(_idx_py "$repo" "d['dispatches']['D-150']['merged']['A-01']['merge_sha']")"
+  assert_eq "fold merged: marker stored per (d,a) -- result_sha" \
+    "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" "$(_idx_py "$repo" "d['dispatches']['D-150']['merged']['A-01']['result_sha']")"
+  assert_eq "fold merged: dispatch state untouched (still VERIFIED)" \
+    "VERIFIED" "$(_idx_py "$repo" "d['dispatches']['D-150']['state']")"
+  assert_eq "fold merged: dispatch result_sha NOT overwritten" \
+    "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" "$(_idx_py "$repo" "d['dispatches']['D-150']['result_sha']")"
+  assert_eq "fold merged: issue state untouched (still ACTIVE)" \
+    "ACTIVE" "$(_idx_py "$repo" "d['issues']['I-001']['state']")"
+  assert_eq "fold merged: zero quarantined entries" \
+    "0" "$(_idx_py "$repo" "len(d['quarantined'])")"
+
+  # identical re-append -> accepted idempotently (no quarantine, same marker)
+  echo "EVENT merged d=D-150 a=A-01 merge_sha=1111111111111111111111111111111111111111 result_sha=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee at=2026-07-23T18:06:00Z" >> "$repo/.pm/events.log"
+  pm_fold "$repo" >/dev/null
+  assert_eq "fold merged: identical re-append accepted idempotently (zero quarantined)" \
+    "0" "$(_idx_py "$repo" "len(d['quarantined'])")"
+  assert_eq "fold merged: identical re-append leaves marker unchanged" \
+    "1111111111111111111111111111111111111111" "$(_idx_py "$repo" "d['dispatches']['D-150']['merged']['A-01']['merge_sha']")"
+
+  rm -rf "$repo"
+}
+
+# ---------------------------------------------------------------------------
+# B2.2: merged marker violations quarantine (never fold, never redirect) and
+# carry the dispatch's AUTHORITATIVE issue attribution so the existing
+# issue-related-quarantine gate blocks the owning issue's auto-close.
+# ---------------------------------------------------------------------------
+section_fold_merged_violations() {
+  local repo
+  repo="$(new_tmp_repo)"
+  {
+    echo "EVENT schema v=1"
+    echo "EVENT issue_state i=I-001 from=OPEN to=ACTIVE at=2026-07-23T18:00:00Z"
+    echo "EVENT dispatch_new d=D-151 i=I-001 at=2026-07-23T18:00:00Z"
+    echo "EVENT dispatch_state d=D-151 from=READY to=DISPATCHED lane=human at=2026-07-23T18:01:00Z repo=svc branch=i151-fix base_sha=abc123"
+    echo "EVENT dispatch_state d=D-151 a=A-01 from=DISPATCHED to=ACKED lane=human at=2026-07-23T18:02:00Z tab=w1.i151"
+    echo "EVENT result d=D-151 a=A-01 status=RETURNED result_sha=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee at=2026-07-23T18:03:00Z"
+    # marker with a result_sha that does NOT match the recorded (d,a) result
+    echo "EVENT merged d=D-151 a=A-01 merge_sha=1111111111111111111111111111111111111111 result_sha=ffffffffffffffffffffffffffffffffffffffff at=2026-07-23T18:04:00Z"
+    # marker for an attempt that never existed / has no recorded result
+    echo "EVENT merged d=D-151 a=A-07 merge_sha=1111111111111111111111111111111111111111 result_sha=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee at=2026-07-23T18:05:00Z"
+    # marker whose repo= contradicts the dispatch's recorded repo
+    echo "EVENT merged d=D-151 a=A-01 merge_sha=1111111111111111111111111111111111111111 result_sha=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee repo=other at=2026-07-23T18:06:00Z"
+    # marker for an unregistered dispatch -> globally unattributable
+    echo "EVENT merged d=D-999 a=A-01 merge_sha=1111111111111111111111111111111111111111 result_sha=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee at=2026-07-23T18:07:00Z"
+  } > "$repo/.pm/events.log"
+
+  pm_fold "$repo" >/dev/null
+
+  assert_eq "fold merged violations: all four bad markers quarantined" \
+    "4" "$(_idx_py "$repo" "len(d['quarantined'])")"
+  assert_eq "fold merged violations: no marker folded into standing state" \
+    "0" "$(_idx_py "$repo" "len((d['dispatches']['D-151'].get('merged') or {}))")"
+  assert_eq "fold merged violations: dispatch state untouched (still RETURNED)" \
+    "RETURNED" "$(_idx_py "$repo" "d['dispatches']['D-151']['state']")"
+  # shellcheck disable=SC2016  # $1 expands inside the nested bash -c, not here
+  assert_true "fold merged violations: attributed to owning issue I-001 (issue-related-quarantine)" \
+    bash -c '[[ "$1" == *issue-related-quarantine* ]]' _ \
+    "$(_idx_py "$repo" "d['quarantine_by_issue'].get('I-001')")"
+  assert_eq "fold merged violations: unregistered-dispatch marker is globally unattributable" \
+    "True" "$(_idx_py "$repo" "d['quarantine_unattributable']")"
+
+  rm -rf "$repo"
+}
+
+# ---------------------------------------------------------------------------
+# B2.2: a CONFLICTING second marker for the same (d,a) -- different
+# merge_sha -- quarantines the LATER line; the first accepted marker stands
+# (conflict = surface, never silently replace / last-write-wins).
+# ---------------------------------------------------------------------------
+section_fold_merged_conflict() {
+  local repo
+  repo="$(new_tmp_repo)"
+  {
+    echo "EVENT schema v=1"
+    echo "EVENT issue_state i=I-001 from=OPEN to=ACTIVE at=2026-07-23T18:00:00Z"
+    echo "EVENT dispatch_new d=D-152 i=I-001 at=2026-07-23T18:00:00Z"
+    echo "EVENT dispatch_state d=D-152 from=READY to=DISPATCHED lane=human at=2026-07-23T18:01:00Z repo=svc branch=i152-fix base_sha=abc123"
+    echo "EVENT dispatch_state d=D-152 a=A-01 from=DISPATCHED to=ACKED lane=human at=2026-07-23T18:02:00Z tab=w1.i152"
+    echo "EVENT result d=D-152 a=A-01 status=RETURNED result_sha=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee at=2026-07-23T18:03:00Z"
+    echo "EVENT merged d=D-152 a=A-01 merge_sha=1111111111111111111111111111111111111111 result_sha=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee at=2026-07-23T18:04:00Z"
+    echo "EVENT merged d=D-152 a=A-01 merge_sha=2222222222222222222222222222222222222222 result_sha=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee at=2026-07-23T18:05:00Z"
+  } > "$repo/.pm/events.log"
+
+  pm_fold "$repo" >/dev/null
+
+  assert_eq "fold merged conflict: later conflicting marker quarantined" \
+    "1" "$(_idx_py "$repo" "len(d['quarantined'])")"
+  assert_eq "fold merged conflict: FIRST marker stands (never silently replaced)" \
+    "1111111111111111111111111111111111111111" "$(_idx_py "$repo" "d['dispatches']['D-152']['merged']['A-01']['merge_sha']")"
+  # shellcheck disable=SC2016  # $1 expands inside the nested bash -c, not here
+  assert_true "fold merged conflict: conflict attributed to owning issue I-001" \
+    bash -c '[[ "$1" == *issue-related-quarantine* ]]' _ \
+    "$(_idx_py "$repo" "d['quarantine_by_issue'].get('I-001')")"
+
+  rm -rf "$repo"
+}
+
+# ---------------------------------------------------------------------------
+# B2.2 fix-pass-6 F3: the fold shape-gates BOTH sha fields of a `merged`
+# event to full 40/64 lowercase hex. A revision expression ("main") or a
+# short sha must quarantine (blocking the owning issue) -- the trust
+# boundary is symmetric with close-time BASE_SHA_RE, never deferred to it.
+# ---------------------------------------------------------------------------
+section_fold_merged_shape_gate() {
+  local repo full_tip
+  repo="$(new_tmp_repo)"
+  full_tip="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  {
+    echo "EVENT schema v=1"
+    echo "EVENT issue_state i=I-001 from=OPEN to=ACTIVE at=2026-07-23T18:00:00Z"
+    echo "EVENT dispatch_new d=D-155 i=I-001 at=2026-07-23T18:00:00Z"
+    echo "EVENT dispatch_state d=D-155 from=READY to=DISPATCHED lane=human at=2026-07-23T18:01:00Z repo=svc branch=i155-fix base_sha=abc123"
+    echo "EVENT dispatch_state d=D-155 a=A-01 from=DISPATCHED to=ACKED lane=human at=2026-07-23T18:02:00Z tab=w1.i155"
+    echo "EVENT result d=D-155 a=A-01 status=RETURNED result_sha=$full_tip at=2026-07-23T18:03:00Z"
+    # merge_sha is a revision expression, not an object name -> quarantine
+    echo "EVENT merged d=D-155 a=A-01 merge_sha=main result_sha=$full_tip at=2026-07-23T18:04:00Z"
+    # merge_sha short-hex -> quarantine
+    echo "EVENT merged d=D-155 a=A-01 merge_sha=1111abcd result_sha=$full_tip at=2026-07-23T18:05:00Z"
+  } > "$repo/.pm/events.log"
+  pm_fold "$repo" >/dev/null
+  assert_eq "fold merged shape gate: non-hex + short merge_sha both quarantined" \
+    "2" "$(_idx_py "$repo" "len(d['quarantined'])")"
+  assert_eq "fold merged shape gate: no marker folded" \
+    "0" "$(_idx_py "$repo" "len(d['dispatches']['D-155']['merged'])")"
+  # shellcheck disable=SC2016  # $1 expands inside the nested bash -c, not here
+  assert_true "fold merged shape gate: quarantine blocks the owning issue" \
+    bash -c '[[ "$1" == *issue-related-quarantine* ]]' _ \
+    "$(_idx_py "$repo" "d['quarantine_by_issue'].get('I-001')")"
+  rm -rf "$repo"
+
+  # a SHORT recorded result: the marker faithfully repeating it must STILL
+  # quarantine (correct fail-closed -- strict G4 would refuse the short
+  # result too; the marker path may never be laxer than strict).
+  repo="$(new_tmp_repo)"
+  {
+    echo "EVENT schema v=1"
+    echo "EVENT issue_state i=I-001 from=OPEN to=ACTIVE at=2026-07-23T18:00:00Z"
+    echo "EVENT dispatch_new d=D-156 i=I-001 at=2026-07-23T18:00:00Z"
+    echo "EVENT dispatch_state d=D-156 from=READY to=DISPATCHED lane=human at=2026-07-23T18:01:00Z repo=svc branch=i156-fix base_sha=abc123"
+    echo "EVENT dispatch_state d=D-156 a=A-01 from=DISPATCHED to=ACKED lane=human at=2026-07-23T18:02:00Z tab=w1.i156"
+    echo "EVENT result d=D-156 a=A-01 status=RETURNED result_sha=deadbeef at=2026-07-23T18:03:00Z"
+    echo "EVENT merged d=D-156 a=A-01 merge_sha=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb result_sha=deadbeef at=2026-07-23T18:04:00Z"
+  } > "$repo/.pm/events.log"
+  pm_fold "$repo" >/dev/null
+  assert_eq "fold merged shape gate: marker echoing a SHORT recorded result quarantined" \
+    "1" "$(_idx_py "$repo" "len(d['quarantined'])")"
+  rm -rf "$repo"
+}
+
+# ---------------------------------------------------------------------------
+# B2.2 fix-pass-6 F1: `note` events with an auto-close provenance ref
+# (ref=auto-close:* + i=) are folded QUERYABLY into index.auto_close_notes
+# so track's marker-close can dedup its pre-close audit note across crash
+# recovery. Ordinary notes stay unfolded.
+# ---------------------------------------------------------------------------
+section_fold_auto_close_notes() {
+  local repo
+  repo="$(new_tmp_repo)"
+  {
+    echo "EVENT schema v=1"
+    echo "EVENT issue_state i=I-001 from=OPEN to=ACTIVE at=2026-07-23T18:00:00Z"
+    echo "EVENT note at=2026-07-23T18:01:00Z ref=auto-close:marker i=I-001"
+    echo "EVENT note at=2026-07-23T18:02:00Z ref=misc-note i=I-001"
+    echo "EVENT note at=2026-07-23T18:03:00Z ref=auto-close:marker i=I-001"
+    echo "EVENT note at=2026-07-23T18:04:00Z ref=auto-close:marker-branch-deleted i=I-002"
+    echo "EVENT note at=2026-07-23T18:05:00Z ref=auto-close:marker"
+  } > "$repo/.pm/events.log"
+  pm_fold "$repo" >/dev/null
+  assert_eq "fold auto_close_notes: dedup'd per issue (duplicate ref stored once)" \
+    "['auto-close:marker']" "$(_idx_py "$repo" "d['auto_close_notes'].get('I-001')")"
+  assert_eq "fold auto_close_notes: branch-deleted ref stored for its issue" \
+    "['auto-close:marker-branch-deleted']" "$(_idx_py "$repo" "d['auto_close_notes'].get('I-002')")"
+  assert_eq "fold auto_close_notes: only auto-close-ref'd, issue-scoped notes stored" \
+    "2" "$(_idx_py "$repo" "len(d['auto_close_notes'])")"
+  rm -rf "$repo"
+}
+
+# ---------------------------------------------------------------------------
 # pm_git_probe on a throwaway temp git repo
 # ---------------------------------------------------------------------------
 section_git_probe() {
@@ -423,6 +633,16 @@ echo "== pm_fold: git-meta (repo/branch/base_sha) carry + preserve-on-omit =="
 section_fold_git_meta
 echo "== pm_fold: question<->issue (B2.0b) =="
 section_fold_question_issue
+echo "== pm_fold: merged markers accepted (B2.2) =="
+section_fold_merged_accepted
+echo "== pm_fold: merged marker violations quarantined (B2.2) =="
+section_fold_merged_violations
+echo "== pm_fold: conflicting merged marker quarantined (B2.2) =="
+section_fold_merged_conflict
+echo "== pm_fold: merged sha shape gate (B2.2 F3) =="
+section_fold_merged_shape_gate
+echo "== pm_fold: auto-close provenance notes folded queryably (B2.2 F1) =="
+section_fold_auto_close_notes
 echo "== pm_git_probe =="
 section_git_probe
 echo "== escapers =="

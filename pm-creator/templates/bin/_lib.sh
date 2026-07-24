@@ -276,6 +276,7 @@ declare -gA _PM_REQUIRED_KEYS=(
   [dispatch_new]="d i at"
   [dispatch_state]="d from to lane at"
   [result]="d a status result_sha at"
+  [merged]="d a merge_sha result_sha at"
   [question]="q state at"
   [unregistered_execution]="at ref"
   [adopt]="d a at ref"
@@ -288,6 +289,7 @@ declare -gA _PM_OPTIONAL_KEYS=(
   [dispatch_new]="child_of supersedes"
   [dispatch_state]="a tab prompt_sha repo branch base_sha"
   [result]=""
+  [merged]="repo"
   [question]="i a_of"
   [unregistered_execution]=""
   [adopt]=""
@@ -302,6 +304,7 @@ declare -gA _PM_KEY_ORDER=(
   [dispatch_new]="d i at child_of supersedes"
   [dispatch_state]="d a from to lane at tab prompt_sha repo branch base_sha"
   [result]="d a status result_sha at"
+  [merged]="d a merge_sha result_sha at repo"
   [question]="q state at i a_of"
   [unregistered_execution]="at ref"
   [adopt]="d a at ref"
@@ -342,12 +345,20 @@ import sys
 
 TOKEN_RE = re.compile(r'^[A-Za-z0-9._:+/@?-]+$')
 
+# B2.2 fix-pass-6 F3: full git object-name shape (sha1=40 / sha256=64
+# lowercase hex) for the sha fields of `merged` corroboration markers. The
+# fold's trust boundary is symmetric with track's close-time BASE_SHA_RE:
+# a revision expression ("main", "HEAD~1") or short hex must never fold
+# into a marker and wait for close time to be refused.
+FULL_SHA_RE = re.compile(r'^([0-9a-f]{40}|[0-9a-f]{64})$')
+
 REQUIRED = {
     "schema": ["v"],
     "issue_state": ["i", "from", "to", "at"],
     "dispatch_new": ["d", "i", "at"],
     "dispatch_state": ["d", "from", "to", "lane", "at"],
     "result": ["d", "a", "status", "result_sha", "at"],
+    "merged": ["d", "a", "merge_sha", "result_sha", "at"],
     "question": ["q", "state", "at"],
     "unregistered_execution": ["at", "ref"],
     "adopt": ["d", "a", "at", "ref"],
@@ -367,6 +378,7 @@ REQUIRED_FOR_APPLY = {
     "dispatch_new": ["d", "i", "at"],
     "dispatch_state": ["d", "to", "at"],
     "result": ["d", "status", "result_sha", "at"],
+    "merged": ["d", "merge_sha", "result_sha", "at"],
     "question": ["q", "state", "at"],
     "unregistered_execution": ["at", "ref"],
     "adopt": ["d", "a", "at", "ref"],
@@ -379,6 +391,7 @@ OPTIONAL = {
     "dispatch_new": ["child_of", "supersedes"],
     "dispatch_state": ["a", "tab", "prompt_sha", "repo", "branch", "base_sha"],
     "result": [],
+    "merged": ["repo"],
     "question": ["i", "a_of"],
     "unregistered_execution": [],
     "adopt": [],
@@ -393,6 +406,7 @@ KEY_ORDER = {
     "dispatch_new": ["d", "i", "at", "child_of", "supersedes"],
     "dispatch_state": ["d", "a", "from", "to", "lane", "at", "tab", "prompt_sha", "repo", "branch", "base_sha"],
     "result": ["d", "a", "status", "result_sha", "at"],
+    "merged": ["d", "a", "merge_sha", "result_sha", "at", "repo"],
     "question": ["q", "state", "at", "i", "a_of"],
     "unregistered_execution": ["at", "ref"],
     "adopt": ["d", "a", "at", "ref"],
@@ -454,6 +468,10 @@ def new_state():
         "quarantine_lines": [],
         "returned_marker": {},  # (d, a) -> line_no of the RETURNED result
         "pending_superseded": set(),  # dispatch ids superseded before they were registered
+        # fix-pass-6 F1: {issue_id: [auto-close:* note refs]} -- the
+        # durable marker-close provenance records, folded queryably for
+        # track's pre-close dedup.
+        "auto_close_notes": {},
     }
 
 
@@ -495,8 +513,8 @@ def _quarantine_attribution(state, etype, kv):
         successfully-applied `question` events (a quarantined line never
         reaches that assignment). A brand-new `q` that only ever appears on
         bad lines has no authoritative owner and resolves to nothing here.
-      - `dispatch_new`/`dispatch_state`/`result` events: the entity is the
-        dispatch `d`. Its authoritative owner is
+      - `dispatch_new`/`dispatch_state`/`result`/`merged` events: the
+        entity is the dispatch `d`. Its authoritative owner is
         `state["dispatch_issue_raw"][d]`, built from the first ACCEPTED
         (successfully-applied) `dispatch_new` event for that `d` (see
         fold_lines; P3-5) -- i.e. the REAL registration, not whatever `i=`
@@ -539,7 +557,7 @@ def _quarantine_attribution(state, etype, kv):
         if i:
             affected.add(i)
         return affected, category
-    elif etype in ("dispatch_new", "dispatch_state", "result"):
+    elif etype in ("dispatch_new", "dispatch_state", "result", "merged"):
         category = "issue"
         d = kv.get("d")
         if d:
@@ -674,6 +692,10 @@ def apply_event(state, etype, kv, line_no, raw, mode):
             "branch": None,
             "attempts": {},
             "result_sha": None,
+            # B2.2: accepted `merged` corroboration markers, keyed by
+            # attempt id -- {a: {merge_sha, result_sha}}. Read ONLY by
+            # track's G4 marker arm.
+            "merged": {},
             "child_of": kv.get("child_of"),
             "supersedes": kv.get("supersedes"),
             "adopted_ref": None,
@@ -901,6 +923,91 @@ def apply_event(state, etype, kv, line_no, raw, mode):
         state["returned_marker"][key] = line_no
         disp["state"] = "RETURNED"
         disp["result_sha"] = kv["result_sha"]
+        # B2.2 prerequisite: ALSO store the result per-attempt, so a later
+        # `merged` marker validates against the result of its OWN (d, a)
+        # rather than the dispatch-level last-write-wins value. Additive to
+        # the attempts entry (which may already carry base_sha); existing
+        # consumers of dispatch-level result_sha are unaffected.
+        if a is not None:
+            disp["attempts"].setdefault(a, {})["result_sha"] = kv["result_sha"]
+        return True
+
+    if etype == "merged":
+        # B2.2: a PURE corroboration record -- the human-attested "this
+        # attempt's result landed on mainline as merge_sha" marker consumed
+        # ONLY by track's G4 marker arm for squash/rebase workflows. It
+        # never transitions dispatch state, never touches issue state,
+        # never auto-VERIFIES, never overwrites result_sha. Deliberately NO
+        # `i=` and NO `mainline_ref=` keys: attribution comes from the
+        # fold's accepted maps, mainline_ref from config ONLY (an
+        # event-supplied value would be a forged-token trap).
+        d = kv["d"]
+        disp = dispatches.get(d)
+        if disp is None:
+            return fail(f"merged marker for unregistered dispatch '{d}'")
+
+        # F3: both sha fields must be full object names (40/64 lowercase
+        # hex) -- shape-gated HERE, at the fold's trust boundary, not
+        # deferred to track's close-time BASE_SHA_RE.
+        for _shakey in ("merge_sha", "result_sha"):
+            if not FULL_SHA_RE.match(kv[_shakey]):
+                return fail(
+                    f"merged marker for '{d}' refused: {_shakey}={kv[_shakey]} is not a "
+                    "full 40/64-char lowercase-hex commit sha"
+                )
+
+        if "a" not in kv:
+            if disp["attempt"] is None:
+                return fail(f"merged marker for '{d}' refused: no attempt on record")
+            kv["a"] = disp["attempt"]
+        a = kv["a"]
+
+        # `a` must be a REAL attempt of d with a recorded result, and the
+        # marker's result_sha must equal that exact (d, a) result -- the
+        # per-attempt store, never the dispatch-level last-write-wins one.
+        att_result = (disp["attempts"].get(a) or {}).get("result_sha")
+        if att_result is None:
+            return fail(
+                f"merged marker for {d}/{a} refused: no recorded result for that attempt "
+                "(record the result first)"
+            )
+        if kv["result_sha"] != att_result:
+            return fail(
+                f"merged marker for {d}/{a} refused: result_sha={kv['result_sha']} does not "
+                f"match the recorded result {att_result}"
+            )
+
+        # repo=: if present it must equal the dispatch's own recorded repo;
+        # if absent, inherit it (may legitimately be unset on both).
+        if "repo" in kv:
+            if disp.get("repo") != kv["repo"]:
+                return fail(
+                    f"merged marker for {d}/{a} refused: repo={kv['repo']} does not match "
+                    f"the dispatch's repo {disp.get('repo')}"
+                )
+        elif disp.get("repo") is not None:
+            kv["repo"] = disp["repo"]
+
+        # Duplicate markers for the same (d, a): an IDENTICAL re-append is
+        # accepted idempotently; a CONFLICTING one (different merge_sha or
+        # result_sha) is refused/quarantined -- conflict = surface, never
+        # silently replace (no last-write-wins for corroboration records).
+        # M4: read-only lookup here -- no setdefault mutation ahead of a
+        # possible fail() on a conflicting marker; mutate only on accept.
+        prior = (disp.get("merged") or {}).get(a)
+        if prior is not None:
+            if (prior.get("merge_sha") == kv["merge_sha"]
+                    and prior.get("result_sha") == kv["result_sha"]):
+                return True
+            return fail(
+                f"conflicting merged marker for {d}/{a}: prior merge_sha={prior.get('merge_sha')} "
+                f"result_sha={prior.get('result_sha')}, got merge_sha={kv['merge_sha']} "
+                f"result_sha={kv['result_sha']}"
+            )
+
+        disp.setdefault("merged", {})[a] = {
+            "merge_sha": kv["merge_sha"], "result_sha": kv["result_sha"],
+        }
         return True
 
     if etype == "question":
@@ -930,7 +1037,17 @@ def apply_event(state, etype, kv, line_no, raw, mode):
         return True
 
     if etype == "note":
-        # never parsed for state.
+        # Never parsed for ISSUE/DISPATCH state. Sole exception (fix-pass-6
+        # F1): auto-close provenance notes (ref=auto-close:* with an i=)
+        # are folded QUERYABLY into state["auto_close_notes"] so track's
+        # marker-close can dedup its pre-close audit note across crash
+        # recovery -- reading the FOLD, never re-scanning the raw log.
+        ref = kv.get("ref") or ""
+        i = kv.get("i")
+        if i and ref.startswith("auto-close:"):
+            refs = state["auto_close_notes"].setdefault(i, [])
+            if ref not in refs:
+                refs.append(ref)
         return True
 
     return fail(f"unhandled event type '{etype}'")
@@ -1069,6 +1186,8 @@ def write_outputs(state, index_path, quarantine_path):
         # dispatch<->issue linkage. Additive
         # to the schema -- existing consumers of index.json are unaffected.
         "dispatch_issue_map": dict(state.get("dispatch_issue_raw", {})),
+        # fix-pass-6 F1: marker-close provenance notes, per issue (additive).
+        "auto_close_notes": state.get("auto_close_notes", {}),
     }
 
     with open(index_path, "w") as f:

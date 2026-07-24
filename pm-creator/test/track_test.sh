@@ -233,6 +233,63 @@ ac_make_worker_commit() {
   git -C "$repo/wt-$branch" rev-parse HEAD
 }
 
+# ---------------------------------------------------------------------------
+# B2.2 marker-path fixtures
+# ---------------------------------------------------------------------------
+
+# new_tmp_repo_with_git_ac_squash [allow_marker_branch_deleted=false]
+# Like new_tmp_repo_with_git_ac true, but demo-repo opts into the B2.2
+# marker path: merge_mode=squash (+ the branch-deleted opt-in as given).
+new_tmp_repo_with_git_ac_squash() {
+  local allow_deleted="${1:-false}"
+  local d gitrepo
+  d="$(new_tmp_repo_with_git)"
+  gitrepo="$d/target-repo"
+  cat >"$d/.pm/config.json" <<JSON
+{"repos": {"demo-repo": {"path": "$gitrepo", "mainline": "main", "mainline_ref": "refs/heads/main", "fetch_policy": "local-only", "merge_mode": "squash", "allow_marker_branch_deleted": $allow_deleted}}, "herdr_workspace": "zzz-test-ws", "automation": {"auto_close": true}}
+JSON
+  echo "$d"
+}
+
+# ac_squash_merge_to_mainline <gitrepo> <branch_tip>
+# Simulates a SQUASH merge: builds a brand-new commit carrying the branch
+# tip's TREE with the current main as sole parent (so the branch tip is NOT
+# an ancestor of the new mainline -- exactly the topology strict G4 cannot
+# corroborate), moves refs/heads/main to it, echoes the squash commit sha.
+ac_squash_merge_to_mainline() {
+  local gitrepo="$1" tip="$2"
+  local main_sha squash_sha
+  main_sha="$(git -C "$gitrepo" rev-parse refs/heads/main)" || {
+    echo "FATAL: fixture git setup failed (ac_squash_merge_to_mainline: rev-parse main)" >&2
+    exit 1
+  }
+  squash_sha="$(git -C "$gitrepo" commit-tree "${tip}^{tree}" -p "$main_sha" -m "squash-merge")" || {
+    echo "FATAL: fixture git setup failed (ac_squash_merge_to_mainline: commit-tree)" >&2
+    exit 1
+  }
+  git_or_die "ac_squash_merge_to_mainline: update-ref main" \
+    -C "$gitrepo" update-ref refs/heads/main "$squash_sha"
+  echo "$squash_sha"
+}
+
+# seed_merged_marker <repo> <d> <merge_sha> <result_sha>
+# Appends a fold-accepted `merged` marker for (d, A-01) via the real
+# enforcement engine (pm_apply) -- exactly what `record merged` emits.
+seed_merged_marker() {
+  local repo="$1" d="$2" merge_sha="$3" result_sha="$4"
+  PM_ROOT="$repo" pm_apply merged d="$d" a=A-01 merge_sha="$merge_sha" \
+    result_sha="$result_sha" at="$(now_iso)" >/dev/null
+}
+
+# ac_delete_worker_branch <gitrepo> <repo> <branch>
+# Post-squash cleanup: removes the worker worktree and deletes the branch
+# ref, leaving the recorded branch unresolvable.
+ac_delete_worker_branch() {
+  local gitrepo="$1" repo="$2" branch="$3"
+  git -C "$gitrepo" worktree remove --force "$repo/wt-$branch" >/dev/null 2>&1 || true
+  git_or_die "ac_delete_worker_branch: branch -D $branch" -C "$gitrepo" branch -D "$branch"
+}
+
 # ac_fetch_policy_config <repo> <gitrepo> <auto_close>
 # Rewrites .pm/config.json with a fetch_policy=fetch demo-repo entry
 # (mainline_ref refs/remotes/origin/main) -- caller must have set up a local
@@ -2460,19 +2517,46 @@ section_ac_close_classifier_line_anchored() {
 # AFTER _TR_CLOSE_PY defines the real one, BEFORE the driver's loop calls
 # it -- to return a deliberately made-up, unregistered reason token. No
 # test-only hook is added to track itself.
+# extract_track_py <corrob|close|driver> <outfile>
+# fix-pass-6 M1: heredoc-marker-anchored extraction of track's embedded
+# python regions (replaces hardcoded sed line ranges, which silently rotted
+# whenever edits shifted line numbers). Anchors are the unique heredoc /
+# quoted-assignment delimiters themselves.
+extract_track_py() {
+  local which="$1" out="$2"
+  case "$which" in
+    corrob)
+      awk "/^read -r -d '' _TR_CORROB_PY <<'PYEOF'/{f=1;next} f&&/^PYEOF\$/{exit} f" "$TRACK" > "$out"
+      ;;
+    close)
+      awk "/^read -r -d '' _TR_CLOSE_PY <<'PYEOF'/{f=1;next} f&&/^PYEOF\$/{exit} f" "$TRACK" > "$out"
+      ;;
+    driver)
+      awk "/^_tr_ac_driver='\$/{f=1;next} f&&/^'\$/{exit} f" "$TRACK" > "$out"
+      ;;
+    *)
+      echo "extract_track_py: unknown region '$which'" >&2
+      return 1
+      ;;
+  esac
+}
+
 section_ac_reasons_registry_enforced() {
-  local corrob_f close_f driver_f override_f index_f out_f prefetch_f repos_f root_d reason
+  local corrob_f close_f driver_f override_f index_f out_f prefetch_f repos_f root_d reason detail
 
   corrob_f="$(mktemp)"; close_f="$(mktemp)"; driver_f="$(mktemp)"
   override_f="$(mktemp)"; index_f="$(mktemp)"; out_f="$(mktemp)"
   prefetch_f="$(mktemp)"; repos_f="$(mktemp)"
   root_d="$(mktemp -d)"
 
-  sed -n '383,532p' "$TRACK" > "$corrob_f"
-  sed -n '543,995p' "$TRACK" > "$close_f"
-  sed -n '1334,1422p' "$TRACK" > "$driver_f"
+  extract_track_py corrob "$corrob_f"
+  extract_track_py close "$close_f"
+  extract_track_py driver "$driver_f"
   assert_true "fix-pass-5b#3: all three extracted driver segments are non-empty" \
     bash -c '[[ -s "$1" && -s "$2" && -s "$3" ]]' _ "$corrob_f" "$close_f" "$driver_f"
+  assert_true "fix-pass-6 M1: extracted segments are anchored on the real regions" \
+    bash -c 'grep -q "^REASONS = frozenset" "$1" && grep -q "def tr_g4_marker_check" "$1" && grep -q "_ac_results" "$2"' \
+    _ "$close_f" "$driver_f"
 
   cat > "$override_f" <<'PYEOF'
 def evaluate_issue(issue_id, *a, **kw):
@@ -2486,12 +2570,18 @@ PYEOF
   PM_TR_INDEX="$index_f" PM_TR_ROOT="$root_d" PM_TR_AUTO_CLOSE=1 \
     PM_TR_AC_OUT="$out_f" PM_TR_REPOS="$(cat "$repos_f")" PM_TR_PREFETCH="$prefetch_f" \
     bash -c 'cat "$1" "$2" "$3" "$4" | python3 -' _ "$corrob_f" "$close_f" "$override_f" "$driver_f"
-  assert_true "fix-pass-5b#3: monkeypatched driver run exits 0" \
+  assert_true "fix-pass-5b#3: monkeypatched driver run produced a verdict file" \
     bash -c '[[ -s "$1" ]]' _ "$out_f"
 
   reason="$(python3 -c 'import json,sys; rows=json.load(open(sys.argv[1])); print(rows[0]["reason"])' "$out_f")"
   assert_true "fix-pass-5b#3: unregistered reason token 'totally-made-up-reason-xyz' does NOT reach the verdict row -- surfaces as auto-close-driver-error instead" \
     bash -c '[[ "$1" == "auto-close-driver-error" ]]' _ "$reason"
+  # fix-pass-6 T2: the failure must be the REGISTRY refusal specifically --
+  # any unrelated in-try crash also yields auto-close-driver-error, so pin
+  # the detail text to the ValueError the registry check raises.
+  detail="$(python3 -c 'import json,sys; rows=json.load(open(sys.argv[1])); print(rows[0].get("detail") or "")' "$out_f")"
+  assert_true "fix-pass-6 T2: driver-error detail names the unregistered reason token check" \
+    bash -c '[[ "$1" == *"unregistered auto-close reason token"* ]]' _ "$detail"
 
   rm -f "$corrob_f" "$close_f" "$driver_f" "$override_f" "$index_f" "$out_f" "$prefetch_f" "$repos_f"
   rm -rf "$root_d"
@@ -2987,6 +3077,799 @@ section_ac_t8_g1_config_variants() {
 }
 
 # ---------------------------------------------------------------------------
+# B2.2 M1: squash workflow end-to-end -- strict topology fails (squash
+# commit, branch tip not on mainline), a fold-accepted marker corroborates,
+# branch still resolvable -> auto-close via the MARKER arm, legibly
+# distinguished from strict closes in TRACKER.md AND in a durable audit
+# note on the event log. Second tick is idempotent.
+# ---------------------------------------------------------------------------
+section_ac_marker_closes_squash() {
+  local repo gitrepo base_sha tip squash_sha
+  repo="$(new_tmp_repo_with_git_ac_squash false)"
+  gitrepo="$repo/target-repo"
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+  tip="$(ac_make_worker_commit "$gitrepo" "$repo" i310-x)"
+  squash_sha="$(ac_squash_merge_to_mainline "$gitrepo" "$tip")"
+
+  seed_verified_dispatch "$repo" D-310 I-310 zzz-test-tab-310 i310-x "$base_sha" "$tip"
+  seed_issue_state "$repo" I-310 OPEN ACTIVE
+  seed_merged_marker "$repo" D-310 "$squash_sha" "$tip"
+
+  run_track "$repo"
+  assert_ac_closed "ac marker squash close" "$repo" "I-310"
+  assert_true "ac marker squash close: TRACKER row is marker-attributed (auto-closed-marker)" \
+    bash -c 'grep -- "I-310" "$1/TRACKER.md" | grep -q "| auto-closed-marker |"' _ "$repo"
+  assert_true "ac marker squash close: durable audit note distinguishes the marker path" \
+    bash -c 'grep -q "^EVENT note .*ref=auto-close:marker i=I-310" "$1/.pm/events.log"' _ "$repo"
+
+  run_track "$repo"
+  assert_true "ac marker squash close: second tick closes nothing new (idempotent)" \
+    bash -c '[[ "$1" == *"auto-closed: 0"* ]]' _ "$TR_OUT"
+
+  git -C "$gitrepo" worktree remove --force "$repo/wt-i310-x" >/dev/null 2>&1 || true
+  rm -rf "$repo"
+}
+
+# ---------------------------------------------------------------------------
+# B2.2 M2: post-squash branch deletion. With allow_marker_branch_deleted
+# true the close proceeds, explicitly labeled as the branch-deleted variant;
+# with it false/absent it surfaces marker-branch-absent-uncorroborated.
+# ---------------------------------------------------------------------------
+section_ac_marker_branch_deleted_allowed() {
+  local repo gitrepo base_sha tip squash_sha
+  repo="$(new_tmp_repo_with_git_ac_squash true)"
+  gitrepo="$repo/target-repo"
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+  tip="$(ac_make_worker_commit "$gitrepo" "$repo" i311-x)"
+  squash_sha="$(ac_squash_merge_to_mainline "$gitrepo" "$tip")"
+
+  seed_verified_dispatch "$repo" D-311 I-311 zzz-test-tab-311 i311-x "$base_sha" "$tip"
+  seed_issue_state "$repo" I-311 OPEN ACTIVE
+  seed_merged_marker "$repo" D-311 "$squash_sha" "$tip"
+  ac_delete_worker_branch "$gitrepo" "$repo" i311-x
+
+  run_track "$repo"
+  assert_ac_closed "ac marker branch-deleted allowed" "$repo" "I-311"
+  assert_true "ac marker branch-deleted allowed: TRACKER row names the branch-deleted variant" \
+    bash -c 'grep -- "I-311" "$1/TRACKER.md" | grep -q "auto-closed-marker-branch-deleted"' _ "$repo"
+  assert_true "ac marker branch-deleted allowed: audit note names the branch-deleted variant" \
+    bash -c 'grep -q "^EVENT note .*ref=auto-close:marker-branch-deleted i=I-311" "$1/.pm/events.log"' _ "$repo"
+
+  rm -rf "$repo"
+}
+
+section_ac_marker_branch_deleted_refused() {
+  local repo gitrepo base_sha tip squash_sha
+  repo="$(new_tmp_repo_with_git_ac_squash false)"
+  gitrepo="$repo/target-repo"
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+  tip="$(ac_make_worker_commit "$gitrepo" "$repo" i312-x)"
+  squash_sha="$(ac_squash_merge_to_mainline "$gitrepo" "$tip")"
+
+  seed_verified_dispatch "$repo" D-312 I-312 zzz-test-tab-312 i312-x "$base_sha" "$tip"
+  seed_issue_state "$repo" I-312 OPEN ACTIVE
+  seed_merged_marker "$repo" D-312 "$squash_sha" "$tip"
+  ac_delete_worker_branch "$gitrepo" "$repo" i312-x
+
+  run_track "$repo"
+  assert_ac_surfaced "ac marker branch-deleted refused (opt-in absent)" "$repo" "I-312" \
+    "marker-branch-absent-uncorroborated"
+
+  rm -rf "$repo"
+}
+
+# ---------------------------------------------------------------------------
+# B2.2 M3: squash repo with NO marker -> the existing fail-closed reason.
+# ---------------------------------------------------------------------------
+section_ac_marker_missing() {
+  local repo gitrepo base_sha tip
+  repo="$(new_tmp_repo_with_git_ac_squash false)"
+  gitrepo="$repo/target-repo"
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+  tip="$(ac_make_worker_commit "$gitrepo" "$repo" i313-x)"
+  ac_squash_merge_to_mainline "$gitrepo" "$tip" >/dev/null
+
+  seed_verified_dispatch "$repo" D-313 I-313 zzz-test-tab-313 i313-x "$base_sha" "$tip"
+  seed_issue_state "$repo" I-313 OPEN ACTIVE
+
+  run_track "$repo"
+  assert_ac_surfaced "ac marker missing" "$repo" "I-313" "no-strict-ancestry-and-no-valid-marker"
+
+  git -C "$gitrepo" worktree remove --force "$repo/wt-i313-x" >/dev/null 2>&1 || true
+  rm -rf "$repo"
+}
+
+# ---------------------------------------------------------------------------
+# B2.2 M4: marker whose merge_sha is a real commit NOT on mainline -> the
+# marker's own mainline-ancestry leg refuses (marker-merge-not-on-mainline).
+# ---------------------------------------------------------------------------
+section_ac_marker_merge_not_on_mainline() {
+  local repo gitrepo base_sha tip stray
+  repo="$(new_tmp_repo_with_git_ac_squash false)"
+  gitrepo="$repo/target-repo"
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+  tip="$(ac_make_worker_commit "$gitrepo" "$repo" i314-x)"
+  # a real, verifiable commit that was never merged anywhere near mainline
+  # (distinct content -- an identical tree/parent/timestamp would mint the
+  # SAME sha as $tip and hollow the test out)
+  stray="$(ac_make_worker_commit "$gitrepo" "$repo" i314-stray)"
+  (
+    set -e
+    cd "$repo/wt-i314-stray" || exit 1
+    printf 'stray-only work\n' >stray.txt
+    git add stray.txt
+    git commit -q -m 'stray work'
+  ) >&2 || { echo "FATAL: fixture git setup failed (m4: stray distinct commit)" >&2; exit 1; }
+  stray="$(git -C "$repo/wt-i314-stray" rev-parse HEAD)"
+
+  seed_verified_dispatch "$repo" D-314 I-314 zzz-test-tab-314 i314-x "$base_sha" "$tip"
+  seed_issue_state "$repo" I-314 OPEN ACTIVE
+  seed_merged_marker "$repo" D-314 "$stray" "$tip"
+
+  run_track "$repo"
+  assert_ac_surfaced "ac marker merge not on mainline" "$repo" "I-314" "marker-merge-not-on-mainline"
+
+  git -C "$gitrepo" worktree remove --force "$repo/wt-i314-x" >/dev/null 2>&1 || true
+  git -C "$gitrepo" worktree remove --force "$repo/wt-i314-stray" >/dev/null 2>&1 || true
+  rm -rf "$repo"
+}
+
+# ---------------------------------------------------------------------------
+# B2.2 M5: marker whose merge_sha is sha-shaped but names no real commit ->
+# tr_verify_commit's identity anchor refuses (marker-merge-sha-unverified).
+# ---------------------------------------------------------------------------
+section_ac_marker_merge_sha_unverified() {
+  local repo gitrepo base_sha tip
+  repo="$(new_tmp_repo_with_git_ac_squash false)"
+  gitrepo="$repo/target-repo"
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+  tip="$(ac_make_worker_commit "$gitrepo" "$repo" i315-x)"
+  ac_squash_merge_to_mainline "$gitrepo" "$tip" >/dev/null
+
+  seed_verified_dispatch "$repo" D-315 I-315 zzz-test-tab-315 i315-x "$base_sha" "$tip"
+  seed_issue_state "$repo" I-315 OPEN ACTIVE
+  seed_merged_marker "$repo" D-315 "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" "$tip"
+
+  run_track "$repo"
+  assert_ac_surfaced "ac marker merge sha unverified" "$repo" "I-315" "marker-merge-sha-unverified"
+
+  git -C "$gitrepo" worktree remove --force "$repo/wt-i315-x" >/dev/null 2>&1 || true
+  rm -rf "$repo"
+}
+
+# ---------------------------------------------------------------------------
+# B2.2 M6: the marker path is consulted ONLY for merge_mode=squash repos --
+# a marker on a default (merge-mode) repo changes nothing: strict failure
+# still surfaces the existing reason.
+# ---------------------------------------------------------------------------
+section_ac_marker_ignored_in_merge_mode() {
+  local repo gitrepo base_sha tip squash_sha
+  repo="$(new_tmp_repo_with_git_ac true)"
+  gitrepo="$repo/target-repo"
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+  tip="$(ac_make_worker_commit "$gitrepo" "$repo" i316-x)"
+  squash_sha="$(ac_squash_merge_to_mainline "$gitrepo" "$tip")"
+
+  seed_verified_dispatch "$repo" D-316 I-316 zzz-test-tab-316 i316-x "$base_sha" "$tip"
+  seed_issue_state "$repo" I-316 OPEN ACTIVE
+  seed_merged_marker "$repo" D-316 "$squash_sha" "$tip"
+
+  run_track "$repo"
+  assert_ac_surfaced "ac marker ignored on merge-mode repo" "$repo" "I-316" \
+    "no-strict-ancestry-and-no-valid-marker"
+
+  git -C "$gitrepo" worktree remove --force "$repo/wt-i316-x" >/dev/null 2>&1 || true
+  rm -rf "$repo"
+}
+
+# ---------------------------------------------------------------------------
+# B2.2 M7: strict still runs FIRST on squash repos -- a fast-forward-merged
+# result closes strictly (auto-closed-strict, no marker needed, no marker
+# audit note).
+# ---------------------------------------------------------------------------
+section_ac_marker_strict_still_preferred() {
+  local repo gitrepo base_sha tip
+  repo="$(new_tmp_repo_with_git_ac_squash false)"
+  gitrepo="$repo/target-repo"
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+  tip="$(ac_make_worker_commit "$gitrepo" "$repo" i317-x)"
+  ac_merge_worker_tip_to_mainline "$gitrepo" "$tip"
+
+  seed_verified_dispatch "$repo" D-317 I-317 zzz-test-tab-317 i317-x "$base_sha" "$tip"
+  seed_issue_state "$repo" I-317 OPEN ACTIVE
+
+  run_track "$repo"
+  assert_ac_closed "ac squash repo strict-first close" "$repo" "I-317"
+  assert_true "ac squash repo strict-first close: TRACKER row says auto-closed-strict" \
+    bash -c 'grep -- "I-317" "$1/TRACKER.md" | grep -q "auto-closed-strict"' _ "$repo"
+  assert_eq "ac squash repo strict-first close: no marker audit note emitted" \
+    "0" "$(grep -c "ref=auto-close:" "$repo/.pm/events.log")"
+
+  git -C "$gitrepo" worktree remove --force "$repo/wt-i317-x" >/dev/null 2>&1 || true
+  rm -rf "$repo"
+}
+
+# ---------------------------------------------------------------------------
+# B2.2 M8: runtime config validation is fail-closed -- an invalid
+# merge_mode, or a non-bool allow_marker_branch_deleted, surfaces
+# repo-config-invalid for that repo's issues (config.json is
+# operator-editable post-scaffold; scaffold-time validity never trusted).
+# ---------------------------------------------------------------------------
+_m8_bad_config_variant() {
+  # _m8_bad_config_variant <label> <repo_json_extras>
+  local label="$1" extras="$2"
+  local repo gitrepo base_sha tip
+  repo="$(new_tmp_repo_with_git_ac true)"
+  gitrepo="$repo/target-repo"
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+  tip="$(ac_make_worker_commit "$gitrepo" "$repo" i318-x)"
+  ac_merge_worker_tip_to_mainline "$gitrepo" "$tip"
+  cat >"$repo/.pm/config.json" <<JSON
+{"repos": {"demo-repo": {"path": "$gitrepo", "mainline": "main", "mainline_ref": "refs/heads/main", "fetch_policy": "local-only"${extras}}}, "herdr_workspace": "zzz-test-ws", "automation": {"auto_close": true}}
+JSON
+
+  seed_verified_dispatch "$repo" D-318 I-318 zzz-test-tab-318 i318-x "$base_sha" "$tip"
+  seed_issue_state "$repo" I-318 OPEN ACTIVE
+
+  run_track "$repo"
+  assert_ac_surfaced "ac m8 ($label)" "$repo" "I-318" "repo-config-invalid"
+
+  git -C "$gitrepo" worktree remove --force "$repo/wt-i318-x" >/dev/null 2>&1 || true
+  rm -rf "$repo"
+}
+
+section_ac_marker_repo_config_invalid() {
+  _m8_bad_config_variant "invalid merge_mode enum" ', "merge_mode": "rebase"'
+  _m8_bad_config_variant "non-bool allow_marker_branch_deleted" ', "allow_marker_branch_deleted": "yes"'
+}
+
+# ---------------------------------------------------------------------------
+# B2.2 M9: BRANCH-BINDING IS NOT WAIVED on the marker path -- a forged
+# result claiming the mainline squash commit itself (marker matches, merge
+# on mainline) whose recorded branch still resolves but does NOT contain
+# the result -> result-not-bound-to-branch, exactly as strict.
+# ---------------------------------------------------------------------------
+section_ac_marker_forged_result_not_on_branch() {
+  local repo gitrepo base_sha tip squash_sha
+  repo="$(new_tmp_repo_with_git_ac_squash false)"
+  gitrepo="$repo/target-repo"
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+  tip="$(ac_make_worker_commit "$gitrepo" "$repo" i319-x)"
+  squash_sha="$(ac_squash_merge_to_mainline "$gitrepo" "$tip")"
+
+  # forged: the recorded result IS the mainline squash commit (never on the
+  # worker branch), and the marker faithfully repeats it.
+  seed_verified_dispatch "$repo" D-319 I-319 zzz-test-tab-319 i319-x "$base_sha" "$squash_sha"
+  seed_issue_state "$repo" I-319 OPEN ACTIVE
+  seed_merged_marker "$repo" D-319 "$squash_sha" "$squash_sha"
+
+  run_track "$repo"
+  assert_ac_surfaced "ac marker forged result not on branch" "$repo" "I-319" \
+    "result-not-bound-to-branch"
+
+  git -C "$gitrepo" worktree remove --force "$repo/wt-i319-x" >/dev/null 2>&1 || true
+  rm -rf "$repo"
+}
+
+# ---------------------------------------------------------------------------
+# B2.2 fix-pass-6 F1(a): the marker-close audit note precedes the durable
+# CLOSE and is DEDUP'd against the folded index -- crash-recovery replay: a
+# tick that already emitted the note (then died before closing) must, on
+# the next tick, close cleanly WITHOUT a second note.
+# ---------------------------------------------------------------------------
+section_ac_marker_note_precedes_close_replay() {
+  local repo gitrepo base_sha tip squash_sha
+  repo="$(new_tmp_repo_with_git_ac_squash false)"
+  gitrepo="$repo/target-repo"
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+  tip="$(ac_make_worker_commit "$gitrepo" "$repo" i320-x)"
+  squash_sha="$(ac_squash_merge_to_mainline "$gitrepo" "$tip")"
+
+  seed_verified_dispatch "$repo" D-320 I-320 zzz-test-tab-320 i320-x "$base_sha" "$tip"
+  seed_issue_state "$repo" I-320 OPEN ACTIVE
+  seed_merged_marker "$repo" D-320 "$squash_sha" "$tip"
+  # crash-sim replay: the audit note is ALREADY on the log (prior tick
+  # emitted it, then died before pm_close_issue).
+  PM_ROOT="$repo" pm_apply note at="$(now_iso)" ref=auto-close:marker i=I-320 >/dev/null
+
+  run_track "$repo"
+  assert_ac_closed "ac marker note-before-close replay" "$repo" "I-320"
+  assert_eq "ac marker note-before-close replay: EXACTLY one audit note (dedup, no re-emit)" \
+    "1" "$(grep -c "ref=auto-close:marker i=I-320" "$repo/.pm/events.log")"
+
+  git -C "$gitrepo" worktree remove --force "$repo/wt-i320-x" >/dev/null 2>&1 || true
+  rm -rf "$repo"
+}
+
+# ---------------------------------------------------------------------------
+# B2.2 fix-pass-6 F1(b): if the audit-note emission FAILS, the close must
+# NOT happen -- no marker close without its durable provenance record.
+# Surfaces the registered reason marker-note-emit-failed; retried next tick.
+# ---------------------------------------------------------------------------
+section_ac_marker_note_emit_failed() {
+  local repo gitrepo base_sha tip squash_sha
+  repo="$(new_tmp_repo_with_git_ac_squash false)"
+  gitrepo="$repo/target-repo"
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+  tip="$(ac_make_worker_commit "$gitrepo" "$repo" i321-x)"
+  squash_sha="$(ac_squash_merge_to_mainline "$gitrepo" "$tip")"
+
+  seed_verified_dispatch "$repo" D-321 I-321 zzz-test-tab-321 i321-x "$base_sha" "$tip"
+  seed_issue_state "$repo" I-321 OPEN ACTIVE
+  seed_merged_marker "$repo" D-321 "$squash_sha" "$tip"
+
+  # Force pm_apply (the note append) to fail: read-only event log.
+  chmod a-w "$repo/.pm/events.log"
+  run_track "$repo"
+  chmod u+w "$repo/.pm/events.log"
+
+  local state
+  state="$(python3 -c "import json;d=json.load(open('$repo/.pm/index.json'));print(d['issues'].get('I-321',{}).get('state'))" 2>/dev/null)"
+  assert_true "ac marker note-emit-failed: issue NOT closed (fail-closed, no close without provenance)" \
+    bash -c '[[ "$1" != "CLOSED" ]]' _ "$state"
+  assert_true "ac marker note-emit-failed: surfaced with the dedicated reason" \
+    bash -c 'grep -- "I-321" "$1/TRACKER.md" | grep -q "marker-note-emit-failed"' _ "$repo"
+
+  # retry next tick with a healthy log -> closes, exactly one note.
+  run_track "$repo"
+  assert_ac_closed "ac marker note-emit-failed: healthy retry closes" "$repo" "I-321"
+  assert_eq "ac marker note-emit-failed: healthy retry leaves exactly one audit note" \
+    "1" "$(grep -c "ref=auto-close:marker i=I-321" "$repo/.pm/events.log")"
+
+  git -C "$gitrepo" worktree remove --force "$repo/wt-i321-x" >/dev/null 2>&1 || true
+  rm -rf "$repo"
+}
+
+# ---------------------------------------------------------------------------
+# B2.2 fix-pass-6 F2 tripwire: result_sha == base_sha (zero new work) on a
+# squash repo with a "valid" marker must surface result==base -- both via
+# the eligible-set exclusion AND the in-arm re-check (mutation-checked).
+# ---------------------------------------------------------------------------
+section_ac_marker_result_equals_base() {
+  local repo gitrepo base_sha squash_sha
+  repo="$(new_tmp_repo_with_git_ac_squash false)"
+  gitrepo="$repo/target-repo"
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+  # worker branch exists but carries NO new commit (tip == base).
+  git_or_die "m-eqbase: worktree add" -C "$gitrepo" worktree add -q -b i322-x "$repo/wt-i322-x" main
+  # a real commit lands on mainline (so the marker's merge_sha is genuine).
+  squash_sha="$(ac_squash_merge_to_mainline "$gitrepo" "$base_sha")"
+
+  seed_verified_dispatch "$repo" D-322 I-322 zzz-test-tab-322 i322-x "$base_sha" "$base_sha"
+  seed_issue_state "$repo" I-322 OPEN ACTIVE
+  seed_merged_marker "$repo" D-322 "$squash_sha" "$base_sha"
+
+  run_track "$repo"
+  assert_ac_surfaced "ac marker result==base refused" "$repo" "I-322" "result==base"
+
+  git -C "$gitrepo" worktree remove --force "$repo/wt-i322-x" >/dev/null 2>&1 || true
+  rm -rf "$repo"
+}
+
+# ---------------------------------------------------------------------------
+# B2.2 fix-pass-6 F3 e2e: a RAW merged line whose merge_sha is a revision
+# expression ("main") quarantines at the FOLD -- the issue surfaces via the
+# G1.5 quarantine gate and the marker never reaches any git call.
+# ---------------------------------------------------------------------------
+section_ac_marker_raw_shape_quarantined() {
+  local repo gitrepo base_sha tip
+  repo="$(new_tmp_repo_with_git_ac_squash false)"
+  gitrepo="$repo/target-repo"
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+  tip="$(ac_make_worker_commit "$gitrepo" "$repo" i323-x)"
+  ac_squash_merge_to_mainline "$gitrepo" "$tip" >/dev/null
+
+  seed_verified_dispatch "$repo" D-323 I-323 zzz-test-tab-323 i323-x "$base_sha" "$tip"
+  seed_issue_state "$repo" I-323 OPEN ACTIVE
+  PM_ROOT="$repo" pm_raw_append merged d=D-323 a=A-01 merge_sha=main result_sha="$tip" at="$(now_iso)"
+
+  run_track "$repo"
+  assert_ac_surfaced "ac marker raw shape gate" "$repo" "I-323" "issue-related-quarantine"
+
+  git -C "$gitrepo" worktree remove --force "$repo/wt-i323-x" >/dev/null 2>&1 || true
+  rm -rf "$repo"
+}
+
+# ---------------------------------------------------------------------------
+# B2.2 fix-pass-6 F4 + T2: direct-function checks on tr_g4_marker_check
+# (extracted via the anchored regions): the marker's att_result is itself
+# identity-anchored (unreachable sha refused), and a marker/result mismatch
+# returns marker-mismatch. Also pins the F2 in-arm result==base re-check.
+# ---------------------------------------------------------------------------
+section_ac_marker_direct_fn_guards() {
+  local corrob_f close_f gitrepo real fake out
+  corrob_f="$(mktemp)"; close_f="$(mktemp)"
+  extract_track_py corrob "$corrob_f"
+  extract_track_py close "$close_f"
+
+  gitrepo="$(mktemp -d "${TMPDIR:-/tmp}/pm-creator-marker-fn.XXXXXX")"
+  git_or_die "marker-fn: init" init -q -b main "$gitrepo"
+  git_or_die "marker-fn: config email" -C "$gitrepo" config user.email t@t
+  git_or_die "marker-fn: config name" -C "$gitrepo" config user.name t
+  git_or_die "marker-fn: seed commit" -C "$gitrepo" commit -q --allow-empty -m init
+  real="$(git -C "$gitrepo" rev-parse HEAD)"
+  fake="cccccccccccccccccccccccccccccccccccccccc"
+
+  out="$({ cat "$corrob_f" "$close_f"; cat <<PY
+import json
+base = "b" * 40
+# T2: marker result_sha disagrees with the fold's per-attempt result
+print(json.dumps(tr_g4_marker_check(
+    "$gitrepo", "main", "refs/heads/main", "local-only", base, "$real",
+    "i999-x", None, {"merge_sha": "$real", "result_sha": "$fake"}, False)))
+# F4: att_result sha-shaped but names no real commit -> identity anchor refuses
+print(json.dumps(tr_g4_marker_check(
+    "$gitrepo", "main", "refs/heads/main", "local-only", base, "$fake",
+    "i999-x", None, {"merge_sha": "$real", "result_sha": "$fake"}, False)))
+# F2: att_result == base_sha (zero new work) -> in-arm re-check refuses
+print(json.dumps(tr_g4_marker_check(
+    "$gitrepo", "main", "refs/heads/main", "local-only", "$real", "$real",
+    "i999-x", None, {"merge_sha": "$real", "result_sha": "$real"}, False)))
+PY
+  } | python3 - 2>&1)"
+
+  assert_eq "fix-pass-6 T2: marker/result mismatch -> marker-mismatch" \
+    '[null, "marker-mismatch"]' "$(printf '%s\n' "$out" | sed -n 1p)"
+  assert_eq "fix-pass-6 F4: unreachable att_result refused by identity anchor" \
+    '[null, "unreachable"]' "$(printf '%s\n' "$out" | sed -n 2p)"
+  assert_eq "fix-pass-6 F2: in-arm result==base re-check refuses" \
+    '[null, "result==base"]' "$(printf '%s\n' "$out" | sed -n 3p)"
+
+  rm -f "$corrob_f" "$close_f"
+  rm -rf "$gitrepo"
+}
+
+# ---------------------------------------------------------------------------
+# B2.2 fix-pass-6 F5: marker arm x fetch policy. (a) reachable remote +
+# valid marker -> auto-closed-marker with EXACTLY one fetch (the pre-lock
+# prefetch; G4 itself never fetches); (b) unreachable remote with a STALE
+# remote-tracking ref that WOULD satisfy the local ancestry check ->
+# fetch-failed (the prefetch verdict rules, never the stale local ref
+# alone); (c) leading-dash remote in mainline_ref -> mainline-ref-missing,
+# zero fetch argv ever.
+# ---------------------------------------------------------------------------
+ac_squash_fetch_config() {
+  local repo="$1" gitrepo="$2" mainline_ref="${3:-refs/remotes/origin/main}"
+  cat >"$repo/.pm/config.json" <<JSON
+{"repos": {"demo-repo": {"path": "$gitrepo", "mainline": "main", "mainline_ref": "$mainline_ref", "fetch_policy": "fetch", "merge_mode": "squash", "allow_marker_branch_deleted": false}}, "herdr_workspace": "zzz-test-ws", "automation": {"auto_close": true}}
+JSON
+}
+
+section_ac_marker_fetch_policy_success() {
+  local repo gitrepo origin_bare base_sha tip squash_sha wrapper_dir log_file
+  repo="$(new_tmp_repo_with_git_ac_squash false)"
+  gitrepo="$repo/target-repo"
+  origin_bare="$repo/origin.git"
+
+  git_or_die "m-fetch-success: init bare origin" init -q --bare "$origin_bare"
+  git_or_die "m-fetch-success: add origin remote" -C "$gitrepo" remote add origin "$origin_bare"
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+  tip="$(ac_make_worker_commit "$gitrepo" "$repo" i324-x)"
+  squash_sha="$(ac_squash_merge_to_mainline "$gitrepo" "$tip")"
+  git_or_die "m-fetch-success: push squashed main to origin" -C "$gitrepo" push -q origin main
+  ac_squash_fetch_config "$repo" "$gitrepo"
+
+  seed_verified_dispatch "$repo" D-324 I-324 zzz-test-tab-324 i324-x "$base_sha" "$tip"
+  seed_issue_state "$repo" I-324 OPEN ACTIVE
+  seed_merged_marker "$repo" D-324 "$squash_sha" "$tip"
+
+  wrapper_dir="$(mktemp -d "${TMPDIR:-/tmp}/pm-creator-git-wrapper.XXXXXX")"
+  log_file="$(mktemp "${TMPDIR:-/tmp}/pm-creator-git-wrapper-log.XXXXXX")"
+  make_git_env_wrapper "$wrapper_dir" "$log_file"
+  run_track_with_git_wrapper "$repo" "$wrapper_dir"
+
+  assert_ac_closed "ac marker fetch success" "$repo" "I-324"
+  assert_true "ac marker fetch success: closed via the marker path" \
+    bash -c 'grep -- "I-324" "$1/TRACKER.md" | grep -q "| auto-closed-marker |"' _ "$repo"
+  assert_eq "ac marker fetch success: EXACTLY one fetch (pre-lock prefetch only)" \
+    "1" "$(grep -c '|fetch ' "$log_file")"
+
+  git -C "$gitrepo" worktree remove --force "$repo/wt-i324-x" >/dev/null 2>&1 || true
+  rm -rf "$repo" "$wrapper_dir"
+  rm -f "$log_file"
+}
+
+section_ac_marker_fetch_policy_failed_stale_ref() {
+  local repo gitrepo origin_bare base_sha tip squash_sha
+  repo="$(new_tmp_repo_with_git_ac_squash false)"
+  gitrepo="$repo/target-repo"
+  origin_bare="$repo/origin.git"
+
+  git_or_die "m-fetch-stale: init bare origin" init -q --bare "$origin_bare"
+  git_or_die "m-fetch-stale: add origin remote" -C "$gitrepo" remote add origin "$origin_bare"
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+  tip="$(ac_make_worker_commit "$gitrepo" "$repo" i325-x)"
+  squash_sha="$(ac_squash_merge_to_mainline "$gitrepo" "$tip")"
+  git_or_die "m-fetch-stale: push squashed main" -C "$gitrepo" push -q origin main
+  # a STALE remote-tracking ref that already contains merge_sha ...
+  git_or_die "m-fetch-stale: prime remote-tracking ref" -C "$gitrepo" fetch -q origin
+  # ... then the remote goes away: prefetch MUST fail and rule.
+  mv "$origin_bare" "${origin_bare}.gone"
+  ac_squash_fetch_config "$repo" "$gitrepo"
+
+  seed_verified_dispatch "$repo" D-325 I-325 zzz-test-tab-325 i325-x "$base_sha" "$tip"
+  seed_issue_state "$repo" I-325 OPEN ACTIVE
+  seed_merged_marker "$repo" D-325 "$squash_sha" "$tip"
+
+  run_track "$repo"
+  assert_ac_surfaced "ac marker fetch stale-ref" "$repo" "I-325" "fetch-failed"
+
+  git -C "$gitrepo" worktree remove --force "$repo/wt-i325-x" >/dev/null 2>&1 || true
+  rm -rf "$repo"
+}
+
+section_ac_marker_fetch_policy_leading_dash() {
+  local repo gitrepo base_sha tip squash_sha wrapper_dir log_file
+  repo="$(new_tmp_repo_with_git_ac_squash false)"
+  gitrepo="$repo/target-repo"
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+  tip="$(ac_make_worker_commit "$gitrepo" "$repo" i326-x)"
+  squash_sha="$(ac_squash_merge_to_mainline "$gitrepo" "$tip")"
+  ac_squash_fetch_config "$repo" "$gitrepo" "refs/remotes/-evil/main"
+
+  seed_verified_dispatch "$repo" D-326 I-326 zzz-test-tab-326 i326-x "$base_sha" "$tip"
+  seed_issue_state "$repo" I-326 OPEN ACTIVE
+  seed_merged_marker "$repo" D-326 "$squash_sha" "$tip"
+
+  wrapper_dir="$(mktemp -d "${TMPDIR:-/tmp}/pm-creator-git-wrapper.XXXXXX")"
+  log_file="$(mktemp "${TMPDIR:-/tmp}/pm-creator-git-wrapper-log.XXXXXX")"
+  make_git_env_wrapper "$wrapper_dir" "$log_file"
+  run_track_with_git_wrapper "$repo" "$wrapper_dir"
+
+  assert_ac_surfaced "ac marker leading-dash remote" "$repo" "I-326" "mainline-ref-missing"
+  assert_eq "ac marker leading-dash remote: zero fetch argv ever" \
+    "0" "$(grep -c '|fetch ' "$log_file")"
+
+  git -C "$gitrepo" worktree remove --force "$repo/wt-i326-x" >/dev/null 2>&1 || true
+  rm -rf "$repo" "$wrapper_dir"
+  rm -f "$log_file"
+}
+
+# ---------------------------------------------------------------------------
+# B2.2 fix-pass-6 T1: a marker recorded for an OLD attempt does not carry
+# over to the re-dispatched attempt -- current-(d,a) lookup only.
+# ---------------------------------------------------------------------------
+section_ac_marker_old_attempt_ignored() {
+  local repo gitrepo base_sha tip1 tip2 squash1
+  repo="$(new_tmp_repo_with_git_ac_squash false)"
+  gitrepo="$repo/target-repo"
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+  tip1="$(ac_make_worker_commit "$gitrepo" "$repo" i327-x)"
+  squash1="$(ac_squash_merge_to_mainline "$gitrepo" "$tip1")"
+  # second attempt's commit on the same branch
+  (
+    set -e
+    cd "$repo/wt-i327-x" || exit 1
+    printf 'second attempt work\n' >again.txt
+    git add again.txt
+    git commit -q -m 'attempt two'
+  ) >&2 || { echo "FATAL: fixture git setup failed (m-t1: attempt-two commit)" >&2; exit 1; }
+  tip2="$(git -C "$repo/wt-i327-x" rev-parse HEAD)"
+  ac_squash_merge_to_mainline "$gitrepo" "$tip2" >/dev/null
+
+  seed_issue_state "$repo" I-327 OPEN ACTIVE
+  local now
+  now="$(now_iso)"
+  PM_ROOT="$repo" pm_apply dispatch_new d=D-327 i=I-327 at="$now" >/dev/null
+  PM_ROOT="$repo" pm_apply dispatch_state d=D-327 from=READY to=DISPATCHED lane=human \
+    at="$now" repo=demo-repo branch=i327-x base_sha="$base_sha" >/dev/null
+  PM_ROOT="$repo" pm_apply dispatch_state d=D-327 a=A-01 from=DISPATCHED to=ACKED lane=human \
+    at="$now" tab=zzz-test-tab-327 >/dev/null
+  PM_ROOT="$repo" pm_apply result d=D-327 a=A-01 status=RETURNED result_sha="$tip1" at="$now" >/dev/null
+  # marker for the FIRST attempt only
+  PM_ROOT="$repo" pm_apply merged d=D-327 a=A-01 merge_sha="$squash1" result_sha="$tip1" at="$now" >/dev/null
+  # attempt one fails; re-dispatch mints A-02; attempt two returns + verifies
+  PM_ROOT="$repo" pm_apply dispatch_state d=D-327 a=A-01 from=RETURNED to=FAILED lane=human at="$now" >/dev/null
+  PM_ROOT="$repo" pm_apply dispatch_state d=D-327 from=FAILED to=DISPATCHED lane=human \
+    at="$now" base_sha="$base_sha" >/dev/null
+  PM_ROOT="$repo" pm_apply dispatch_state d=D-327 a=A-02 from=DISPATCHED to=ACKED lane=human \
+    at="$now" tab=zzz-test-tab-327b >/dev/null
+  PM_ROOT="$repo" pm_apply result d=D-327 a=A-02 status=RETURNED result_sha="$tip2" at="$now" >/dev/null
+  PM_ROOT="$repo" pm_apply dispatch_state d=D-327 a=A-02 from=RETURNED to=VERIFIED lane=human at="$now" >/dev/null
+
+  run_track "$repo"
+  assert_ac_surfaced "ac marker old-attempt ignored" "$repo" "I-327" \
+    "no-strict-ancestry-and-no-valid-marker"
+
+  git -C "$gitrepo" worktree remove --force "$repo/wt-i327-x" >/dev/null 2>&1 || true
+  rm -rf "$repo"
+}
+
+# ---------------------------------------------------------------------------
+# B2.2 fix-pass-6 T3: close_modes precedence -- one issue, dispatch A
+# strict-corroborated, dispatch B marker-corroborated, same tick: the row
+# says auto-closed-marker (the most permissive path used) and the audit
+# note is present.
+# ---------------------------------------------------------------------------
+section_ac_marker_close_modes_precedence() {
+  local repo gitrepo base_sha tip_a tip_b squash_b
+  repo="$(new_tmp_repo_with_git_ac_squash false)"
+  gitrepo="$repo/target-repo"
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+  tip_a="$(ac_make_worker_commit "$gitrepo" "$repo" i328-x)"
+  # second worker branch touching a DIFFERENT file
+  git_or_die "m-t3: branch i329-x" -C "$gitrepo" branch i329-x main
+  git_or_die "m-t3: worktree add wt-i329-x" -C "$gitrepo" worktree add -q "$repo/wt-i329-x" i329-x
+  (
+    set -e
+    cd "$repo/wt-i329-x" || exit 1
+    printf 'other work\n' >second.txt
+    git add second.txt
+    git commit -q -m 'other work'
+  ) >&2 || { echo "FATAL: fixture git setup failed (m-t3: i329-x commit)" >&2; exit 1; }
+  tip_b="$(git -C "$repo/wt-i329-x" rev-parse HEAD)"
+
+  # dispatch A's tip lands as a REAL merge (strict corroborates) ...
+  git_or_die "m-t3: merge i328-x" -C "$gitrepo" merge -q -m 'merge i328-x' "$tip_a"
+  # ... dispatch B's tip lands as a SQUASH (marker needed).
+  squash_b="$(ac_squash_merge_to_mainline "$gitrepo" "$tip_b")"
+
+  seed_verified_dispatch "$repo" D-328 I-328 zzz-test-tab-328 i328-x "$base_sha" "$tip_a"
+  seed_verified_dispatch "$repo" D-329 I-328 zzz-test-tab-329 i329-x "$base_sha" "$tip_b"
+  seed_issue_state "$repo" I-328 OPEN ACTIVE
+  seed_merged_marker "$repo" D-329 "$squash_b" "$tip_b"
+
+  run_track "$repo"
+  assert_ac_closed "ac marker close-modes precedence" "$repo" "I-328"
+  assert_true "ac marker close-modes precedence: row reason is auto-closed-marker" \
+    bash -c 'grep -- "I-328" "$1/TRACKER.md" | grep -q "| auto-closed-marker |"' _ "$repo"
+  assert_eq "ac marker close-modes precedence: audit note present" \
+    "1" "$(grep -c "ref=auto-close:marker i=I-328" "$repo/.pm/events.log")"
+
+  git -C "$gitrepo" worktree remove --force "$repo/wt-i328-x" >/dev/null 2>&1 || true
+  git -C "$gitrepo" worktree remove --force "$repo/wt-i329-x" >/dev/null 2>&1 || true
+  rm -rf "$repo"
+}
+
+# ---------------------------------------------------------------------------
+# B2.2 fix-pass-6 T5: allow_marker_branch_deleted key ABSENT (legacy squash
+# config, not merely false) + deleted branch -> fail-closed surface.
+# ---------------------------------------------------------------------------
+section_ac_marker_branch_deleted_key_absent() {
+  local repo gitrepo base_sha tip squash_sha
+  repo="$(new_tmp_repo_with_git_ac_squash false)"
+  gitrepo="$repo/target-repo"
+  # config WITHOUT the allow_marker_branch_deleted key at all
+  cat >"$repo/.pm/config.json" <<JSON
+{"repos": {"demo-repo": {"path": "$gitrepo", "mainline": "main", "mainline_ref": "refs/heads/main", "fetch_policy": "local-only", "merge_mode": "squash"}}, "herdr_workspace": "zzz-test-ws", "automation": {"auto_close": true}}
+JSON
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+  tip="$(ac_make_worker_commit "$gitrepo" "$repo" i330-x)"
+  squash_sha="$(ac_squash_merge_to_mainline "$gitrepo" "$tip")"
+
+  seed_verified_dispatch "$repo" D-330 I-330 zzz-test-tab-330 i330-x "$base_sha" "$tip"
+  seed_issue_state "$repo" I-330 OPEN ACTIVE
+  seed_merged_marker "$repo" D-330 "$squash_sha" "$tip"
+  ac_delete_worker_branch "$gitrepo" "$repo" i330-x
+
+  run_track "$repo"
+  assert_ac_surfaced "ac marker allow-key absent" "$repo" "I-330" \
+    "marker-branch-absent-uncorroborated"
+
+  rm -rf "$repo"
+}
+
+# ---------------------------------------------------------------------------
+# B2.2 fix-pass-6 T6 (track half): a marker recorded on an ABANDONED
+# dispatch's attempt never participates in the same-issue successor's close
+# -- the successor needs its OWN marker.
+# ---------------------------------------------------------------------------
+section_ac_marker_abandoned_not_borrowed() {
+  local repo gitrepo base_sha tip1 tip2 squash1 now
+  repo="$(new_tmp_repo_with_git_ac_squash false)"
+  gitrepo="$repo/target-repo"
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+  tip1="$(ac_make_worker_commit "$gitrepo" "$repo" i331-x)"
+  squash1="$(ac_squash_merge_to_mainline "$gitrepo" "$tip1")"
+  # successor's branch + commit, squash-merged too (so strict fails for it)
+  git_or_die "m-t6: branch i332-x" -C "$gitrepo" branch i332-x main
+  git_or_die "m-t6: worktree add wt-i332-x" -C "$gitrepo" worktree add -q "$repo/wt-i332-x" i332-x
+  (
+    set -e
+    cd "$repo/wt-i332-x" || exit 1
+    printf 'successor work\n' >succ.txt
+    git add succ.txt
+    git commit -q -m 'successor work'
+  ) >&2 || { echo "FATAL: fixture git setup failed (m-t6: i332-x commit)" >&2; exit 1; }
+  tip2="$(git -C "$repo/wt-i332-x" rev-parse HEAD)"
+  ac_squash_merge_to_mainline "$gitrepo" "$tip2" >/dev/null
+
+  seed_issue_state "$repo" I-331 OPEN ACTIVE
+  now="$(now_iso)"
+  # D-331: RETURNED with a marker, then ABANDONED.
+  PM_ROOT="$repo" pm_apply dispatch_new d=D-331 i=I-331 at="$now" >/dev/null
+  PM_ROOT="$repo" pm_apply dispatch_state d=D-331 from=READY to=DISPATCHED lane=human \
+    at="$now" repo=demo-repo branch=i331-x base_sha="$base_sha" >/dev/null
+  PM_ROOT="$repo" pm_apply dispatch_state d=D-331 a=A-01 from=DISPATCHED to=ACKED lane=human \
+    at="$now" tab=zzz-test-tab-331 >/dev/null
+  PM_ROOT="$repo" pm_apply result d=D-331 a=A-01 status=RETURNED result_sha="$tip1" at="$now" >/dev/null
+  PM_ROOT="$repo" pm_apply merged d=D-331 a=A-01 merge_sha="$squash1" result_sha="$tip1" at="$now" >/dev/null
+  PM_ROOT="$repo" pm_apply dispatch_state d=D-331 a=A-01 from=RETURNED to=ABANDONED lane=human at="$now" >/dev/null
+  # D-332: the SAME-ISSUE SUCCESSOR (supersedes=D-331, satisfying G3),
+  # VERIFIED, squash-merged, NO marker of its own.
+  PM_ROOT="$repo" pm_apply dispatch_new d=D-332 i=I-331 supersedes=D-331 at="$now" >/dev/null
+  PM_ROOT="$repo" pm_apply dispatch_state d=D-332 from=READY to=DISPATCHED lane=human \
+    at="$now" repo=demo-repo branch=i332-x base_sha="$base_sha" >/dev/null
+  PM_ROOT="$repo" pm_apply dispatch_state d=D-332 a=A-01 from=DISPATCHED to=ACKED lane=human \
+    at="$now" tab=zzz-test-tab-332 >/dev/null
+  PM_ROOT="$repo" pm_apply result d=D-332 a=A-01 status=RETURNED result_sha="$tip2" at="$now" >/dev/null
+  PM_ROOT="$repo" pm_apply dispatch_state d=D-332 a=A-01 from=RETURNED to=VERIFIED lane=human at="$now" >/dev/null
+
+  run_track "$repo"
+  assert_ac_surfaced "ac marker abandoned-not-borrowed" "$repo" "I-331" \
+    "no-strict-ancestry-and-no-valid-marker"
+
+  git -C "$gitrepo" worktree remove --force "$repo/wt-i331-x" >/dev/null 2>&1 || true
+  git -C "$gitrepo" worktree remove --force "$repo/wt-i332-x" >/dev/null 2>&1 || true
+  rm -rf "$repo"
+}
+
+# ---------------------------------------------------------------------------
+# B2.2 fix-pass-6 T7: repo-config-invalid has PER-REPO blast radius -- an
+# invalid merge_mode on repo B never blocks an issue whose dispatch lives
+# on valid repo A.
+# ---------------------------------------------------------------------------
+section_ac_marker_config_invalid_per_repo() {
+  local repo gitrepo base_sha tip
+  repo="$(new_tmp_repo_with_git_ac true)"
+  gitrepo="$repo/target-repo"
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+  tip="$(ac_make_worker_commit "$gitrepo" "$repo" i333-x)"
+  ac_merge_worker_tip_to_mainline "$gitrepo" "$tip"
+  cat >"$repo/.pm/config.json" <<JSON
+{"repos": {"demo-repo": {"path": "$gitrepo", "mainline": "main", "mainline_ref": "refs/heads/main", "fetch_policy": "local-only"}, "other-repo": {"path": "$gitrepo", "mainline": "main", "mainline_ref": "refs/heads/main", "fetch_policy": "local-only", "merge_mode": "rebase"}}, "herdr_workspace": "zzz-test-ws", "automation": {"auto_close": true}}
+JSON
+
+  seed_verified_dispatch "$repo" D-333 I-333 zzz-test-tab-333 i333-x "$base_sha" "$tip"
+  seed_issue_state "$repo" I-333 OPEN ACTIVE
+
+  run_track "$repo"
+  assert_ac_closed "ac marker per-repo config blast radius: valid-repo issue still closes" "$repo" "I-333"
+
+  git -C "$gitrepo" worktree remove --force "$repo/wt-i333-x" >/dev/null 2>&1 || true
+  rm -rf "$repo"
+}
+
+# ---------------------------------------------------------------------------
+# B2.2 fix-pass-6 T9 (track half): the marker arm is reachable via the
+# result-not-descendant-of-base eligible strict failure too (recorded base
+# not an ancestor of the branch's result), and the marker then closes.
+# ---------------------------------------------------------------------------
+section_ac_marker_via_not_descendant() {
+  local repo gitrepo base_sha tip stray squash_sha
+  repo="$(new_tmp_repo_with_git_ac_squash false)"
+  gitrepo="$repo/target-repo"
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+  tip="$(ac_make_worker_commit "$gitrepo" "$repo" i334-x)"
+  # a side commit that is NOT an ancestor of the worker tip -- recorded as
+  # the dispatch's base_sha to force result-not-descendant-of-base.
+  # (distinct content, else it would mint the same sha as $tip)
+  stray="$(ac_make_worker_commit "$gitrepo" "$repo" i334-stray)"
+  (
+    set -e
+    cd "$repo/wt-i334-stray" || exit 1
+    printf 'stray-only work\n' >stray.txt
+    git add stray.txt
+    git commit -q -m 'stray work'
+  ) >&2 || { echo "FATAL: fixture git setup failed (t9: stray distinct commit)" >&2; exit 1; }
+  stray="$(git -C "$repo/wt-i334-stray" rev-parse HEAD)"
+  squash_sha="$(ac_squash_merge_to_mainline "$gitrepo" "$tip")"
+
+  seed_verified_dispatch "$repo" D-334 I-334 zzz-test-tab-334 i334-x "$stray" "$tip"
+  seed_issue_state "$repo" I-334 OPEN ACTIVE
+  seed_merged_marker "$repo" D-334 "$squash_sha" "$tip"
+
+  run_track "$repo"
+  assert_ac_closed "ac marker via not-descendant strict failure" "$repo" "I-334"
+  assert_true "ac marker via not-descendant: marker-attributed close" \
+    bash -c 'grep -- "I-334" "$1/TRACKER.md" | grep -q "| auto-closed-marker |"' _ "$repo"
+
+  git -C "$gitrepo" worktree remove --force "$repo/wt-i334-x" >/dev/null 2>&1 || true
+  git -C "$gitrepo" worktree remove --force "$repo/wt-i334-stray" >/dev/null 2>&1 || true
+  rm -rf "$repo"
+}
+
+# ---------------------------------------------------------------------------
 echo "== track: fully corroborated done tab records RETURNED intake =="
 section_fully_corroborated_records_returned
 echo "== track: surface -- missing-metadata =="
@@ -3154,6 +4037,54 @@ echo "== track: B2.1 auto-close -- T7 idempotent second tick =="
 section_ac_t7_idempotent_second_tick
 echo "== track: B2.1 auto-close -- T8 G1 config variants both read disabled =="
 section_ac_t8_g1_config_variants
+echo "== track: B2.2 marker -- M1 squash close via marker arm =="
+section_ac_marker_closes_squash
+echo "== track: B2.2 marker -- M2 branch deleted, opt-in present =="
+section_ac_marker_branch_deleted_allowed
+echo "== track: B2.2 marker -- M2 branch deleted, opt-in ABSENT =="
+section_ac_marker_branch_deleted_refused
+echo "== track: B2.2 marker -- M3 no marker recorded =="
+section_ac_marker_missing
+echo "== track: B2.2 marker -- M4 merge_sha not on mainline =="
+section_ac_marker_merge_not_on_mainline
+echo "== track: B2.2 marker -- M5 merge_sha unverifiable =="
+section_ac_marker_merge_sha_unverified
+echo "== track: B2.2 marker -- M6 marker ignored on merge-mode repo =="
+section_ac_marker_ignored_in_merge_mode
+echo "== track: B2.2 marker -- M7 strict-first still closes strictly =="
+section_ac_marker_strict_still_preferred
+echo "== track: B2.2 marker -- M8 invalid per-repo config fail-closed =="
+section_ac_marker_repo_config_invalid
+echo "== track: B2.2 marker -- M9 branch binding not waived (forged result) =="
+section_ac_marker_forged_result_not_on_branch
+echo "== track: B2.2 fix-pass-6 F1a note precedes close (crash replay dedup) =="
+section_ac_marker_note_precedes_close_replay
+echo "== track: B2.2 fix-pass-6 F1b note emission failure blocks close =="
+section_ac_marker_note_emit_failed
+echo "== track: B2.2 fix-pass-6 F2 result==base refused on marker path =="
+section_ac_marker_result_equals_base
+echo "== track: B2.2 fix-pass-6 F3 raw non-sha marker quarantined at fold =="
+section_ac_marker_raw_shape_quarantined
+echo "== track: B2.2 fix-pass-6 F4+T2 direct-function marker guards =="
+section_ac_marker_direct_fn_guards
+echo "== track: B2.2 fix-pass-6 F5a marker + fetch policy success =="
+section_ac_marker_fetch_policy_success
+echo "== track: B2.2 fix-pass-6 F5b marker + stale ref, unreachable remote =="
+section_ac_marker_fetch_policy_failed_stale_ref
+echo "== track: B2.2 fix-pass-6 F5c marker + leading-dash remote =="
+section_ac_marker_fetch_policy_leading_dash
+echo "== track: B2.2 fix-pass-6 T1 old-attempt marker ignored =="
+section_ac_marker_old_attempt_ignored
+echo "== track: B2.2 fix-pass-6 T3 close-modes precedence =="
+section_ac_marker_close_modes_precedence
+echo "== track: B2.2 fix-pass-6 T5 allow-key absent fail-closed =="
+section_ac_marker_branch_deleted_key_absent
+echo "== track: B2.2 fix-pass-6 T6 abandoned marker not borrowed =="
+section_ac_marker_abandoned_not_borrowed
+echo "== track: B2.2 fix-pass-6 T7 per-repo config blast radius =="
+section_ac_marker_config_invalid_per_repo
+echo "== track: B2.2 fix-pass-6 T9 marker via not-descendant leg =="
+section_ac_marker_via_not_descendant
 
 echo
 echo "-----------------------------------------"

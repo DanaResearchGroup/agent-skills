@@ -7,6 +7,23 @@ strict git-corroboration predicate: fully corroborated tabs are auto-recorded as
 NOT auto-recorded, so the operator can act. Working/blocked tabs are not evaluated and do not
 appear here.
 
+The same tick also runs the auto-close pass (config-gated on `automation.auto_close`, default
+OFF): an issue closes only when it passes the human-state gates (VERIFIED dispatch, no open
+questions, clean dispatch graph) AND strict git topology corroborates the result on the
+configured mainline. For repos configured `merge_mode: "squash"` (squash/rebase workflows,
+where the branch tip never lands on mainline verbatim), strict is still tried first; on a
+strict-topology miss the pass consults a human-attested `merged` marker (`record merged`).
+Be clear about what that means: a marker close is **human attestation sanity-checked by
+git**, not git corroboration that the work landed — git verifies only that the attested
+merge commit is real and on mainline (a squash destroys the ancestry that would prove more),
+so setting `merge_mode: "squash"` is an explicit statement that you accept human-attested
+auto-closes for that repo. Rows below always say which path closed an issue
+(`auto-closed-strict` vs `auto-closed-marker`, with an explicit
+`auto-closed-marker-branch-deleted` variant that additionally requires the per-repo
+`allow_marker_branch_deleted: true` opt-in when the worker branch was already cleaned up),
+and every marker close leaves a durable `auto-close:*` audit note on the event log before
+the close itself. Everything else is surfaced with a reason, never closed.
+
 > Human narrative only. Authoritative state is the event log; `bin/track` renders the block
 > below fresh on every `--once` tick (pure function of index/snapshot/git — unchanged state
 > re-renders byte-identical).

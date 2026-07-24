@@ -53,7 +53,17 @@ is lost on the next `reconcile`.
   `done`, checks the worker's branch tip against git: fully corroborated cases are
   auto-recorded `RETURNED` (intake only, never auto-verified); everything else — ambiguous
   history, a missing/reused tab, no commit — is surfaced in `TRACKER.md` for you to work by
-  hand. Verification and close stay human-gated regardless of what `track` records.
+  hand. Verification and close stay human-gated regardless of what `track` records — except
+  the opt-in auto-close pass (`automation.auto_close`, default OFF), which closes an issue
+  only after human VERIFY plus strict git-topology corroboration. Squash/rebase repos
+  (`merge_mode: "squash"`) may additionally close on a human-attested `record merged`
+  marker when strict topology cannot see the squash. A marker close is human attestation
+  sanity-checked by git (the attested merge commit must be real and on mainline), NOT git
+  corroboration that the work itself landed — opting a repo into `merge_mode: "squash"`
+  means "I accept human-attested auto-closes for this repo". Such closes say
+  `auto-closed-marker` (or `auto-closed-marker-branch-deleted`, which also needs the
+  per-repo `allow_marker_branch_deleted: true` opt-in) instead of `auto-closed-strict`,
+  and each one leaves a durable `auto-close:*` audit note on the event log.
 
 ## 5. herdr workspace + tab naming
 

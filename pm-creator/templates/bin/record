@@ -33,6 +33,9 @@
 #     refused here — reached only via `record result`, see NOTE below)
 #   record result <D-###> [<STATUS>] --sha <hex>
 #     STATUS defaults to RETURNED.
+#   record merged <D-###> --merge-sha <sha> [--attempt A-##]
+#     B2.2 squash/rebase corroboration marker (human attestation; result_sha
+#     and repo stamped from the folded index, never caller-typed).
 #   record question <Q-###> <STATE> [--issue <I-###>] [--answers <Q-###>]
 #   record adopt <D-###> --ref <token>
 #   record note --ref <token> [--issue <I-###>] [--dispatch <D-###>]
@@ -73,6 +76,10 @@ usage:
       (RETURNED is refused here; use `record result` instead)
   record result <D-###> [<STATUS>] --sha <hex>
       STATUS defaults to RETURNED
+  record merged <D-###> --merge-sha <sha> [--attempt A-##]
+      human attestation that the (d, attempt) result landed on mainline as
+      <sha> (squash/rebase workflows); result_sha/repo are stamped from the
+      folded index, never typed. Requires a recorded result first.
   record question <Q-###> <STATE> [--issue <I-###>] [--answers <Q-###>]
   record adopt <D-###> --ref <token>
   record note --ref <token> [--issue <I-###>] [--dispatch <D-###>]
@@ -332,6 +339,102 @@ cmd_result() {
   echo "record: result $dispatch_id a=$attempt status=$status result_sha=$sha"
 }
 
+cmd_merged() {
+  # B2.2 human-lane marker: `record merged <D-###> --merge-sha <sha>
+  # [--attempt A-##]`. Emits a `merged` corroboration event whose
+  # result_sha and repo come FROM THE FOLDED INDEX (never caller-typed);
+  # the caller supplies only the dispatch, the mainline merge/squash
+  # commit sha, and (optionally) which attempt. No automation-lane
+  # entrypoint exists for this event -- it is a human attestation.
+  local dispatch_id="${1:-}"
+  [[ -z "$dispatch_id" ]] && {
+    echo "record: usage: record merged <D-###> --merge-sha <sha> [--attempt A-##]" >&2
+    exit 2
+  }
+  shift
+  local merge_sha="" attempt=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --merge-sha)
+        merge_sha="${2:-}"
+        shift 2
+        ;;
+      --attempt)
+        attempt="${2:-}"
+        shift 2
+        ;;
+      *)
+        echo "record merged: unknown argument '$1'" >&2
+        exit 2
+        ;;
+    esac
+  done
+
+  _require_id "dispatch id" "D" "$dispatch_id"
+  if [[ -z "$merge_sha" ]]; then
+    echo "record merged: --merge-sha <sha> is required (the mainline merge/squash commit)" >&2
+    exit 2
+  fi
+  # full-length lowercase-hex object name only (sha1=40 / sha256=64) --
+  # mirrors track's BASE_SHA_RE: never a revision expression or short hex.
+  if [[ ! "$merge_sha" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]; then
+    echo "record merged: --merge-sha must be a full 40- or 64-char lowercase-hex commit sha (got '$merge_sha')" >&2
+    exit 2
+  fi
+  if [[ -n "$attempt" && ! "$attempt" =~ ^A-[0-9]+$ ]]; then
+    echo "record merged: --attempt must look like A-## (got '$attempt')" >&2
+    exit 2
+  fi
+
+  _fold
+  local info from_state cur_attempt
+  info="$(_dispatch_info "$dispatch_id")"
+  from_state="${info%%$'\t'*}"
+  cur_attempt="${info#*$'\t'}"
+
+  if [[ "$from_state" == "NONE" ]]; then
+    echo "record: refusing merged for $dispatch_id: not registered (no dispatch_new). No event was emitted." >&2
+    exit 1
+  fi
+  if [[ -z "$attempt" ]]; then
+    attempt="$cur_attempt"
+  fi
+  if [[ "$attempt" == "NONE" ]]; then
+    echo "record: refusing merged for $dispatch_id: no attempt on record yet (never dispatched). No event was emitted." >&2
+    exit 1
+  fi
+
+  # result_sha and repo are read from the folded index for THIS (d, a) --
+  # the per-attempt store, so the marker binds to the right attempt.
+  local stamped
+  stamped="$(DISPATCH_ID="$dispatch_id" ATTEMPT_ID="$attempt" python3 -c "
+import json, os, sys
+idx = json.load(open(sys.argv[1]))
+d = os.environ['DISPATCH_ID']
+a = os.environ['ATTEMPT_ID']
+disp = idx.get('dispatches', {}).get(d) or {}
+att = (disp.get('attempts') or {}).get(a) or {}
+print((att.get('result_sha') or 'NONE') + '\t' + (disp.get('repo') or 'NONE'))
+" "$_index")"
+  local result_sha repo
+  result_sha="${stamped%%$'\t'*}"
+  repo="${stamped#*$'\t'}"
+
+  if [[ "$result_sha" == "NONE" ]]; then
+    echo "record: refusing merged for $dispatch_id/$attempt: no result recorded for that attempt -- record the result first (record result $dispatch_id --sha <hex>). No event was emitted." >&2
+    exit 1
+  fi
+
+  local -a kv=(merged d="$dispatch_id" a="$attempt" merge_sha="$merge_sha" result_sha="$result_sha" at="$(now_iso)")
+  [[ "$repo" != "NONE" ]] && kv+=(repo="$repo")
+  local apply_out
+  if ! apply_out="$(pm_apply "${kv[@]}" 2>&1 1>/dev/null)"; then
+    echo "record: refusing merged for $dispatch_id/$attempt ($apply_out). No event was emitted." >&2
+    exit 1
+  fi
+  echo "record: merged $dispatch_id a=$attempt merge_sha=$merge_sha result_sha=$result_sha"
+}
+
 cmd_question() {
   local question_id="${1:-}" state="${2:-}"
   [[ -z "$question_id" || -z "$state" ]] && {
@@ -468,6 +571,7 @@ case "$sub" in
   issue) cmd_issue "$@" ;;
   dispatch) cmd_dispatch "$@" ;;
   result) cmd_result "$@" ;;
+  merged) cmd_merged "$@" ;;
   question) cmd_question "$@" ;;
   adopt) cmd_adopt "$@" ;;
   note) cmd_note "$@" ;;

@@ -817,6 +817,128 @@ section_stale_lock_reused_pid_identity_reclaimed() {
 }
 
 # ---------------------------------------------------------------------------
+# B2.2 `merged` markers -- pure corroboration records, human-attested. The
+# engine must accept one only for a registered dispatch's real attempt whose
+# recorded result matches, refuse conflicts/forgeries at write, and
+# quarantine the identical raw lines at fold.
+# ---------------------------------------------------------------------------
+
+# Full 40-hex sha constants for the merged-marker sections (the fold
+# shape-gates a marker's merge_sha/result_sha to full object names).
+_M_RS="dddddddddddddddddddddddddddddddddddddddd"
+_M_MS1="1111111111111111111111111111111111111111"
+_M_MS2="2222222222222222222222222222222222222222"
+_M_RS_OTHER="ffffffffffffffffffffffffffffffffffffffff"
+
+# _seed_returned_merged_fixture <repo> <d> -- registered + DISPATCHED(+git
+# meta) + ACKED + result($_M_RS) for attempt A-01.
+_seed_returned_merged_fixture() {
+  local repo="$1" d="$2"
+  PM_ROOT="$repo" pm_apply dispatch_new d="$d" i=I-001 at="$(now_iso)" >/dev/null
+  PM_ROOT="$repo" pm_apply dispatch_state d="$d" from=READY to=DISPATCHED lane=human \
+    at="$(now_iso)" repo=svc branch=i001-fix base_sha=abc123 >/dev/null
+  PM_ROOT="$repo" pm_apply dispatch_state d="$d" a=A-01 from=DISPATCHED to=ACKED lane=human at="$(now_iso)" >/dev/null
+  PM_ROOT="$repo" pm_apply result d="$d" a=A-01 status=RETURNED result_sha="$_M_RS" at="$(now_iso)" >/dev/null
+}
+
+section_merged_accepted_after_verified() {
+  local repo before after
+  repo="$(new_tmp_repo)"
+  _seed_returned_merged_fixture "$repo" D-160
+  PM_ROOT="$repo" pm_apply dispatch_state d=D-160 a=A-01 from=RETURNED to=VERIFIED lane=human at="$(now_iso)" >/dev/null
+  # D-160 is VERIFIED (terminal) -- a merged marker is NOT a "late event
+  # after terminal": it is the normal post-VERIFY corroboration record.
+  before="$(line_count "$repo")"
+  assert_true "merged accepted after VERIFIED (pm_apply exits 0)" \
+    bash -c 'PM_ROOT="$1"; shift; source "$1"; shift; pm_apply "$@" >/dev/null 2>&1' \
+    _ "$repo" "$LIB" merged d=D-160 a=A-01 merge_sha="$_M_MS1" result_sha="$_M_RS" at="$(now_iso)"
+  after="$(line_count "$repo")"
+  assert_eq "merged accepted: exactly one line appended" "$((before + 1))" "$after"
+  local marker
+  marker="$(python3 -c "import json;d=json.load(open('$repo/.pm/index.json'));print(d['dispatches']['D-160']['merged']['A-01']['merge_sha'])" 2>/dev/null)"
+  assert_eq "merged accepted: marker folded into index per (d,a)" "$_M_MS1" "$marker"
+  local dstate
+  dstate="$(python3 -c "import json;d=json.load(open('$repo/.pm/index.json'));print(d['dispatches']['D-160']['state'])" 2>/dev/null)"
+  assert_eq "merged accepted: dispatch state NOT transitioned by marker" "VERIFIED" "$dstate"
+
+  rm -rf "$repo"
+}
+
+section_merged_without_recorded_result_refused() {
+  local repo
+  repo="$(new_tmp_repo)"
+  PM_ROOT="$repo" pm_apply dispatch_new d=D-161 i=I-001 at="$(now_iso)" >/dev/null
+  PM_ROOT="$repo" pm_apply dispatch_state d=D-161 from=READY to=DISPATCHED lane=human at="$(now_iso)" >/dev/null
+  PM_ROOT="$repo" pm_apply dispatch_state d=D-161 a=A-01 from=DISPATCHED to=ACKED lane=human at="$(now_iso)" >/dev/null
+  # ACKED but NO result recorded for (D-161, A-01) yet.
+  assert_refused_and_quarantined "merged with no recorded result for (d,a)" "$repo" \
+    merged d=D-161 a=A-01 merge_sha="$_M_MS1" result_sha="$_M_RS" at="$(now_iso)"
+  rm -rf "$repo"
+}
+
+section_merged_result_mismatch_refused() {
+  local repo
+  repo="$(new_tmp_repo)"
+  _seed_returned_merged_fixture "$repo" D-162
+  assert_refused_and_quarantined "merged with result_sha != recorded result for (d,a)" "$repo" \
+    merged d=D-162 a=A-01 merge_sha="$_M_MS1" result_sha="$_M_RS_OTHER" at="$(now_iso)"
+  rm -rf "$repo"
+}
+
+section_merged_wrong_attempt_refused() {
+  local repo
+  repo="$(new_tmp_repo)"
+  _seed_returned_merged_fixture "$repo" D-163
+  assert_refused_and_quarantined "merged naming a non-existent attempt" "$repo" \
+    merged d=D-163 a=A-05 merge_sha="$_M_MS1" result_sha="$_M_RS" at="$(now_iso)"
+  rm -rf "$repo"
+}
+
+section_merged_unregistered_dispatch_refused() {
+  local repo
+  repo="$(new_tmp_repo)"
+  PM_ROOT="$repo" pm_apply issue_state i=I-001 from=OPEN to=ACTIVE at="$(now_iso)" >/dev/null
+  assert_refused_and_quarantined "merged for unregistered dispatch" "$repo" \
+    merged d=D-998 a=A-01 merge_sha="$_M_MS1" result_sha="$_M_RS" at="$(now_iso)"
+  rm -rf "$repo"
+}
+
+section_merged_repo_mismatch_refused() {
+  local repo
+  repo="$(new_tmp_repo)"
+  _seed_returned_merged_fixture "$repo" D-164
+  assert_refused_and_quarantined "merged with repo= contradicting the dispatch's repo" "$repo" \
+    merged d=D-164 a=A-01 merge_sha="$_M_MS1" result_sha="$_M_RS" repo=other at="$(now_iso)"
+  rm -rf "$repo"
+}
+
+# fix-pass-6 T6 (enforce half): a merged marker is a pure record even
+# against an ABANDONED (terminal) dispatch -- accepted, and the terminal
+# state is NOT touched (it is not a "late event after terminal" bypass).
+section_merged_after_abandoned_accepted() {
+  local repo dstate
+  repo="$(new_tmp_repo)"
+  _seed_returned_merged_fixture "$repo" D-166
+  PM_ROOT="$repo" pm_apply dispatch_state d=D-166 a=A-01 from=RETURNED to=ABANDONED lane=human at="$(now_iso)" >/dev/null
+  assert_true "merged after ABANDONED accepted (pm_apply exits 0)" \
+    bash -c 'PM_ROOT="$1"; shift; source "$1"; shift; pm_apply "$@" >/dev/null 2>&1' \
+    _ "$repo" "$LIB" merged d=D-166 a=A-01 merge_sha="$_M_MS1" result_sha="$_M_RS" at="$(now_iso)"
+  dstate="$(python3 -c "import json;d=json.load(open('$repo/.pm/index.json'));print(d['dispatches']['D-166']['state'])" 2>/dev/null)"
+  assert_eq "merged after ABANDONED: terminal state untouched" "ABANDONED" "$dstate"
+  rm -rf "$repo"
+}
+
+section_merged_conflicting_second_marker_refused() {
+  local repo
+  repo="$(new_tmp_repo)"
+  _seed_returned_merged_fixture "$repo" D-165
+  PM_ROOT="$repo" pm_apply merged d=D-165 a=A-01 merge_sha="$_M_MS1" result_sha="$_M_RS" at="$(now_iso)" >/dev/null 2>&1
+  assert_refused_and_quarantined "conflicting second merged marker for same (d,a)" "$repo" \
+    merged d=D-165 a=A-01 merge_sha="$_M_MS2" result_sha="$_M_RS" at="$(now_iso)"
+  rm -rf "$repo"
+}
+
+# ---------------------------------------------------------------------------
 echo "== adversarial: illegal edge READY->VERIFIED =="
 section_illegal_edge_ready_to_verified
 echo "== adversarial: duplicate dispatch_new =="
@@ -877,6 +999,22 @@ echo "== adversarial: pm_apply_batch all-or-nothing atomicity =="
 section_batch_atomicity_all_or_nothing
 echo "== adversarial: stale lock reclaimed on reused-PID identity mismatch =="
 section_stale_lock_reused_pid_identity_reclaimed
+echo "== B2.2 merged: accepted after VERIFIED (pure corroboration record) =="
+section_merged_accepted_after_verified
+echo "== B2.2 merged: no recorded result for (d,a) refused =="
+section_merged_without_recorded_result_refused
+echo "== B2.2 merged: result_sha mismatch refused =="
+section_merged_result_mismatch_refused
+echo "== B2.2 merged: non-existent attempt refused =="
+section_merged_wrong_attempt_refused
+echo "== B2.2 merged: unregistered dispatch refused =="
+section_merged_unregistered_dispatch_refused
+echo "== B2.2 merged: repo mismatch refused =="
+section_merged_repo_mismatch_refused
+echo "== B2.2 merged: conflicting second marker refused =="
+section_merged_conflicting_second_marker_refused
+echo "== B2.2 fix-pass-6 T6: merged after ABANDONED accepted, state untouched =="
+section_merged_after_abandoned_accepted
 
 echo
 echo "-----------------------------------------"

@@ -283,6 +283,205 @@ section_note() {
 # section: usage errors
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# section: record merged (B2.2) — human-lane marker for squash/rebase
+# workflows. result_sha and repo are stamped FROM THE FOLDED INDEX (never
+# caller-typed); refuses when no result is recorded for the (d, a).
+# ---------------------------------------------------------------------------
+
+# Full 40-hex result sha used by the merged fixtures (the engine
+# shape-gates a marker's result_sha to a full object name).
+_MERGED_RS="dddddddddddddddddddddddddddddddddddddddd"
+
+# _seed_merged_ready <repo> <d>: dispatch through ACKED + result, so a
+# result_sha ($_MERGED_RS) is on record for (d, A-01), with repo=svc git meta.
+_seed_merged_ready() {
+  local repo="$1" d="$2"
+  local now
+  now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  PM_ROOT="$repo" pm_apply dispatch_new d="$d" i=I-001 at="$now" >/dev/null
+  PM_ROOT="$repo" pm_apply dispatch_state d="$d" from=READY to=DISPATCHED lane=human \
+    at="$now" repo=svc branch=i001-fix base_sha=abc123 >/dev/null
+  PM_ROOT="$repo" pm_apply dispatch_state d="$d" a=A-01 from=DISPATCHED to=ACKED lane=human at="$now" >/dev/null
+  PM_ROOT="$repo" pm_apply result d="$d" a=A-01 status=RETURNED result_sha="$_MERGED_RS" at="$now" >/dev/null
+}
+
+_MERGE_SHA_40="1111111111111111111111111111111111111111"
+
+section_merged_happy_path() {
+  local repo out rc log
+  repo="$(new_tmp_repo)"
+  _seed_merged_ready "$repo" D-001
+
+  out="$(PM_ROOT="$repo" "$RECORD" merged D-001 --merge-sha "$_MERGE_SHA_40" 2>&1)"
+  rc=$?
+  assert_eq "merged: happy path exits 0" "0" "$rc"
+  log="$(tail -1 "$repo/.pm/events.log")"
+  assert_contains "merged: emits a merged event for D-001/A-01" \
+    "$log" "EVENT merged d=D-001 a=A-01"
+  assert_contains "merged: carries the caller's merge_sha" \
+    "$log" "merge_sha=$_MERGE_SHA_40"
+  assert_contains "merged: stamps result_sha FROM THE FOLDED INDEX" \
+    "$log" "result_sha=$_MERGED_RS"
+  assert_contains "merged: stamps repo FROM THE FOLDED INDEX (svc)" \
+    "$log" "repo=svc"
+
+  rm -rf "$repo"
+}
+
+section_merged_no_result_sha_flag_exists() {
+  # the caller must NEVER be able to type the result_sha -- there is no
+  # flag for it; an attempt to pass one is an unknown-argument error.
+  local repo out rc lines_before lines_after
+  repo="$(new_tmp_repo)"
+  _seed_merged_ready "$repo" D-001
+  lines_before="$(line_count "$repo")"
+  out="$(PM_ROOT="$repo" "$RECORD" merged D-001 --merge-sha "$_MERGE_SHA_40" --result-sha beefbeef 2>&1)"
+  rc=$?
+  assert_nonzero "merged: --result-sha is NOT a recognized flag" "$rc"
+  lines_after="$(line_count "$repo")"
+  assert_eq "merged: unknown-flag refusal emits nothing" "$lines_before" "$lines_after"
+  rm -rf "$repo"
+}
+
+section_merged_refuses_without_result() {
+  local repo out rc lines_before lines_after now
+  repo="$(new_tmp_repo)"
+  now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  PM_ROOT="$repo" pm_apply dispatch_new d=D-002 i=I-001 at="$now" >/dev/null
+  PM_ROOT="$repo" pm_apply dispatch_state d=D-002 from=READY to=DISPATCHED lane=human at="$now" >/dev/null
+  PM_ROOT="$repo" pm_apply dispatch_state d=D-002 a=A-01 from=DISPATCHED to=ACKED lane=human at="$now" >/dev/null
+  lines_before="$(line_count "$repo")"
+
+  out="$(PM_ROOT="$repo" "$RECORD" merged D-002 --merge-sha "$_MERGE_SHA_40" 2>&1)"
+  rc=$?
+  assert_nonzero "merged: refuses when no result is recorded for (d,a)" "$rc"
+  assert_contains "merged: refusal says to record the result first" "$out" "record the result first"
+  lines_after="$(line_count "$repo")"
+  assert_eq "merged: no-result refusal emits nothing" "$lines_before" "$lines_after"
+
+  rm -rf "$repo"
+}
+
+section_merged_refuses_bad_merge_sha() {
+  local repo out rc lines_before lines_after
+  repo="$(new_tmp_repo)"
+  _seed_merged_ready "$repo" D-003
+  lines_before="$(line_count "$repo")"
+
+  out="$(PM_ROOT="$repo" "$RECORD" merged D-003 --merge-sha deadbeef 2>&1)"
+  rc=$?
+  assert_nonzero "merged: refuses a short (non-40/64-hex) merge sha" "$rc"
+
+  out="$(PM_ROOT="$repo" "$RECORD" merged D-003 2>&1)"
+  rc=$?
+  assert_nonzero "merged: refuses a missing --merge-sha" "$rc"
+
+  lines_after="$(line_count "$repo")"
+  assert_eq "merged: bad/missing merge-sha refusals emit nothing" "$lines_before" "$lines_after"
+
+  rm -rf "$repo"
+}
+
+section_merged_refuses_unregistered() {
+  local repo out rc
+  repo="$(new_tmp_repo)"
+  out="$(PM_ROOT="$repo" "$RECORD" merged D-404 --merge-sha "$_MERGE_SHA_40" 2>&1)"
+  rc=$?
+  assert_nonzero "merged: refuses an unregistered dispatch" "$rc"
+  assert_contains "merged: unregistered refusal names the dispatch" "$out" "D-404"
+  rm -rf "$repo"
+}
+
+section_merged_attempt_flag() {
+  local repo out rc log
+  repo="$(new_tmp_repo)"
+  _seed_merged_ready "$repo" D-004
+
+  # explicit --attempt naming the current attempt works ...
+  out="$(PM_ROOT="$repo" "$RECORD" merged D-004 --attempt A-01 --merge-sha "$_MERGE_SHA_40" 2>&1)"
+  rc=$?
+  assert_eq "merged: explicit --attempt A-01 exits 0" "0" "$rc"
+  log="$(tail -1 "$repo/.pm/events.log")"
+  assert_contains "merged: explicit attempt stamped on the event" "$log" "a=A-01"
+
+  # ... an attempt with no recorded result is refused.
+  out="$(PM_ROOT="$repo" "$RECORD" merged D-004 --attempt A-09 --merge-sha "$_MERGE_SHA_40" 2>&1)"
+  rc=$?
+  assert_nonzero "merged: --attempt with no recorded result refused" "$rc"
+
+  # ... a malformed attempt id is refused.
+  out="$(PM_ROOT="$repo" "$RECORD" merged D-004 --attempt bogus --merge-sha "$_MERGE_SHA_40" 2>&1)"
+  rc=$?
+  assert_nonzero "merged: malformed --attempt refused" "$rc"
+
+  rm -rf "$repo"
+}
+
+# fix-pass-6 T4: merge-sha shape boundaries -- 64-hex accepted; uppercase,
+# 39/41-hex, and revision expressions all refused with nothing emitted.
+section_merged_sha_boundaries() {
+  local repo out rc log lines_before lines_after sha64
+  repo="$(new_tmp_repo)"
+  _seed_merged_ready "$repo" D-005
+  sha64="$(printf 'ab%.0s' $(seq 1 32))"
+
+  out="$(PM_ROOT="$repo" "$RECORD" merged D-005 --merge-sha "$sha64" 2>&1)"
+  rc=$?
+  assert_eq "merged sha boundaries: 64-hex accepted" "0" "$rc"
+  log="$(tail -1 "$repo/.pm/events.log")"
+  assert_contains "merged sha boundaries: 64-hex emitted on the event" "$log" "merge_sha=$sha64"
+
+  lines_before="$(line_count "$repo")"
+  local bad
+  for bad in \
+    "1111111111111111111111111111111111111111111111111111111111111111111111111111111" \
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" \
+    "111111111111111111111111111111111111111" \
+    "11111111111111111111111111111111111111111" \
+    "main" \
+    "HEAD~1"; do
+    out="$(PM_ROOT="$repo" "$RECORD" merged D-005 --merge-sha "$bad" 2>&1)"
+    rc=$?
+    assert_nonzero "merged sha boundaries: '$bad' refused" "$rc"
+  done
+  lines_after="$(line_count "$repo")"
+  assert_eq "merged sha boundaries: refused shapes emit nothing" "$lines_before" "$lines_after"
+
+  rm -rf "$repo"
+}
+
+# fix-pass-6 T8: CLI branches -- idempotent re-run exits 0; a conflicting
+# re-run surfaces the engine's refusal; a never-dispatched D refuses with
+# "no attempt on record".
+section_merged_cli_branches() {
+  local repo out rc
+  repo="$(new_tmp_repo)"
+  _seed_merged_ready "$repo" D-006
+
+  out="$(PM_ROOT="$repo" "$RECORD" merged D-006 --merge-sha "$_MERGE_SHA_40" 2>&1)"
+  rc=$?
+  assert_eq "merged cli: first run exits 0" "0" "$rc"
+  out="$(PM_ROOT="$repo" "$RECORD" merged D-006 --merge-sha "$_MERGE_SHA_40" 2>&1)"
+  rc=$?
+  assert_eq "merged cli: identical re-run exits 0 (idempotent accept)" "0" "$rc"
+
+  out="$(PM_ROOT="$repo" "$RECORD" merged D-006 --merge-sha "2222222222222222222222222222222222222222" 2>&1)"
+  rc=$?
+  assert_nonzero "merged cli: conflicting re-run refused" "$rc"
+  assert_contains "merged cli: conflicting re-run surfaces the engine refusal" "$out" "conflicting merged marker"
+
+  local now
+  now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  PM_ROOT="$repo" pm_apply dispatch_new d=D-007 i=I-001 at="$now" >/dev/null
+  out="$(PM_ROOT="$repo" "$RECORD" merged D-007 --merge-sha "$_MERGE_SHA_40" 2>&1)"
+  rc=$?
+  assert_nonzero "merged cli: never-dispatched D refused" "$rc"
+  assert_contains "merged cli: never-dispatched refusal names no-attempt" "$out" "no attempt on record"
+
+  rm -rf "$repo"
+}
+
 section_usage_errors() {
   local rc
   "$RECORD" bogus-subcommand >/dev/null 2>&1
@@ -310,6 +509,14 @@ section_result
 section_question
 section_adopt
 section_note
+section_merged_happy_path
+section_merged_no_result_sha_flag_exists
+section_merged_refuses_without_result
+section_merged_refuses_bad_merge_sha
+section_merged_refuses_unregistered
+section_merged_attempt_flag
+section_merged_sha_boundaries
+section_merged_cli_branches
 section_usage_errors
 
 echo "-----------------------------------------"

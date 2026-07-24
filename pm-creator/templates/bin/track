@@ -345,11 +345,15 @@ def add(name, val):
         mainline = val.get("mainline")
         mainline_ref = val.get("mainline_ref")
         fetch_policy = val.get("fetch_policy")
+        merge_mode = val.get("merge_mode")
+        allow_marker_branch_deleted = val.get("allow_marker_branch_deleted")
     elif isinstance(val, str):
         path = val
         mainline = None
         mainline_ref = None
         fetch_policy = None
+        merge_mode = None
+        allow_marker_branch_deleted = None
     else:
         return
     if name and path:
@@ -362,6 +366,12 @@ def add(name, val):
             # of these VALUES (never trusts scaffold-time validity survived).
             "mainline_ref": mainline_ref,
             "fetch_policy": fetch_policy,
+            # B2.2 marker-path opt-ins, same contract: passed through raw
+            # here, runtime-validated fail-closed in evaluate_issue (absent
+            # keys mean the defaults "merge"/false -- generated repos
+            # predating B2.2 keep working unchanged).
+            "merge_mode": merge_mode,
+            "allow_marker_branch_deleted": allow_marker_branch_deleted,
         }
 if isinstance(repos, dict):
     for name, val in repos.items():
@@ -586,6 +596,26 @@ REASONS = frozenset({
     "result-not-descendant-of-base",
     "result-not-bound-to-branch",     # P2-2 branch-binding gate
     "no-strict-ancestry-and-no-valid-marker",
+    # B2.2 -- per-repo marker-path config (fail-closed runtime validation)
+    "repo-config-invalid",
+    # B2.2 -- G4 marker arm (squash/rebase workflows)
+    "marker-mismatch",
+    "marker-merge-sha-unverified",
+    "marker-merge-not-on-mainline",
+    "marker-branch-absent-uncorroborated",
+    # [bash] fix-pass-6 F1: minted by track's close loop when the pre-close
+    # audit-note emission fails -- the marker close is REFUSED (fail-closed:
+    # no marker close without its durable provenance record) and retried
+    # next tick. Listed purely for the registry; the python driver itself
+    # never returns it.
+    "marker-note-emit-failed",
+    # B2.2 -- close-mode legibility tokens: carried as the `reason` of a
+    # CLOSE row (action=close), so TRACKER.md and the audit trail always
+    # distinguish a strict close from a marker (human-attested) close --
+    # and the branch-deleted variant explicitly.
+    "auto-closed-strict",
+    "auto-closed-marker",
+    "auto-closed-marker-branch-deleted",
     # driver failure paths
     "auto-close-driver-error",
     # [bash] minted by track's close loop from pm_close_issue's stable
@@ -716,6 +746,43 @@ def tr_prefetch_mainline_refs(repos):
     return status
 
 
+def tr_branch_binding_state(run, result_sha, branch):
+    # Shared P2-2 branch-binding probe (strict G4 + the marker arm; M2):
+    # resolves refs/heads/<branch> and reports whether result_sha is its
+    # tip or an ancestor of it (i.e. the commit actually lived on that
+    # branch). Returns "bound" | "absent" | "unbound". refs/heads/ +
+    # --end-of-options keep the index-sourced branch name inert in argv.
+    rc, branch_tip, _ = run(
+        ["rev-parse", "--verify", "--end-of-options", "refs/heads/" + branch + "^{commit}"]
+    )
+    if rc != 0:
+        return "absent"
+    branch_tip = branch_tip.strip()
+    if branch_tip == result_sha:
+        return "bound"
+    rc, _, _ = run(["merge-base", "--is-ancestor", "--end-of-options", result_sha, branch_tip])
+    return "bound" if rc == 0 else "unbound"
+
+
+def tr_resolve_mainline(run, mainline, mainline_ref, fetch_policy, prefetch_status):
+    # Shared fetch-verdict + mainline-resolve leg (strict G4 + the marker
+    # arm; M2). P2-1(b): the network fetch already ran in track's
+    # pre-fetch phase (pre-lock, at most once per (repo,ref) per tick);
+    # here we only consume its recorded verdict -- a pre-fetch failure, or
+    # a missing verdict for this repo (fail-closed), surfaces fetch-failed
+    # and refs resolve locally only. Returns (mainline_sha, None) on
+    # success, (None, reason) on failure.
+    if fetch_policy == "fetch":
+        if tr_parse_fetch_ref(mainline, mainline_ref) is None:
+            return None, "mainline-ref-missing"
+        if prefetch_status != "ok":
+            return None, "fetch-failed"
+    rc, mainline_sha, _ = run(["rev-parse", "--verify", "--end-of-options", mainline_ref + "^{commit}"])
+    if rc != 0:
+        return None, "mainline-ref-missing"
+    return mainline_sha.strip(), None
+
+
 def tr_g4_check(repo_path, mainline, mainline_ref, fetch_policy, base_sha, result_sha, branch, prefetch_status):
     # Returns reason string, or None on full G4 pass. STRICT topology only
     # (B2.1) -- no patch-id / git cherry / content-equivalence, ever.
@@ -757,7 +824,7 @@ def tr_g4_check(repo_path, mainline, mainline_ref, fetch_policy, base_sha, resul
     if result_sha == base_sha:
         return "result==base"
 
-    rc, _, _ = run(["merge-base", "--is-ancestor", base_sha, result_sha])
+    rc, _, _ = run(["merge-base", "--is-ancestor", "--end-of-options", base_sha, result_sha])
     if rc != 0:
         return "result-not-descendant-of-base"
 
@@ -769,41 +836,135 @@ def tr_g4_check(repo_path, mainline, mainline_ref, fetch_policy, base_sha, resul
     # already-merged commit descending from base (e.g. the mainline tip
     # itself) satisfies pure topology and a forged `result` + human VERIFY
     # would false-close. A missing/deleted/unresolvable branch is
-    # fail-closed the same way -- surface, never close. refs/heads/ +
-    # --end-of-options keep the index-sourced branch name inert in argv.
+    # fail-closed the same way -- surface, never close.
     if not branch or not isinstance(branch, str):
         return "result-not-bound-to-branch"
-    rc, branch_tip, _ = run(
-        ["rev-parse", "--verify", "--end-of-options", "refs/heads/" + branch + "^{commit}"]
-    )
-    if rc != 0:
+    if tr_branch_binding_state(run, result_sha, branch) != "bound":
         return "result-not-bound-to-branch"
-    branch_tip = branch_tip.strip()
-    if branch_tip != result_sha:
-        rc, _, _ = run(["merge-base", "--is-ancestor", result_sha, branch_tip])
-        if rc != 0:
-            return "result-not-bound-to-branch"
 
-    if fetch_policy == "fetch":
-        # P2-1(b): the network fetch already ran in track's pre-fetch phase
-        # (pre-lock, at most once per (repo,ref) per tick); here G4 only
-        # consumes its recorded verdict. A pre-fetch failure -- or a
-        # missing verdict for this repo (fail-closed) -- surfaces
-        # fetch-failed; refs below resolve locally only.
-        if tr_parse_fetch_ref(mainline, mainline_ref) is None:
-            return "mainline-ref-missing"
-        if prefetch_status != "ok":
-            return "fetch-failed"
-    rc, mainline_sha, _ = run(["rev-parse", "--verify", "--end-of-options", mainline_ref + "^{commit}"])
-    if rc != 0:
-        return "mainline-ref-missing"
-    mainline_sha = mainline_sha.strip()
+    mainline_sha, reason = tr_resolve_mainline(
+        run, mainline, mainline_ref, fetch_policy, prefetch_status
+    )
+    if reason:
+        return reason
 
-    rc, _, _ = run(["merge-base", "--is-ancestor", result_sha, mainline_sha])
+    rc, _, _ = run(["merge-base", "--is-ancestor", "--end-of-options", result_sha, mainline_sha])
     if rc != 0:
         return "no-strict-ancestry-and-no-valid-marker"
 
     return None
+
+
+# B2.2: the ONLY strict-G4 failure reasons the marker arm may take over --
+# the final topology legs (base-ancestor / mainline-ancestor) plus the
+# branch-binding leg (which the marker arm RE-RUNS itself, with the
+# explicit branch-deleted opt-out; it is never waived). Every other strict
+# failure (config shape, unreachable repo, graft/replace suspicion,
+# sha-malformed, fetch-failed, result==base, ...) surfaces as-is: the
+# marker corroborates topology, nothing else.
+MARKER_ELIGIBLE_STRICT_FAILURES = frozenset({
+    "result-not-descendant-of-base",
+    "result-not-bound-to-branch",
+    "no-strict-ancestry-and-no-valid-marker",
+})
+
+
+def tr_g4_marker_check(repo_path, mainline, mainline_ref, fetch_policy, base_sha,
+                       att_result, branch, prefetch_status, marker, allow_branch_deleted):
+    # B2.2 G4 marker arm -- consulted ONLY for merge_mode=squash repos and
+    # ONLY after strict G4 failed with a MARKER_ELIGIBLE_STRICT_FAILURES
+    # reason. Returns (close_mode, None) on full pass -- close_mode is
+    # "auto-closed-marker" or "auto-closed-marker-branch-deleted" -- else
+    # (None, reason).
+    #
+    # TRUTHFUL FRAMING (fix-pass-6 F6): a marker close is HUMAN ATTESTATION
+    # sanity-checked by git, NOT git corroboration that the dispatch's work
+    # landed. Git verifies only that merge_sha names a real commit on the
+    # configured mainline; it CANNOT verify that this commit contains the
+    # attempt's work (that is exactly the information squash/rebase
+    # destroys). A forged or typo'd marker on a squash repo can therefore
+    # close VERIFIED-but-unmerged work. The compensating controls are: the
+    # double opt-in (automation.auto_close AND merge_mode=squash, plus
+    # allow_marker_branch_deleted for the laxest variant), the human VERIFY
+    # gate upstream (G2), and the durable auto-close:* audit note emitted
+    # BEFORE the close.
+    #
+    # This function does NOT re-run strict G4's config-shape guards
+    # (mainline_ref/fetch_policy shape): its safety against being invoked
+    # on a config-shaped failure rests on MARKER_ELIGIBLE_STRICT_FAILURES
+    # excluding every config reason -- keep that set and this constraint in
+    # lockstep. It DOES re-run the repo-level guards (object format, graft
+    # probe) and identity-anchors both shas it consumes. Everything here is
+    # LOCAL-only under the lock, via tr_run's env policy (GIT_ENV_SCRUB +
+    # GIT_NO_REPLACE_OBJECTS); the fetch verdict is consumed from the
+    # pre-lock prefetch phase exactly like strict G4.
+    def run(args, timeout=10):
+        return tr_run(args, repo_path, timeout=timeout)
+
+    rc, obj_format, _ = run(["rev-parse", "--show-object-format"])
+    if rc != 0:
+        return None, "unreachable"
+    obj_format = obj_format.strip()
+
+    if tr_repo_has_grafts(repo_path):
+        return None, "replace-affected"
+
+    # fix-pass-6 F4: att_result is a cross-function input (the fold's
+    # per-attempt result, selected by the caller) -- identity-anchor it
+    # here rather than trusting the caller's sequencing to have verified
+    # it. Reuses the strict sha-verification reason tokens.
+    reason, _ = tr_verify_commit(repo_path, att_result, obj_format)
+    if reason:
+        return None, reason
+
+    # fix-pass-6 F2: zero-new-work re-check. The marker path deliberately
+    # skips base-ANCESTRY (squash rewrites it away), but a result equal to
+    # its base means no work at all -- refuse in-arm, independently of the
+    # eligible-set exclusion of "result==base".
+    if att_result == base_sha:
+        return None, "result==base"
+
+    # marker shape + fold-result agreement. The fold already refused any
+    # marker whose result_sha disagreed with the recorded (d, a) result,
+    # so a mismatch here means a corrupted/hand-edited index -- surface.
+    merge_sha = marker.get("merge_sha") if isinstance(marker, dict) else None
+    marker_result = marker.get("result_sha") if isinstance(marker, dict) else None
+    if not merge_sha or not marker_result:
+        return None, "no-strict-ancestry-and-no-valid-marker"
+    if marker_result != att_result:
+        return None, "marker-mismatch"
+
+    reason, _ = tr_verify_commit(repo_path, merge_sha, obj_format)
+    if reason:
+        return None, "marker-merge-sha-unverified"
+
+    # BRANCH-BINDING IS NOT WAIVED: if the dispatch's recorded branch still
+    # resolves, the result MUST be bound to it exactly as in strict G4. A
+    # branch that no longer resolves (normal post-squash cleanup) permits a
+    # close ONLY under the repo's explicit allow_marker_branch_deleted
+    # opt-in; otherwise surface.
+    close_mode = "auto-closed-marker"
+    if not branch or not isinstance(branch, str):
+        return None, "result-not-bound-to-branch"
+    binding = tr_branch_binding_state(run, att_result, branch)
+    if binding == "unbound":
+        return None, "result-not-bound-to-branch"
+    if binding == "absent":
+        if not allow_branch_deleted:
+            return None, "marker-branch-absent-uncorroborated"
+        close_mode = "auto-closed-marker-branch-deleted"
+
+    mainline_sha, reason = tr_resolve_mainline(
+        run, mainline, mainline_ref, fetch_policy, prefetch_status
+    )
+    if reason:
+        return None, reason
+
+    rc, _, _ = run(["merge-base", "--is-ancestor", "--end-of-options", merge_sha, mainline_sha])
+    if rc != 0:
+        return None, "marker-merge-not-on-mainline"
+
+    return close_mode, None
 
 
 def evaluate_issue(issue_id, index, repos, dispatch_issue_map, auto_close_enabled, archive_leftovers, prefetch):
@@ -957,6 +1118,7 @@ def evaluate_issue(issue_id, index, repos, dispatch_issue_map, auto_close_enable
         return "surface", "auto-close-disabled"
 
     # G4 -----------------------------------------------------------------
+    close_modes = set()
     for d in verified:
         disp = dispatches.get(d) or {}
         repo_name = disp.get("repo")
@@ -974,12 +1136,25 @@ def evaluate_issue(issue_id, index, repos, dispatch_issue_map, auto_close_enable
         repo_path = repo_entry.get("path") if repo_entry else None
         if not repo_path:
             return "surface", "repo-not-configured"
+        # B2.2 marker-path opt-ins: runtime fail-closed validation (config
+        # is operator-editable post-scaffold; scaffold-time validity is
+        # never trusted). Absent keys mean the defaults ("merge" / false)
+        # so generated repos predating B2.2 keep working; anything else
+        # invalid surfaces for this repo's issues rather than guessing.
+        merge_mode = repo_entry.get("merge_mode")
+        if merge_mode is None:
+            merge_mode = "merge"
+        allow_marker_branch_deleted = repo_entry.get("allow_marker_branch_deleted")
+        if allow_marker_branch_deleted is None:
+            allow_marker_branch_deleted = False
+        if merge_mode not in ("merge", "squash") or not isinstance(allow_marker_branch_deleted, bool):
+            return "surface", "repo-config-invalid"
         rc, _, _ = tr_run(["rev-parse", "--is-inside-work-tree"], repo_path)
         if rc != 0:
             return "surface", "repo-not-on-disk"
 
         attempt = disp.get("attempt")
-        base_sha = (disp.get("attempts") or {}).get(attempt, {}).get("base_sha")
+        base_sha = ((disp.get("attempts") or {}).get(attempt) or {}).get("base_sha")
         result_sha = disp.get("result_sha")
         if not base_sha or not result_sha:
             return "surface", "missing-repo-metadata"
@@ -989,10 +1164,42 @@ def evaluate_issue(issue_id, index, repos, dispatch_issue_map, auto_close_enable
         fetch_policy = repo_entry.get("fetch_policy")
         reason = tr_g4_check(repo_path, mainline, mainline_ref, fetch_policy,
                              base_sha, result_sha, branch, prefetch.get(repo_name))
-        if reason:
+        if reason is None:
+            # strict topology corroborated -- squash repos included (fast-
+            # forward / merge-commit cases still close strictly).
+            close_modes.add("auto-closed-strict")
+            continue
+        if merge_mode != "squash" or reason not in MARKER_ELIGIBLE_STRICT_FAILURES:
             return "surface", reason
 
-    return "close", None
+        # B2.2 marker arm: strict topology failed on a squash-workflow
+        # repo -- consult the fold-accepted, human-attested `merged`
+        # marker for THIS dispatch's current attempt. The marker's
+        # result_sha is validated against the per-attempt fold result
+        # (never the dispatch-level last-write-wins value).
+        att_result = ((disp.get("attempts") or {}).get(attempt) or {}).get("result_sha")
+        if not att_result:
+            return "surface", "missing-repo-metadata"
+        marker = (disp.get("merged") or {}).get(attempt)
+        if not isinstance(marker, dict):
+            return "surface", "no-strict-ancestry-and-no-valid-marker"
+        close_mode, mreason = tr_g4_marker_check(
+            repo_path, mainline, mainline_ref, fetch_policy, base_sha, att_result,
+            branch, prefetch.get(repo_name), marker, allow_marker_branch_deleted,
+        )
+        if mreason:
+            return "surface", mreason
+        close_modes.add(close_mode)
+
+    # Close-mode legibility: the row's reason records HOW the close was
+    # corroborated. If ANY dispatch needed the marker path, the row says
+    # so (the branch-deleted variant wins for explicitness); a pure-strict
+    # close says auto-closed-strict.
+    if "auto-closed-marker-branch-deleted" in close_modes:
+        return "close", "auto-closed-marker-branch-deleted"
+    if "auto-closed-marker" in close_modes:
+        return "close", "auto-closed-marker"
+    return "close", "auto-closed-strict"
 PYEOF
 
 # ---------------------------------------------------------------------------
@@ -1522,6 +1729,62 @@ with open(path, "w") as f:
     #                                   counted closed, rendered
     #                                   closed-with-pending-archive
     #   anything else                -> close/archive-failure
+    # B2.2 (fix-pass-6 F1): a MARKER-path close leaves a durable audit
+    # note on the event log (`note ref=auto-close:marker[-branch-deleted]
+    # i=<issue>`), so the human-attested corroboration mode survives
+    # beyond TRACKER.md's per-tick re-render. Ordering is load-bearing:
+    # the note is emitted BEFORE pm_close_issue, so a crash between the
+    # two leaves an un-closed issue WITH its provenance record -- the next
+    # tick re-evaluates the gates, the fold-derived dedup below skips the
+    # re-emit, and the close proceeds (exactly one note total). Emission
+    # failure REFUSES the close (fail-closed: no marker close without its
+    # durable provenance record) and surfaces marker-note-emit-failed for
+    # a retry next tick. Strict closes stay note-free (byte-identical
+    # B2.1 behavior).
+    if [[ "${_tr_ac_action}" == "close" ]]; then
+      _tr_ac_mode="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("reason") or "")' "${_tr_ac_line}")"
+      _tr_ac_note_ref=""
+      case "${_tr_ac_mode}" in
+        auto-closed-marker) _tr_ac_note_ref="auto-close:marker" ;;
+        auto-closed-marker-branch-deleted) _tr_ac_note_ref="auto-close:marker-branch-deleted" ;;
+      esac
+      if [[ -n "${_tr_ac_note_ref}" ]]; then
+        # Dedup against the FOLD (index.auto_close_notes, folded at tick
+        # start) -- never a raw-log re-scan. A prior crashed tick's note
+        # is found here; this tick's own fresh emission cannot be (the
+        # re-fold happens next tick), which is exactly right: emit at most
+        # once per tick, skip when a durable record already exists.
+        _tr_ac_note_dup="$(NOTE_I="${_tr_ac_i}" NOTE_REF="${_tr_ac_note_ref}" python3 -c '
+import json, os, sys
+try:
+    with open(sys.argv[1]) as f:
+        idx = json.load(f)
+except Exception:
+    print("0"); raise SystemExit
+refs = (idx.get("auto_close_notes") or {}).get(os.environ["NOTE_I"]) or []
+print("1" if os.environ["NOTE_REF"] in refs else "0")
+' "${_tr_root}/.pm/index.json")"
+        if [[ "${_tr_ac_note_dup}" != "1" ]]; then
+          if ! PM_ROOT="${_tr_root}" pm_apply note at="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            ref="${_tr_ac_note_ref}" i="${_tr_ac_i}" >/dev/null 2>&1; then
+            python3 -c '
+import json, sys
+path = sys.argv[1]
+row = json.loads(sys.argv[2])
+row["reason"] = "marker-note-emit-failed"
+row["detail"] = "audit-note emission failed; marker close refused (retry next tick)"
+row["action"] = "surface"
+with open(path) as f:
+    rows = json.load(f)
+rows.append(row)
+with open(path, "w") as f:
+    json.dump(rows, f)
+' "${_tr_ac_surfaced_file}" "${_tr_ac_line}"
+            continue
+          fi
+        fi
+      fi
+    fi
     _tr_ac_out="$(pm_close_issue "${_tr_root}" "${_tr_ac_i}" 2>&1)"
     _tr_ac_rc=$?
     if [[ "${_tr_ac_rc}" -eq 0 ]]; then
@@ -1818,7 +2081,7 @@ for r in sorted(recorded, key=lambda r: r["d"]):
 for r in sorted(surfaced, key=lambda r: r["d"]):
     print(f"  SURFACED {r['d']} tab={r.get('tab')} reason={r.get('reason')}")
 for r in sorted(ac_closed, key=lambda r: r["i"]):
-    print(f"  AUTO-CLOSED {r['i']} action={r.get('action')}")
+    print(f"  AUTO-CLOSED {r['i']} action={r.get('action')} reason={r.get('reason')}")
 for r in sorted(ac_actionable, key=lambda r: r["i"]):
     print(f"  AUTO-CLOSE-SURFACED {r['i']} reason={r.get('reason')}")
 for reason in AC_STEADY_STATE_REASONS:

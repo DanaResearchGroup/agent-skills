@@ -774,6 +774,171 @@ PY
 }
 
 # ---------------------------------------------------------------------------
+# 15b. B2.2: per-repo merge_mode + allow_marker_branch_deleted are
+#      normalized at scaffold time -- defaults ("merge" / false) added when
+#      absent (config complete-by-construction), explicit valid values
+#      preserved, invalid enum/type FAIL LOUD with no partial --out.
+# ---------------------------------------------------------------------------
+section_repos_merge_mode_defaults() {
+  local demo values out
+  demo="$WORK/demo15b"
+  mkdir -p "$demo"
+  (cd "$demo" && git init -q -b main && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init)
+
+  values="$WORK/values15b.json"
+  write_full_values "$values" "$demo"
+  # legacy minimal shape: no merge_mode / allow_marker_branch_deleted at all
+  python3 - "$values" "$demo" <<'PY'
+import json, sys
+p, demo = sys.argv[1], sys.argv[2]
+v = json.load(open(p))
+v["REPOS_JSON"] = json.dumps([{"name": "demo", "path": demo, "mainline": "main"}])
+json.dump(v, open(p, "w"))
+PY
+
+  out="$WORK/out15b"
+  bash "$SCAFFOLD" --values "$values" --out "$out" >"$WORK/s15b.out" 2>"$WORK/s15b.err" \
+    || fail "merge_mode defaults: scaffold succeeds on legacy shape" "$(cat "$WORK/s15b.err")"
+
+  local merge_mode allow_deleted
+  merge_mode="$(python3 -c "import json; print(json.load(open('$out/.pm/config.json'))['repos'][0]['merge_mode'])" 2>/dev/null)"
+  allow_deleted="$(python3 -c "import json; print(json.load(open('$out/.pm/config.json'))['repos'][0]['allow_marker_branch_deleted'])" 2>/dev/null)"
+  [[ "$merge_mode" == "merge" ]] && ok "config.json repos[0].merge_mode defaults to 'merge'" \
+    || fail "config.json repos[0].merge_mode defaults to 'merge'" "got [$merge_mode]"
+  [[ "$allow_deleted" == "False" ]] && ok "config.json repos[0].allow_marker_branch_deleted defaults to false" \
+    || fail "config.json repos[0].allow_marker_branch_deleted defaults to false" "got [$allow_deleted]"
+}
+
+section_repos_merge_mode_explicit_squash() {
+  local demo values out
+  demo="$WORK/demo15c"
+  mkdir -p "$demo"
+  (cd "$demo" && git init -q -b main && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init)
+
+  values="$WORK/values15c.json"
+  write_full_values "$values" "$demo"
+  python3 - "$values" "$demo" <<'PY'
+import json, sys
+p, demo = sys.argv[1], sys.argv[2]
+v = json.load(open(p))
+v["REPOS_JSON"] = json.dumps([{
+    "name": "demo", "path": demo, "mainline": "main",
+    "mainline_ref": "refs/heads/main", "fetch_policy": "local-only",
+    "merge_mode": "squash", "allow_marker_branch_deleted": True,
+}])
+json.dump(v, open(p, "w"))
+PY
+
+  out="$WORK/out15c"
+  bash "$SCAFFOLD" --values "$values" --out "$out" >"$WORK/s15c.out" 2>"$WORK/s15c.err" \
+    || fail "merge_mode explicit: scaffold succeeds" "$(cat "$WORK/s15c.err")"
+
+  local merge_mode allow_deleted
+  merge_mode="$(python3 -c "import json; print(json.load(open('$out/.pm/config.json'))['repos'][0]['merge_mode'])" 2>/dev/null)"
+  allow_deleted="$(python3 -c "import json; print(json.load(open('$out/.pm/config.json'))['repos'][0]['allow_marker_branch_deleted'])" 2>/dev/null)"
+  [[ "$merge_mode" == "squash" ]] && ok "explicit merge_mode='squash' preserved verbatim" \
+    || fail "explicit merge_mode='squash' preserved verbatim" "got [$merge_mode]"
+  [[ "$allow_deleted" == "True" ]] && ok "explicit allow_marker_branch_deleted=true preserved verbatim" \
+    || fail "explicit allow_marker_branch_deleted=true preserved verbatim" "got [$allow_deleted]"
+}
+
+section_repos_bad_merge_mode_fails() {
+  local demo values out
+  demo="$WORK/demo15d"
+  mkdir -p "$demo"
+  (cd "$demo" && git init -q -b main && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init)
+
+  values="$WORK/values15d.json"
+  write_full_values "$values" "$demo"
+  python3 - "$values" "$demo" <<'PY'
+import json, sys
+p, demo = sys.argv[1], sys.argv[2]
+v = json.load(open(p))
+v["REPOS_JSON"] = json.dumps([{
+    "name": "demo", "path": demo, "mainline": "main",
+    "mainline_ref": "refs/heads/main", "fetch_policy": "local-only",
+    "merge_mode": "rebase-ff",
+}])
+json.dump(v, open(p, "w"))
+PY
+
+  out="$WORK/out15d"
+  if bash "$SCAFFOLD" --values "$values" --out "$out" >"$WORK/s15d.out" 2>"$WORK/s15d.err"; then
+    fail "merge_mode='rebase-ff' makes scaffold exit non-zero" "unexpectedly succeeded"
+  else
+    ok "merge_mode='rebase-ff' makes scaffold exit non-zero"
+  fi
+  grep -qi "merge_mode" "$WORK/s15d.err" && ok "failure output names 'merge_mode'" \
+    || fail "failure output names 'merge_mode'" "$(cat "$WORK/s15d.err")"
+  [[ -e "$out" ]] && fail "no partial --out dir left behind (bad merge_mode case)" "found: $out" \
+    || ok "no partial --out dir left behind (bad merge_mode case)"
+}
+
+section_repos_bad_allow_marker_fails() {
+  local demo values out
+  demo="$WORK/demo15e"
+  mkdir -p "$demo"
+  (cd "$demo" && git init -q -b main && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init)
+
+  values="$WORK/values15e.json"
+  write_full_values "$values" "$demo"
+  python3 - "$values" "$demo" <<'PY'
+import json, sys
+p, demo = sys.argv[1], sys.argv[2]
+v = json.load(open(p))
+v["REPOS_JSON"] = json.dumps([{
+    "name": "demo", "path": demo, "mainline": "main",
+    "mainline_ref": "refs/heads/main", "fetch_policy": "local-only",
+    "allow_marker_branch_deleted": "yes",
+}])
+json.dump(v, open(p, "w"))
+PY
+
+  out="$WORK/out15e"
+  if bash "$SCAFFOLD" --values "$values" --out "$out" >"$WORK/s15e.out" 2>"$WORK/s15e.err"; then
+    fail "allow_marker_branch_deleted='yes' (string) makes scaffold exit non-zero" "unexpectedly succeeded"
+  else
+    ok "allow_marker_branch_deleted='yes' (string) makes scaffold exit non-zero"
+  fi
+  grep -qi "allow_marker_branch_deleted" "$WORK/s15e.err" && ok "failure output names 'allow_marker_branch_deleted'" \
+    || fail "failure output names 'allow_marker_branch_deleted'" "$(cat "$WORK/s15e.err")"
+  [[ -e "$out" ]] && fail "no partial --out dir left behind (bad allow_marker case)" "found: $out" \
+    || ok "no partial --out dir left behind (bad allow_marker case)"
+}
+
+section_repos_null_merge_mode_fails() {
+  # fix-pass-6 T9 (scaffold half): an EXPLICIT "merge_mode": null is not
+  # "absent" -- it fails loud rather than silently defaulting.
+  local demo values out
+  demo="$WORK/demo15f"
+  mkdir -p "$demo"
+  (cd "$demo" && git init -q -b main && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init)
+
+  values="$WORK/values15f.json"
+  write_full_values "$values" "$demo"
+  python3 - "$values" "$demo" <<'PY'
+import json, sys
+p, demo = sys.argv[1], sys.argv[2]
+v = json.load(open(p))
+v["REPOS_JSON"] = json.dumps([{
+    "name": "demo", "path": demo, "mainline": "main",
+    "mainline_ref": "refs/heads/main", "fetch_policy": "local-only",
+    "merge_mode": None,
+}])
+json.dump(v, open(p, "w"))
+PY
+
+  out="$WORK/out15f"
+  if bash "$SCAFFOLD" --values "$values" --out "$out" >"$WORK/s15f.out" 2>"$WORK/s15f.err"; then
+    fail "merge_mode=null makes scaffold exit non-zero" "unexpectedly succeeded"
+  else
+    ok "merge_mode=null makes scaffold exit non-zero"
+  fi
+  grep -qi "merge_mode" "$WORK/s15f.err" && ok "null-merge_mode failure output names 'merge_mode'" \
+    || fail "null-merge_mode failure output names 'merge_mode'" "$(cat "$WORK/s15f.err")"
+}
+
+# ---------------------------------------------------------------------------
 # 16a. Round-21 Low hardening: a repo whose string field contains hostile
 #      content (quotes, backslashes, a control char) must round-trip intact
 #      through the repos-normalization re-serialize -- proving json.dumps
@@ -896,6 +1061,16 @@ echo "== round-21: non-string explicit 'mainline_ref' fails loud (no AttributeEr
 section_repos_mainline_ref_non_string_fails
 echo "== round-21: fetch_policy outside {fetch,local-only} enum fails loud =="
 section_repos_bad_fetch_policy_fails
+echo "== B2.2: merge_mode/allow_marker_branch_deleted defaults added =="
+section_repos_merge_mode_defaults
+echo "== B2.2: explicit merge_mode=squash + allow_marker preserved =="
+section_repos_merge_mode_explicit_squash
+echo "== B2.2: invalid merge_mode fails loud =="
+section_repos_bad_merge_mode_fails
+echo "== B2.2: non-bool allow_marker_branch_deleted fails loud =="
+section_repos_bad_allow_marker_fails
+echo "== B2.2 fix-pass-6 T9: explicit merge_mode=null fails loud =="
+section_repos_null_merge_mode_fails
 echo "== round-21: hostile repo field round-trips through normalization =="
 section_repos_hostile_field_round_trips
 echo "== round-21: {{...}}-shaped repo field data still trips the broad survivor guard =="
