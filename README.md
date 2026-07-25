@@ -97,6 +97,7 @@ Verify with `/plugin` — you should see `superpowers` enabled. Full docs:
 | **Notifications** | `slack-ask`, `slack-notify` — reach you over Slack during unattended runs |
 | **Matt Pocock** ([`mattpocock/skills`](https://github.com/mattpocock/skills), MIT — see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)) | `tdd`, `to-spec`, `to-tickets`, `implement`, `code-review`, `triage`, `prototype`, `codebase-design`, `domain-modeling`, `improve-codebase-architecture`, `grilling`, `grill-me`, `grill-with-docs`, `resolving-merge-conflicts`, `setup-matt-pocock-skills`, `writing-great-skills`, `handoff`, `edit-article`, `obsidian-vault`, `wayfinder` |
 | **Workflow** | `writing-git-commits`, `copilot-review` — fold a PR's Copilot/security bot review back into history; `merged` — after a PR lands, sync `main` and rebase the open PRs onto it; `sync-matt-pocock-skills` — pull a newer `mattpocock/skills` release into our vendored copies, keeping local edits |
+| **Orchestration** | `session-sweep` — for an overseer/PM session driving worker sessions: scan every relevant session, triage each `RUN`/`CLOSE`/`MESSAGE`/`ESCALATE` against ground truth, and auto-send any message a worker needs |
 
 Plus **gstack** (installed in step 3) and the **Superpowers** plugin (step 4).
 
