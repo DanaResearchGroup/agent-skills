@@ -615,7 +615,7 @@ sys.exit(0 if got == psha else 3)
 
       # (ii) OUTSIDE the lock: create the worker tab. On failure the
       # durable intent stays and ages into Phase A recovery next ticks.
-      _tr_sp_tab_out="$(herdr tab create --workspace "${_tr_herdr_workspace}" \
+      _tr_sp_tab_out="$(herdr tab create --workspace "${_tr_herdr_workspace_id:-${_tr_herdr_workspace}}" \
         --label "${_tr_sp_label}" --no-focus </dev/null 2>/dev/null)"
       _tr_sp_rc=$?
       if [[ ${_tr_sp_rc} -ne 0 ]]; then
@@ -649,7 +649,7 @@ import json, sys
 for el in json.loads(sys.argv[1])["argv"]:
     sys.stdout.write(el + "\0")
 ' "${_tr_sp_line}")
-      _tr_sp_start_out="$(herdr agent start "${_tr_sp_ref}" --workspace "${_tr_herdr_workspace}" \
+      _tr_sp_start_out="$(herdr agent start "${_tr_sp_ref}" --workspace "${_tr_herdr_workspace_id:-${_tr_herdr_workspace}}" \
         --tab "${_tr_sp_tab_id}" --no-focus -- "${_tr_sp_argv[@]}" </dev/null 2>/dev/null)"
       _tr_sp_rc=$?
       if [[ ${_tr_sp_rc} -ne 0 ]]; then
