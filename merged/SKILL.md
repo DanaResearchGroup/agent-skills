@@ -1,13 +1,13 @@
 ---
 name: merged
-description: After a PR merges, sync local main, prune the merged branch and its worktree, and offer to rebase the remaining open PRs onto the new main.
+description: After a PR merges, sync local main, prune every fully-merged branch and its worktree, and offer to rebase the remaining open PRs onto the new main.
 disable-model-invocation: true
 ---
 
 # merged
 
 A PR just merged. Reconcile the local repo with the new `main` and offer the downstream cleanup:
-**confirm** the merge → **sync** main → **prune** the merged branch → **rebase** the other open PRs.
+**confirm** the merge → **sync** main → **prune** every merged branch → **rebase** the other open PRs.
 
 Anchor to the PR this session just discussed or merged — don't re-derive it. If none is in hand, ask
 which one merged. The canonical remote is whatever `git remote -v` shows (often `official`, not
@@ -35,19 +35,46 @@ resetting over it.
 
 **Done when:** `git rev-parse main` equals `git rev-parse <remote>/main`.
 
-## 3. Prune the merged branch
+## 3. Prune every merged branch, not just this one
 
-Only after **both** checks pass — the worktree is clean (`git status --porcelain` empty) and the branch
-is fully merged (`git branch --merged <remote>/main` lists it):
+Sweep **all** fully-merged local branches, not only `<headRefName>`. A branch whose own `/merged` run
+never happened — the merge landed from the web UI, the session ended first — is invisible debris that
+no later run will ever collect unless this step is a sweep. Expect to find some; treat a non-empty list
+as normal, not as a sign something went wrong.
+
 ```bash
-git worktree remove <path>    # if the branch lived in its own worktree
-git branch -d <headRefName>   # -d refuses an unmerged branch — a safety net, not an obstacle to force past
+git branch --merged <remote>/main | grep -vE '^\*|^\s*main$'
 ```
-`git fetch --prune` already dropped the remote-tracking ref. If either check fails, leave the branch and
-report why — a dirty worktree is a live session, not debris.
 
-**Done when:** the merged branch's worktree and local branch are gone (or explicitly left with a reason),
-and `git worktree list` is clean.
+Delete each name that comes back (including `<headRefName>`) once **both** checks pass — its worktree,
+if it has one, is clean, and `-d` accepts it. Most branches have no worktree; resolve `<path>` from
+`git worktree list` and skip the two worktree lines entirely when the branch isn't listed there:
+```bash
+git worktree list                  # <path> for <name>, if it has one at all
+git -C <path> status --porcelain   # only if it does — must be empty before touching that branch
+git worktree remove <path>         # only if it does
+git branch -d <name>               # -d refuses an unmerged branch — a safety net, not an obstacle to force past
+git worktree prune                 # drop worktree records whose directory is already gone
+```
+If either check fails, leave that branch and report why — a dirty worktree is a live session, not debris.
+
+**On the remote:** `git fetch --prune` drops the remote-tracking ref only when GitHub deleted the head
+branch on merge. Repos without auto-delete-on-merge silently accumulate merged heads, so list them too:
+```bash
+# anchor the exclusions, or a branch like <remote>/feature/main drops out of the list unnoticed
+git branch -r --merged <remote>/main | sed 's|^ *<remote>/||' | grep -vE '^(main|HEAD)\b'
+```
+That strips the `<remote>/` prefix `git branch -r` prints, leaving the bare `<branch>` that
+`git push <remote> --delete <branch>` actually expects. Capture each SHA **before** deleting
+(`git rev-parse --short <remote>/<branch>`) — afterwards there's no ref left to resolve.
+
+Each is fully contained in `main`. Skip any with an open PR, then **ask before deleting** — `git push
+<remote> --delete <branch>` is outward-facing on a shared repo. It is recoverable (the commits live on
+in `main`; `git push <remote> <sha>:refs/heads/<branch>` restores it), so report each SHA you captured.
+
+**Done when:** every fully-merged local branch and its worktree are gone (or explicitly left with a
+reason), `git worktree list` shows no stale entries, and merged remote branches are deleted-with-approval
+or reported.
 
 ## 4. Rebase the other open PRs
 
