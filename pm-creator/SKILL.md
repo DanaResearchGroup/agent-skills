@@ -63,9 +63,22 @@ a glossary. Extract every value the templates need:
     ```
 
     (`bash -lc SCRIPT NAME ARG` sets `$0`=NAME, `$1`=ARG.) Note the worker starts with default
-    permissions and will therefore **stop at permission prompts** — fine when someone is
-    watching, a stall when the point was an unattended background fleet. Raise it with the
-    user as a deliberate choice rather than deciding it for them.
+    permissions. In practice a Claude Code worker inherits **auto mode**, so ordinary
+    tool-permission prompts do not stall it — but a first spawn into a directory the agent has
+    never been trusted in stalls **indefinitely** on the trust-this-folder dialog, having done
+    nothing. Since the worker's cwd is the dispatch's configured repo path, tell the user to
+    trust each configured repo directory once before relying on unattended spawns. Raise it as
+    a deliberate choice rather than deciding it for them.
+  - ⛔ **Ask the governance question, separately from the capacity one: must the user approve
+    each piece of work BEFORE it starts?** `auto_spawn` is usually discussed as throughput —
+    it is really the switch that decides whether the manager can put work in motion on its own
+    authority. If the user's operating model is "I am involved at defining and reviewing every
+    item", then `auto_spawn: true` quietly deletes the *defining* half: a manager that
+    proposes and then executes its own proposal has reviewed nothing. Where the user wants a
+    start-gate, set `auto_spawn: false` **and** write the rule into `CONVENTIONS.md` §4 and the
+    top of `RESUME.md` — the flag is the enforcement (a compacted manager cannot skim past it),
+    the prose is the explanation. Note that per-issue `Approval gates:` do NOT cover this:
+    they gate actions taken *during* the work, never the decision to begin it.
   - **`max_live_workers` counts every live agent in the workspace**, including hand-spawned
     ones, not just auto-spawned. Size it against the actual constraints — API rate limits and
     how many returning results a human can review — rather than CPU, since agent sessions are

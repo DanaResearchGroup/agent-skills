@@ -161,6 +161,69 @@ section_dispatch_full_roundtrip() {
 }
 
 # ---------------------------------------------------------------------------
+# section: `record dispatch` inherits the dispatch's FIXED lane.
+#
+# The lane is fixed at dispatch-prep and stored on the fold. `record
+# dispatch` used to default `--lane human`, so every terminal transition on
+# an AUTOMATION-lane dispatch (`record dispatch D-00X ABANDONED`) was refused
+# with a lane-mismatch error naming a lane the operator never claimed --
+# making an automation dispatch impossible to abandon or fail without
+# knowing to restate `--lane automation`. Hit live on 2026-07-25 trying to
+# withdraw a running dispatch.
+# ---------------------------------------------------------------------------
+
+section_dispatch_lane_inherited() {
+  local repo out rc log
+  repo="$(new_tmp_repo)"
+
+  PM_ROOT="$repo" pm_apply dispatch_new d=D-010 i=I-001 at=2026-07-23T18:01:00Z >/dev/null
+  PM_ROOT="$repo" pm_apply dispatch_state d=D-010 from=READY to=DISPATCHED \
+    lane=automation at=2026-07-23T18:02:00Z tab=? prompt_sha=ab12cd34 >/dev/null
+  PM_ROOT="$repo" pm_apply dispatch_state d=D-010 a=A-01 from=DISPATCHED to=ACKED \
+    lane=automation at=2026-07-23T18:03:00Z tab=zzz-tab-9 >/dev/null
+
+  # No --lane: must inherit lane=automation, not default to human.
+  out="$(PM_ROOT="$repo" "$RECORD" dispatch D-010 ABANDONED 2>&1)"
+  rc=$?
+  assert_eq "lane inherit: ABANDONED on an automation dispatch exits 0 without --lane" "0" "$rc"
+  log="$(cat "$repo/.pm/events.log")"
+  assert_contains "lane inherit: emitted event carries the FIXED lane=automation" \
+    "$log" "EVENT dispatch_state d=D-010 a=A-01 from=ACKED to=ABANDONED lane=automation"
+  assert_contains "lane inherit: success message reports the inherited lane" \
+    "$out" "lane=automation"
+
+  rm -rf "$repo"
+}
+
+section_dispatch_lane_explicit_wrong_still_refused() {
+  # Inheritance must not become a bypass: a caller who explicitly ASSERTS
+  # the wrong lane is still refused, and still emits nothing. Only the
+  # silent wrong default is gone.
+  local repo out rc before after
+  repo="$(new_tmp_repo)"
+
+  PM_ROOT="$repo" pm_apply dispatch_new d=D-011 i=I-001 at=2026-07-23T18:01:00Z >/dev/null
+  PM_ROOT="$repo" pm_apply dispatch_state d=D-011 from=READY to=DISPATCHED \
+    lane=automation at=2026-07-23T18:02:00Z tab=? prompt_sha=ab12cd34 >/dev/null
+  PM_ROOT="$repo" pm_apply dispatch_state d=D-011 a=A-01 from=DISPATCHED to=ACKED \
+    lane=automation at=2026-07-23T18:03:00Z tab=zzz-tab-9 >/dev/null
+
+  before="$(wc -l <"$repo/.pm/events.log")"
+  # NB: this suite runs under `set -u` only -- do NOT bracket this with
+  # `set +e`/`set -e`. Restoring `set -e` would enable it for every section
+  # that follows (the suite never had it on), and the next expected-refusal
+  # assertion would kill the run instead of being measured.
+  out="$(PM_ROOT="$repo" "$RECORD" dispatch D-011 ABANDONED --lane human 2>&1)"
+  rc=$?
+  after="$(wc -l <"$repo/.pm/events.log")"
+  assert_nonzero "lane guard: explicitly claiming the WRONG lane is still refused" "$rc"
+  assert_contains "lane guard: refusal names the lane mismatch" "$out" "lane mismatch"
+  assert_eq "lane guard: refusal emitted no event" "$before" "$after"
+
+  rm -rf "$repo"
+}
+
+# ---------------------------------------------------------------------------
 # section: record dispatch refuses an illegal/stale transition (DISPATCHED
 # -> VERIFIED, skipping ACKED/RETURNED) without emitting anything.
 # ---------------------------------------------------------------------------
@@ -504,6 +567,8 @@ section_usage_errors() {
 section_issue_first_transition
 section_issue_refuses_noop
 section_dispatch_full_roundtrip
+section_dispatch_lane_inherited
+section_dispatch_lane_explicit_wrong_still_refused
 section_dispatch_refuses_illegal
 section_result
 section_question

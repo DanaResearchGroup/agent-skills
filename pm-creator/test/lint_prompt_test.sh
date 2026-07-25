@@ -112,6 +112,36 @@ section_prefixed_secret_warn() {
     "key-style secret assignment"
 }
 
+assert_output_lacks() {
+  local name="$1" file="$2" needle="$3"
+  local out
+  out="$("$LINT_PROMPT" "$file" 2>&1)"
+  if [[ "$out" != *"$needle"* ]]; then
+    ok "$name"
+  else
+    fail "$name" "expected output NOT to contain [$needle] -- output:"$'\n'"$out"
+  fi
+}
+
+section_paths_are_not_secrets() {
+  # The "long hex/base64 blob" pattern's char class includes `/`, so an
+  # ordinary absolute path matched as one long blob and warned. That made
+  # lint-prompt warn on the single thing CONVENTIONS §8 rule 4 most wants a
+  # prompt to contain -- grounded absolute paths -- which trains the
+  # operator to skim the output, which is how a real leak gets waved
+  # through. Paths must be silent; genuine blobs must still warn.
+  local f="${FIXTURES}/lint_prompt_paths_not_secrets.md"
+  assert_exit "path-heavy prompt: exit 0" 0 "$f"
+  assert_output_lacks "path-heavy prompt: absolute paths do NOT warn as secrets" "$f" \
+    "possible secret (long hex/base64 blob): home/alon"
+  assert_output_lacks "path-heavy prompt: no blob warning on any ARC path" "$f" \
+    "arc/job/adapters"
+  # ...and the suppressor must not have disarmed the pattern itself: a real
+  # slash-free base64 blob on the same page still warns.
+  assert_output_contains "path-heavy prompt: a real base64 blob still warns" "$f" \
+    "possible secret (long hex/base64 blob): aGVsbG8"
+}
+
 section_no_marker() {
   local f="${FIXTURES}/lint_prompt_no_marker.md"
   assert_exit "no-marker prompt: exit 0" 0 "$f"
@@ -152,6 +182,8 @@ echo "== secret WARN =="
 section_secret_warn
 echo "== prefixed-token secret WARN (I23) =="
 section_prefixed_secret_warn
+echo "== absolute paths are not secret-shaped =="
+section_paths_are_not_secrets
 echo "== no marker found =="
 section_no_marker
 echo "== usage errors =="

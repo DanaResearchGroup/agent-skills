@@ -150,7 +150,8 @@ disp = idx.get('dispatches', {}).get(d)
 if disp is None:
     print('NONE\tNONE')
 else:
-    print((disp.get('state') or 'NONE') + '\t' + (disp.get('attempt') or 'NONE'))
+    print((disp.get('state') or 'NONE') + '\t' + (disp.get('attempt') or 'NONE')
+          + '\t' + (disp.get('lane') or 'NONE'))
 " "$_index"
 }
 
@@ -225,7 +226,12 @@ cmd_dispatch() {
     exit 2
   }
   shift 2
-  local lane="human" tab=""
+  # Lane is NOT defaulted here. A dispatch's lane is fixed at dispatch-prep
+  # and stored on the folded index; defaulting to "human" made every
+  # automation-lane terminal transition (`record dispatch D-00X ABANDONED`)
+  # fail with a lane-mismatch refusal for a lane the caller never claimed.
+  # Empty means "inherit the fixed lane", resolved after _fold below.
+  local lane="" tab=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --lane)
@@ -244,7 +250,7 @@ cmd_dispatch() {
   done
 
   _require_id "dispatch id" "D" "$dispatch_id"
-  if [[ "$lane" != "human" && "$lane" != "automation" ]]; then
+  if [[ -n "$lane" && "$lane" != "human" && "$lane" != "automation" ]]; then
     echo "record dispatch: --lane must be 'human' or 'automation' (got '$lane')" >&2
     exit 2
   fi
@@ -265,14 +271,25 @@ cmd_dispatch() {
   esac
 
   _fold
-  local info from_state attempt
-  info="$(_dispatch_info "$dispatch_id")"
-  from_state="${info%%$'\t'*}"
-  attempt="${info#*$'\t'}"
+  local from_state attempt fixed_lane
+  IFS=$'\t' read -r from_state attempt fixed_lane < <(_dispatch_info "$dispatch_id")
 
   if [[ "$from_state" == "NONE" ]]; then
     echo "record: refusing $dispatch_id -> $to_state: $dispatch_id is not registered (no dispatch_new on record). No event was emitted." >&2
     exit 1
+  fi
+
+  # Inherit the lane fixed at dispatch-prep unless the caller named one
+  # explicitly. An explicit --lane is still checked by pm_apply against the
+  # fixed lane, so a caller who asserts the WRONG lane is still refused --
+  # only the silent wrong default is gone. "NONE" means the fold carries no
+  # lane yet (pre-DISPATCHED); keep the historical human default there.
+  if [[ -z "$lane" ]]; then
+    if [[ -n "$fixed_lane" && "$fixed_lane" != "NONE" ]]; then
+      lane="$fixed_lane"
+    else
+      lane="human"
+    fi
   fi
 
   local -a kv=(dispatch_state d="$dispatch_id" from="$from_state" to="$to_state" lane="$lane" at="$(now_iso)")
@@ -321,10 +338,8 @@ cmd_result() {
   fi
 
   _fold
-  local info from_state attempt
-  info="$(_dispatch_info "$dispatch_id")"
-  from_state="${info%%$'\t'*}"
-  attempt="${info#*$'\t'}"
+  local from_state attempt fixed_lane
+  IFS=$'\t' read -r from_state attempt fixed_lane < <(_dispatch_info "$dispatch_id")
 
   if [[ "$from_state" == "NONE" ]]; then
     echo "record: refusing result for $dispatch_id: not registered (no dispatch_new). No event was emitted." >&2
@@ -387,10 +402,8 @@ cmd_merged() {
   fi
 
   _fold
-  local info from_state cur_attempt
-  info="$(_dispatch_info "$dispatch_id")"
-  from_state="${info%%$'\t'*}"
-  cur_attempt="${info#*$'\t'}"
+  local from_state cur_attempt fixed_lane
+  IFS=$'\t' read -r from_state cur_attempt fixed_lane < <(_dispatch_info "$dispatch_id")
 
   if [[ "$from_state" == "NONE" ]]; then
     echo "record: refusing merged for $dispatch_id: not registered (no dispatch_new). No event was emitted." >&2
@@ -503,9 +516,8 @@ cmd_adopt() {
   fi
 
   _fold
-  local info attempt
-  info="$(_dispatch_info "$dispatch_id")"
-  attempt="${info#*$'\t'}"
+  local _st attempt _lane
+  IFS=$'\t' read -r _st attempt _lane < <(_dispatch_info "$dispatch_id")
   if [[ "$attempt" == "NONE" ]]; then
     echo "record: refusing adopt for $dispatch_id: no attempt on record yet (never dispatched). No event was emitted." >&2
     exit 1

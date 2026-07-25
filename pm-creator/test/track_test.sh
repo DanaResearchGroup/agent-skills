@@ -4332,6 +4332,119 @@ section_ac_marker_via_not_descendant
 # configured label filtered correctly and then made EVERY spawn fail. The
 # resolution now happens once, in the shared snapshot parse.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 30d. Worker cwd. CONVENTIONS §5 makes "start the tab in the primary repo
+# the ticket touches" law, but the spawn never passed `--cwd` to `herdr
+# agent start`, so every automation worker started in whatever directory the
+# herdr server held. Observed live on 2026-07-25: the worker landed in
+# $HOME and sat forever on the agent's trust-this-folder dialog, having done
+# nothing -- an unattended fleet that silently never starts.
+#
+# A dispatch NAMING a repo starts in that repo; a [no-repo] dispatch starts
+# at the PM root (covered by the exact-argv assertion in 30b); a dispatch
+# naming an UNRESOLVABLE repo fails closed and surfaces rather than quietly
+# starting somewhere arbitrary.
+# ---------------------------------------------------------------------------
+section_spawn_cwd_is_the_configured_repo() {
+  local repo call_log gitrepo
+  repo="$(new_tmp_repo_spawn true 2 1)"
+  gitrepo="$repo/target-repo"
+  mkdir -p "$gitrepo"
+  REPO="$repo" GITREPO="$gitrepo" python3 - <<'RECONF'
+import json, os
+p = os.path.join(os.environ["REPO"], ".pm", "config.json")
+cfg = json.load(open(p))
+cfg["repos"] = {"demo-repo": {"path": os.environ["GITREPO"], "mainline": "main"}}
+json.dump(cfg, open(p, "w"))
+RECONF
+
+  local base="I-001_widget_2026-07-25.md"
+  printf 'Automation prompt.\n' >"$repo/prompts/$base"
+  seed_issue_state "$repo" I-001 OPEN ACTIVE
+  PM_ROOT="$repo" "${PM_CREATOR_DIR}/templates/bin/dispatch-prep" \
+    --dispatch D-001 --issue I-001 --lane automation --repo demo-repo \
+    --prompt "$repo/prompts/$base" >/dev/null 2>&1
+
+  call_log="$(mktemp "${TMPDIR:-/tmp}/pm-creator-spawn-calls.XXXXXX")"
+  HERDR_CALL_LOG="$call_log" run_track "$repo" "$(spawn_snapshot_json)"
+
+  assert_eq "spawn cwd: exit 0" "0" "$TR_RC"
+  if grep -q -- "--cwd $gitrepo" "$call_log"; then
+    ok "spawn cwd: agent start ran with --cwd = the dispatch's configured repo path"
+  else
+    fail "spawn cwd: agent start ran with --cwd = the dispatch's configured repo path" \
+      "$(cat "$call_log")"
+  fi
+  # It must be the REPO, not the PM root -- the bug's signature was landing
+  # somewhere plausible-but-wrong, so pin the negative too.
+  if grep -q -- "--cwd $repo " "$call_log"; then
+    fail "spawn cwd: did NOT fall back to the PM root for a repo-bearing dispatch" \
+      "$(cat "$call_log")"
+  else
+    ok "spawn cwd: did NOT fall back to the PM root for a repo-bearing dispatch"
+  fi
+
+  rm -f "$call_log"
+}
+
+section_spawn_cwd_unresolvable_repo_fails_closed() {
+  # Config DRIFT between mint and spawn is the reachable form of this: the
+  # dispatch recorded repo=demo-repo when the path was good, and by spawn
+  # time the path is gone (repo moved, worktree removed, config edited).
+  # dispatch-prep only records `repo` when it already resolves, so a
+  # never-valid repo name cannot reach the fold at all.
+  #
+  # Silent degradation is this codebase's recurring failure class, so an
+  # unresolvable cwd must surface and spawn NOTHING -- not quietly start the
+  # worker in the PM root. Asserting exit 0 alone would pass either way (and
+  # did, vacuously, in an earlier draft of this very test); assert effects.
+  local repo call_log gitrepo
+  repo="$(new_tmp_repo_spawn true 2 1)"
+  gitrepo="$repo/target-repo"
+  mkdir -p "$gitrepo"
+  REPO="$repo" GITREPO="$gitrepo" python3 - <<'RECONF'
+import json, os
+p = os.path.join(os.environ["REPO"], ".pm", "config.json")
+cfg = json.load(open(p))
+cfg["repos"] = {"demo-repo": {"path": os.environ["GITREPO"], "mainline": "main"}}
+json.dump(cfg, open(p, "w"))
+RECONF
+
+  local base="I-001_widget_2026-07-25.md"
+  printf 'Automation prompt.\n' >"$repo/prompts/$base"
+  seed_issue_state "$repo" I-001 OPEN ACTIVE
+  PM_ROOT="$repo" "${PM_CREATOR_DIR}/templates/bin/dispatch-prep" \
+    --dispatch D-001 --issue I-001 --lane automation --repo demo-repo \
+    --prompt "$repo/prompts/$base" >/dev/null 2>&1
+
+  # ...now the drift: the recorded repo's path stops existing before spawn.
+  rmdir "$gitrepo"
+
+  call_log="$(mktemp "${TMPDIR:-/tmp}/pm-creator-spawn-calls.XXXXXX")"
+  HERDR_CALL_LOG="$call_log" run_track "$repo" "$(spawn_snapshot_json)"
+
+  assert_eq "spawn cwd unresolved: exit 0 (informational, not fatal)" "0" "$TR_RC"
+  if grep -q "spawn-cwd-unresolved" "$repo/TRACKER.md"; then
+    ok "spawn cwd unresolved: surfaced in TRACKER.md"
+  else
+    fail "spawn cwd unresolved: surfaced in TRACKER.md" "$(cat "$repo/TRACKER.md")"
+  fi
+  if grep -q "agent start" "$call_log" || grep -q "tab create" "$call_log"; then
+    fail "spawn cwd unresolved: spawned NOTHING (no tab create, no agent start)" \
+      "$(cat "$call_log")"
+  else
+    ok "spawn cwd unresolved: spawned NOTHING (no tab create, no agent start)"
+  fi
+  if grep -q "EVENT spawn_intent" "$repo/.pm/events.log"; then
+    fail "spawn cwd unresolved: took no spawn-intent lease" \
+      "$(grep 'spawn_intent' "$repo/.pm/events.log")"
+  else
+    ok "spawn cwd unresolved: took no spawn-intent lease"
+  fi
+
+  rm -f "$call_log"
+}
+
 section_spawn_workspace_label_resolves_to_id() {
   local repo call_log snapshot
   repo="$(new_tmp_repo_spawn true 2 1)"
@@ -4480,7 +4593,7 @@ section_spawn_happy_path() {
     "tab create --workspace zzz-test-ws --label i001-widget --no-focus" \
     "$(sed -n '1p' "$call_log")"
   assert_eq "spawn happy: herdr agent start argv exact (name, tab from tab-create stdout, --no-focus, argv w/ substituted prompt path)" \
-    "agent start i001-widget-D001A01 --workspace zzz-test-ws --tab zzz-test-ws:t91 --no-focus -- zzz-test-runner $repo/prompts/I-001_widget_2026-07-25.md" \
+    "agent start i001-widget-D001A01 --workspace zzz-test-ws --tab zzz-test-ws:t91 --cwd $repo --no-focus -- zzz-test-runner $repo/prompts/I-001_widget_2026-07-25.md" \
     "$(sed -n '2p' "$call_log")"
   assert_eq "spawn happy: exactly two herdr side-effect calls" "2" "$(wc -l < "$call_log" | tr -d ' ')"
 
@@ -5357,6 +5470,9 @@ section_spawn_workspace_label_resolves_to_id
 echo "== 30c. real herdr api snapshot shape (arrays nested under result.snapshot) =="
 section_nested_snapshot_tabs_are_seen
 section_nested_snapshot_workspace_resolves
+echo "== 30d. worker cwd (§5: start in the ticket's repo) =="
+section_spawn_cwd_is_the_configured_repo
+section_spawn_cwd_unresolvable_repo_fails_closed
 echo "== 31. B3: auto_spawn disabled -> steady count, zero spawns =="
 section_spawn_disabled_steady
 echo "== 32. B3: capacity at/over -> steady count, zero spawns =="
