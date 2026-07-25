@@ -47,6 +47,14 @@ short.
 - **Out-of-protocol work is absorbed, not hidden.** Work that appears with no matching
   dispatch is logged `unregistered_execution`; you `adopt` it into a D. The system detects
   bypass; it does not pretend to prevent it.
+- **Starting work may itself be a gate.** A campaign whose operating model puts the user at
+  *defining* as well as *reviewing* should require explicit user approval before any dispatch
+  begins — approval given per piece of work, never inferred from an issue being ACTIVE, next
+  in queue order, or already carrying a `Verifier:`. Ranking says what is *next*; it never
+  says *go*. Per-issue `Approval gates:` below do NOT cover this: they gate actions taken
+  *during* the work, not the decision to begin it. Where this applies, `automation.auto_spawn`
+  is `false` so `bin/track` cannot spawn regardless of what the manager believes, and the rule
+  is restated at the top of `RESUME.md` — the flag is the enforcement, the prose the reason.
 - **Always-human gates (both lanes):** merges to shared/mainline branches, pushes/uploads,
   and any `NEEDS-USER` item NEVER auto-execute.
 - **Verifier contract** — every issue declares, at grill/issue creation and WITH the user:
