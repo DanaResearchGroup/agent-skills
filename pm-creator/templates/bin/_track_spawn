@@ -66,6 +66,13 @@ _SP_ID_RE = re.compile(r"\A[A-Za-z0-9:_-]+\Z")
 _sp_cfg = json.loads(os.environ["PM_TR_SPAWN_CFG"])
 _sp_herdr_ok = os.environ["PM_TR_HERDR_OK"] == "1"
 _sp_root = os.environ["PM_TR_ROOT"]
+# name -> {"path": ..., ...}; used to resolve each worker's cwd (see below).
+try:
+    _sp_repos = json.loads(os.environ.get("PM_TR_REPOS") or "{}")
+    if not isinstance(_sp_repos, dict):
+        _sp_repos = {}
+except Exception:
+    _sp_repos = {}
 _sp_out = os.environ["PM_TR_SPAWN_PLAN"]
 _sp_age_path = os.environ["PM_TR_SPAWN_AGE"]
 
@@ -318,10 +325,40 @@ else:
                 _sp_surface(_sp_d, "name-collision",
                             f"a live pane named {_sp_name} already exists")
                 continue
+            # Worker cwd. CONVENTIONS §5 makes "start the tab in the primary
+            # repo the ticket touches" law, but the automation lane had no
+            # way to honor it: `herdr agent start` takes --cwd and the spawn
+            # never passed one, so every worker started in whatever
+            # directory the herdr server happened to hold. Two real
+            # consequences: the worker's git context is wrong (a prompt
+            # saying "commit on branch X" silently operates in the wrong
+            # tree), and a first spawn into a never-trusted directory stalls
+            # forever on the agent's trust-this-folder dialog, which defeats
+            # the whole point of an unattended fleet.
+            #
+            # A dispatch with no repo (the [no-repo] items) legitimately
+            # starts at the PM root. A dispatch NAMING a repo we cannot
+            # resolve is fail-closed and surfaced -- silently falling back
+            # to the PM root would be exactly the quiet degradation this
+            # codebase keeps getting bitten by.
+            _sp_repo = (_sp_disp.get("repo") or "").strip()
+            if _sp_repo:
+                _sp_cwd = ((_sp_repos.get(_sp_repo) or {}).get("path") or "").strip()
+                if not _sp_cwd:
+                    _sp_surface(_sp_d, "spawn-cwd-unresolved",
+                                f"dispatch names repo {_sp_repo!r}, which has no "
+                                "configured path in .pm/config.json")
+                    continue
+                if not os.path.isdir(_sp_cwd):
+                    _sp_surface(_sp_d, "spawn-cwd-unresolved",
+                                f"repo {_sp_repo!r} path {_sp_cwd!r} is not a directory")
+                    continue
+            else:
+                _sp_cwd = _sp_root
             _sp_free -= 1
             _sp_plan["spawn"].append({
                 "d": _sp_d, "a": _sp_a, "ref": _sp_name, "label": _sp_label,
-                "prompt": _sp_abs,
+                "prompt": _sp_abs, "cwd": _sp_cwd,
                 "argv": [_sp_abs if el == "{prompt}" else el for el in _sp_cfg["argv"]],
             })
         if _sp_over:
@@ -337,6 +374,7 @@ if ! PM_TR_INDEX="${_tr_index}" \
   PM_TR_SPAWN_CFG="${_tr_spawn_cfg}" \
   PM_TR_HERDR_OK="${_tr_herdr_ok}" \
   PM_TR_ROOT="${_tr_root}" \
+  PM_TR_REPOS="${_tr_repos_json}" \
   PM_TR_SPAWN_AGE="${_tr_spawn_age_file}" \
   PM_TR_SPAWN_PLAN="${_tr_spawn_plan_file}" \
   bash -c 'printf "%s\n%s\n%s\n" "$1" "$2" "$3" | python3 -' _ "${_TR_CORROB_PY}" "${_TR_CLOSE_PY}" "${_tr_spawn_plan_driver}" \
@@ -649,8 +687,9 @@ import json, sys
 for el in json.loads(sys.argv[1])["argv"]:
     sys.stdout.write(el + "\0")
 ' "${_tr_sp_line}")
+      _tr_sp_cwd="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("cwd") or "")' "${_tr_sp_line}")"
       _tr_sp_start_out="$(herdr agent start "${_tr_sp_ref}" --workspace "${_tr_herdr_workspace_id:-${_tr_herdr_workspace}}" \
-        --tab "${_tr_sp_tab_id}" --no-focus -- "${_tr_sp_argv[@]}" </dev/null 2>/dev/null)"
+        --tab "${_tr_sp_tab_id}" --cwd "${_tr_sp_cwd}" --no-focus -- "${_tr_sp_argv[@]}" </dev/null 2>/dev/null)"
       _tr_sp_rc=$?
       if [[ ${_tr_sp_rc} -ne 0 ]]; then
         _tr_sp_code="$(python3 -c '
