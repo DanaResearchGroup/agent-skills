@@ -11,7 +11,7 @@
 # FROZEN API — every function signature below is depended on by downstream
 # scripts. Treat signature changes as breaking; add, don't rename/reshape.
 #
-#   pm_lock        [repo_root]                -- acquire .pm/.lock (mkdir-based)
+#   pm_lock        [repo_root]                -- acquire .pm/.lock (flock-based)
 #   pm_unlock                                  -- release the most recent pm_lock
 #   pm_apply        <type> <k=v> [<k=v> ...]   -- validate + atomically apply ONE event
 #   pm_apply_batch  -- <type> <k=v>... [-- <type> <k=v>...]
@@ -21,11 +21,8 @@
 #   pm_close_issue <repo_root> <I-###> [--dry-run]
 #                                               -- close+archive core (in-process, lock-reentrant)
 #   pm_git_probe   <repo_path>                 -- echo JSON snapshot of a repo's real state
+#   pm_config_repos <config.json path>         -- echo normalized `repos` JSON list (THE one parser)
 #   esc_shell      <string>                    -- echo a shell-safe single-quoted token
-#   esc_md         <string>                    -- echo a Markdown-safe token
-#   esc_json       <string>                    -- echo a JSON-string-safe token (no quotes)
-#   esc_path       <string>                    -- echo a path-safe token (no leading '-', no glob hazard)
-#   esc_gitref     <string>                    -- echo a git-ref-safe token
 #
 # `pm_raw_append` (formerly the public `pm_emit`) does NOT exist in this
 # shipped file: a grammar-only, rule-engine-bypassing appender must never be
@@ -74,7 +71,7 @@
 # ---------------------------------------------------------------------------
 
 _PM_LOCK_DEPTH=0
-_PM_LOCK_DIR=""
+_PM_LOCK_FD=""
 _PM_LOCK_ROOT=""
 
 _pm_root() {
@@ -110,15 +107,33 @@ _pm_root() {
 
 pm_lock() {
   # pm_lock [repo_root]
-  # Acquire an mkdir-based lock at <repo_root>/.pm/.lock. Re-entrant within a
-  # single script's lifetime (nested pm_lock/pm_unlock pairs just adjust a
-  # depth counter); a trap on EXIT/INT/TERM guarantees the lock directory is
-  # removed even if the script is interrupted mid-critical-section. The
-  # owner's PID is recorded in "$lockdir/pid" so a crashed/killed holder's
-  # lock can be reclaimed (see _pm_lock_try_reclaim_stale, L2).
+  # Acquire an flock(2)-based lock on the regular file <repo_root>/.pm/.lock.
+  # Re-entrant within a single script's lifetime (nested pm_lock/pm_unlock
+  # pairs just adjust a depth counter); a trap on EXIT/INT/TERM releases the
+  # lock if the script is interrupted mid-critical-section.
+  #
+  # Why flock and not mkdir (C3/I4): the kernel releases an flock when the
+  # holding process dies -- ANY death, including kill -9 / OOM -- so there is
+  # no stale-lock state, no reclaim protocol, and therefore no ABA window in
+  # which two waiters can both "reclaim" and both hold the lock (the mkdir
+  # protocol's `.reclaiming` marker lived inside the directory being deleted
+  # and was reproducibly defeated by two concurrent reclaimers). The lock
+  # file itself is never deleted; ownership lives in the kernel lock, not in
+  # the file's existence.
+  #
+  # FD inheritance note: the lock fd is inherited by children forked while
+  # the lock is held. That is safe here because every child spawned under
+  # the lock (python engine, git, sed) is short-lived and awaited before
+  # pm_unlock; no code path backgrounds a long-lived process while holding
+  # the lock (herdr spawn calls are explicitly made OUTSIDE the lock -- see
+  # track's spawn stage). A long-lived child would otherwise keep the
+  # kernel lock alive via its inherited fd after the parent released.
+  #
+  # Timeout is PM_LOCK_TIMEOUT seconds (default 10, matching the old
+  # 100 x 0.1s wait loop); on timeout: non-zero return + operator message.
   local root
   root="$(_pm_root "${1:-}")" || return 1
-  local lockdir="$root/.pm/.lock"
+  local lockfile="$root/.pm/.lock"
 
   if [[ "$_PM_LOCK_DEPTH" -gt 0 ]]; then
     # Reentrant acquire: refuse to silently share the held lock with a
@@ -136,113 +151,48 @@ pm_lock() {
     return 0
   fi
 
-  local waited=0
-  while ! mkdir "$lockdir" 2>/dev/null; do
-    if _pm_lock_try_reclaim_stale "$lockdir"; then
-      continue
-    fi
-    if [[ "$waited" -ge 100 ]]; then
-      echo "pm-creator: timed out waiting for lock $lockdir" >&2
-      return 1
-    fi
-    sleep 0.1
-    waited=$((waited + 1))
-  done
-
-  # L-low: a bare PID is a weak owner identity — PIDs get reused, so a
-  # dead original holder's PID can be picked up by an unrelated live
-  # process, making a genuinely stale lock look "live" and hang the
-  # waiter for the full timeout instead of reclaiming it. Record PID +
-  # process start-time (/proc/<pid>/stat field 22 on Linux) as a
-  # composite identity; where /proc is unavailable this degrades to the
-  # PID-only liveness check pm_lock already had.
-  {
-    printf '%s\n' "$$"
-    _pm_lock_pid_start "$$" 2>/dev/null
-  } > "$lockdir/pid" 2>/dev/null || true
-  _PM_LOCK_DIR="$lockdir"
-  _PM_LOCK_ROOT="$root"
-  _PM_LOCK_DEPTH=1
-  # shellcheck disable=SC2064
-  trap "_pm_lock_release_all" EXIT INT TERM
-  return 0
-}
-
-_pm_lock_pid_start() {
-  # _pm_lock_pid_start <pid> -- print that pid's process start-time token
-  # (field 22 of /proc/<pid>/stat, Linux-only) or nothing if unavailable.
-  # The comm field (field 2) is parenthesized and may itself contain
-  # spaces/parens, so fields are counted from the LAST ')' rather than by
-  # naive whitespace-splitting the whole line.
-  local pid="$1" statfile content rest
-  statfile="/proc/$pid/stat"
-  [[ -r "$statfile" ]] || return 1
-  content="$(cat "$statfile" 2>/dev/null)" || return 1
-  rest="${content##*) }"
-  [[ "$rest" == "$content" ]] && return 1
-  local -a fields
-  read -r -a fields <<< "$rest"
-  # rest[0] is field 3 (state); field 22 (starttime) is therefore
-  # rest[22-3] = rest[19].
-  [[ -n "${fields[19]:-}" ]] || return 1
-  printf '%s\n' "${fields[19]}"
-}
-
-_pm_lock_try_reclaim_stale() {
-  # _pm_lock_try_reclaim_stale <lockdir>
-  # L2: after a hard crash / `kill -9`, the mkdir-lock is never released and
-  # a plain timeout just fails forever. If <lockdir>/pid names a PID that is
-  # provably dead (kill -0 fails), reclaim the lock. L-low: also reclaim
-  # when the PID is alive but its recorded start-time identity no longer
-  # matches (the PID was reused by an unrelated, later process — the
-  # original holder is just as gone as if it were dead). Race-safe: a
-  # nested mkdir "<lockdir>/.reclaiming" is itself atomic, so of any number
-  # of waiters that independently notice the same stale lock, exactly one
-  # wins the right to remove it; the rest fall through and retry on the
-  # next loop iteration.
-  local lockdir="$1"
-  local pidfile="$lockdir/pid"
-  [[ -d "$lockdir" ]] || return 1
-  local owner_pid="" owner_start=""
-  if [[ -f "$pidfile" ]]; then
-    owner_pid="$(sed -n '1p' "$pidfile" 2>/dev/null)"
-    owner_start="$(sed -n '2p' "$pidfile" 2>/dev/null)"
-  fi
-  # A missing/unreadable/non-numeric pid file might mean a concurrent
-  # racer is still between mkdir and writing its pid — do not reclaim.
-  [[ "$owner_pid" =~ ^[0-9]+$ ]] || return 1
-  local reason=""
-  if ! kill -0 "$owner_pid" 2>/dev/null; then
-    reason="owner pid $owner_pid is dead"
-  else
-    # PID is alive. Only treat it as a genuine identity mismatch (reused
-    # PID) when we recorded a start-time AND can read the live process's
-    # current start-time and the two disagree — if either is unavailable
-    # (e.g. no /proc), we cannot prove mismatch, so degrade to the old
-    # PID-liveness-only behavior and do not reclaim.
-    if [[ -n "$owner_start" ]]; then
-      local live_start
-      live_start="$(_pm_lock_pid_start "$owner_pid" 2>/dev/null)"
-      if [[ -n "$live_start" && "$live_start" != "$owner_start" ]]; then
-        reason="owner pid $owner_pid is alive but its identity (start-time) no longer matches — PID reused"
-      fi
-    fi
-  fi
-  [[ -n "$reason" ]] || return 1
-  if ! mkdir "$lockdir/.reclaiming" 2>/dev/null; then
+  # NOTE: no stderr redirect on the `exec` -- a redirection attached to a
+  # bare `exec` would permanently rebind the SCRIPT's stderr, not just this
+  # open. A failed open prints bash's own diagnostic, which is what we want.
+  local fd=""
+  if ! exec {fd}>>"$lockfile"; then
+    echo "pm-creator: cannot open lock file $lockfile" >&2
     return 1
   fi
-  echo "pm-creator: reclaiming stale lock $lockdir ($reason)" >&2
-  rm -rf "$lockdir"
+  if ! flock -w "${PM_LOCK_TIMEOUT:-10}" "$fd"; then
+    exec {fd}>&-
+    echo "pm-creator: timed out waiting for lock $lockfile" >&2
+    return 1
+  fi
+  _PM_LOCK_FD="$fd"
+  _PM_LOCK_ROOT="$root"
+  _PM_LOCK_DEPTH=1
+  # C6: signal handlers must TERMINATE, not just clean up. A handler that
+  # releases the lock and then lets the script keep running would continue
+  # the critical section WITHOUT the lock (and, in track's case, could
+  # still reach the spawn stage after the operator hit Ctrl-C). EXIT only
+  # releases; INT/TERM release, restore default disposition, and re-raise
+  # so the process dies with the correct 128+signum status. BASHPID (not
+  # $$) so a subshell that acquired the lock kills itself, not its parent
+  # script. Callers that install their own traps after pm_lock (track,
+  # reconcile) must follow the same terminate-on-signal shape.
+  trap '_pm_lock_release_all' EXIT
+  trap '_pm_lock_release_all; trap - EXIT INT TERM; kill -INT "${BASHPID:-$$}"' INT
+  trap '_pm_lock_release_all; trap - EXIT INT TERM; kill -TERM "${BASHPID:-$$}"' TERM
   return 0
 }
 
 _pm_lock_release_all() {
-  if [[ -n "$_PM_LOCK_DIR" && -d "$_PM_LOCK_DIR" ]]; then
-    rm -f "$_PM_LOCK_DIR/pid" 2>/dev/null || true
-    rmdir "$_PM_LOCK_DIR" 2>/dev/null || true
+  # Closing the fd releases the flock. If the process dies without ever
+  # getting here (kill -9, OOM), the kernel closes the fd and releases the
+  # lock anyway -- that is the whole point of the flock design. No stderr
+  # redirect on the bare `exec` (it would permanently rebind the script's
+  # stderr); _PM_LOCK_FD is only ever set to a successfully-opened fd and
+  # cleared right after closing, so a double-close cannot happen.
+  if [[ -n "$_PM_LOCK_FD" ]]; then
+    exec {_PM_LOCK_FD}>&- || true
   fi
-  _PM_LOCK_DIR=""
+  _PM_LOCK_FD=""
   _PM_LOCK_ROOT=""
   _PM_LOCK_DEPTH=0
 }
@@ -250,7 +200,7 @@ _pm_lock_release_all() {
 pm_unlock() {
   # pm_unlock
   # Release one level of the lock acquired by pm_lock. Only the outermost
-  # pm_unlock in a nested pair actually removes the lock directory.
+  # pm_unlock in a nested pair actually releases the flock (closes the fd).
   if [[ "$_PM_LOCK_DEPTH" -le 0 ]]; then
     return 0
   fi
@@ -346,14 +296,19 @@ import os
 import re
 import sys
 
-TOKEN_RE = re.compile(r'^[A-Za-z0-9._:+/@?-]+$')
+# \A/\Z (not ^/$): Python's $ matches just before a trailing "\n", so
+# "token\n" would satisfy ^...+$ without the char class ever having to
+# accept \n -- a value with an embedded trailing newline would validate as
+# a clean token and then corrupt a rendered grammar line on append. \A/\Z
+# anchor to the true start/end of the string, with no such exception.
+TOKEN_RE = re.compile(r'\A[A-Za-z0-9._:+/@?-]+\Z')
 
 # B2.2 fix-pass-6 F3: full git object-name shape (sha1=40 / sha256=64
 # lowercase hex) for the sha fields of `merged` corroboration markers. The
 # fold's trust boundary is symmetric with track's close-time BASE_SHA_RE:
 # a revision expression ("main", "HEAD~1") or short hex must never fold
 # into a marker and wait for close time to be refused.
-FULL_SHA_RE = re.compile(r'^([0-9a-f]{40}|[0-9a-f]{64})$')
+FULL_SHA_RE = re.compile(r'\A([0-9a-f]{40}|[0-9a-f]{64})\Z')
 
 REQUIRED = {
     "schema": ["v"],
@@ -668,6 +623,16 @@ def apply_event(state, etype, kv, line_no, raw, mode):
     questions = state["questions"]
 
     if etype == "schema":
+        # I7: loud-fail on any grammar revision this tooling does not
+        # understand -- silently folding a v!=1 log as if it were v=1 could
+        # misread state the newer grammar encodes differently. Quarantining
+        # the header also flips quarantine_unattributable, which blocks
+        # every auto-close (fail-closed).
+        if kv["v"] != "1":
+            return fail(
+                f"unsupported schema version v='{kv['v']}' "
+                "(this tooling understands only v=1)"
+            )
         if mode == "quarantine" and line_no != 1:
             return fail("schema header not on first line")
         return True
@@ -1053,10 +1018,14 @@ def apply_event(state, etype, kv, line_no, raw, mode):
         return True
 
     if etype == "adopt":
+        # Fail closed like every sibling handler (I2): an adopt naming an
+        # unregistered dispatch is refused at write / quarantined at fold,
+        # never a silent no-op ("never silently dropped", essence.md).
         d = kv["d"]
         disp = dispatches.get(d)
-        if disp is not None:
-            disp["adopted_ref"] = kv["ref"]
+        if disp is None:
+            return fail(f"adopt for unregistered dispatch '{d}'")
+        disp["adopted_ref"] = kv["ref"]
         return True
 
     if etype == "spawn_intent":
@@ -1067,10 +1036,21 @@ def apply_event(state, etype, kv, line_no, raw, mode):
         # only when `d` is a registered dispatch, `a` is d's CURRENT
         # attempt, the dispatch is currently DISPATCHED, and its lane is
         # `automation` (the automation-lane guard: a spawn intent against a
-        # human-lane dispatch is always a violation). A second intent for
-        # the same (d, a): identical ref -> accepted idempotently;
-        # different ref -> refused/quarantined, the FIRST stands (conflict
-        # = surface, never silently replace -- mirrors `merged`).
+        # human-lane dispatch is always a violation). The lease is
+        # EXCLUSIVE (C4): ANY second intent for a (d, a) that already has
+        # an open intent is refused at write / quarantined at fold, the
+        # FIRST stands. Identical ref included -- track computes a
+        # deterministic worker ref, so two concurrent tracks always
+        # collide on the SAME ref, and treating that duplicate as
+        # idempotent success made the loser believe it WON the lease and
+        # spawn a second live agent. Refusing removes a spawn path
+        # (fail-closed); the identical-ref refusal carries the distinct
+        # `spawn-lease-held` token so track's spawn stage can classify
+        # "lease held elsewhere -- skip" apart from a benign race.
+        # Crash-replay stays convergent: a track that crashed after
+        # appending its own intent never re-applies it on rerun -- the
+        # plan stage's open-intent filter (fold-driven) routes that
+        # dispatch down the ACK/orphan-surface path instead.
         d = kv["d"]
         disp = dispatches.get(d)
         if disp is None:
@@ -1094,7 +1074,12 @@ def apply_event(state, etype, kv, line_no, raw, mode):
         prior = (disp.get("spawn_intent") or {}).get(a)
         if prior is not None:
             if prior.get("ref") == kv.get("ref"):
-                return True
+                return fail(
+                    f"spawn-lease-held: duplicate spawn_intent for {d}/{a} "
+                    f"refused: an open intent (ref={prior.get('ref')}) "
+                    "already holds the exclusive lease -- a duplicate "
+                    "append NEVER means the lease was won"
+                )
             return fail(
                 f"conflicting spawn_intent for {d}/{a}: prior "
                 f"ref={prior.get('ref')}, got ref={kv.get('ref')}"
@@ -1270,13 +1255,23 @@ def write_outputs(state, index_path, quarantine_path):
         "auto_close_notes": state.get("auto_close_notes", {}),
     }
 
-    with open(index_path, "w") as f:
+    # C5: never truncate the authoritative index/quarantine in place -- a
+    # concurrent reader must only ever see a complete OLD file or a
+    # complete NEW file, never a half-written one. Write to a same-dir tmp
+    # and os.replace() (atomic rename on POSIX). No fsync here: both files
+    # are DERIVED state, fully regenerable from events.log by the next
+    # fold, so crash-durability is not part of their contract.
+    index_tmp = index_path + ".tmp"
+    with open(index_tmp, "w") as f:
         json.dump(index, f, indent=2, sort_keys=True)
         f.write("\n")
+    os.replace(index_tmp, index_path)
 
     if state["quarantine_lines"]:
-        with open(quarantine_path, "w") as f:
+        quarantine_tmp = quarantine_path + ".tmp"
+        with open(quarantine_tmp, "w") as f:
             f.write("\n".join(state["quarantine_lines"]) + "\n")
+        os.replace(quarantine_tmp, quarantine_path)
     elif os.path.exists(quarantine_path):
         os.remove(quarantine_path)
 PYEOF
@@ -1320,10 +1315,24 @@ pm_fold() {
     return 1
   fi
 
+  # C5: fold under the repo lock. Without it, an unlocked fold that read
+  # events.log BEFORE a lock-holder's append could finish writing
+  # index.json AFTER that holder's own refold, silently reverting the
+  # index to pre-commit state. pm_lock is reentrant, so callers already
+  # holding the lock (pm_apply's post-commit refold path, track's
+  # under-lock refolds) pay nothing. The fold's python never re-enters
+  # bash, so no lock-ordering cycle is possible. Note the lock is taken
+  # in THIS shell (not the subshell) so reentrancy depth is tracked
+  # correctly in the caller's process.
+  pm_lock "$root" || return 1
+  local rc
   (
     export PM_FOLD_LOG="$log" PM_FOLD_INDEX="$index" PM_FOLD_QUARANTINE="$quarantine"
     printf '%s\n%s\n' "$_PM_ENGINE_PY" "$_PM_FOLD_DRIVER_PY" | python3 -
   )
+  rc=$?
+  pm_unlock
+  return "$rc"
 }
 
 # ---------------------------------------------------------------------------
@@ -1395,15 +1404,35 @@ for ev in events:
         if v is None or not TOKEN_RE.match(str(v)):
             print(f"pm_apply: internal error: derived key '{k}' invalid for type '{etype}': {v!r}")
             sys.exit(1)
-    new_lines.append(render_line(etype, kv))
+    _rendered = render_line(etype, kv)
+    # I1 belt-and-suspenders: TOKEN_RE/FULL_SHA_RE et al gate every value
+    # BEFORE this point, but a single embedded "\n" reaching render_line
+    # (a future new field, a regex weakened by a future edit, ...) would
+    # silently split one committed event into two log lines -- corrupting
+    # line-oriented parse/quarantine attribution downstream. Refuse the
+    # whole batch outright rather than stripping/escaping it: a value that
+    # made it this far with a newline in it means a upstream guard already
+    # failed, and silently sanitizing would hide that failure instead of
+    # surfacing it.
+    if "\n" in _rendered:
+        print(f"pm_apply: internal error: rendered line for type '{etype}' contains a newline")
+        sys.exit(1)
+    new_lines.append(_rendered)
 
-# H2: the log append is the FINAL durable commit point. It MUST be a
-# single write() call — not a per-line loop — so a crash mid-append can
-# never leave a partial multi-event batch in the log (all-or-nothing at
-# the OS level, not just at the Python-loop level).
+# H2/I3: the log append is the FINAL commit point. It is issued as one
+# f.write() -- not a per-line loop -- to MINIMIZE the window for a partial
+# multi-event batch (this is tear-minimizing, not a hard all-or-nothing
+# guarantee: a payload larger than the stdio buffer can still split into
+# multiple write(2) syscalls). It is then flushed and fsync'ed BEFORE
+# success is reported, so no caller can order an external side effect
+# (e.g. track's herdr spawn after a spawn_intent lease) ahead of the
+# commit actually reaching disk -- a power loss after exit 0 must never
+# lose an event the caller already acted on.
 batch_text = "".join(line + "\n" for line in new_lines)
 with open(log_path, "a") as f:
     f.write(batch_text)
+    f.flush()
+    os.fsync(f.fileno())
 
 # H2: once the append above has returned, the batch is COMMITTED — the
 # rule for callers is "exit non-zero => nothing was committed; exit zero
@@ -1653,285 +1682,226 @@ PYEOF
 }
 
 # ---------------------------------------------------------------------------
-# pm_close_issue — in-process, lock-reentrant core of `bin/close`
+# pm_config_repos — THE one parser of config.json's `repos` (I6)
 # ---------------------------------------------------------------------------
 
-_pm_close_issue_state() {
-  # _pm_close_issue_state <I-###> <index_json_path>
-  # Echo the issue's current folded state, or "NONE" if it never appeared.
-  # Mirrors record's / close's own local `_issue_state` (duplicated rather
-  # than shared, same as record/close/dispatch-prep each keep their own
-  # root-resolution copy — see the FROZEN API note at the top of this file).
-  local id="$1" index="$2"
-  ISSUE_ID="$id" python3 -c "
-import json, os, sys
-idx = json.load(open(sys.argv[1]))
-i = os.environ['ISSUE_ID']
-st = idx.get('issues', {}).get(i)
-print((st or {}).get('state') or 'NONE')
-" "$index"
-}
-
-pm_close_issue() {
-  # pm_close_issue <repo_root> <I-###> [--dry-run]
-  # Sourceable, in-process equivalent of `bin/close`'s core: transitions
-  # <I-###> to CLOSED (idempotent: skipped if already CLOSED) and archives
-  # its ephemeral prompts/<I-###>_* and messages/<I-###>_* files into
-  # archive/{prompts,messages}/ (git-mv when tracked, else mv; skip with a
-  # warning rather than clobber an existing archive/ file). `reports/` is
-  # never touched.
-  #
-  # Both the issue_state transition and the audit `note --ref
-  # archived:<I-###>` are emitted via `pm_apply` DIRECTLY, in-process —
-  # never by shelling out to `record` as a subprocess. That is the entire
-  # reason this function exists: `pm_lock` is reentrant only within a
-  # single sourced shell process (depth counter), so a caller that already
-  # holds `pm_lock` (e.g. a future `bin/track` auto-close pass) and invokes
-  # this function in-process safely RE-ENTERS the same lock, whereas
-  # shelling out to a `record` subprocess would try to acquire a brand-new
-  # lock and block forever waiting on the lock its own parent process is
-  # holding. A standalone caller with no pre-held lock gets a freshly
-  # acquired lock around the whole operation, same net effect as before.
-  #
-  # Refuses (returns 1, message on stderr) if the issue was never
-  # registered, or if any archive move fails partway through (see
-  # _pm_close_issue_core). `--dry-run` prints what would happen and returns
-  # 0 without emitting any event or moving any file. Returns 2 on a usage
-  # error (no lock is taken in that case).
-  #
-  # This outer function is a thin lock/PM_ROOT unwind shell around
-  # _pm_close_issue_core: cleanup (PM_ROOT restore + pm_unlock) always runs
-  # exactly once on every path once the lock is held, because the core's
-  # result is captured via an `if core; then ... else ...; fi` — a checked
-  # context — rather than letting any internal failure inside the core
-  # propagate as a bare `set -e` abort past this function's tail.
-  local root="${1:-}" issue_id="${2:-}"
-  if [[ $# -ge 2 ]]; then shift 2; else shift "$#"; fi
-  local dry_run=0 arg
-  for arg in "$@"; do
-    case "$arg" in
-      --dry-run) dry_run=1 ;;
-      *)
-        echo "close: unknown argument '$arg'" >&2
-        return 2
-        ;;
-    esac
-  done
-
-  if [[ -z "$root" || -z "$issue_id" ]]; then
-    echo "close: usage: pm_close_issue <repo_root> <I-###> [--dry-run]" >&2
-    return 2
-  fi
-  if [[ ! "$issue_id" =~ ^I-[0-9]+$ ]]; then
-    echo "close: issue id must look like I-### (got '$issue_id')" >&2
-    return 2
-  fi
-
-  # pm_apply/pm_fold/pm_lock resolve root via $PM_ROOT (else cwd search),
-  # not via an explicit argument — pin $PM_ROOT to the given root for the
-  # duration so a caller whose cwd isn't the repo root still lands events
-  # in the right place, then restore whatever the caller had.
-  local had_pm_root=0 prev_pm_root=""
-  if [[ -n "${PM_ROOT+x}" ]]; then
-    had_pm_root=1
-    prev_pm_root="$PM_ROOT"
-  fi
-  export PM_ROOT="$root"
-
-  if ! pm_lock "$root"; then
-    if [[ "$had_pm_root" -eq 1 ]]; then
-      export PM_ROOT="$prev_pm_root"
-    else
-      unset PM_ROOT
-    fi
+pm_config_repos() {
+  # pm_config_repos <config.json path>
+  # Echo a normalized JSON LIST of repo objects:
+  #   {"name", "path", "mainline", "mainline_ref", "fetch_policy",
+  #    "merge_mode", "allow_marker_branch_deleted"}
+  # (absent per-entry keys -> null; unknown extra keys are preserved).
+  # Every tool that reads `repos` MUST call this instead of re-parsing, so
+  # shape tolerance can never diverge between tools again (I6: four
+  # independent parsers accepted four different subsets). Canonical shape is
+  # scaffold's -- a LIST of {name, path, ...} objects; a legacy dict
+  # {name: {...}} / {name: "path"} is tolerated. Any entry without BOTH a
+  # non-empty name and a non-empty path is skipped WITH a stderr warning
+  # (surfaced, never silent -- and uniformly: previously ledger-check
+  # probed nameless entries that track dropped without a word). VALUE
+  # validation (e.g. mainline_ref well-formedness) stays with each
+  # consumer's own fail-closed runtime checks. An unreadable/invalid
+  # config yields [] plus a warning, never a crash.
+  local config_path="${1:-}"
+  if [[ -z "$config_path" ]]; then
+    echo "pm_config_repos: missing <config.json path>" >&2
     return 1
   fi
+  PM_CFG_PATH="$config_path" python3 - <<'PYEOF'
+import json
+import os
+import sys
 
-  local rc=0
-  if _pm_close_issue_core "$root" "$issue_id" "$dry_run"; then
-    rc=0
-  else
-    rc=$?
-  fi
+cfg_path = os.environ["PM_CFG_PATH"]
+try:
+    with open(cfg_path) as f:
+        cfg = json.load(f)
+except Exception as e:
+    print(f"pm_config_repos: WARN: cannot read {cfg_path}: {e}", file=sys.stderr)
+    print("[]")
+    raise SystemExit(0)
 
-  if [[ "$had_pm_root" -eq 1 ]]; then
-    export PM_ROOT="$prev_pm_root"
-  else
-    unset PM_ROOT
-  fi
+repos = cfg.get("repos")
+KNOWN = (
+    "mainline",
+    "mainline_ref",
+    "fetch_policy",
+    "merge_mode",
+    "allow_marker_branch_deleted",
+)
+out = []
 
-  pm_unlock
-  return "$rc"
-}
 
-_pm_close_issue_core() {
-  # _pm_close_issue_core <repo_root> <I-###> <dry_run:0|1>
-  # The lock-held, PM_ROOT-pinned body of pm_close_issue. Every fallible
-  # command in here is explicitly checked (never a bare command whose
-  # failure would trigger an uncaught `set -e` abort) so that returning is
-  # always reached and pm_close_issue's cleanup tail always runs.
-  local root="$1" issue_id="$2" dry_run="$3"
-  local rc=0
-  local index="${root}/.pm/index.json"
+def add(name, val, where):
+    entry = {}
+    if isinstance(val, dict):
+        entry = dict(val)
+        path = entry.get("path") or ""
+    elif isinstance(val, str):
+        path = val
+    else:
+        print(
+            f"pm_config_repos: WARN: skipping repos entry {where}: "
+            f"not an object or path string",
+            file=sys.stderr,
+        )
+        return
+    if not (isinstance(name, str) and name) or not (isinstance(path, str) and path):
+        print(
+            f"pm_config_repos: WARN: skipping repos entry {where}: "
+            "missing a non-empty name and/or path (canonical shape is a list "
+            'of {"name", "path", "mainline", ...} objects)',
+            file=sys.stderr,
+        )
+        return
+    entry["name"] = name
+    entry["path"] = path
+    for k in KNOWN:
+        entry.setdefault(k, None)
+    out.append(entry)
 
-  # P3-4: every refusal class below opens its stderr line with a STABLE
-  # machine-readable token (close-refused-unfoldable-log /
-  # close-refused-never-registered / close-refused-state-race), and a
-  # durable-but-incomplete close additionally emits close-transition-durable
-  # before returning -- callers (track's auto-close classifier) key on
-  # these exact tokens; change them in both places or not at all.
-  pm_fold "$root" || {
-    echo "close-refused-unfoldable-log: pm_fold failed; refusing to close $issue_id against an unfoldable log" >&2
-    rc=1
-  }
-  if [[ "$rc" -eq 0 && ! -f "$index" ]]; then
-    echo "close: no index at $index after fold" >&2
-    rc=1
-  fi
 
-  local from_state=""
-  if [[ "$rc" -eq 0 ]]; then
-    from_state="$(_pm_close_issue_state "$issue_id" "$index")"
-    if [[ "$from_state" == "NONE" ]]; then
-      echo "close-refused-never-registered: refusing to close $issue_id: it was never registered (no issue_state event on record). You cannot close an issue that was never opened." >&2
-      rc=1
-    fi
-  fi
+if isinstance(repos, dict):
+    for name, val in repos.items():
+        add(name, val, f"'{name}'")
+elif isinstance(repos, list):
+    for idx, val in enumerate(repos):
+        name = val.get("name") if isinstance(val, dict) else None
+        add(name, val, f"[{idx}]")
+elif repos is not None:
+    print(
+        f"pm_config_repos: WARN: repos has unsupported type "
+        f"{type(repos).__name__}; treating as empty",
+        file=sys.stderr,
+    )
 
-  # NOTE: `did_something` tracks whether at least one file was ACTUALLY
-  # archived below -- it must NOT be set by the transition alone, or a
-  # transition-succeeded-but-archive-entirely-failed run would still emit a
-  # false `note --ref archived:<I>` audit event (FIX-1).
-  #
-  # `did_transition` (FIX-B) tracks separately whether the CLOSED
-  # `issue_state` event was actually emitted this run. Pre-refactor `close`
-  # semantics: the `archived:<I>` note fires whenever the transition
-  # happened OR any file was archived -- a pure close with zero files to
-  # archive must still get the note + "done" outcome (it is not a no-op).
-  local did_something=0
-  local did_transition=0
-  if [[ "$rc" -eq 0 ]]; then
-    if [[ "$from_state" == "CLOSED" ]]; then
-      echo "close: $issue_id already CLOSED; skipping transition"
-    elif [[ "$dry_run" -eq 1 ]]; then
-      echo "would close $issue_id (currently $from_state)"
-    else
-      local apply_out
-      if apply_out="$(pm_apply issue_state i="$issue_id" from="$from_state" to=CLOSED at="$(date -u +%Y-%m-%dT%H:%M:%SZ)" 2>&1 1>/dev/null)"; then
-        did_transition=1
-      else
-        echo "close-refused-state-race: refusing to close $issue_id: current=$from_state requested=CLOSED ($apply_out). No event was emitted." >&2
-        rc=1
-      fi
-    fi
-  fi
-
-  # Archive ephemeral working files. Deliberately still done under the same
-  # held pm_lock as the transition above (atomic close+archive): archive
-  # I/O here is fast local mkdir/mv/git-mv on a handful of files, so the
-  # lock-contention window this adds for any other waiter is bounded; a
-  # crash mid-archive leaves the log/index consistent (the transition event,
-  # if any, is already durably appended) and a re-run of close/track's
-  # auto-close finishes the archive idempotently.
-  local archive_failed=0
-  if [[ "$rc" -eq 0 ]]; then
-    local subdir src_dir dest_dir f base dest relpath mkdir_err mv_err
-    for subdir in prompts messages; do
-      src_dir="${root}/${subdir}"
-      dest_dir="${root}/archive/${subdir}"
-
-      if [[ "$dry_run" -ne 1 ]]; then
-        if ! mkdir_err="$(mkdir -p "$dest_dir" 2>&1)"; then
-          echo "close: failed to create archive/${subdir}/ ($mkdir_err); ${subdir}/${issue_id}_* left unarchived" >&2
-          archive_failed=1
-          continue
-        fi
-      fi
-      [[ -d "$src_dir" ]] || continue
-
-      for f in "$src_dir/${issue_id}_"*; do
-        [[ -e "$f" ]] || continue # no match (glob didn't expand)
-        base="$(basename "$f")"
-        dest="${dest_dir}/${base}"
-        relpath="${subdir}/${base}"
-
-        if [[ -e "$dest" ]]; then
-          echo "close: WARNING: archive/${subdir}/${base} already exists; skipping (not clobbering)" >&2
-          continue
-        fi
-
-        if [[ "$dry_run" -eq 1 ]]; then
-          echo "would archive: ${subdir}/${base} -> archive/${subdir}/${base}"
-          continue
-        fi
-
-        if git -C "$root" rev-parse --is-inside-work-tree > /dev/null 2>&1 \
-          && git -C "$root" ls-files --error-unmatch "$relpath" > /dev/null 2>&1; then
-          if ! mv_err="$(git -C "$root" mv "$relpath" "archive/${subdir}/${base}" 2>&1)"; then
-            echo "close: failed to archive ${subdir}/${base} (git mv: $mv_err)" >&2
-            archive_failed=1
-            continue
-          fi
-        else
-          if ! mv_err="$(mv "$f" "$dest" 2>&1)"; then
-            echo "close: failed to archive ${subdir}/${base} (mv: $mv_err)" >&2
-            archive_failed=1
-            continue
-          fi
-        fi
-        echo "close: archived ${subdir}/${base} -> archive/${subdir}/${base}"
-        did_something=1
-      done
-    done
-  fi
-
-  # FIX-A: a failed/partial archive must never emit the `archived:<I>` note
-  # -- fold `archive_failed` into `rc` BEFORE the note-emission decision
-  # below, so a partial failure returns nonzero, emits NO note, and leaves
-  # the CLOSED transition + already-moved files in place (idempotent). A
-  # subsequent re-run (issue already CLOSED -> transition skipped) archives
-  # the remaining files cleanly and emits the note exactly once.
-  if [[ "$rc" -eq 0 && "$archive_failed" -eq 1 ]]; then
-    rc=1
-  fi
-
-  if [[ "$rc" -eq 0 ]]; then
-    if [[ "$dry_run" -eq 1 ]]; then
-      echo "close: dry-run complete for $issue_id; nothing moved, no event emitted"
-    elif [[ "$did_transition" -eq 1 || "$did_something" -eq 1 ]]; then
-      # FIX-B: the note (and "done" outcome) fires whenever the CLOSED
-      # transition happened this run OR any file was archived this run --
-      # matches pre-refactor `close` semantics. A pure close with zero
-      # files to archive is NOT a no-op.
-      local note_out
-      if note_out="$(pm_apply note at="$(date -u +%Y-%m-%dT%H:%M:%SZ)" ref="archived:${issue_id}" i="$issue_id" 2>&1 1>/dev/null)"; then
-        echo "close: $issue_id done (transition + archive recorded)"
-      else
-        echo "close: refusing note ref=archived:${issue_id} ($note_out). No event was emitted." >&2
-        rc=1
-      fi
-    else
-      echo "close: $issue_id already closed and nothing to archive; no-op"
-    fi
-  fi
-
-  # P3-4: durability signal -- when the CLOSED transition is durably on the
-  # log (emitted this run, or already there for the rearchive path) but a
-  # LATER step (archive/note) failed, say so with a stable token so callers
-  # can count the issue closed-with-pending-archive instead of "not closed".
-  if [[ "$dry_run" -ne 1 && "$rc" -ne 0 ]]; then
-    if [[ "$did_transition" -eq 1 || "$from_state" == "CLOSED" ]]; then
-      echo "close-transition-durable: $issue_id is durably CLOSED on the log; a later archive/note step failed" >&2
-    fi
-  fi
-
-  return "$rc"
+print(json.dumps(out))
+PYEOF
 }
 
 # ---------------------------------------------------------------------------
-# escapers — one function per context, each round-trips or neutralizes
-# hostile input (spaces, newlines, $(), backticks, ;, |, glob chars, quotes,
-# leading -).
+# _PM_MD_PY — shared Markdown-surface python helpers (single-sourced, I8)
+# ---------------------------------------------------------------------------
+# The ONE copy of the GENERATED-block writer (render_marker) and the
+# Markdown-injection escapers (esc_md_inline / esc_md_cell / esc_md_heading)
+# used by track's and reconcile's embedded python. Consumers PREPEND this
+# snippet to their driver -- never copy-paste it -- the same way track
+# composes _TR_CORROB_PY:
+#   bash -c 'printf "%s\n%s\n" "$1" "$2" | python3 -' _ "${_PM_MD_PY}" "${driver}"
+# Contract: render_marker appends its skip notices to a global `conflicts`
+# list, which the DRIVER must define before calling it.
+# shellcheck disable=SC2034  # consumed by sourcing scripts (track/reconcile)
+read -r -d '' _PM_MD_PY <<'PYEOF' || true
+import os
+import re
+
+
+def esc_md_inline(value):
+    # Backslash-escape GFM inline-Markdown-active characters so a value we
+    # did not author cannot be reinterpreted as emphasis, code spans,
+    # links, or (if it lands at the very start of a line) a heading/list/
+    # blockquote marker. Must run AFTER any "&"/pipe HTML-entity escaping
+    # so the backslashes it inserts are never themselves re-escaped.
+    s = "" if value is None else str(value)
+    s = re.sub(r"([`*_\[\]()~])", r"\\\1", s)
+    s = re.sub(r"^([#>+-])", r"\\\1", s)
+    # Ordered-list marker: the backslash must precede the "." (CommonMark
+    # does not treat "\<digit>" as an escape -- only "\." is), not the digits.
+    s = re.sub(r"^(\d+)\.", r"\1\\.", s)
+    return s
+
+
+def esc_md_cell(value):
+    # Sanitize a value for use inside a Markdown table cell: neutralize
+    # embedded HTML, pipes, line breaks, and inline Markdown syntax so a
+    # value we did not author (a repo path, branch name, herdr tab label,
+    # or status string) can never break out of its row/column, fabricate
+    # extra table rows, render as live HTML, or render as live Markdown
+    # (emphasis, code spans, links). Order matters: escape "&" first so the
+    # entities produced by the later replacements are not themselves
+    # re-escaped, then pipes, then the inline-Markdown backslash-escapes.
+    s = "" if value is None else str(value)
+    s = s.replace("&", "&amp;")
+    s = s.replace("<", "&lt;").replace(">", "&gt;")
+    # GFM table-cell pipe escaping via "\|" is ambiguous next to other
+    # backslashes; the HTML entity is unambiguous regardless of context.
+    s = s.replace("|", "&#124;")
+    s = s.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+    s = esc_md_inline(s)
+    return s
+
+
+def esc_md_heading(value):
+    # Sanitize a value for use as Markdown heading text (e.g. "### {name}"):
+    # strip CR/LF so it cannot inject a new line that starts its own
+    # heading/fence, escape HTML so it cannot render as live markup,
+    # neutralize inline Markdown syntax (emphasis, code spans, links) so
+    # the value renders literally, and neutralize a leading "#" or
+    # backtick by escaping just that first character -- CommonMark's
+    # ATX-heading rule only fires when "#" is the very first character of
+    # the line, so a leading "\#"/"\`" can never be reinterpreted as a
+    # heading marker or code-fence opener. Order matters: HTML entities
+    # first, then the inline-Markdown backslash-escapes, so the escaping
+    # backslashes are not themselves re-escaped.
+    s = "" if value is None else str(value)
+    s = s.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+    s = s.replace("&", "&amp;")
+    s = s.replace("<", "&lt;").replace(">", "&gt;")
+    s = esc_md_inline(s)
+    return s
+
+
+def render_marker(md_path, key, body):
+    # The GENERATED-block writer: replace ONLY the bytes between the
+    # BEGIN/END markers for `key`, never anything outside them (hand-
+    # authored prose is sacred). Missing file / missing markers append a
+    # skip notice to the driver's global `conflicts` list -- surfaced,
+    # never fatal.
+    if not os.path.isfile(md_path):
+        conflicts.append(f"{os.path.basename(md_path)}: file not found at {md_path} -- skipped")
+        return
+    with open(md_path, "r") as f:
+        content = f.read()
+    begin = f"<!-- GENERATED:BEGIN {key} -->"
+    end = f"<!-- GENERATED:END {key} -->"
+    pattern = re.compile(re.escape(begin) + r".*?" + re.escape(end), re.DOTALL)
+    if not pattern.search(content):
+        conflicts.append(
+            f"{os.path.basename(md_path)}: no '{key}' GENERATED markers found -- skipped "
+            f"(scaffold may not have materialized them yet)"
+        )
+        return
+    replacement = f"{begin}\n{body}\n{end}"
+    # NOTE: pass the replacement via a lambda so re.sub treats it as a
+    # literal string -- it must NOT go through re.sub's plain-string
+    # replacement path (which interprets backslash escapes / \g<...>
+    # group references and would corrupt any literal backslash in a
+    # label or path inside `body`).
+    new_content = pattern.sub(lambda _m: replacement, content, count=1)
+    if new_content != content:
+        with open(md_path, "w") as f:
+            f.write(new_content)
+PYEOF
+
+# ---------------------------------------------------------------------------
+# pm_close_issue — in-process, lock-reentrant core of `bin/close`.
+# The close-and-archive block (~275 lines: _pm_close_issue_state /
+# pm_close_issue / _pm_close_issue_core) lives in the sibling
+# _close_lib.sh (I24); sourcing it here keeps the FROZEN API surface of
+# this file unchanged for every existing consumer.
+# ---------------------------------------------------------------------------
+# shellcheck source=./_close_lib.sh
+# shellcheck disable=SC1091
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_close_lib.sh"
+
+# ---------------------------------------------------------------------------
+# escapers — esc_shell is the ONE bash escaper with real call sites
+# (dispatch-prep's printed herdr command). The former esc_md / esc_json /
+# esc_path / esc_gitref were deleted (I14): zero call sites in any shipped
+# script, while the Markdown job is actually done by the shared _PM_MD_PY
+# python helpers above -- keeping dead near-duplicates of a security
+# surface invites drift. Re-add a context-specific escaper only WITH its
+# first real caller.
 # ---------------------------------------------------------------------------
 
 esc_shell() {
@@ -1941,102 +1911,4 @@ esc_shell() {
   # word; neutralizes $(), backticks, ;, |, globs, leading '-'.
   local s="${1-}"
   printf "'%s'" "${s//\'/\'\\\'\'}"
-}
-
-esc_md() {
-  # esc_md <string>
-  # Escape Markdown special characters so the string renders as literal text
-  # rather than being interpreted as Markdown syntax.
-  local s="${1-}"
-  s="${s//\\/\\\\}"
-  local special='`*_{}[]()#+.!|<>~-'
-  local i out=""
-  for ((i = 0; i < ${#s}; i++)); do
-    local c="${s:i:1}"
-    if [[ "$special" == *"$c"* ]]; then
-      out+="\\$c"
-    else
-      out+="$c"
-    fi
-  done
-  printf '%s' "$out"
-}
-
-esc_json() {
-  # esc_json <string>
-  # Echo a JSON-string-safe token WITHOUT surrounding quotes (caller wraps in
-  # "..."). Delegates to python3 json.dumps and strips the outer quotes.
-  local s="${1-}"
-  PM_ESC_INPUT="$s" python3 -c '
-import json, os
-s = os.environ.get("PM_ESC_INPUT", "")
-print(json.dumps(s)[1:-1], end="")
-'
-}
-
-esc_path() {
-  # esc_path <string>
-  # Neutralize a string for safe use as a single path COMPONENT/argument:
-  # prefix a leading '-' with './' (arg-injection guard). REJECTS (returns
-  # non-zero, prints nothing) a string containing an embedded newline,
-  # rather than silently stripping it — stripping is unsafe because it can
-  # collide distinct inputs (e.g. "a\nc" and "ac" would both silently
-  # become "ac", and "a\nc" would previously become "ac" while looking like
-  # a no-op to a caller not checking the return code).
-  #
-  # NOT A CONTAINMENT CHECK: this does not resolve or reject '..' path
-  # segments, symlinks, or absolute-path escapes — a caller needing to keep
-  # a path inside some root must additionally validate that itself. This
-  # function only guards against the string being parsed as a flag and
-  # against embedded newlines corrupting whatever line-oriented format it's
-  # placed into.
-  local s="${1-}"
-  if [[ "$s" == *$'\n'* ]]; then
-    echo "esc_path: refusing string with embedded newline" >&2
-    return 1
-  fi
-  if [[ "$s" == -* ]]; then
-    s="./$s"
-  fi
-  printf '%s' "$s"
-}
-
-esc_gitref() {
-  # esc_gitref <string>
-  # Sanitize a string into something safe to use as (part of) a git ref
-  # name per `git check-ref-format` (no space ~ ^ : ? * [ \ control chars,
-  # no consecutive dots, no leading dot / trailing dot, no double slash, no
-  # leading/trailing slash, no trailing '.lock'). '.' is treated as
-  # not-safe-on-its-own and mapped away entirely (simpler than tracking
-  # per-component dot placement) so callers get a single unambiguous rule.
-  #
-  # NEUTRALIZES RATHER THAN PRESERVES IDENTITY: this is a many-to-one
-  # mapping (e.g. every disallowed character collapses to the same '-'), so
-  # two distinct hostile inputs can legitimately sanitize to the same
-  # output. Callers must not assume the result round-trips back to the
-  # original string, or that distinct inputs stay distinct after
-  # sanitizing — only that the output is always a safe ref token.
-  local s="${1-}"
-  s="${s//$'\n'/-}"
-  local out="" i c
-  for ((i = 0; i < ${#s}; i++)); do
-    c="${s:i:1}"
-    case "$c" in
-      [A-Za-z0-9_/-]) out+="$c" ;;
-      *) out+="-" ;;
-    esac
-  done
-  # collapse repeated slashes/dashes; trim leading/trailing separators
-  # (repeatedly — they can alternate, e.g. "-/-" — until both ends are clean).
-  while [[ "$out" == *"//"* ]]; do out="${out//\/\//\/}"; done
-  while [[ "$out" == *"--"* ]]; do out="${out//--/-}"; done
-  while [[ "$out" == -* || "$out" == /* || "$out" == *- || "$out" == */ ]]; do
-    out="${out#[-/]}"
-    out="${out%[-/]}"
-  done
-  out="${out%.lock}"
-  if [[ -z "$out" ]]; then
-    out="ref"
-  fi
-  printf '%s' "$out"
 }

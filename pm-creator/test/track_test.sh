@@ -10,6 +10,9 @@ THIS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PM_CREATOR_DIR="$(cd "${THIS_DIR}/.." && pwd)"
 LIB="${PM_CREATOR_DIR}/templates/bin/_lib.sh"
 TRACK="${PM_CREATOR_DIR}/templates/bin/track"
+# I25: track's auto-close pass and spawn stage live in sourced components
+TRACK_AUTOCLOSE="${PM_CREATOR_DIR}/templates/bin/_track_autoclose"
+TRACK_SPAWN="${PM_CREATOR_DIR}/templates/bin/_track_spawn"
 
 # shellcheck source=../templates/bin/_lib.sh
 # shellcheck disable=SC1091
@@ -91,7 +94,10 @@ new_tmp_repo() {
   d="$(mktemp -d "${TMPDIR:-/tmp}/pm-creator-track-test.XXXXXX")"
   mkdir -p "$d/.pm" "$d/bin"
   cp "$LIB" "$d/bin/_lib.sh"
+  cp "${LIB%_lib.sh}_close_lib.sh" "$d/bin/_close_lib.sh"
   cp "$TRACK" "$d/bin/track"
+  cp "$TRACK_AUTOCLOSE" "$d/bin/_track_autoclose"
+  cp "$TRACK_SPAWN" "$d/bin/_track_spawn"
   chmod +x "$d/bin/track"
   cat >"$d/TRACKER.md" <<'EOF'
 # TRACKER — live session auto-record ledger (narrative surface)
@@ -335,6 +341,7 @@ run_track() {
     TR_OUT="$(
       cd "$repo" && \
       HERDR_SNAPSHOT_FIXTURE="$fixture_file" \
+      HERDR_FIXTURES="${THIS_DIR}/fixtures" \
       HERDR_CALL_LOG="${HERDR_CALL_LOG:-}" \
       HERDR_TAB_CREATE_MODE="${HERDR_TAB_CREATE_MODE:-ok}" \
       HERDR_AGENT_START_MODE="${HERDR_AGENT_START_MODE:-ok}" \
@@ -343,10 +350,13 @@ run_track() {
       PATH="/usr/bin:/bin" \
       bash -c '
         # herdr shadow (B3-extended): `api snapshot` returns the fixture;
-        # `tab create` / `agent start` / `tab close` emit the EXACT
-        # live-probed herdr JSON shapes (success and error variants), log
-        # their full argv to HERDR_CALL_LOG, and never touch the real herdr
-        # binary or a live workspace. HERDR_RACE_APPEND injects a raw
+        # `tab create` / `agent start` / `tab close` emit the live-probed
+        # herdr JSON shapes from test/fixtures/herdr_*.json (I21: version
+        # pin + provenance in test/fixtures/herdr_README.md; sed fills the
+        # __N__/__LABEL__/__NAME__/__TAB__ placeholders -- test labels stay
+        # inside the pm token charset, so plain sed substitution is safe),
+        # log their full argv to HERDR_CALL_LOG, and never touch the real
+        # herdr binary or a live workspace. HERDR_RACE_APPEND injects a raw
         # event-log line during `tab create` -- inside track own
         # intent->ack window -- to reproduce the TOCTOU race
         # deterministically; HERDR_TAMPER_PROMPT appends junk to the named
@@ -363,11 +373,11 @@ run_track() {
               if [[ -n "${HERDR_RACE_APPEND:-}" ]]; then printf "%s\n" "$HERDR_RACE_APPEND" >>.pm/events.log; fi
               if [[ -n "${HERDR_TAMPER_PROMPT:-}" ]]; then printf "tampered mid-window\n" >>"$HERDR_TAMPER_PROMPT"; fi
               if [[ "${HERDR_TAB_CREATE_MODE:-ok}" == "fail" ]]; then
-                printf "{\"error\":{\"code\":\"workspace_not_found\",\"message\":\"zzz-test tab create failure\"},\"id\":\"cli:tab:create\"}\n"
+                cat "$HERDR_FIXTURES/herdr_tab_create_error.json"
                 return 1
               fi
               if [[ "${HERDR_TAB_CREATE_MODE:-ok}" == "ok_no_id" ]]; then
-                printf "{\"id\":\"cli:tab:create\",\"result\":{\"root_pane\":{},\"tab\":{\"agent_status\":\"unknown\",\"label\":\"x\",\"workspace_id\":\"zzz-test-ws\"},\"type\":\"tab_created\"}}\n"
+                cat "$HERDR_FIXTURES/herdr_tab_created_no_id.json"
                 return 0
               fi
               local label="" prev="" arg n=1
@@ -375,17 +385,17 @@ run_track() {
                 if [[ "$prev" == "--label" ]]; then label="$arg"; fi
                 prev="$arg"
               done
-              if [[ -n "${HERDR_CALL_LOG:-}" ]]; then n="$(grep -c "^tab create" "$HERDR_CALL_LOG" 2>/dev/null || echo 1)"; fi
-              printf "{\"id\":\"cli:tab:create\",\"result\":{\"root_pane\":{\"pane_id\":\"zzz-test-ws:p8%s\"},\"tab\":{\"agent_status\":\"unknown\",\"label\":\"%s\",\"tab_id\":\"zzz-test-ws:t9%s\",\"workspace_id\":\"zzz-test-ws\"},\"type\":\"tab_created\"}}\n" "$n" "$label" "$n"
+              if [[ -n "${HERDR_CALL_LOG:-}" ]]; then n="$(grep -c "^tab create" "$HERDR_CALL_LOG" 2>/dev/null)" || n=1; fi
+              sed -e "s|__N__|$n|g" -e "s|__LABEL__|$label|g" "$HERDR_FIXTURES/herdr_tab_created.json"
               ;;
             "tab close")
               if [[ -n "${HERDR_CALL_LOG:-}" ]]; then printf "%s\n" "$*" >>"$HERDR_CALL_LOG"; fi
-              printf "{\"id\":\"cli:tab:close\",\"result\":{\"type\":\"tab_closed\"}}\n"
+              cat "$HERDR_FIXTURES/herdr_tab_closed.json"
               ;;
             "agent start")
               if [[ -n "${HERDR_CALL_LOG:-}" ]]; then printf "%s\n" "$*" >>"$HERDR_CALL_LOG"; fi
               if [[ "${HERDR_AGENT_START_MODE:-ok}" == "fail" ]]; then
-                printf "{\"error\":{\"code\":\"agent_placement_not_found\",\"message\":\"zzz-test agent start failure\"},\"id\":\"cli:agent:start\"}\n"
+                cat "$HERDR_FIXTURES/herdr_agent_start_error.json"
                 return 1
               fi
               local name="$3" tab="" prev="" arg
@@ -393,7 +403,7 @@ run_track() {
                 if [[ "$prev" == "--tab" ]]; then tab="$arg"; fi
                 prev="$arg"
               done
-              printf "{\"id\":\"cli:agent:start\",\"result\":{\"agent\":{\"agent_status\":\"unknown\",\"name\":\"%s\",\"pane_id\":\"zzz-test-ws:p77\",\"tab_id\":\"%s\",\"workspace_id\":\"zzz-test-ws\"},\"argv\":[\"%s\"],\"type\":\"agent_started\"}}\n" "$name" "$tab" "$name"
+              sed -e "s|__NAME__|$name|g" -e "s|__TAB__|$tab|g" "$HERDR_FIXTURES/herdr_agent_started.json"
               ;;
             *) return 1 ;;
           esac
@@ -766,6 +776,40 @@ section_surface_worktree_missing() {
   seed_acked_dispatch "$repo" D-917 I-917 zzz-test-tab-917 i917-nowt "$base_sha"
   run_track "$repo" "$(snapshot_json zzz-test-tab-917 "done" "i917-nowt")"
   assert_surfaced_not_recorded "worktree-missing" "$repo" "D-917" "worktree-missing"
+  rm -rf "$repo"
+}
+
+# C1 regression: a worker that does zero real work and simply resets its
+# ticket branch onto a FOREIGN mainline tip (advanced by unrelated work
+# after this dispatch's base_sha was minted) must NOT strictly
+# git-corroborate. Before the C1 fix, branch_tip != base_sha (no-new-commit
+# misses) and base_sha IS an ancestor of branch_tip (not-descendant misses,
+# since mainline only moves forward) -- track would auto-RECORD the
+# foreign commit as this worker's own result.
+section_surface_branch_contains_no_new_work() {
+  local repo gitrepo base_sha foreign_tip
+  repo="$(new_tmp_repo_with_git)"
+  gitrepo="$repo/target-repo"
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+
+  # Unrelated work advances mainline PAST this dispatch's base_sha, done
+  # entirely by someone/something else -- not this ticket's worker.
+  git_or_die "branch-contains-no-new-work: unrelated mainline commit" \
+    -C "$gitrepo" commit --allow-empty -q -m 'unrelated work by another dispatch'
+  foreign_tip="$(git -C "$gitrepo" rev-parse HEAD)"
+
+  # The worker does zero work of its own: its ticket branch is simply cut
+  # at (equivalent to `git reset --hard main` onto) the foreign tip.
+  git_or_die "branch-contains-no-new-work: branch i918-forge at foreign tip" \
+    -C "$gitrepo" branch i918-forge "$foreign_tip"
+  git_or_die "branch-contains-no-new-work: worktree add wt-918" \
+    -C "$gitrepo" worktree add -q "$repo/wt-918" i918-forge
+
+  seed_acked_dispatch "$repo" D-918 I-918 zzz-test-tab-918 i918-forge "$base_sha"
+  run_track "$repo" "$(snapshot_json zzz-test-tab-918 "done" "i918-forge")"
+  assert_surfaced_not_recorded "branch-contains-no-new-work" "$repo" "D-918" \
+    "branch-contains-no-new-work"
+  git -C "$gitrepo" worktree remove --force "$repo/wt-918" >/dev/null 2>&1 || true
   rm -rf "$repo"
 }
 
@@ -2400,6 +2444,14 @@ section_ac_auto_close_disabled() {
 # SAME tick's intake pass is not yet VERIFIED (human gate not yet applied),
 # so G3 naturally blocks its issue from auto-closing in the same tick --
 # no auto-record -> auto-close cascade in one tick.
+#
+# Deliberately does NOT pre-merge the worker's tip into mainline (unlike
+# sibling AC sections that seed an already-RETURNED/VERIFIED dispatch): the
+# C1 fix refuses stage-1 git corroboration (RECORD) for a branch tip that's
+# already reachable from mainline (branch-contains-no-new-work) -- doing
+# that here would prevent D-980 from ever reaching RETURNED this tick,
+# which is orthogonal to what this section actually asserts (G3's
+# dispatch-not-VERIFIED gate fires irrespective of mainline state).
 # ---------------------------------------------------------------------------
 section_ac_same_tick_safety() {
   local repo gitrepo base_sha tip
@@ -2410,7 +2462,6 @@ section_ac_same_tick_safety() {
 
   seed_acked_dispatch "$repo" D-980 I-980 zzz-test-tab-980 i980-x "$base_sha"
   seed_issue_state "$repo" I-980 OPEN ACTIVE
-  ac_merge_worker_tip_to_mainline "$gitrepo" "$tip"
 
   run_track "$repo" "$(snapshot_json zzz-test-tab-980 "done" "i980-x")"
   assert_eq "ac same-tick: exit 0" "0" "$TR_RC"
@@ -2601,7 +2652,8 @@ section_ac_p22_branch_not_ticket_convention() {
 }
 
 # AC fix-pass-5b item 2: the close-outcome classifier
-# (tr_ac_classify_close_failure, defined in templates/bin/track) must key
+# (tr_ac_classify_close_failure, defined in templates/bin/_track_autoclose,
+# track's sourced auto-close component) must key
 # on WHOLE stderr LINES that _lib.sh itself emits with a `<token>: ...`
 # prefix (P3-4) -- never a bare substring match over the captured blob,
 # which embeds pm_apply's own output and could let attacker/data-controlled
@@ -2610,7 +2662,7 @@ section_ac_p22_branch_not_ticket_convention() {
 # definition (never the whole `track` script, which has no main-guard and
 # would run real side effects) so this is a true unit-level test.
 section_ac_close_classifier_line_anchored() {
-  local track_bin="$TRACK" fn_file got
+  local track_bin="$TRACK_AUTOCLOSE" fn_file got
   fn_file="$(mktemp)"
 
   awk '/^tr_ac_classify_close_failure\(\) \{/,/^}/' "$track_bin" > "$fn_file"
@@ -2665,10 +2717,10 @@ extract_track_py() {
       awk "/^read -r -d '' _TR_CORROB_PY <<'PYEOF'/{f=1;next} f&&/^PYEOF\$/{exit} f" "$TRACK" > "$out"
       ;;
     close)
-      awk "/^read -r -d '' _TR_CLOSE_PY <<'PYEOF'/{f=1;next} f&&/^PYEOF\$/{exit} f" "$TRACK" > "$out"
+      awk "/^read -r -d '' _TR_CLOSE_PY <<'PYEOF'/{f=1;next} f&&/^PYEOF\$/{exit} f" "$TRACK_AUTOCLOSE" > "$out"
       ;;
     driver)
-      awk "/^_tr_ac_driver='\$/{f=1;next} f&&/^'\$/{exit} f" "$TRACK" > "$out"
+      awk "/^_tr_ac_driver='\$/{f=1;next} f&&/^'\$/{exit} f" "$TRACK_AUTOCLOSE" > "$out"
       ;;
     *)
       echo "extract_track_py: unknown region '$which'" >&2
@@ -2873,13 +2925,18 @@ section_p34_close_refusal_tokens() {
     bash -c '[[ "$1" == *close-refused-never-registered* ]]' _ "$out"
   rm -rf "$repo"
 
-  # (iii) unfoldable log -- pm_fold cannot rewrite a read-only index.json.
+  # (iii) unfoldable log -- pm_fold cannot write the index. A read-only
+  # index.json no longer triggers this (C5: the fold writes <path>.tmp +
+  # os.replace, which only needs DIRECTORY write permission); a read-only
+  # .pm/ blocks the tmp-file creation itself. The .lock file already
+  # exists (seed_issue_state applied events), so pm_lock's append-open
+  # still succeeds against the read-only directory.
   repo="$(new_tmp_repo)"
   seed_issue_state "$repo" I-778 OPEN ACTIVE
-  chmod 444 "$repo/.pm/index.json"
+  chmod 555 "$repo/.pm"
   out="$(pm_close_issue "$repo" I-778 2>&1)"
   rc=$?
-  chmod 644 "$repo/.pm/index.json"
+  chmod 755 "$repo/.pm"
   assert_true "p3-4 unfoldable-log: nonzero rc" bash -c '[[ "$1" != "0" ]]' _ "$rc"
   assert_true "p3-4 unfoldable-log: refusal branch actually hit" \
     bash -c '[[ "$1" == *unfoldable* ]]' _ "$out"
@@ -3583,6 +3640,44 @@ section_ac_marker_result_equals_base() {
 }
 
 # ---------------------------------------------------------------------------
+# review C2: a marker's merge_sha may be a REAL, verified, on-mainline
+# commit and still be a lie -- if it landed BEFORE this dispatch's own
+# base_sha, it proves nothing about this dispatch's work (it's some earlier,
+# unrelated squash-merge the attacker recycled as the marker's merge_sha).
+# merge_sha must not be an ancestor of (or equal to) base_sha -- i.e. it
+# must not predate this dispatch's own base_sha -- otherwise refuse
+# marker-merge-predates-dispatch. Never close.
+# ---------------------------------------------------------------------------
+section_ac_marker_merge_predates_dispatch() {
+  local repo gitrepo old_tip old_squash_sha base_sha tip
+  repo="$(new_tmp_repo_with_git_ac_squash false)"
+  gitrepo="$repo/target-repo"
+  # an EARLIER, unrelated squash-merge that already landed on mainline
+  # before this dispatch's base_sha was ever cut.
+  old_tip="$(ac_make_worker_commit "$gitrepo" "$repo" i335-earlier)"
+  old_squash_sha="$(ac_squash_merge_to_mainline "$gitrepo" "$old_tip")"
+  git -C "$gitrepo" worktree remove --force "$repo/wt-i335-earlier" >/dev/null 2>&1 || true
+
+  # this dispatch's base_sha is cut AFTER that earlier merge landed.
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+  tip="$(ac_make_worker_commit "$gitrepo" "$repo" i335-x)"
+
+  seed_verified_dispatch "$repo" D-335 I-335 zzz-test-tab-335 i335-x "$base_sha" "$tip"
+  seed_issue_state "$repo" I-335 OPEN ACTIVE
+  # marker_result matches att_result (tip) so the mismatch check is
+  # satisfied -- the forgery lives entirely in merge_sha, an old, genuine,
+  # on-mainline commit that predates base_sha.
+  seed_merged_marker "$repo" D-335 "$old_squash_sha" "$tip"
+
+  run_track "$repo"
+  assert_ac_surfaced "ac marker merge predates dispatch base" "$repo" "I-335" \
+    "marker-merge-predates-dispatch"
+
+  git -C "$gitrepo" worktree remove --force "$repo/wt-i335-x" >/dev/null 2>&1 || true
+  rm -rf "$repo"
+}
+
+# ---------------------------------------------------------------------------
 # B2.2 fix-pass-6 F3 e2e: a RAW merged line whose merge_sha is a revision
 # expression ("main") quarantines at the FOLD -- the issue surfaces via the
 # G1.5 quarantine gate and the marker never reaches any git call.
@@ -4024,6 +4119,8 @@ echo "== track: surface -- not-descendant (rewritten/sibling branch) =="
 section_surface_not_descendant
 echo "== track: surface -- worktree-missing =="
 section_surface_worktree_missing
+echo "== track: surface -- branch-contains-no-new-work (C1: foreign mainline reset) =="
+section_surface_branch_contains_no_new_work
 echo "== track: surface -- herdr unavailable degrades gracefully =="
 section_surface_herdr_unavailable
 echo "== track: idempotent re-tick, no double-record =="
@@ -4199,6 +4296,8 @@ echo "== track: B2.2 fix-pass-6 F1b note emission failure blocks close =="
 section_ac_marker_note_emit_failed
 echo "== track: B2.2 fix-pass-6 F2 result==base refused on marker path =="
 section_ac_marker_result_equals_base
+echo "== track: review C2 marker merge_sha must postdate dispatch base =="
+section_ac_marker_merge_predates_dispatch
 echo "== track: B2.2 fix-pass-6 F3 raw non-sha marker quarantined at fold =="
 section_ac_marker_raw_shape_quarantined
 echo "== track: B2.2 fix-pass-6 F4+T2 direct-function marker guards =="
@@ -4844,7 +4943,7 @@ section_spawn_driver_error() {
   repo="$(new_tmp_repo_spawn true 2 5)"
   seed_automation_dispatch "$repo" D-741 I-741 widget
   sed -i 's/^_sp_plan = {"spawn": \[\], "rows": \[\], "steady": {}, "age": {}, "ran": False}$/raise RuntimeError("zzz-test poison")/' \
-    "$repo/bin/track"
+    "$repo/bin/_track_spawn"
   call_log="$(mktemp "${TMPDIR:-/tmp}/pm-creator-spawn-calls.XXXXXX")"
 
   HERDR_CALL_LOG="$call_log" run_track "$repo" "$(spawn_snapshot_json)"
@@ -4869,7 +4968,7 @@ section_spawn_unregistered_reason() {
   seed_automation_dispatch "$repo" D-751 I-751 widget
   seed_spawn_intent "$repo" D-751 A-01 i751-widget-D751A01
   sed -i 's/_sp_surface(_sp_d, "suspected-orphan-intent", _sp_detail)/_sp_surface(_sp_d, "zzz-unregistered-reason", _sp_detail)/' \
-    "$repo/bin/track"
+    "$repo/bin/_track_spawn"
   call_log="$(mktemp "${TMPDIR:-/tmp}/pm-creator-spawn-calls.XXXXXX")"
 
   HERDR_CALL_LOG="$call_log" run_track "$repo" "$(spawn_snapshot_json)"
@@ -4885,13 +4984,15 @@ section_spawn_unregistered_reason() {
 }
 
 # 53c. Static registry check: every reason literal the BASH side of the
-# spawn stage emits (not covered by the python-side runtime check) is a
-# member of the REASONS frozenset in the same file.
+# spawn stage (_track_spawn) emits (not covered by the python-side runtime
+# check) is a member of the REASONS frozenset (in _track_autoclose, in
+# scope at every spawn-stage call site via the composed _TR_CLOSE_PY).
 section_spawn_reason_literals_registered() {
   local reasons_block r
-  reasons_block="$(sed -n '/^REASONS = frozenset({/,/^})/p' "$TRACK")"
-  for r in raced-refused herdr-tab-create-failed herdr-start-failed \
-    capacity-exceeded prompt-sha-mismatch spawn-driver-error spawn-ack-unconfirmed; do
+  reasons_block="$(sed -n '/^REASONS = frozenset({/,/^})/p' "$TRACK_AUTOCLOSE")"
+  for r in raced-refused lease-held-elsewhere herdr-tab-create-failed \
+    herdr-start-failed capacity-exceeded prompt-sha-mismatch \
+    spawn-driver-error spawn-ack-unconfirmed; do
     if [[ "$reasons_block" == *"\"$r\""* ]]; then
       ok "spawn registry: bash-emitted reason '$r' is registered in REASONS"
     else
@@ -5177,6 +5278,122 @@ echo "== 57. B3 fix: hostile snapshot id withheld from the paste command =="
 section_spawn_ack_unconfirmed_hostile_id
 echo "== 58. B3 fix: superseded open intent excluded + reconcile backstop =="
 section_spawn_superseded_open_intent
+
+# ---------------------------------------------------------------------------
+# 59. C6: SIGTERM delivered mid-tick must TERMINATE track (cleanup, then die
+# with 128+SIGTERM), never let it continue into later stages. The shadow
+# herdr's `api snapshot` blocks (marker + sleep) so the signal lands while
+# track is deterministically inside its tick; a pre-C6 track would run the
+# trap, CONTINUE, render TRACKER.md and exit 0. SIGINT shares the identical
+# handler shape but cannot be delivered to a background child of a
+# non-interactive shell (POSIX starts those with SIGINT ignored).
+# ---------------------------------------------------------------------------
+section_sigterm_mid_tick_terminates() {
+  local repo tp rc i
+  repo="$(new_tmp_repo)"
+  # Backgrounded wrapper `exec`s track, so $! IS track's PID and the
+  # signal reaches the process that owns the traps. Shadow herdr only;
+  # zzz-test workspace; never the real binary.
+  # shellcheck disable=SC2016
+  PATH="/usr/bin:/bin" bash -c '
+    cd "$1" || exit 9
+    # shellcheck disable=SC2317,SC2329  # invoked indirectly by bin/track
+    herdr() {
+      if [[ "$1 $2" == "api snapshot" ]]; then
+        touch .zzz-snapshot-called
+        sleep 2
+        printf "{}\n"
+        return 0
+      fi
+      return 1
+    }
+    export -f herdr
+    exec bash bin/track --once
+  ' _ "$repo" >/dev/null 2>&1 &
+  tp=$!
+  i=0
+  while [[ ! -e "$repo/.zzz-snapshot-called" ]]; do
+    i=$((i + 1)); [[ "$i" -ge 50 ]] && break; sleep 0.1
+  done
+  assert_true "sigterm mid-tick: track observably reached the herdr snapshot" \
+    bash -c '[[ "$1" -lt 50 ]]' _ "$i"
+  kill -TERM "$tp" 2>/dev/null || true
+  wait "$tp"
+  rc=$?
+  assert_eq "sigterm mid-tick: track dies with 128+SIGTERM (143), not a completed tick" \
+    "143" "$rc"
+  assert_true "sigterm mid-tick: later stages never ran (TRACKER.md untouched)" \
+    grep -q "no track ticks recorded yet" "$repo/TRACKER.md"
+  rm -rf "$repo"
+}
+
+echo "== 59. C6: SIGTERM mid-tick terminates track =="
+section_sigterm_mid_tick_terminates
+
+# ---------------------------------------------------------------------------
+# 60. C8: a symlink planted at the spawn-intent-age *.tmp* name (not the
+# destination itself -- that's already guarded) must not turn the advisory
+# age-file write into an arbitrary-file clobber. Exercises
+# _tr_sp_write_age_from_plan via the ordinary happy-path spawn tick, which
+# always calls it once a plan actually "ran".
+# ---------------------------------------------------------------------------
+section_spawn_age_write_symlink_tmp_refused() {
+  local repo call_log victim
+  repo="$(new_tmp_repo_spawn true 2 1)"
+  seed_automation_dispatch "$repo" D-901 I-901 widget
+  call_log="$(mktemp "${TMPDIR:-/tmp}/pm-creator-spawn-calls.XXXXXX")"
+  victim="$(mktemp "${TMPDIR:-/tmp}/pm-creator-victim.XXXXXX")"
+  printf 'victim-original-content\n' >"$victim"
+  ln -s "$victim" "$repo/.pm/spawn-intent-age.json.tmp"
+
+  HERDR_CALL_LOG="$call_log" run_track "$repo" "$(spawn_snapshot_json)"
+  assert_eq "spawn age symlink-tmp: exit 0 (advisory write failure never gates the tick)" \
+    "0" "$TR_RC"
+  assert_eq "spawn age symlink-tmp: spawn itself still happened (advisory-only)" \
+    "1" "$(grep -c '^EVENT spawn_intent d=D-901 ' "$repo/.pm/events.log")"
+  assert_eq "spawn age symlink-tmp: victim file untouched" \
+    "victim-original-content" "$(cat "$victim")"
+  assert_true "spawn age symlink-tmp: the planted symlink itself was never followed/replaced" \
+    bash -c 'test -L "$1" && [[ "$(readlink "$1")" == "$2" ]]' \
+    _ "$repo/.pm/spawn-intent-age.json.tmp" "$victim"
+
+  rm -f "$call_log" "$victim"
+  rm -rf "$repo"
+}
+
+# ---------------------------------------------------------------------------
+# 61. C8: same symlink-at-tmp-name attack against _tr_sp_note_cause, driven
+# via the tab-create-failure spawn scenario (the one real call site that
+# calls it with the age file already possibly pre-existing).
+# ---------------------------------------------------------------------------
+section_spawn_note_cause_symlink_tmp_refused() {
+  local repo call_log victim
+  repo="$(new_tmp_repo_spawn true 2 5)"
+  seed_automation_dispatch "$repo" D-902 I-902 widget
+  victim="$(mktemp "${TMPDIR:-/tmp}/pm-creator-victim.XXXXXX")"
+  printf 'victim-original-content\n' >"$victim"
+  ln -s "$victim" "$repo/.pm/spawn-intent-age.json.tmp"
+  call_log="$(mktemp "${TMPDIR:-/tmp}/pm-creator-spawn-calls.XXXXXX")"
+
+  HERDR_CALL_LOG="$call_log" HERDR_TAB_CREATE_MODE=fail run_track "$repo" "$(spawn_snapshot_json)"
+  assert_eq "note-cause symlink-tmp: exit 0 (advisory write failure never gates the tick)" \
+    "0" "$TR_RC"
+  assert_contains "note-cause symlink-tmp: herdr-tab-create-failed still surfaced" \
+    "$TR_OUT" "herdr-tab-create-failed"
+  assert_eq "note-cause symlink-tmp: victim file untouched" \
+    "victim-original-content" "$(cat "$victim")"
+  assert_true "note-cause symlink-tmp: the planted symlink itself was never followed/replaced" \
+    bash -c 'test -L "$1" && [[ "$(readlink "$1")" == "$2" ]]' \
+    _ "$repo/.pm/spawn-intent-age.json.tmp" "$victim"
+
+  rm -f "$call_log" "$victim"
+  rm -rf "$repo"
+}
+
+echo "== 60. C8: symlink-planted spawn-age .tmp write is refused, not followed =="
+section_spawn_age_write_symlink_tmp_refused
+echo "== 61. C8: symlink-planted note-cause .tmp write is refused, not followed =="
+section_spawn_note_cause_symlink_tmp_refused
 
 echo
 echo "-----------------------------------------"

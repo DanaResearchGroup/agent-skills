@@ -84,8 +84,15 @@ new_tmp_repo() {
 }
 
 line_count() {
-  # count of EVENT lines (excludes the schema header) in a repo's log.
-  grep -c '^EVENT ' "$1/.pm/events.log" 2>/dev/null || echo 0
+  # Count of EVENT lines (the schema header matches too) in a repo's log.
+  # NOT `grep -c ... || echo 0`: grep -c already PRINTS "0" on zero matches
+  # (while exiting 1), so that idiom emits "0\n0" and feeds an arithmetic
+  # syntax error downstream (I22 -- the exact trap this file documents at
+  # its count_events note). Capture instead; a missing file (grep exits 2,
+  # prints nothing) defaults to 0.
+  local n
+  n="$(grep -c '^EVENT ' "$1/.pm/events.log" 2>/dev/null)" || true
+  echo "${n:-0}"
 }
 
 # assert_refused_and_quarantined <name-prefix> <repo> <raw-line-for-pm_raw_append...>
@@ -538,30 +545,253 @@ section_supersede_forward_reference() {
 }
 
 # ---------------------------------------------------------------------------
-# L2: a stale lock (owner PID provably dead) must be reclaimed rather than
-# hanging until timeout.
-section_stale_lock_reclaimed() {
-  local repo lockdir
+# Lock primitive (flock, C3/I4/I17). The old mkdir-lock's stale-reclaim
+# protocol had a reproducible ABA race (two waiters could both "reclaim" a
+# dead holder's lock and both enter the critical section) and a permanent
+# wedge (a leftover `.reclaiming` marker blocked reclaim forever). flock(2)
+# has neither: the kernel releases the lock on ANY holder death, so there is
+# no stale state and no reclaim path left to test. These sections bind the
+# new primitive's contract directly.
+#
+# Holder processes below `exec sleep` so the PID we kill is the one holding
+# the lock fd -- a forked child would inherit the fd and keep the kernel
+# lock alive past the kill (the documented fd-inheritance caveat).
+# ---------------------------------------------------------------------------
+
+# Poll until the lock file at $1 is observably HELD (a probe `flock -n`
+# fails). Prints the number of 0.1s polls used; callers assert it stayed
+# under the cap, i.e. the holder really started before the section acted.
+_wait_lock_held() {
+  local lockfile="$1" i=0
+  while flock -n "$lockfile" true 2>/dev/null; do
+    i=$((i + 1))
+    [[ "$i" -ge 50 ]] && break
+    sleep 0.1
+  done
+  printf '%s\n' "$i"
+}
+
+section_lock_mutual_exclusion() {
+  # Two concurrent raw pm_lock holders: their critical sections must
+  # serialize (trace reads IN/OUT/IN/OUT, never IN/IN).
+  local repo trace w first_two
   repo="$(new_tmp_repo)"
-  lockdir="$repo/.pm/.lock"
-  mkdir -p "$lockdir"
-
-  # Fabricate an owner PID that is definitely dead: `( : )` run in the
-  # foreground never sets $!, so actually background a short-lived process,
-  # kill it, and wait on it so its PID is guaranteed dead and reaped.
-  ( sleep 60 ) &
-  local dead_pid=$!
-  kill "$dead_pid" 2>/dev/null || true
-  wait "$dead_pid" 2>/dev/null || true
-  printf '%s\n' "$dead_pid" > "$lockdir/pid"
-
-  assert_true "stale lock: pm_lock reclaims a dead-owner lock instead of hanging" \
+  trace="$repo/.lock-trace"
+  : > "$trace"
+  for w in A B; do
     bash -c '
       source "$1"
-      pm_lock "$2"
-    ' _ "$LIB" "$repo"
-
+      pm_lock "$2" || exit 9
+      echo "IN $3" >> "$4"
+      sleep 0.05
+      echo "OUT $3" >> "$4"
+      pm_unlock
+    ' _ "$LIB" "$repo" "$w" "$trace" &
+  done
+  wait
+  first_two="$(sed -n '1p;2p' "$trace" | grep -c '^IN')"
+  assert_true "flock: 2-way concurrent acquire serializes (no interleaved IN/IN)" \
+    bash -c '[[ "$1" -eq 1 ]]' _ "$first_two"
+  assert_eq "flock: both critical sections completed (4 trace lines)" \
+    "4" "$(wc -l < "$trace" | tr -d ' ')"
   rm -rf "$repo"
+}
+
+section_lock_reentrancy_depth() {
+  local repo out rc
+  repo="$(new_tmp_repo)"
+  out="$(
+    # shellcheck disable=SC1090
+    source "$LIB"
+    pm_lock "$repo" || exit 9
+    pm_lock "$repo" || exit 8
+    printf 'depth=%s\n' "$_PM_LOCK_DEPTH"
+    pm_unlock
+    printf 'held_after_inner_unlock=%s\n' \
+      "$(flock -n "$repo/.pm/.lock" true 2>/dev/null && echo no || echo yes)"
+    pm_unlock
+    printf 'held_after_outer_unlock=%s\n' \
+      "$(flock -n "$repo/.pm/.lock" true 2>/dev/null && echo no || echo yes)"
+  )"
+  rc=$?
+  assert_eq "flock reentrancy: nested acquire+release completes cleanly" "0" "$rc"
+  assert_true "flock reentrancy: nested acquire raises depth to 2" \
+    bash -c '[[ "$1" == *"depth=2"* ]]' _ "$out"
+  assert_true "flock reentrancy: inner unlock keeps the lock held" \
+    bash -c '[[ "$1" == *"held_after_inner_unlock=yes"* ]]' _ "$out"
+  assert_true "flock reentrancy: outer unlock releases the lock" \
+    bash -c '[[ "$1" == *"held_after_outer_unlock=no"* ]]' _ "$out"
+  rm -rf "$repo"
+}
+
+section_lock_released_on_kill9() {
+  # The property the mkdir-lock never had: a kill -9'd holder's lock is
+  # released by the KERNEL, so a fresh acquirer succeeds promptly with no
+  # reclaim protocol and no operator intervention.
+  local repo hp polls
+  repo="$(new_tmp_repo)"
+  bash -c 'source "$1"; pm_lock "$2" || exit 9; exec sleep 60' _ "$LIB" "$repo" &
+  hp=$!
+  polls="$(_wait_lock_held "$repo/.pm/.lock")"
+  assert_true "flock kill-9: holder observably held the lock before the kill" \
+    bash -c '[[ "$1" -lt 50 ]]' _ "$polls"
+  kill -9 "$hp" 2>/dev/null || true
+  wait "$hp" 2>/dev/null || true
+  assert_true "flock kill-9: lock auto-released, fresh acquire succeeds" \
+    bash -c '
+      source "$1"
+      PM_LOCK_TIMEOUT=3 pm_lock "$2"
+    ' _ "$LIB" "$repo"
+  rm -rf "$repo"
+}
+
+section_lock_timeout_message() {
+  local repo hp polls out rc
+  repo="$(new_tmp_repo)"
+  bash -c 'source "$1"; pm_lock "$2" || exit 9; exec sleep 60' _ "$LIB" "$repo" &
+  hp=$!
+  polls="$(_wait_lock_held "$repo/.pm/.lock")"
+  assert_true "flock timeout: holder observably held the lock first" \
+    bash -c '[[ "$1" -lt 50 ]]' _ "$polls"
+  out="$(PM_LOCK_TIMEOUT=1 bash -c 'source "$1"; pm_lock "$2"' _ "$LIB" "$repo" 2>&1)"
+  rc=$?
+  assert_true "flock timeout: returns non-zero while lock held elsewhere" \
+    bash -c '[[ "$1" -ne 0 ]]' _ "$rc"
+  assert_true "flock timeout: operator-facing timeout message present" \
+    bash -c '[[ "$1" == *"timed out waiting for lock"* ]]' _ "$out"
+  kill -9 "$hp" 2>/dev/null || true
+  wait "$hp" 2>/dev/null || true
+  rm -rf "$repo"
+}
+
+# ---------------------------------------------------------------------------
+# C4: the spawn_intent lease is EXCLUSIVE. pm_apply exit 0 must mean "MY
+# append was accepted" (the lease was won), never "the state I asked for
+# already exists" -- track hangs a real herdr spawn off that exit code.
+# ---------------------------------------------------------------------------
+section_spawn_intent_exclusive_lease() {
+  local repo out rc before after
+  repo="$(new_tmp_repo)"
+  PM_ROOT="$repo" pm_apply dispatch_new d=D-300 i=I-001 at="$(now_iso)" >/dev/null
+  PM_ROOT="$repo" pm_apply dispatch_state d=D-300 from=READY to=DISPATCHED lane=automation at="$(now_iso)" >/dev/null
+  PM_ROOT="$repo" pm_apply spawn_intent d=D-300 a=A-01 ref=zzz-test-w-D300A01 at="$(now_iso)" >/dev/null
+  rc=$?
+  assert_eq "spawn lease: first intent accepted" "0" "$rc"
+
+  before="$(line_count "$repo")"
+  out="$(PM_ROOT="$repo" pm_apply spawn_intent d=D-300 a=A-01 ref=zzz-test-w-D300A01 at="$(now_iso)" 2>&1)"
+  rc=$?
+  after="$(line_count "$repo")"
+  assert_true "spawn lease: duplicate identical-ref intent refused (nonzero)" \
+    bash -c '[[ "$1" -ne 0 ]]' _ "$rc"
+  assert_true "spawn lease: refusal carries the stable spawn-lease-held token" \
+    bash -c '[[ "$1" == *spawn-lease-held* ]]' _ "$out"
+  assert_eq "spawn lease: log line-count unchanged by the refused duplicate" \
+    "$before" "$after"
+  rm -rf "$repo"
+}
+
+section_spawn_intent_two_concurrent_acquirers() {
+  # C4 + C3 combined shape: two concurrent pm_apply-shaped writers race
+  # for the same (d, a) lease with the SAME deterministic ref -- exactly
+  # what two concurrent track spawn stages produce. Exactly one may win,
+  # exactly one spawn_intent line may land, and the loser must see the
+  # spawn-lease-held refusal (it must NOT believe it won).
+  local repo p1 p2 rc1 rc2 o1 o2 n
+  repo="$(new_tmp_repo)"
+  PM_ROOT="$repo" pm_apply dispatch_new d=D-301 i=I-001 at="$(now_iso)" >/dev/null
+  PM_ROOT="$repo" pm_apply dispatch_state d=D-301 from=READY to=DISPATCHED lane=automation at="$(now_iso)" >/dev/null
+  o1="$(mktemp "${TMPDIR:-/tmp}/pm-creator-enforce-lease.XXXXXX")"
+  o2="$(mktemp "${TMPDIR:-/tmp}/pm-creator-enforce-lease.XXXXXX")"
+  (
+    PM_ROOT="$repo" pm_apply spawn_intent d=D-301 a=A-01 ref=zzz-test-w-D301A01 at="$(now_iso)" >"$o1" 2>&1
+  ) &
+  p1=$!
+  (
+    PM_ROOT="$repo" pm_apply spawn_intent d=D-301 a=A-01 ref=zzz-test-w-D301A01 at="$(now_iso)" >"$o2" 2>&1
+  ) &
+  p2=$!
+  wait "$p1"; rc1=$?
+  wait "$p2"; rc2=$?
+  assert_true "concurrent lease: exactly one of the two racers wins" \
+    bash -c '[[ ("$1" -eq 0 && "$2" -ne 0) || ("$1" -ne 0 && "$2" -eq 0) ]]' _ "$rc1" "$rc2"
+  n="$(grep -c '^EVENT spawn_intent d=D-301 ' "$repo/.pm/events.log")"
+  assert_eq "concurrent lease: exactly one spawn_intent line committed" "1" "$n"
+  assert_true "concurrent lease: the loser saw the spawn-lease-held refusal" \
+    bash -c '[[ "$(cat "$1" "$2")" == *spawn-lease-held* ]]' _ "$o1" "$o2"
+  rm -f "$o1" "$o2"
+  rm -rf "$repo"
+}
+
+section_signal_terminates_lock_holder() {
+  # C6: a script interrupted mid-critical-section must DIE after cleanup
+  # (128+signum), not keep executing past the interrupted command with the
+  # lock silently released. Both INT and TERM. A background child of a
+  # non-interactive shell starts with SIGINT ignored (POSIX), so GNU
+  # `env --default-signal` restores the default disposition first --
+  # exactly what a foreground Ctrl-C'd track would have.
+  local sig want repo sp rc i
+  for sig in INT TERM; do
+    case "$sig" in INT) want=130 ;; *) want=143 ;; esac
+    repo="$(new_tmp_repo)"
+    # shellcheck disable=SC2016
+    env "--default-signal=SIG${sig}" bash -c '
+      source "$1"
+      pm_lock "$2" || exit 9
+      : > "$2/stage1"
+      sleep 1
+      : > "$2/stage2"
+      pm_unlock
+    ' _ "$LIB" "$repo" &
+    sp=$!
+    i=0
+    while [[ ! -e "$repo/stage1" ]]; do
+      i=$((i + 1)); [[ "$i" -ge 50 ]] && break; sleep 0.1
+    done
+    assert_true "sig$sig: holder observably entered its critical section" \
+      bash -c '[[ "$1" -lt 50 ]]' _ "$i"
+    kill "-$sig" "$sp" 2>/dev/null || true
+    wait "$sp"
+    rc=$?
+    assert_eq "sig$sig: interrupted holder dies with 128+signum ($want)" "$want" "$rc"
+    assert_false "sig$sig: the stage after the interrupted command never ran" \
+      test -e "$repo/stage2"
+    assert_true "sig$sig: lock released by the dying holder" \
+      flock -n "$repo/.pm/.lock" true
+    rm -rf "$repo"
+  done
+}
+
+section_concurrent_dispatch_after_killed_holder() {
+  # C3 regression, review probe shape (15/40 duplicate dispatch_new commits
+  # under the mkdir-lock's ABA stale-reclaim): a holder dies HARD, then two
+  # pm_apply-shaped writers race for the same brand-new dispatch id.
+  # Exactly one dispatch_new may ever land in the log. Several rounds give
+  # the scheduler room to interleave.
+  local round repo hp rc1 rc2 p1 p2 dn
+  for round in 1 2 3 4 5; do
+    repo="$(new_tmp_repo)"
+    bash -c 'source "$1"; pm_lock "$2" || exit 9; exec sleep 60' _ "$LIB" "$repo" &
+    hp=$!
+    sleep 0.2
+    kill -9 "$hp" 2>/dev/null || true
+    wait "$hp" 2>/dev/null || true
+    (
+      PM_ROOT="$repo" pm_apply dispatch_new d=D-999 i=I-001 at="$(now_iso)" >/dev/null 2>&1
+    ) &
+    p1=$!
+    (
+      PM_ROOT="$repo" pm_apply dispatch_new d=D-999 i=I-001 at="$(now_iso)" >/dev/null 2>&1
+    ) &
+    p2=$!
+    wait "$p1"; rc1=$?
+    wait "$p2"; rc2=$?
+    dn="$(grep -c '^EVENT dispatch_new d=D-999 ' "$repo/.pm/events.log")"
+    assert_eq "killed-holder race (round $round): exactly one dispatch_new committed" "1" "$dn"
+    assert_true "killed-holder race (round $round): exactly one racer succeeded" \
+      bash -c '[[ ("$1" -eq 0 && "$2" -ne 0) || ("$1" -ne 0 && "$2" -eq 0) ]]' _ "$rc1" "$rc2"
+    rm -rf "$repo"
+  done
 }
 
 # ---------------------------------------------------------------------------
@@ -780,43 +1010,6 @@ section_batch_atomicity_all_or_nothing() {
 }
 
 # ---------------------------------------------------------------------------
-# Low: a stale lock owned by a PID that is alive (reused) but whose recorded
-# start-time identity no longer matches must be reclaimed, not hung until
-# timeout.
-section_stale_lock_reused_pid_identity_reclaimed() {
-  local repo lockdir real_start
-  repo="$(new_tmp_repo)"
-  lockdir="$repo/.pm/.lock"
-  mkdir -p "$lockdir"
-
-  # Fabricate an owner "identity" using OUR OWN (very much alive) PID, but a
-  # start-time token that cannot possibly match our own real start-time --
-  # this is exactly what PID reuse looks like: the PID is alive, but it is
-  # not the same process that acquired the lock.
-  real_start="$(bash -c 'source "$1"; _pm_lock_pid_start "$$"' _ "$LIB" 2>/dev/null || true)"
-  {
-    printf '%s\n' "$$"
-    printf '%s\n' "999999999"
-  } > "$lockdir/pid"
-
-  if [[ -z "$real_start" ]]; then
-    # /proc not available on this platform -- the mismatch path degrades to
-    # PID-liveness-only and correctly does NOT reclaim a live PID's lock.
-    # Nothing to assert beyond "did not hang"; skip silently.
-    rm -rf "$repo"
-    return 0
-  fi
-
-  assert_true "stale lock: mismatched (reused-PID) identity is reclaimed via _pm_lock_try_reclaim_stale" \
-    bash -c '
-      source "$1"
-      _pm_lock_try_reclaim_stale "$2"
-    ' _ "$LIB" "$lockdir"
-
-  rm -rf "$repo"
-}
-
-# ---------------------------------------------------------------------------
 # B2.2 `merged` markers -- pure corroboration records, human-attested. The
 # engine must accept one only for a registered dispatch's real attempt whose
 # recorded result matches, refuse conflicts/forgeries at write, and
@@ -938,6 +1131,18 @@ section_merged_conflicting_second_marker_refused() {
   rm -rf "$repo"
 }
 
+# I2: an `adopt` naming an unregistered dispatch must fail closed (refused at
+# write, quarantined at fold) like every sibling handler -- never fold to a
+# silent no-op with no operator-visible trace.
+section_adopt_unregistered_dispatch_refused() {
+  local repo
+  repo="$(new_tmp_repo)"
+  PM_ROOT="$repo" pm_apply issue_state i=I-001 from=OPEN to=ACTIVE at="$(now_iso)" >/dev/null
+  assert_refused_and_quarantined "adopt for unregistered dispatch" "$repo" \
+    adopt d=D-999 a=A-01 at="$(now_iso)" ref=i999-orphan
+  rm -rf "$repo"
+}
+
 # ---------------------------------------------------------------------------
 echo "== adversarial: illegal edge READY->VERIFIED =="
 section_illegal_edge_ready_to_verified
@@ -981,8 +1186,22 @@ echo "== adversarial: no literal None ever serialized =="
 section_no_none_ever_serialized
 echo "== adversarial: supersede forward reference =="
 section_supersede_forward_reference
-echo "== adversarial: stale lock reclaimed =="
-section_stale_lock_reclaimed
+echo "== lock: 2-way mutual exclusion =="
+section_lock_mutual_exclusion
+echo "== lock: reentrancy depth =="
+section_lock_reentrancy_depth
+echo "== lock: kill -9'd holder auto-released =="
+section_lock_released_on_kill9
+echo "== lock: timeout path =="
+section_lock_timeout_message
+echo "== C4: spawn_intent exclusive lease (duplicate refused) =="
+section_spawn_intent_exclusive_lease
+echo "== C4: two concurrent lease acquirers, one winner =="
+section_spawn_intent_two_concurrent_acquirers
+echo "== lock: INT/TERM mid-critical-section terminates (C6) =="
+section_signal_terminates_lock_holder
+echo "== lock: no duplicate dispatch_new after killed holder (C3 regression) =="
+section_concurrent_dispatch_after_killed_holder
 echo "== adversarial: record dispatch RETURNED refused =="
 section_record_dispatch_returned_refused
 echo "== concurrency: two racers, one new dispatch =="
@@ -997,8 +1216,6 @@ echo "== adversarial: late-terminal quarantine preserves standing state =="
 section_late_terminal_preserves_standing_state
 echo "== adversarial: pm_apply_batch all-or-nothing atomicity =="
 section_batch_atomicity_all_or_nothing
-echo "== adversarial: stale lock reclaimed on reused-PID identity mismatch =="
-section_stale_lock_reused_pid_identity_reclaimed
 echo "== B2.2 merged: accepted after VERIFIED (pure corroboration record) =="
 section_merged_accepted_after_verified
 echo "== B2.2 merged: no recorded result for (d,a) refused =="
@@ -1015,6 +1232,8 @@ echo "== B2.2 merged: conflicting second marker refused =="
 section_merged_conflicting_second_marker_refused
 echo "== B2.2 fix-pass-6 T6: merged after ABANDONED accepted, state untouched =="
 section_merged_after_abandoned_accepted
+echo "== I2: adopt for unregistered dispatch refused =="
+section_adopt_unregistered_dispatch_refused
 
 echo
 echo "-----------------------------------------"

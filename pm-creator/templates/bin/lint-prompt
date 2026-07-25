@@ -88,9 +88,27 @@ PHRASES = [
 SECRET_PATTERNS = [
     ("AWS-key-like token", re.compile(r"AKIA[0-9A-Z]{16}")),
     ("PEM header", re.compile(r"-----BEGIN [A-Z ]+-----")),
+    # I23: `\bpassword` / `\btoken` never match after `_` (`_` is a \w char,
+    # so e.g. GH_TOKEN=... has no boundary immediately before "TOKEN") --
+    # these two stay as a cheap common-case catch; the key-style pattern
+    # below is what actually covers underscore-prefixed key names.
     ("password= assignment", re.compile(r"\bpassword\s*=\s*\S+", re.IGNORECASE)),
     ("token= assignment", re.compile(r"\btoken\s*=\s*\S+", re.IGNORECASE)),
     ("long hex/base64 blob", re.compile(r"\b[A-Za-z0-9+/]{32,}={0,2}\b")),
+    # I23: key-style assignment/mapping covering both `=` and `:` syntax,
+    # and (unlike \bpassword.../\btoken... above) matching regardless of
+    # what precedes the key name -- so GH_TOKEN=..., api_key: ..., and
+    # AUTH_TOKEN: ... are all caught, not just a bare leading "token"/
+    # "password".
+    ("key-style secret assignment",
+     re.compile(r"(?:token|secret|api[_-]?key|passwd|password)\s*[:=]\s*\S+", re.IGNORECASE)),
+    # I23: known provider token prefixes are unambiguous secret shapes on
+    # their own, independent of any preceding assignment syntax -- and
+    # critically, these must be found even when directly preceded by `_`
+    # (GH_TOKEN=ghp_xxx) where the \b-anchored patterns above cannot see
+    # them, since regex \b never matches immediately after a word char.
+    ("known secret-token prefix",
+     re.compile(r"(?:ghp_|gho_|ghs_|ghu_|github_pat_|xox[baprs]-|sk-ant-|AIza|glpat-)[A-Za-z0-9_-]{8,}")),
 ]
 
 report_cite_exception_used = False

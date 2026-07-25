@@ -270,35 +270,33 @@ _tr_cleanup() {
   pm_unlock 2>/dev/null || true
   return "${rc}"
 }
-trap _tr_cleanup EXIT INT TERM
+
+# C6: INT/TERM must TERMINATE. _tr_cleanup ends in `return`, so trapping it
+# directly on INT/TERM would clean up and then let the script CONTINUE past
+# the interrupted command -- a Ctrl-C'd track could run its stale critical
+# section to completion and still reach the SPAWN stage. Clean up, restore
+# default disposition, and re-raise (same shape as scaffold.sh's cleanup):
+# the process dies with 128+signum and no later stage runs.
+# shellcheck disable=SC2329  # invoked indirectly via trap below
+_tr_cleanup_sig() {
+  _tr_cleanup
+  trap - EXIT INT TERM
+  kill -s "$1" "${BASHPID:-$$}"
+}
+trap _tr_cleanup EXIT
+trap '_tr_cleanup_sig INT' INT
+trap '_tr_cleanup_sig TERM' TERM
 
 _tr_tmpmanifest="$(mktemp "${TMPDIR:-/tmp}/pm-track-tmpmanifest.XXXXXX")"
 
-# fix-pass-5b#2: classify pm_close_issue's captured stderr into one of the
-# stable P3-4 reason tokens. Matches ONLY whole stderr LINES that _lib.sh
-# itself emits with a `<token>: ...` prefix -- never a substring match over
-# the raw blob (which embeds pm_apply's own output and could let a token
-# forged mid-line, e.g. inside an echoed detail or filename, spoof a
-# classification). Pure function, no side effects -- unit-testable in
-# isolation by extracting just this definition.
-tr_ac_classify_close_failure() {
-  local blob="$1" reason="close/archive-failure" line
-  while IFS= read -r line; do
-    case "${line}" in
-      close-refused-state-race:*) reason="close-race/refusal"; break ;;
-      close-refused-unfoldable-log:*) reason="close-refused-unfoldable-log"; break ;;
-    esac
-  done <<<"${blob}"
-  if [[ "${reason}" == "close/archive-failure" ]]; then
-    while IFS= read -r line; do
-      if [[ "${line}" == close-transition-durable:* ]]; then
-        reason="closed-with-pending-archive"
-        break
-      fi
-    done <<<"${blob}"
-  fi
-  printf '%s\n' "${reason}"
-}
+# fix-pass-5b#2 classify helper + the whole B2.1 auto-close pass (the
+# _TR_CLOSE_PY python routines with the REASONS registry, the pre-fetch
+# phase and the stage-2.5 pass) live in the sourced component
+# _track_autoclose (I25); its two entry points are invoked at the original
+# stage positions below.
+# shellcheck source=./_track_autoclose
+# shellcheck disable=SC1091
+source "${_TR_SELF}/_track_autoclose"
 
 # ---------------------------------------------------------------------------
 # one herdr api snapshot (defensive, centralized parse). Raw herdr stdout is
@@ -454,55 +452,22 @@ fi
 # simply cannot trigger for that repo (never mistaken for a pass -- it just
 # means this particular guard is a no-op until `mainline` is configured).
 # ---------------------------------------------------------------------------
-_tr_repos_json="$(python3 -c '
+# I6: repos parsing is delegated to pm_config_repos (THE one shared
+# parser); this step only RESHAPES its normalized list into the
+# name-keyed map track's stages consume. mainline_ref/fetch_policy/
+# merge_mode/allow_marker_branch_deleted are passed through raw here --
+# config.json is operator-editable post-scaffold, so B2.1's auto-close
+# pass performs its OWN runtime fail-closed validation of these VALUES
+# (never trusts scaffold-time validity survived; absent keys arrive as
+# null and mean the defaults "merge"/false downstream).
+_tr_repos_json="$(pm_config_repos "${_tr_config}" | python3 -c '
 import json, sys
-with open(sys.argv[1]) as f:
-    cfg = json.load(f)
-repos = cfg.get("repos")
 out = {}
-def add(name, val):
-    if isinstance(val, dict):
-        path = val.get("path") or ""
-        mainline = val.get("mainline")
-        mainline_ref = val.get("mainline_ref")
-        fetch_policy = val.get("fetch_policy")
-        merge_mode = val.get("merge_mode")
-        allow_marker_branch_deleted = val.get("allow_marker_branch_deleted")
-    elif isinstance(val, str):
-        path = val
-        mainline = None
-        mainline_ref = None
-        fetch_policy = None
-        merge_mode = None
-        allow_marker_branch_deleted = None
-    else:
-        return
-    if name and path:
-        out[name] = {
-            "path": path,
-            "mainline": mainline,
-            # mainline_ref/fetch_policy are scaffold-time-normalized (B2.0b)
-            # but config.json is operator-editable post-scaffold -- B2.1s
-            # auto-close pass performs its OWN runtime fail-closed validation
-            # of these VALUES (never trusts scaffold-time validity survived).
-            "mainline_ref": mainline_ref,
-            "fetch_policy": fetch_policy,
-            # B2.2 marker-path opt-ins, same contract: passed through raw
-            # here, runtime-validated fail-closed in evaluate_issue (absent
-            # keys mean the defaults "merge"/false -- generated repos
-            # predating B2.2 keep working unchanged).
-            "merge_mode": merge_mode,
-            "allow_marker_branch_deleted": allow_marker_branch_deleted,
-        }
-if isinstance(repos, dict):
-    for name, val in repos.items():
-        add(name, val)
-elif isinstance(repos, list):
-    for val in repos:
-        if isinstance(val, dict):
-            add(val.get("name"), val)
+for r in json.load(sys.stdin):
+    name = r.pop("name")
+    out[name] = r
 print(json.dumps(out))
-' "${_tr_config}")"
+')"
 
 # ---------------------------------------------------------------------------
 # Shared git-corroboration python routines (F2: the SAME logic is re-run
@@ -519,7 +484,8 @@ import subprocess
 TICKET_RE = re.compile(r"^(i\d+)-", re.IGNORECASE)
 # F1: the dispatch's own linked issue id, as persisted in the raw event log
 # (`dispatch_new i=I-<num>`) -- always the literal `I-<digits>` form.
-ISSUE_RE = re.compile(r"^I-(\d+)$", re.IGNORECASE)
+# \A/\Z (not ^/$): see BASE_SHA_RE above -- $ tolerates a trailing "\n".
+ISSUE_RE = re.compile(r"\AI-(\d+)\Z", re.IGNORECASE)
 # F3: a literal, FULL-LENGTH lowercase-hex git object name only -- never a
 # revision expression (HEAD/main/branch~2/...), which would resolve
 # DYNAMICALLY instead of anchoring a fixed point, and never a SHORT hex
@@ -528,7 +494,12 @@ ISSUE_RE = re.compile(r"^I-(\d+)$", re.IGNORECASE)
 # object. 40 hex == sha-1 object name; 64 hex == sha-256 object name
 # (dispatch-prep records 64-hex on sha256-object-format repos). Checked
 # BEFORE any git use of the value.
-BASE_SHA_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+#
+# \A/\Z (not ^/$): Python's $ matches just before a trailing "\n", so a
+# value with an embedded trailing newline would validate here without the
+# char class ever accepting \n, then corrupt a rendered grammar line on
+# append. \A/\Z anchor to the true start/end of the string.
+BASE_SHA_RE = re.compile(r"\A(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 
 
 # P3-2: repo-redirecting git environment variables are scrubbed from the
@@ -598,11 +569,12 @@ def tr_is_dirty(path):
     return bool(status.strip())
 
 
-def tr_corroborate_git(repo_path, branch, base_sha):
+def tr_corroborate_git(repo_path, branch, base_sha, mainline_ref=None, mainline=None):
     # Returns (reason, result_sha): reason is None (full pass, result_sha ==
     # lock-time branch tip) or one of base-sha-wrong-length-for-repo/
     # base-sha-unreachable/branch-missing/worktree-missing/dirty-worktree/
-    # no-new-commit/not-descendant.
+    # no-new-commit/not-descendant/mainline-ref-not-configured/
+    # mainline-ref-missing/branch-contains-no-new-work.
     #
     # BASE_SHA_RE only gates *shape* (40 or 64 hex). A 64-hex string is a
     # valid SHA-1 *object* length mismatch in a sha1 repo, but nothing stops
@@ -660,685 +632,78 @@ def tr_corroborate_git(repo_path, branch, base_sha):
     if rc != 0:
         return "not-descendant", None
 
+    # C1 fix: the two checks above only relate branch_tip to base_sha --
+    # they say nothing about whether branch_tip is ALSO already reachable
+    # from the repo's mainline. A worker that does zero real work and
+    # simply points its ticket branch at (or descended from) mainline's
+    # current tip -- e.g. `git reset --hard main` in its worktree -- passes
+    # both: branch_tip != base_sha (base_sha is stale relative to a mainline
+    # that has since advanced past it from OTHER work), and base_sha IS an
+    # ancestor of branch_tip (mainline only moves forward). Without this
+    # check that forged tip would strictly-git-corroborate as though it
+    # were the worker's own result. Refuse (never pass) whenever branch_tip
+    # is itself reachable from mainline: the branch carries no commit of
+    # its own beyond what mainline already has.
+    #
+    # Both mainline_ref and mainline are optional per repo -- if this repo
+    # has neither configured, this guard is simply a no-op for it, same as
+    # elsewhere in this file. A repo with neither can then also never reach
+    # G4/marker auto-close (both require mainline_ref), so leaving this
+    # guard inert in that specific case doesn't open an auto-close path.
+    #
+    # Local-only lookup, deliberately: stage 1 runs pre-lock, before
+    # track's separate pre-fetch phase, so mainline is resolved exactly as
+    # it stands in this local clone right now -- never fetched here.
+    #
+    # Edge case (a): in merge_mode=merge repos, a legitimately-merged
+    # branch's tip becomes an ancestor of mainline the moment a human
+    # merges it. If a slow/delayed track tick corroborates AFTER that
+    # merge, this guard fires and the row surfaces under
+    # branch-contains-no-new-work instead of auto-recording. That is
+    # fail-closed and acceptable (a human can still `bin/record` it
+    # manually) -- surfacing a merged branch under this reason is a false
+    # negative on legibility, never a false positive on safety.
+    #
+    # Edge case (b): mainline_ref may be configured but simply not resolve
+    # in this particular worker repo clone (e.g. never fetched here) --
+    # that is cannot-corroborate, not pass, so it refuses via
+    # mainline-ref-missing rather than silently skipping the check.
+    #
+    # Resolution order: prefer the fully-qualified `mainline_ref` (refs/...)
+    # when configured -- it is the form G4/marker auto-close itself trusts.
+    # Fall back to the plain `mainline` branch-name field (e.g. "main", the
+    # same field F1's branch-is-mainline guard already reads) resolved as
+    # refs/heads/<mainline> in THIS local clone: most repos configure only
+    # `mainline`, not `mainline_ref` (mainline_ref is reserved for fetch-
+    # policy repos), and RECORD-stage forgery is exploitable regardless of
+    # whether auto-close is reachable for this repo, so this guard must not
+    # go inert just because mainline_ref specifically is unset.
+    resolved_mainline_ref = None
+    if mainline_ref:
+        if not isinstance(mainline_ref, str) or not mainline_ref.startswith("refs/"):
+            return "mainline-ref-not-configured", None
+        resolved_mainline_ref = mainline_ref
+    elif mainline and isinstance(mainline, str):
+        resolved_mainline_ref = "refs/heads/" + mainline
+
+    if resolved_mainline_ref:
+        rc, mainline_sha, _ = tr_run(
+            ["rev-parse", "--verify", "--end-of-options", resolved_mainline_ref + "^{commit}"],
+            repo_path,
+        )
+        if rc != 0:
+            return "mainline-ref-missing", None
+        mainline_sha = mainline_sha.strip()
+        rc, _, _ = tr_run(
+            ["merge-base", "--is-ancestor", "--end-of-options", branch_tip, mainline_sha],
+            repo_path,
+        )
+        if rc == 0:
+            return "branch-contains-no-new-work", None
+
     return None, branch_tip
 PYEOF
 
-# ---------------------------------------------------------------------------
-# Shared B2.1 auto-close python routines (STRICT merged-path only; the
-# MARKER path is explicitly out of scope for B2.1 -- see header note above
-# the auto-close stage below). Appended to (not merged into) _TR_CORROB_PY:
-# concatenated ahead of it at call sites via `_TR_CORROB_PY`+`_TR_CLOSE_PY`,
-# so `tr_run`/`tr_worktree_list`/BASE_SHA_RE/etc are already in scope.
-# ---------------------------------------------------------------------------
-read -r -d '' _TR_CLOSE_PY <<'PYEOF' || true
-# ---------------------------------------------------------------------------
-# REASONS (P3-9) -- the single registry of every surface-reason token the
-# auto-close pass can emit, INCLUDING the ones minted by track's bash close
-# loop / driver fallback rather than by this python (marked [bash]). Any
-# new reason token MUST be added here; consumers (tests, operators grepping
-# TRACKER.md) treat these strings as a stable contract.
-# ---------------------------------------------------------------------------
-REASONS = frozenset({
-    # G1 -- issue state
-    "issue-unregistered",
-    "CLOSED-but-archive-leftovers",   # action=rearchive, not a refusal
-    "NEEDS-USER",
-    "BLOCKED",
-    "paused/non-active",
-    # G1.5 -- quarantine blast radius (constants shared with _lib.sh below)
-    "invalid-question-state",
-    "issue-related-quarantine",
-    "quarantine-unattributable-blocks-autoclose",
-    # G2 -- open questions
-    "open-question-for-issue",
-    "open-question-unscoped",
-    # G3 -- dispatch graph
-    "no-non-superseded-dispatch",
-    "superseded-by-other-issue",
-    "parent/child-roll-up-violation",
-    "ABANDONED-without-same-issue-successor",
-    "FAILED",
-    "QUARANTINED",
-    "dispatch-not-VERIFIED",
-    # gate between G3 and G4 (P2-1(a): G4 never runs when disabled)
-    "auto-close-disabled",
-    # G4 -- strict git corroboration
-    "repo-not-configured",
-    "repo-not-on-disk",
-    "missing-repo-metadata",
-    "mainline-ref-not-configured",
-    "mainline-ref-missing",
-    "fetch-failed",
-    "unreachable",
-    "sha-malformed",
-    "wrong-length",
-    "replace-affected",
-    "result==base",
-    "result-not-descendant-of-base",
-    "result-not-bound-to-branch",     # P2-2 branch-binding gate
-    "no-strict-ancestry-and-no-valid-marker",
-    # B2.2 -- per-repo marker-path config (fail-closed runtime validation)
-    "repo-config-invalid",
-    # B2.2 -- G4 marker arm (squash/rebase workflows)
-    "marker-mismatch",
-    "marker-merge-sha-unverified",
-    "marker-merge-not-on-mainline",
-    "marker-branch-absent-uncorroborated",
-    # [bash] fix-pass-6 F1: minted by track's close loop when the pre-close
-    # audit-note emission fails -- the marker close is REFUSED (fail-closed:
-    # no marker close without its durable provenance record) and retried
-    # next tick. Listed purely for the registry; the python driver itself
-    # never returns it.
-    "marker-note-emit-failed",
-    # B2.2 -- close-mode legibility tokens: carried as the `reason` of a
-    # CLOSE row (action=close), so TRACKER.md and the audit trail always
-    # distinguish a strict close from a marker (human-attested) close --
-    # and the branch-deleted variant explicitly.
-    "auto-closed-strict",
-    "auto-closed-marker",
-    "auto-closed-marker-branch-deleted",
-    # driver failure paths
-    "auto-close-driver-error",
-    # [bash] minted by track's close loop from pm_close_issue's stable
-    # stderr tokens (P3-4)
-    "close-race/refusal",
-    "close-refused-unfoldable-log",
-    "close/archive-failure",
-    "closed-with-pending-archive",   # rendered in the Auto-closed section
-    # fix-pass-5b#3: registry-completeness -- these three tokens are real,
-    # currently-emitted reason values from OTHER stages of the auto-close
-    # pipeline (the stage-2 corroboration driver's record loop, and the AC
-    # record-loop's standalone raced-write path). Neither of those call
-    # sites has REASONS in scope today (they run _TR_CORROB_PY alone, or a
-    # separate one-off python3 -c snippet, not concatenated with
-    # _TR_CLOSE_PY) so the enforcement check above never actually sees
-    # them -- they're listed here purely so REASONS stays the complete,
-    # accurate registry of every reason token the auto-close pass can
-    # surface, per P3-9's intent.
-    "already-recorded",
-    "corroboration-changed-under-lock",
-    "raced-refused",
-    # B3 -- auto-spawn stage (actionable rows)
-    "spawn-ack-unconfirmed",
-    "suspected-orphan-intent",
-    "herdr-tab-create-failed",
-    "herdr-start-failed",
-    "name-collision",
-    "ambiguous-spawn-ack",
-    "prompt-sha-mismatch",
-    # B3 -- auto-spawn stage (fail-closed config skip; the spawn-stage
-    # extension of the existing config-invalid pathway)
-    "spawn-config-invalid",
-    # B3 -- auto-spawn stage (steady-state counts)
-    "capacity-exceeded",
-    "auto-spawn-disabled",
-    # B3 -- whole-plan-driver crash (loud degrade, mirrors
-    # auto-close-driver-error)
-    "spawn-driver-error",
-})
-
-# P3-9 cross-reference: templates/bin/_lib.sh's fold python defines these
-# SAME two constants (same names, same values) where quarantine_by_issue is
-# projected -- the G1.5 gate below keys on the exact strings the fold
-# emits, so they must change in BOTH places or not at all.
-REASON_INVALID_QUESTION_STATE = "invalid-question-state"
-REASON_ISSUE_RELATED_QUARANTINE = "issue-related-quarantine"
-
-CLOSEABLE_STATES = {"ACTIVE", "IN-PROGRESS"}
-# Non-terminal dispatch states -- used by the cross-issue child_of roll-up
-# gate below to decide whether a child dispatch is still "active" (anything
-# short of the two TERMINAL states counts, matching _lib.sh's own
-# TERMINAL = {VERIFIED, ABANDONED}).
-TERMINAL_DISPATCH_STATES = {"VERIFIED", "ABANDONED"}
-
-
-
-
-def tr_verify_commit(repo_path, sha, obj_format):
-    # Returns (reason, None) on failure, else (None, sha). Shape check
-    # (length-vs-object-format) BEFORE any git use of the value (mirrors
-    # tr_corroborate_git's base_sha guard), then identity-anchored
-    # `rev-parse --verify <sha>^{commit}` (a real object peels to itself; a
-    # ref name peels to whatever it points at, so this also closes the
-    # dynamic-ref bypass for a sha-shaped ref name).
-    if not BASE_SHA_RE.match(sha or ""):
-        return "sha-malformed", None
-    expected_len = {"sha1": 40, "sha256": 64}.get(obj_format)
-    if expected_len is None or len(sha) != expected_len:
-        return "wrong-length", None
-    rc, resolved, _ = tr_run(
-        ["rev-parse", "--verify", "--end-of-options", sha + "^{commit}"], repo_path
-    )
-    if rc != 0 or resolved.strip() != sha:
-        return "unreachable", None
-    return None, sha
-
-
-def tr_repo_has_grafts(repo_path):
-    # GIT_NO_REPLACE_OBJECTS=1 (set by the caller around every git
-    # invocation in this module) disables replace-REFS, but old-style
-    # `.git/info/grafts` is a *separate* mechanism it does NOT neutralize --
-    # detect it directly and refuse (fail-closed) rather than silently
-    # trusting history that could be graft-rewritten.
-    rc, path, _ = tr_run(["rev-parse", "--git-path", "info/grafts"], repo_path)
-    if rc != 0:
-        return True  # probe itself failed -- fail closed
-    path = path.strip()
-    if not path:
-        return False
-    full = path if os.path.isabs(path) else os.path.join(repo_path, path)
-    try:
-        return os.path.isfile(full) and os.path.getsize(full) > 0
-    except OSError:
-        return True
-
-
-def tr_parse_fetch_ref(mainline, mainline_ref):
-    # Shared shape validation for fetch-policy repos, used by BOTH track's
-    # pre-lock pre-fetch phase (tr_prefetch_mainline_refs) and tr_g4_check
-    # under the lock -- one predicate, so the two phases can never disagree
-    # about which repos are fetchable. Returns the remote name, or None on
-    # any shape failure. P3-1 (git argv hygiene): a leading-dash remote or
-    # mainline segment is rejected outright -- a config value must never be
-    # able to smuggle an option into git's argv -- on top of the
-    # --end-of-options guard on the fetch invocation itself.
-    if not mainline or not isinstance(mainline, str):
-        return None
-    if not isinstance(mainline_ref, str):
-        return None
-    m = re.match(r"^refs/remotes/([^/]+)/(.+)$", mainline_ref)
-    if not m:
-        return None
-    remote = m.group(1)
-    if remote.startswith("-") or mainline.startswith("-") or m.group(2).startswith("-"):
-        return None
-    return remote
-
-
-def tr_prefetch_mainline_refs(repos):
-    # P2-1(b): the pre-fetch phase, run by track BEFORE pm_lock is acquired
-    # -- the ONLY place the auto-close pass ever touches the network. Each
-    # configured fetch-policy repo's mainline ref is fetched at most once
-    # per (repo,ref) per tick; returns {repo_name: "ok"|"fetch-failed"}.
-    # Repos whose config shape fails tr_parse_fetch_ref are skipped here;
-    # tr_g4_check re-derives the same verdict locally under the lock and
-    # surfaces mainline-ref-missing for them (fail-closed either way).
-    status = {}
-    for name, entry in sorted((repos or {}).items()):
-        if not isinstance(entry, dict):
-            continue
-        if entry.get("fetch_policy") != "fetch":
-            continue
-        repo_path = entry.get("path")
-        mainline = entry.get("mainline")
-        mainline_ref = entry.get("mainline_ref")
-        remote = tr_parse_fetch_ref(mainline, mainline_ref)
-        if not repo_path or remote is None:
-            continue
-        rc, _, _ = tr_run(
-            ["fetch", "--end-of-options", remote,
-             "+refs/heads/" + mainline + ":" + mainline_ref],
-            repo_path,
-        )
-        status[name] = "ok" if rc == 0 else "fetch-failed"
-    return status
-
-
-def tr_branch_binding_state(run, result_sha, branch):
-    # Shared P2-2 branch-binding probe (strict G4 + the marker arm; M2):
-    # resolves refs/heads/<branch> and reports whether result_sha is its
-    # tip or an ancestor of it (i.e. the commit actually lived on that
-    # branch). Returns "bound" | "absent" | "unbound". refs/heads/ +
-    # --end-of-options keep the index-sourced branch name inert in argv.
-    rc, branch_tip, _ = run(
-        ["rev-parse", "--verify", "--end-of-options", "refs/heads/" + branch + "^{commit}"]
-    )
-    if rc != 0:
-        return "absent"
-    branch_tip = branch_tip.strip()
-    if branch_tip == result_sha:
-        return "bound"
-    rc, _, _ = run(["merge-base", "--is-ancestor", "--end-of-options", result_sha, branch_tip])
-    return "bound" if rc == 0 else "unbound"
-
-
-def tr_resolve_mainline(run, mainline, mainline_ref, fetch_policy, prefetch_status):
-    # Shared fetch-verdict + mainline-resolve leg (strict G4 + the marker
-    # arm; M2). P2-1(b): the network fetch already ran in track's
-    # pre-fetch phase (pre-lock, at most once per (repo,ref) per tick);
-    # here we only consume its recorded verdict -- a pre-fetch failure, or
-    # a missing verdict for this repo (fail-closed), surfaces fetch-failed
-    # and refs resolve locally only. Returns (mainline_sha, None) on
-    # success, (None, reason) on failure.
-    if fetch_policy == "fetch":
-        if tr_parse_fetch_ref(mainline, mainline_ref) is None:
-            return None, "mainline-ref-missing"
-        if prefetch_status != "ok":
-            return None, "fetch-failed"
-    rc, mainline_sha, _ = run(["rev-parse", "--verify", "--end-of-options", mainline_ref + "^{commit}"])
-    if rc != 0:
-        return None, "mainline-ref-missing"
-    return mainline_sha.strip(), None
-
-
-def tr_g4_check(repo_path, mainline, mainline_ref, fetch_policy, base_sha, result_sha, branch, prefetch_status):
-    # Returns reason string, or None on full G4 pass. STRICT topology only
-    # (B2.1) -- no patch-id / git cherry / content-equivalence, ever.
-    # LOCAL-ONLY under the lock: never fetches (P2-1(b)) -- for
-    # fetch-policy repos it consumes the pre-lock pre-fetch phase's
-    # verdict (prefetch_status) instead. `branch` is the dispatch's own
-    # recorded branch, used by the P2-2 result-binding gate below.
-    if not mainline_ref or not isinstance(mainline_ref, str):
-        return "mainline-ref-not-configured"
-    if not mainline_ref.startswith("refs/"):
-        return "mainline-ref-missing"
-    if fetch_policy not in ("fetch", "local-only"):
-        # The design doc's surface-reason enumeration has no distinct token
-        # for "invalid fetch_policy value"; bucketed with the adjacent
-        # not-configured reason (same remediation: fix .pm/config.json).
-        return "mainline-ref-not-configured"
-
-    def run(args, timeout=10):
-        # P3-2: pure delegate to tr_run -- the single home of the git env
-        # policy (GIT_ENV_SCRUB + GIT_NO_REPLACE_OBJECTS), never a second
-        # env-building copy.
-        return tr_run(args, repo_path, timeout=timeout)
-
-    rc, obj_format, _ = run(["rev-parse", "--show-object-format"])
-    if rc != 0:
-        return "unreachable"
-    obj_format = obj_format.strip()
-
-    if tr_repo_has_grafts(repo_path):
-        return "replace-affected"
-
-    reason, _ = tr_verify_commit(repo_path, result_sha, obj_format)
-    if reason:
-        return reason
-    reason, _ = tr_verify_commit(repo_path, base_sha, obj_format)
-    if reason:
-        return reason
-
-    if result_sha == base_sha:
-        return "result==base"
-
-    rc, _, _ = run(["merge-base", "--is-ancestor", "--end-of-options", base_sha, result_sha])
-    if rc != 0:
-        return "result-not-descendant-of-base"
-
-    # P2-2: bind result_sha to the dispatch's OWN recorded branch -- the
-    # same strict binding stage-1 intake's tr_corroborate_git enforces
-    # (there: result_sha IS the branch tip by construction; here: branch
-    # tip == result_sha, or result_sha is an ancestor of the branch tip,
-    # i.e. the commit actually lived on that branch). Without this, ANY
-    # already-merged commit descending from base (e.g. the mainline tip
-    # itself) satisfies pure topology and a forged `result` + human VERIFY
-    # would false-close. A missing/deleted/unresolvable branch is
-    # fail-closed the same way -- surface, never close.
-    if not branch or not isinstance(branch, str):
-        return "result-not-bound-to-branch"
-    if tr_branch_binding_state(run, result_sha, branch) != "bound":
-        return "result-not-bound-to-branch"
-
-    mainline_sha, reason = tr_resolve_mainline(
-        run, mainline, mainline_ref, fetch_policy, prefetch_status
-    )
-    if reason:
-        return reason
-
-    rc, _, _ = run(["merge-base", "--is-ancestor", "--end-of-options", result_sha, mainline_sha])
-    if rc != 0:
-        return "no-strict-ancestry-and-no-valid-marker"
-
-    return None
-
-
-# B2.2: the ONLY strict-G4 failure reasons the marker arm may take over --
-# the final topology legs (base-ancestor / mainline-ancestor) plus the
-# branch-binding leg (which the marker arm RE-RUNS itself, with the
-# explicit branch-deleted opt-out; it is never waived). Every other strict
-# failure (config shape, unreachable repo, graft/replace suspicion,
-# sha-malformed, fetch-failed, result==base, ...) surfaces as-is: the
-# marker corroborates topology, nothing else.
-MARKER_ELIGIBLE_STRICT_FAILURES = frozenset({
-    "result-not-descendant-of-base",
-    "result-not-bound-to-branch",
-    "no-strict-ancestry-and-no-valid-marker",
-})
-
-
-def tr_g4_marker_check(repo_path, mainline, mainline_ref, fetch_policy, base_sha,
-                       att_result, branch, prefetch_status, marker, allow_branch_deleted):
-    # B2.2 G4 marker arm -- consulted ONLY for merge_mode=squash repos and
-    # ONLY after strict G4 failed with a MARKER_ELIGIBLE_STRICT_FAILURES
-    # reason. Returns (close_mode, None) on full pass -- close_mode is
-    # "auto-closed-marker" or "auto-closed-marker-branch-deleted" -- else
-    # (None, reason).
-    #
-    # TRUTHFUL FRAMING (fix-pass-6 F6): a marker close is HUMAN ATTESTATION
-    # sanity-checked by git, NOT git corroboration that the dispatch's work
-    # landed. Git verifies only that merge_sha names a real commit on the
-    # configured mainline; it CANNOT verify that this commit contains the
-    # attempt's work (that is exactly the information squash/rebase
-    # destroys). A forged or typo'd marker on a squash repo can therefore
-    # close VERIFIED-but-unmerged work. The compensating controls are: the
-    # double opt-in (automation.auto_close AND merge_mode=squash, plus
-    # allow_marker_branch_deleted for the laxest variant), the human VERIFY
-    # gate upstream (G2), and the durable auto-close:* audit note emitted
-    # BEFORE the close.
-    #
-    # This function does NOT re-run strict G4's config-shape guards
-    # (mainline_ref/fetch_policy shape): its safety against being invoked
-    # on a config-shaped failure rests on MARKER_ELIGIBLE_STRICT_FAILURES
-    # excluding every config reason -- keep that set and this constraint in
-    # lockstep. It DOES re-run the repo-level guards (object format, graft
-    # probe) and identity-anchors both shas it consumes. Everything here is
-    # LOCAL-only under the lock, via tr_run's env policy (GIT_ENV_SCRUB +
-    # GIT_NO_REPLACE_OBJECTS); the fetch verdict is consumed from the
-    # pre-lock prefetch phase exactly like strict G4.
-    def run(args, timeout=10):
-        return tr_run(args, repo_path, timeout=timeout)
-
-    rc, obj_format, _ = run(["rev-parse", "--show-object-format"])
-    if rc != 0:
-        return None, "unreachable"
-    obj_format = obj_format.strip()
-
-    if tr_repo_has_grafts(repo_path):
-        return None, "replace-affected"
-
-    # fix-pass-6 F4: att_result is a cross-function input (the fold's
-    # per-attempt result, selected by the caller) -- identity-anchor it
-    # here rather than trusting the caller's sequencing to have verified
-    # it. Reuses the strict sha-verification reason tokens.
-    reason, _ = tr_verify_commit(repo_path, att_result, obj_format)
-    if reason:
-        return None, reason
-
-    # fix-pass-6 F2: zero-new-work re-check. The marker path deliberately
-    # skips base-ANCESTRY (squash rewrites it away), but a result equal to
-    # its base means no work at all -- refuse in-arm, independently of the
-    # eligible-set exclusion of "result==base".
-    if att_result == base_sha:
-        return None, "result==base"
-
-    # marker shape + fold-result agreement. The fold already refused any
-    # marker whose result_sha disagreed with the recorded (d, a) result,
-    # so a mismatch here means a corrupted/hand-edited index -- surface.
-    merge_sha = marker.get("merge_sha") if isinstance(marker, dict) else None
-    marker_result = marker.get("result_sha") if isinstance(marker, dict) else None
-    if not merge_sha or not marker_result:
-        return None, "no-strict-ancestry-and-no-valid-marker"
-    if marker_result != att_result:
-        return None, "marker-mismatch"
-
-    reason, _ = tr_verify_commit(repo_path, merge_sha, obj_format)
-    if reason:
-        return None, "marker-merge-sha-unverified"
-
-    # BRANCH-BINDING IS NOT WAIVED: if the dispatch's recorded branch still
-    # resolves, the result MUST be bound to it exactly as in strict G4. A
-    # branch that no longer resolves (normal post-squash cleanup) permits a
-    # close ONLY under the repo's explicit allow_marker_branch_deleted
-    # opt-in; otherwise surface.
-    close_mode = "auto-closed-marker"
-    if not branch or not isinstance(branch, str):
-        return None, "result-not-bound-to-branch"
-    binding = tr_branch_binding_state(run, att_result, branch)
-    if binding == "unbound":
-        return None, "result-not-bound-to-branch"
-    if binding == "absent":
-        if not allow_branch_deleted:
-            return None, "marker-branch-absent-uncorroborated"
-        close_mode = "auto-closed-marker-branch-deleted"
-
-    mainline_sha, reason = tr_resolve_mainline(
-        run, mainline, mainline_ref, fetch_policy, prefetch_status
-    )
-    if reason:
-        return None, reason
-
-    rc, _, _ = run(["merge-base", "--is-ancestor", "--end-of-options", merge_sha, mainline_sha])
-    if rc != 0:
-        return None, "marker-merge-not-on-mainline"
-
-    return close_mode, None
-
-
-def evaluate_issue(issue_id, index, repos, dispatch_issue_map, auto_close_enabled, archive_leftovers, prefetch):
-    # Returns (action, reason): action in {"close", "rearchive", "surface",
-    # "skip"}. "skip" = steady-state CLOSED, nothing to do, no TRACKER.md
-    # row at all. "rearchive" is ALWAYS attempted regardless of
-    # auto_close_enabled (crash recovery finishes an already-decided close,
-    # it is not a new close decision). "close"/"surface" are the normal
-    # G1-G4 outcomes; when auto_close_enabled is False evaluation STOPS
-    # after G3 (P2-1(a)) and surfaces `auto-close-disabled` -- G4 (and any
-    # git work) is never run for a disabled tick. `prefetch` is the
-    # pre-lock pre-fetch phase's {repo_name: verdict} map (P2-1(b)).
-    issues = index.get("issues", {})
-    dispatches = index.get("dispatches", {})
-    issue = issues.get(issue_id)
-
-    # G1 -----------------------------------------------------------------
-    if issue is None:
-        return "surface", "issue-unregistered"
-    state = issue.get("state")
-    if state == "CLOSED":
-        if archive_leftovers:
-            return "rearchive", "CLOSED-but-archive-leftovers"
-        return "skip", None
-    if state == "NEEDS-USER":
-        return "surface", "NEEDS-USER"
-    if state == "BLOCKED":
-        return "surface", "BLOCKED"
-    if state not in CLOSEABLE_STATES:
-        # OPEN / TODO / PARKED / any other non-{ACTIVE,IN-PROGRESS} state.
-        return "surface", "paused/non-active"
-
-    # G1.5 -- quarantined events touching this issue -----------------------
-    # A quarantined line was rejected by the fold's rule engine, but it can
-    # still name real semantic content (an invalid question state on an
-    # otherwise-legit issue link, a corrupt issue_state/dispatch_*/result
-    # touching this issue or one of its dispatches) that MUST NOT be
-    # silently invisible to the close decision -- surface, never close.
-    quarantine_reasons = (index.get("quarantine_by_issue", {}) or {}).get(issue_id)
-    if quarantine_reasons:
-        if REASON_INVALID_QUESTION_STATE in quarantine_reasons:
-            return "surface", REASON_INVALID_QUESTION_STATE
-        return "surface", REASON_ISSUE_RELATED_QUARANTINE
-    if index.get("quarantine_unattributable"):
-        # A quarantined line the fold could not cleanly and unambiguously
-        # attribute to one issue (a hard grammar failure, a duplicate-key/
-        # quoted/trailing-token poison line, or any other reparse-divergent
-        # case) could plausibly belong to ANY issue, so block ALL closeable
-        # issues this tick rather than risk closing the one it was meant
-        # for -- or, worse, letting a poisoned dispatch<->issue join close
-        # the wrong issue outright (Codex-sparred defect, round 2).
-        return "surface", "quarantine-unattributable-blocks-autoclose"
-
-    # G2 -----------------------------------------------------------------
-    open_by_issue = index.get("open_questions_by_issue", {}) or {}
-    if open_by_issue.get(issue_id):
-        return "surface", "open-question-for-issue"
-    if index.get("open_questions_unscoped"):
-        return "surface", "open-question-unscoped"
-
-    # G3 -----------------------------------------------------------------
-    my_dispatch_ids = [d for d, i in dispatch_issue_map.items() if i == issue_id]
-    non_superseded = [
-        d for d in my_dispatch_ids if not (dispatches.get(d) or {}).get("superseded")
-    ]
-    if not non_superseded:
-        return "surface", "no-non-superseded-dispatch"
-
-    # successor_of[d] = the dispatch that named `d` via `supersedes=`.
-    successor_of = {}
-    for d, disp in dispatches.items():
-        sup = disp.get("supersedes")
-        if sup:
-            successor_of[sup] = d
-
-    for d in my_dispatch_ids:
-        disp = dispatches.get(d) or {}
-        if not disp.get("superseded"):
-            continue
-        succ = successor_of.get(d)
-        succ_issue = dispatch_issue_map.get(succ) if succ else None
-        if succ_issue is not None and succ_issue != issue_id:
-            return "surface", "superseded-by-other-issue"
-
-    # Cross-issue child_of roll-up: ANY dispatch ANYWHERE in the full
-    # descendant graph of one of I's dispatches (not just direct children --
-    # grandchildren, great-grandchildren, ...) that is still active
-    # (non-terminal) blocks I's close, regardless of which issue that
-    # descendant dispatch itself belongs to (ledger-check enforces this
-    # roll-up globally, not per-issue). Walk the transitive closure via a
-    # children_of adjacency built from the WHOLE dispatch set, with a
-    # visited-set guard against cycles.
-    children_of = {}
-    for d, disp in dispatches.items():
-        parent = disp.get("child_of")
-        if parent:
-            children_of.setdefault(parent, []).append(d)
-
-    visited = set()
-    stack = list(my_dispatch_ids)
-    while stack:
-        cur = stack.pop()
-        for child in children_of.get(cur, []):
-            if child in visited:
-                continue
-            visited.add(child)
-            child_disp = dispatches.get(child) or {}
-            if child_disp.get("state") not in TERMINAL_DISPATCH_STATES:
-                return "surface", "parent/child-roll-up-violation"
-            stack.append(child)
-
-    verified = []
-    for d in non_superseded:
-        disp = dispatches.get(d) or {}
-        dstate = disp.get("state")
-        if dstate == "VERIFIED":
-            verified.append(d)
-            continue
-        if dstate == "ABANDONED":
-            succ = successor_of.get(d)
-            succ_issue = dispatch_issue_map.get(succ) if succ else None
-            has_same_issue_successor = False
-            if succ_issue == issue_id:
-                has_same_issue_successor = True
-            else:
-                for d2, disp2 in dispatches.items():
-                    if disp2.get("child_of") == d and dispatch_issue_map.get(d2) == issue_id:
-                        has_same_issue_successor = True
-                        break
-            if not has_same_issue_successor:
-                return "surface", "ABANDONED-without-same-issue-successor"
-            continue
-        if dstate == "FAILED":
-            return "surface", "FAILED"
-        if dstate == "QUARANTINED":
-            return "surface", "QUARANTINED"
-        return "surface", "dispatch-not-VERIFIED"
-
-    if not verified:
-        # Every non-superseded dispatch was ABANDONED-with-successor; none
-        # left to G4-corroborate. Treat as "no work to corroborate a close
-        # against" -- conservatively surface rather than close on nothing.
-        return "surface", "no-non-superseded-dispatch"
-
-    # P2-1(a): with automation.auto_close OFF, stop HERE -- before G4.
-    # `auto-close-disabled` means "G1-G3 passed; G4 corroboration was NOT
-    # run because the flag is off" (an informative candidate list, not a
-    # fully-corroborated one). An OFF tick performs zero git/network work
-    # for its candidates by construction.
-    if not auto_close_enabled:
-        return "surface", "auto-close-disabled"
-
-    # G4 -----------------------------------------------------------------
-    close_modes = set()
-    for d in verified:
-        disp = dispatches.get(d) or {}
-        repo_name = disp.get("repo")
-        branch = disp.get("branch")
-        # fix-pass-5b#1: `branch` here is read straight from the index
-        # (disp.get("branch")), not re-derived from anything F1 already
-        # validated at ACK-recording time. A corrupted/forged index entry
-        # would otherwise let an arbitrary, non-ticket-convention branch
-        # name build refs/heads/<branch> and silently satisfy the P2-2
-        # binding check below. Mirror F1's own TICKET_RE shape gate here,
-        # fail-closed, before that ref is ever built.
-        if not branch or not TICKET_RE.match(branch):
-            return "surface", "result-not-bound-to-branch"
-        repo_entry = repos.get(repo_name) if repo_name else None
-        repo_path = repo_entry.get("path") if repo_entry else None
-        if not repo_path:
-            return "surface", "repo-not-configured"
-        # B2.2 marker-path opt-ins: runtime fail-closed validation (config
-        # is operator-editable post-scaffold; scaffold-time validity is
-        # never trusted). Absent keys mean the defaults ("merge" / false)
-        # so generated repos predating B2.2 keep working; anything else
-        # invalid surfaces for this repo's issues rather than guessing.
-        merge_mode = repo_entry.get("merge_mode")
-        if merge_mode is None:
-            merge_mode = "merge"
-        allow_marker_branch_deleted = repo_entry.get("allow_marker_branch_deleted")
-        if allow_marker_branch_deleted is None:
-            allow_marker_branch_deleted = False
-        if merge_mode not in ("merge", "squash") or not isinstance(allow_marker_branch_deleted, bool):
-            return "surface", "repo-config-invalid"
-        rc, _, _ = tr_run(["rev-parse", "--is-inside-work-tree"], repo_path)
-        if rc != 0:
-            return "surface", "repo-not-on-disk"
-
-        attempt = disp.get("attempt")
-        base_sha = ((disp.get("attempts") or {}).get(attempt) or {}).get("base_sha")
-        result_sha = disp.get("result_sha")
-        if not base_sha or not result_sha:
-            return "surface", "missing-repo-metadata"
-
-        mainline = repo_entry.get("mainline")
-        mainline_ref = repo_entry.get("mainline_ref")
-        fetch_policy = repo_entry.get("fetch_policy")
-        reason = tr_g4_check(repo_path, mainline, mainline_ref, fetch_policy,
-                             base_sha, result_sha, branch, prefetch.get(repo_name))
-        if reason is None:
-            # strict topology corroborated -- squash repos included (fast-
-            # forward / merge-commit cases still close strictly).
-            close_modes.add("auto-closed-strict")
-            continue
-        if merge_mode != "squash" or reason not in MARKER_ELIGIBLE_STRICT_FAILURES:
-            return "surface", reason
-
-        # B2.2 marker arm: strict topology failed on a squash-workflow
-        # repo -- consult the fold-accepted, human-attested `merged`
-        # marker for THIS dispatch's current attempt. The marker's
-        # result_sha is validated against the per-attempt fold result
-        # (never the dispatch-level last-write-wins value).
-        att_result = ((disp.get("attempts") or {}).get(attempt) or {}).get("result_sha")
-        if not att_result:
-            return "surface", "missing-repo-metadata"
-        marker = (disp.get("merged") or {}).get(attempt)
-        if not isinstance(marker, dict):
-            return "surface", "no-strict-ancestry-and-no-valid-marker"
-        close_mode, mreason = tr_g4_marker_check(
-            repo_path, mainline, mainline_ref, fetch_policy, base_sha, att_result,
-            branch, prefetch.get(repo_name), marker, allow_marker_branch_deleted,
-        )
-        if mreason:
-            return "surface", mreason
-        close_modes.add(close_mode)
-
-    # Close-mode legibility: the row's reason records HOW the close was
-    # corroborated. If ANY dispatch needed the marker path, the row says
-    # so (the branch-deleted variant wins for explicitness); a pure-strict
-    # close says auto-closed-strict.
-    if "auto-closed-marker-branch-deleted" in close_modes:
-        return "close", "auto-closed-marker-branch-deleted"
-    if "auto-closed-marker" in close_modes:
-        return "close", "auto-closed-marker"
-    return "close", "auto-closed-strict"
-PYEOF
 
 # ---------------------------------------------------------------------------
 # STAGE 1 (outside any lock, read-only): identify candidate dispatches (ACKED
@@ -1465,7 +830,9 @@ for d, disp in sorted(dispatches.items()):
         surface("tab-binding-unconfirmed")
         continue
 
-    reason, result_sha = tr_corroborate_git(repo_path, branch, base_sha)
+    reason, result_sha = tr_corroborate_git(
+        repo_path, branch, base_sha, repo_entry.get("mainline_ref"), mainline
+    )
     if reason:
         surface(reason)
         continue
@@ -1500,44 +867,20 @@ fi
 # ---------------------------------------------------------------------------
 _tr_final_file="$(_tr_mktemp "${TMPDIR:-/tmp}/pm-track-final.XXXXXX")"
 
-# ---------------------------------------------------------------------------
 # Auto-close pre-fetch phase (P2-1(b)) -- STILL OUTSIDE the lock, right
-# before acquiring it: the ONLY network work the auto-close pass ever does.
-# Fetches each configured fetch-policy repo's mainline ref at most once per
-# (repo,ref) per tick and records a per-repo verdict; stage 2.5's G4 then
-# resolves refs LOCALLY under the lock and consumes the verdict (a
-# pre-fetch failure surfaces `fetch-failed` for the issues that need that
-# repo). Skipped entirely when automation.auto_close is OFF -- a disabled
-# tick performs zero fetches (P2-1(a)). A driver failure degrades to an
-# empty verdict map, which G4 reads as fetch-failed for every fetch-policy
-# repo (fail-closed, never fail-open).
-# ---------------------------------------------------------------------------
-_tr_prefetch_file="$(_tr_mktemp "${TMPDIR:-/tmp}/pm-track-ac-prefetch.XXXXXX")"
-printf '{}' >"${_tr_prefetch_file}"
-if [[ "${_tr_auto_close_enabled}" == "1" ]]; then
-  _tr_prefetch_driver='
-import json, os
-
-_pf_repos = json.loads(os.environ["PM_TR_REPOS"])
-_pf_out = os.environ["PM_TR_PREFETCH_OUT"]
-_pf_status = tr_prefetch_mainline_refs(_pf_repos)
-with open(_pf_out, "w") as f:
-    json.dump(_pf_status, f)
-'
-  if ! PM_TR_REPOS="${_tr_repos_json}" \
-    PM_TR_PREFETCH_OUT="${_tr_prefetch_file}" \
-    bash -c 'printf "%s\n%s\n%s\n" "$1" "$2" "$3" | python3 -' _ "${_TR_CORROB_PY}" "${_TR_CLOSE_PY}" "${_tr_prefetch_driver}"; then
-    printf '{}' >"${_tr_prefetch_file}"
-  fi
-fi
+# before acquiring it; see _track_autoclose for the full contract.
+_tr_autoclose_prefetch
 
 if ! pm_lock "${_tr_root}"; then
   echo "track: failed to acquire repo lock" >&2
   exit 1
 fi
-# pm_lock installs its own EXIT/INT/TERM trap; re-install ours so temp files
-# are still cleaned up on abnormal exit.
-trap _tr_cleanup EXIT INT TERM
+# pm_lock installs its own EXIT/INT/TERM traps; re-install ours so temp
+# files are still cleaned up on abnormal exit (same terminate-on-signal
+# shape -- see the C6 note at the trap definitions).
+trap _tr_cleanup EXIT
+trap '_tr_cleanup_sig INT' INT
+trap '_tr_cleanup_sig TERM' TERM
 
 if ! pm_fold "${_tr_root}"; then
   echo "track: pm_fold failed (see above)" >&2
@@ -1581,7 +924,11 @@ for row in verdict["rows"]:
     if not repo_path or not branch or not base_sha:
         reason = "corroboration-changed-under-lock"
     else:
-        reason, result_sha = tr_corroborate_git(repo_path, branch, base_sha)
+        reason, result_sha = tr_corroborate_git(
+            repo_path, branch, base_sha,
+            repo_entry.get("mainline_ref") if repo_entry else None,
+            repo_entry.get("mainline") if repo_entry else None,
+        )
 
     if reason:
         row = dict(row)
@@ -1624,7 +971,14 @@ for row in rows:
     fi
     _tr_a="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["a"])' "${_tr_line}")"
     _tr_sha="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["result_sha"])' "${_tr_line}")"
-    if pm_apply result d="${_tr_d}" a="${_tr_a}" status=RETURNED result_sha="${_tr_sha}" at="${_tr_now}" >/dev/null 2>"${_tr_root}/.pm/.track-apply-err.tmp"; then
+    # C8: a fixed, predictable `.pm/*.tmp` path here would let anything
+    # with write access to `.pm/` (operator territory, but not a reason to
+    # hand out an arbitrary-file clobber) plant a symlink and have this
+    # stderr redirect truncate-through it. mktemp's unpredictable name
+    # closes that; register it on the manifest so a signal mid-loop still
+    # reaps it.
+    _tr_apply_err_file="$(_tr_mktemp "${TMPDIR:-/tmp}/pm-track-apply-err.XXXXXX")"
+    if pm_apply result d="${_tr_d}" a="${_tr_a}" status=RETURNED result_sha="${_tr_sha}" at="${_tr_now}" >/dev/null 2>"${_tr_apply_err_file}"; then
       python3 -c '
 import json, sys
 path = sys.argv[1]
@@ -1636,7 +990,7 @@ with open(path, "w") as f:
     json.dump(rows, f)
 ' "${_tr_recorded_file}" "${_tr_line}"
     else
-      _tr_err="$(cat "${_tr_root}/.pm/.track-apply-err.tmp" 2>/dev/null || true)"
+      _tr_err="$(cat "${_tr_apply_err_file}" 2>/dev/null || true)"
       python3 -c '
 import json, sys
 path = sys.argv[1]
@@ -1651,968 +1005,24 @@ with open(path, "w") as f:
     json.dump(rows, f)
 ' "${_tr_final_file}" "${_tr_line}" "${_tr_err}"
     fi
-    rm -f "${_tr_root}/.pm/.track-apply-err.tmp"
+    rm -f "${_tr_apply_err_file}"
   done
 }
 
-# ---------------------------------------------------------------------------
-# STAGE 2.5 (still under the SAME pm_lock hold, after the RETURNED-intake
-# apply loop above): B2.1 auto-close pass, STRICT merged-path only (the
-# MARKER path is B2.2, not built here). index.json is already fresh here --
-# pm_apply/pm_apply_batch refolds it on every successful write above, so no
-# extra pm_fold call is needed. Config-gated on automation.auto_close
-# (_tr_auto_close_enabled, default OFF): when OFF, every issue that passes
-# G1-G3 is surfaced as `auto-close-disabled` -- meaning "G1-G3 passed; G4
-# corroboration was NOT run because the flag is off" (P2-1(a)) -- an
-# informative candidate list; nothing is ever closed, and no git/network
-# work runs, with the flag off.
-# Crash-recovery re-archiving (CLOSED issue with leftover prompts/messages
-# files) is ALWAYS attempted regardless of the flag: it completes an
-# already-decided close, not a new close decision.
-#
-# This pass is a pure function of index.json + .pm/config.json + live git --
-# the herdr snapshot (_tr_snapshot_file / _tr_herdr_ok) is NEVER read here,
-# by construction, so a herdr-unavailable tick still auto-closes normally.
-# ---------------------------------------------------------------------------
-_tr_ac_verdict_file="$(_tr_mktemp "${TMPDIR:-/tmp}/pm-track-ac-verdict.XXXXXX")"
-_tr_ac_driver='
-import json, os, traceback
-
-_ac_index_path = os.environ["PM_TR_INDEX"]
-_ac_root = os.environ["PM_TR_ROOT"]
-_ac_auto_close = os.environ["PM_TR_AUTO_CLOSE"] == "1"
-_ac_out_path = os.environ["PM_TR_AC_OUT"]
-
-with open(_ac_index_path) as f:
-    _ac_index = json.load(f)
-_ac_repos = json.loads(os.environ["PM_TR_REPOS"])
-# Pre-lock pre-fetch verdicts (P2-1(b)); unreadable/absent degrades to {}
-# -> G4 treats every fetch-policy repo as fetch-failed (fail-closed).
-try:
-    with open(os.environ["PM_TR_PREFETCH"]) as f:
-        _ac_prefetch = json.load(f)
-except Exception:
-    _ac_prefetch = {}
-if not isinstance(_ac_prefetch, dict):
-    _ac_prefetch = {}
-
-# Authoritative dispatch_new -> issue map, fold-derived (index.json key
-# "dispatch_issue_map", built ONLY from ACCEPTED -- successfully-applied,
-# never quarantined -- dispatch_new events; P3-5). NEVER a second raw-log
-# re-scan of the event log.
-# A raw re-parse here would diverge from the strict grammar the fold
-# itself uses (e.g. accepting a duplicate-key line the fold quarantined)
-# and could misattribute a dispatch to the wrong issue, closing it in
-# error.
-_ac_dispatch_issue_map = dict(_ac_index.get("dispatch_issue_map") or {})
-
-_ac_issue_ids = set(_ac_index.get("issues", {}).keys())
-_ac_issue_ids.update(_ac_dispatch_issue_map.values())
-
-def _ac_has_leftovers(issue_id):
-    # P3-6: an OSError here (unreadable prompts/ or messages/) must NOT be
-    # read as "no leftovers" -- it deliberately PROPAGATES to the per-issue
-    # handler below and surfaces auto-close-driver-error with the traceback
-    # as detail. A silently-swallowed False would skip crash-recovery
-    # re-archiving for a CLOSED issue forever, with no trace anywhere.
-    for sub in ("prompts", "messages"):
-        d = os.path.join(_ac_root, sub)
-        if not os.path.isdir(d):
-            continue
-        prefix = issue_id + "_"
-        for name in os.listdir(d):
-            if name.startswith(prefix):
-                return True
-    return False
-
-_ac_results = []
-for _ac_i in sorted(_ac_issue_ids):
-    # Never let a single unexpected exception on this issue (bad/malformed
-    # config values, corrupt index data, ...) crash the WHOLE auto-close
-    # pass -- that would silently leave every OTHER issue with no verdict
-    # at all (Codex-sparred defect #3). Surface a loud, attributable
-    # reason for just this issue and keep going.
-    try:
-        _ac_action, _ac_reason = evaluate_issue(
-            _ac_i, _ac_index, _ac_repos, _ac_dispatch_issue_map,
-            _ac_auto_close, _ac_has_leftovers(_ac_i), _ac_prefetch,
-        )
-        # fix-pass-5b#3: REASONS is the single registry of every surface
-        # reason token this pass may emit. Enforce it here rather than let
-        # it silently drift from what evaluate_issue actually returns --
-        # an unregistered token would otherwise flow straight into the
-        # verdict row unexamined. Reuses the existing per-issue
-        # crash-isolation path below (loud, attributable, never crashes
-        # the whole pass).
-        if _ac_reason is not None and _ac_reason not in REASONS:
-            raise ValueError(
-                f"unregistered auto-close reason token: {_ac_reason!r} "
-                f"(action={_ac_action!r}) -- REASONS registry has drifted; "
-                "add it to REASONS in track"
-            )
-        _ac_detail = None
-    except Exception:
-        _ac_action, _ac_reason = "surface", "auto-close-driver-error"
-        # P3-3(a): the surfaced row carries a bounded traceback as detail
-        # -- attributable diagnostics, never a bare opaque reason.
-        _ac_detail = traceback.format_exc()[-2000:]
-    if _ac_action == "skip":
-        continue
-    _ac_row = {"i": _ac_i, "action": _ac_action, "reason": _ac_reason}
-    if _ac_detail:
-        _ac_row["detail"] = _ac_detail
-    _ac_results.append(_ac_row)
-
-with open(_ac_out_path, "w") as f:
-    json.dump(_ac_results, f)
-'
-# Default to a valid-but-empty verdict file BEFORE invoking the driver, so
-# a total driver crash (before it ever gets to write PM_TR_AC_OUT itself --
-# e.g. an exception outside the per-issue try/except above) still leaves
-# behind parseable JSON rather than a missing/truncated file.
-printf '[]' >"${_tr_ac_verdict_file}"
-_tr_ac_driver_stderr_file="$(_tr_mktemp "${TMPDIR:-/tmp}/pm-track-ac-driver-err.XXXXXX")"
-_tr_ac_driver_ok=1
-if ! PM_TR_INDEX="${_tr_index}" \
-  PM_TR_REPOS="${_tr_repos_json}" \
-  PM_TR_ROOT="${_tr_root}" \
-  PM_TR_AUTO_CLOSE="${_tr_auto_close_enabled}" \
-  PM_TR_PREFETCH="${_tr_prefetch_file}" \
-  PM_TR_AC_OUT="${_tr_ac_verdict_file}" \
-  bash -c 'printf "%s\n%s\n%s\n" "$1" "$2" "$3" | python3 -' _ "${_TR_CORROB_PY}" "${_TR_CLOSE_PY}" "${_tr_ac_driver}" \
-  2>"${_tr_ac_driver_stderr_file}"; then
-  _tr_ac_driver_ok=0
-fi
-# Belt-and-suspenders on top of the per-issue try/except above (defect #3):
-# even a nonzero exit AND/OR an unparseable verdict file must never be a
-# silent no-op -- degrade to one loud, unmistakable surfaced row rather
-# than leaving ac_closed/ac_surfaced both empty with no trace anywhere.
-if [[ "${_tr_ac_driver_ok}" -eq 1 ]]; then
-  if ! python3 -c '
-import json, sys
-try:
-    with open(sys.argv[1]) as f:
-        json.load(f)
-except Exception:
-    sys.exit(1)
-' "${_tr_ac_verdict_file}"; then
-    _tr_ac_driver_ok=0
-  fi
-fi
-if [[ "${_tr_ac_driver_ok}" -eq 0 ]]; then
-  # P3-3(b): a whole-driver crash must never discard its only diagnostics
-  # -- the driver's bounded stderr tail is (1) echoed to track's own
-  # stderr and (2) embedded as the fallback row's detail, BEFORE the temp
-  # stderr file is removed below.
-  _tr_ac_err_tail="$(tail -c 2000 "${_tr_ac_driver_stderr_file}" 2>/dev/null || true)"
-  if [[ -n "${_tr_ac_err_tail}" ]]; then
-    {
-      echo "track: auto-close driver failed; stderr tail:"
-      printf '%s\n' "${_tr_ac_err_tail}"
-    } >&2
-  fi
-  if ! python3 -c '
-import json, sys
-row = {"i": "(auto-close)", "action": "surface", "reason": "auto-close-driver-error"}
-if sys.argv[2]:
-    row["detail"] = sys.argv[2]
-with open(sys.argv[1], "w") as f:
-    json.dump([row], f)
-' "${_tr_ac_verdict_file}" "${_tr_ac_err_tail}"; then
-    printf '[{"i": "(auto-close)", "action": "surface", "reason": "auto-close-driver-error"}]' >"${_tr_ac_verdict_file}"
-  fi
-fi
-rm -f "${_tr_ac_driver_stderr_file}"
-
-_tr_ac_closed_file="$(_tr_mktemp "${TMPDIR:-/tmp}/pm-track-ac-closed.XXXXXX")"
-_tr_ac_surfaced_file="$(_tr_mktemp "${TMPDIR:-/tmp}/pm-track-ac-surfaced.XXXXXX")"
-printf '[]' >"${_tr_ac_closed_file}"
-printf '[]' >"${_tr_ac_surfaced_file}"
-
-python3 -c '
-import json, sys
-with open(sys.argv[1]) as f:
-    rows = json.load(f)
-for row in rows:
-    print(json.dumps(row))
-' "${_tr_ac_verdict_file}" | {
-  while IFS= read -r _tr_ac_line; do
-    [[ -z "${_tr_ac_line}" ]] && continue
-    _tr_ac_i="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["i"])' "${_tr_ac_line}")"
-    _tr_ac_action="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["action"])' "${_tr_ac_line}")"
-    if [[ "${_tr_ac_action}" == "surface" ]]; then
-      python3 -c '
-import json, sys
-path = sys.argv[1]
-row = json.loads(sys.argv[2])
-with open(path) as f:
-    rows = json.load(f)
-rows.append(row)
-with open(path, "w") as f:
-    json.dump(rows, f)
-' "${_tr_ac_surfaced_file}" "${_tr_ac_line}"
-      continue
-    fi
-    # action in {close, rearchive}: both invoke pm_close_issue IN-PROCESS
-    # (never `bin/close` -- a subprocess acquiring pm_lock while this shell
-    # already holds it would deadlock; pm_lock's reentrancy is in-process
-    # only). Failures are classified via pm_close_issue's STABLE stderr
-    # tokens (P3-4), never by prose matching:
-    #   close-refused-state-race     -> close-race/refusal (BENIGN: the
-    #                                   issue's state changed under us)
-    #   close-refused-unfoldable-log -> close-refused-unfoldable-log
-    #                                   (LOUD -- the log itself is sick)
-    #   close-transition-durable     -> the CLOSED event IS durably on the
-    #                                   log; only archive/note failed ->
-    #                                   counted closed, rendered
-    #                                   closed-with-pending-archive
-    #   anything else                -> close/archive-failure
-    # B2.2 (fix-pass-6 F1): a MARKER-path close leaves a durable audit
-    # note on the event log (`note ref=auto-close:marker[-branch-deleted]
-    # i=<issue>`), so the human-attested corroboration mode survives
-    # beyond TRACKER.md's per-tick re-render. Ordering is load-bearing:
-    # the note is emitted BEFORE pm_close_issue, so a crash between the
-    # two leaves an un-closed issue WITH its provenance record -- the next
-    # tick re-evaluates the gates, the fold-derived dedup below skips the
-    # re-emit, and the close proceeds (exactly one note total). Emission
-    # failure REFUSES the close (fail-closed: no marker close without its
-    # durable provenance record) and surfaces marker-note-emit-failed for
-    # a retry next tick. Strict closes stay note-free (byte-identical
-    # B2.1 behavior).
-    if [[ "${_tr_ac_action}" == "close" ]]; then
-      _tr_ac_mode="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("reason") or "")' "${_tr_ac_line}")"
-      _tr_ac_note_ref=""
-      case "${_tr_ac_mode}" in
-        auto-closed-marker) _tr_ac_note_ref="auto-close:marker" ;;
-        auto-closed-marker-branch-deleted) _tr_ac_note_ref="auto-close:marker-branch-deleted" ;;
-      esac
-      if [[ -n "${_tr_ac_note_ref}" ]]; then
-        # Dedup against the FOLD (index.auto_close_notes, folded at tick
-        # start) -- never a raw-log re-scan. A prior crashed tick's note
-        # is found here; this tick's own fresh emission cannot be (the
-        # re-fold happens next tick), which is exactly right: emit at most
-        # once per tick, skip when a durable record already exists.
-        _tr_ac_note_dup="$(NOTE_I="${_tr_ac_i}" NOTE_REF="${_tr_ac_note_ref}" python3 -c '
-import json, os, sys
-try:
-    with open(sys.argv[1]) as f:
-        idx = json.load(f)
-except Exception:
-    print("0"); raise SystemExit
-refs = (idx.get("auto_close_notes") or {}).get(os.environ["NOTE_I"]) or []
-print("1" if os.environ["NOTE_REF"] in refs else "0")
-' "${_tr_root}/.pm/index.json")"
-        if [[ "${_tr_ac_note_dup}" != "1" ]]; then
-          if ! PM_ROOT="${_tr_root}" pm_apply note at="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            ref="${_tr_ac_note_ref}" i="${_tr_ac_i}" >/dev/null 2>&1; then
-            python3 -c '
-import json, sys
-path = sys.argv[1]
-row = json.loads(sys.argv[2])
-row["reason"] = "marker-note-emit-failed"
-row["detail"] = "audit-note emission failed; marker close refused (retry next tick)"
-row["action"] = "surface"
-with open(path) as f:
-    rows = json.load(f)
-rows.append(row)
-with open(path, "w") as f:
-    json.dump(rows, f)
-' "${_tr_ac_surfaced_file}" "${_tr_ac_line}"
-            continue
-          fi
-        fi
-      fi
-    fi
-    _tr_ac_out="$(pm_close_issue "${_tr_root}" "${_tr_ac_i}" 2>&1)"
-    _tr_ac_rc=$?
-    if [[ "${_tr_ac_rc}" -eq 0 ]]; then
-      python3 -c '
-import json, sys
-path = sys.argv[1]
-row = json.loads(sys.argv[2])
-with open(path) as f:
-    rows = json.load(f)
-rows.append(row)
-with open(path, "w") as f:
-    json.dump(rows, f)
-' "${_tr_ac_closed_file}" "${_tr_ac_line}"
-    else
-      _tr_ac_reason="$(tr_ac_classify_close_failure "${_tr_ac_out}")"
-      _tr_ac_dest_file="${_tr_ac_surfaced_file}"
-      if [[ "${_tr_ac_reason}" == "closed-with-pending-archive" ]]; then
-        # P3-4: the CLOSED transition durably landed; only a later
-        # archive/note step failed -> the issue IS closed. Count it in the
-        # closed set, flagged, instead of misreporting "not auto-closed".
-        _tr_ac_dest_file="${_tr_ac_closed_file}"
-      fi
-      python3 -c '
-import json, sys
-path = sys.argv[1]
-row = json.loads(sys.argv[2])
-row["reason"] = sys.argv[3]
-row["detail"] = sys.argv[4]
-with open(path) as f:
-    rows = json.load(f)
-rows.append(row)
-with open(path, "w") as f:
-    json.dump(rows, f)
-' "${_tr_ac_dest_file}" "${_tr_ac_line}" "${_tr_ac_reason}" "${_tr_ac_out}"
-    fi
-  done
-}
+# STAGE 2.5 (still under the SAME pm_lock hold): B2.1 auto-close pass;
+# see _track_autoclose for the full contract.
+_tr_autoclose_pass
 
 pm_unlock
-trap _tr_cleanup EXIT INT TERM
+trap _tr_cleanup EXIT
+trap '_tr_cleanup_sig INT' INT
+trap '_tr_cleanup_sig TERM' TERM
 
-# ---------------------------------------------------------------------------
-# SPAWN stage (B3, after STAGE 2.5): automation-lane auto-spawn via the
-# durable spawn-intent lease. Runs only when automation.auto_spawn is true
-# AND herdr was available this tick (else it skips exactly like STAGE 1);
-# with auto_spawn OFF and a non-empty queue it surfaces the steady-state
-# `auto-spawn-disabled` count instead. An invalid spawn config is a
-# FAIL-CLOSED skip with a surfaced `spawn-config-invalid` row.
-#
-# Two phases, planned OUTSIDE any lock from the fold + the workspace-
-# filtered panes[], then executed with durability-before-effect ordering:
-#
-#   Phase A (crash recovery): a spawn_intent open from a PRIOR tick with no
-#   ACK joins panes[name == ref]. Phase A NEVER ACKs: herdr allows
-#   DUPLICATE pane names and the deterministic worker name is derivable
-#   from events.log, so a name join alone is impostor-forgeable -- an
-#   auto-ACK here would let a single impostor pane permanently silence the
-#   orphan surface. Exactly one live pane -> `spawn-ack-unconfirmed` row
-#   naming the candidate pane (name/tab_id/pane_id) + the exact manual
-#   `bin/record dispatch <D> ACKED --tab <id>` command; >1 ->
-#   `ambiguous-spawn-ack`; none -> the intent ages (advisory
-#   .pm/spawn-intent-age.json -- drives ONLY the `suspected-orphan-intent`
-#   surface, never state; track NEVER auto-abandons). Phase B's same-tick
-#   ACK below is different in kind: track created that tab itself this
-#   tick, so the join is strongly corroborated, not name-guessed.
-#
-#   Phase B (spawn, per free capacity slot, FIFO by dispatch number):
-#   guards (prompt re-resolved from the folded note binding + RE-HASHED
-#   against the recorded prompt_sha; deterministic worker name not already
-#   a live pane), then (i) under pm_lock: re-fold, re-check eligibility,
-#   append the spawn_intent DURABLY, release; (ii) OUTSIDE the lock:
-#   herdr tab create; (iii) OUTSIDE the lock: herdr agent start; (iv)
-#   under pm_lock: DISPATCHED->ACKED with the created tab_id, SAME tick.
-#   Every failure after (i) leaves the durable intent in place (it ages
-#   into Phase A recovery) and surfaces -- fail-closed, never a guess.
-#   pm_lock is NEVER held across the herdr calls.
-# ---------------------------------------------------------------------------
-_tr_spawn_plan_file="$(_tr_mktemp "${TMPDIR:-/tmp}/pm-track-spawn-plan.XXXXXX")"
-printf '{"spawn": [], "rows": [], "steady": {}, "age": {}, "ran": false}' >"${_tr_spawn_plan_file}"
-_tr_spawn_rows_file="$(_tr_mktemp "${TMPDIR:-/tmp}/pm-track-spawn-rows.XXXXXX")"
-printf '[]' >"${_tr_spawn_rows_file}"
-_tr_spawn_spawned_file="$(_tr_mktemp "${TMPDIR:-/tmp}/pm-track-spawn-done.XXXXXX")"
-printf '[]' >"${_tr_spawn_spawned_file}"
-_tr_spawn_age_file="${_tr_root}/.pm/spawn-intent-age.json"
-_tr_spawn_now="$(now_iso)"
-
-read -r -d '' _tr_spawn_plan_driver <<'PYEOF' || true
-import hashlib
-
-# Snapshot-derived herdr ids (tab_id/pane_id) that may be embedded into an
-# operator-pasteable command must match this strict charset; anything else
-# is withheld from the command position (P2 -- paste-injection guard).
-_SP_ID_RE = re.compile(r"^[A-Za-z0-9:_-]+$")
-
-_sp_cfg = json.loads(os.environ["PM_TR_SPAWN_CFG"])
-_sp_herdr_ok = os.environ["PM_TR_HERDR_OK"] == "1"
-_sp_root = os.environ["PM_TR_ROOT"]
-_sp_out = os.environ["PM_TR_SPAWN_PLAN"]
-_sp_age_path = os.environ["PM_TR_SPAWN_AGE"]
-
-with open(os.environ["PM_TR_INDEX"]) as f:
-    _sp_index = json.load(f)
-with open(os.environ["PM_TR_PANES"]) as f:
-    _sp_panes = json.load(f)
-
-_sp_plan = {"spawn": [], "rows": [], "steady": {}, "age": {}, "ran": False}
-
-
-def _sp_check_reason(reason):
-    # fix-pass-5b#3 discipline: every reason this stage can surface MUST be
-    # registered in REASONS; an unregistered token is a programming error.
-    if reason not in REASONS:
-        raise RuntimeError(
-            f"spawn stage produced unregistered reason {reason!r} -- REASONS "
-            "registry has drifted; add it to REASONS in track"
-        )
-
-
-def _sp_surface(d, reason, detail=""):
-    _sp_check_reason(reason)
-    row = {"d": d, "reason": reason}
-    if detail:
-        row["detail"] = detail
-    _sp_plan["rows"].append(row)
-
-
-def _sp_steady(reason, ids):
-    _sp_check_reason(reason)
-    _sp_plan["steady"][reason] = sorted(ids)
-
-
-_sp_dispatches = _sp_index.get("dispatches", {})
-_sp_issues = _sp_index.get("issues", {})
-_sp_dim = _sp_index.get("dispatch_issue_map") or {}
-_sp_oq = _sp_index.get("open_questions_by_issue") or {}
-
-
-def _sp_open_intent(disp):
-    # An OPEN lease: the dispatch is still DISPATCHED and its CURRENT
-    # attempt has an accepted spawn_intent (an ACK moves the state on; a
-    # retry mints a new attempt the old intent is not keyed under).
-    # Superseded dispatches are excluded (Red Team F5): they need human
-    # adjudication, matching Phase B's queue rule and under-lock re-check.
-    if disp.get("superseded"):
-        return None, None
-    a = disp.get("attempt")
-    si = disp.get("spawn_intent") or {}
-    if disp.get("state") == "DISPATCHED" and a and a in si:
-        return a, si[a]
-    return None, None
-
-
-def _sp_dnum(d):
-    try:
-        return int(d.split("-", 1)[1])
-    except Exception:
-        return 1 << 30
-
-
-# The queue (computed for BOTH the enabled and disabled paths -- the
-# disabled path needs to know whether anything is waiting): automation-lane
-# dispatches currently DISPATCHED with tab still "?", no open intent, not
-# superseded, whose owning issue is known, not NEEDS-USER/BLOCKED, and has
-# no open question. FIFO by dispatch number.
-_sp_queue = []
-for _sp_d in sorted(_sp_dispatches, key=_sp_dnum):
-    _sp_disp = _sp_dispatches[_sp_d]
-    if _sp_disp.get("state") != "DISPATCHED":
-        continue
-    if _sp_disp.get("lane") != "automation":
-        continue
-    if _sp_disp.get("tab") != "?":
-        continue
-    if _sp_disp.get("superseded"):
-        continue
-    _sp_a, _ = _sp_open_intent(_sp_disp)
-    if _sp_a:
-        continue
-    _sp_issue = _sp_dim.get(_sp_d)
-    if not _sp_issue:
-        continue
-    if (_sp_issues.get(_sp_issue) or {}).get("state") in ("NEEDS-USER", "BLOCKED"):
-        continue
-    if _sp_oq.get(_sp_issue):
-        continue
-    _sp_queue.append(_sp_d)
-
-if not _sp_cfg.get("valid"):
-    # FAIL-CLOSED: invalid automation config -> one loud row, zero spawns.
-    _sp_surface("(automation)", "spawn-config-invalid", _sp_cfg.get("detail") or "")
-elif not _sp_cfg.get("enabled"):
-    if _sp_queue:
-        _sp_steady("auto-spawn-disabled", _sp_queue)
-elif not _sp_herdr_ok:
-    # skip exactly like STAGE 1 -- the global herdr-unavailable banner
-    # already covers the tick.
-    pass
-else:
-    _sp_plan["ran"] = True
-
-    # ---- Phase A: crash-recovery over open PRIOR-tick intents ----
-    # (every folded open intent predates this tick by construction: Phase B
-    # has not run yet, so nothing from THIS tick can be in the fold.)
-    # Age-file failure direction (hunter P2): a corrupt/unreadable file
-    # must FAIL TOWARD SURFACING -- if the counter could be wiped every
-    # tick, a true orphan would never age past the timeout. Whole-file
-    # corruption therefore treats every open intent as ALREADY AGED this
-    # tick (surface sooner, never later); a single malformed ENTRY merely
-    # restarts that entry's count.
-    _sp_age_corrupt = False
-    try:
-        with open(_sp_age_path) as f:
-            _sp_age = json.load(f)
-        if not isinstance(_sp_age, dict):
-            _sp_age = {}
-            _sp_age_corrupt = True
-    except FileNotFoundError:
-        _sp_age = {}
-    except Exception:
-        _sp_age = {}
-        _sp_age_corrupt = True
-
-    def _sp_age_entry(key):
-        # v1 entries were bare ints; v2 entries are {"n": int, "cause": str}
-        # (cause = last known spawn-window failure, advisory text only).
-        raw = _sp_age.get(key)
-        if isinstance(raw, dict):
-            n = raw.get("n")
-            return (n if isinstance(n, int) and n >= 0 else 0), raw.get("cause")
-        if isinstance(raw, int) and raw >= 0:
-            return raw, None
-        return 0, None
-
-    _sp_live_panes = [p for p in _sp_panes.get("panes", []) if p.get("name")]
-    for _sp_d in sorted(_sp_dispatches, key=_sp_dnum):
-        _sp_disp = _sp_dispatches[_sp_d]
-        _sp_a, _sp_intent = _sp_open_intent(_sp_disp)
-        if not _sp_a:
-            continue
-        _sp_ref = _sp_intent.get("ref")
-        _sp_matches = [
-            p for p in _sp_live_panes
-            if _sp_ref and p.get("name") == _sp_ref and p.get("tab_id")
-        ]
-        if len(_sp_matches) == 1:
-            # NEVER auto-ack on a bare name join (impostor-forgeable; see
-            # the stage header). Surface the candidate + the exact manual
-            # confirmation command instead. The ids are SNAPSHOT-derived
-            # (not fold-validated tokens), and the command is built to be
-            # operator-PASTEABLE -- so both ids must pass a strict charset
-            # check before they may ride into it (a hostile tab_id like
-            # `foo; rm -rf ~` must never reach a shell via copy-paste).
-            _sp_pane = _sp_matches[0]
-            _sp_tab_id = str(_sp_pane.get("tab_id") or "")
-            _sp_pane_id = str(_sp_pane.get("pane_id") or "")
-            if _SP_ID_RE.match(_sp_tab_id) and _SP_ID_RE.match(_sp_pane_id):
-                _sp_detail = (
-                    "live pane candidate name={} tab_id={} pane_id={}; if this "
-                    "is the real worker, confirm manually: bin/record dispatch "
-                    "{} ACKED --tab {}".format(
-                        _sp_ref, _sp_tab_id, _sp_pane_id, _sp_d, _sp_tab_id,
-                    )
-                )
-            else:
-                _sp_detail = (
-                    "live pane candidate matched worker name {} but its "
-                    "snapshot ids failed the charset check; ready-to-paste "
-                    "command withheld -- inspect the herdr snapshot "
-                    "manually".format(_sp_ref)
-                )
-            _sp_surface(_sp_d, "spawn-ack-unconfirmed", _sp_detail)
-        elif len(_sp_matches) > 1:
-            _sp_surface(_sp_d, "ambiguous-spawn-ack",
-                        f"{len(_sp_matches)} live panes named {_sp_ref}")
-        else:
-            _sp_key = f"{_sp_d}/{_sp_a}"
-            _sp_prev_n, _sp_cause = _sp_age_entry(_sp_key)
-            if _sp_age_corrupt:
-                _sp_n = max(_sp_cfg["timeout"], 1)
-            else:
-                _sp_n = _sp_prev_n + 1
-            _sp_plan["age"][_sp_key] = {"n": _sp_n, "cause": _sp_cause}
-            if _sp_n >= _sp_cfg["timeout"]:
-                _sp_detail = (
-                    f"no live pane named {_sp_ref} after {_sp_n} herdr-visible "
-                    "tick(s); operator adjudication needed (track never auto-abandons)"
-                )
-                if _sp_age_corrupt:
-                    _sp_detail += "; age counter file was corrupt (failed toward surfacing)"
-                if _sp_cause:
-                    _sp_detail += f"; last known cause: {_sp_cause}"
-                _sp_surface(_sp_d, "suspected-orphan-intent", _sp_detail)
-
-    # ---- Phase B: spawn planning per free capacity slot ----
-    _sp_live = _sp_panes.get("live_agents", 0)
-    _sp_free = _sp_cfg["max_live_workers"] - (_sp_live if isinstance(_sp_live, int) else 0)
-    _sp_pane_names = {p.get("name") for p in _sp_live_panes}
-    if _sp_queue and _sp_free <= 0:
-        _sp_steady("capacity-exceeded", _sp_queue)
-    elif _sp_queue:
-        _sp_over = []
-        for _sp_d in _sp_queue:
-            if _sp_free <= 0:
-                _sp_over.append(_sp_d)
-                continue
-            _sp_disp = _sp_dispatches[_sp_d]
-            _sp_a = _sp_disp.get("attempt")
-            _sp_pref = _sp_disp.get("prompt_ref")
-            _sp_psha = _sp_disp.get("prompt_sha")
-            # D2 guard: the durable prompt copy is re-resolved from the
-            # FOLDED note binding and RE-HASHED against the recorded
-            # prompt_sha before any spawn -- a mismatch/missing binding is
-            # a surface, never a spawn.
-            if not _sp_pref or not _sp_psha:
-                _sp_surface(_sp_d, "prompt-sha-mismatch",
-                            "no folded prompt binding (prompt_ref/prompt_sha missing)")
-                continue
-            if not _sp_pref.startswith("prompts/") or ".." in _sp_pref.split("/"):
-                _sp_surface(_sp_d, "prompt-sha-mismatch",
-                            f"unsafe prompt binding {_sp_pref!r}")
-                continue
-            _sp_m = re.match(r"^I-(\d+)_(.+)_\d{4}-\d{2}-\d{2}\.md$",
-                             _sp_pref.split("/")[-1])
-            if not _sp_m:
-                _sp_surface(_sp_d, "prompt-sha-mismatch",
-                            f"prompt binding {_sp_pref!r} does not match "
-                            "I-###_<slug>_YYYY-MM-DD.md")
-                continue
-            _sp_abs = os.path.join(_sp_root, _sp_pref)
-            try:
-                with open(_sp_abs, "rb") as _sp_f:
-                    _sp_got = hashlib.sha256(_sp_f.read()).hexdigest()[:8]
-            except OSError:
-                _sp_surface(_sp_d, "prompt-sha-mismatch", f"{_sp_pref} unreadable")
-                continue
-            if _sp_got != _sp_psha:
-                _sp_surface(_sp_d, "prompt-sha-mismatch",
-                            f"recorded prompt_sha={_sp_psha}, durable copy hashes {_sp_got}")
-                continue
-            # Deterministic worker identity: label keeps STAGE 1's
-            # ticket-prefix join working; the name is exact for recovery.
-            _sp_label = f"i{_sp_m.group(1)}-{_sp_m.group(2)}"
-            _sp_name = "{}-D{}A{}".format(
-                _sp_label, _sp_d.split("-", 1)[1], (_sp_a or "").split("-", 1)[-1]
-            )
-            if _sp_name in _sp_pane_names:
-                _sp_surface(_sp_d, "name-collision",
-                            f"a live pane named {_sp_name} already exists")
-                continue
-            _sp_free -= 1
-            _sp_plan["spawn"].append({
-                "d": _sp_d, "a": _sp_a, "ref": _sp_name, "label": _sp_label,
-                "prompt": _sp_abs,
-                "argv": [_sp_abs if el == "{prompt}" else el for el in _sp_cfg["argv"]],
-            })
-        if _sp_over:
-            _sp_steady("capacity-exceeded", _sp_over)
-
-with open(_sp_out, "w") as f:
-    json.dump(_sp_plan, f)
-PYEOF
-
-_tr_spawn_err_file="$(_tr_mktemp "${TMPDIR:-/tmp}/pm-track-spawn-err.XXXXXX")"
-if ! PM_TR_INDEX="${_tr_index}" \
-  PM_TR_PANES="${_tr_panes_file}" \
-  PM_TR_SPAWN_CFG="${_tr_spawn_cfg}" \
-  PM_TR_HERDR_OK="${_tr_herdr_ok}" \
-  PM_TR_ROOT="${_tr_root}" \
-  PM_TR_SPAWN_AGE="${_tr_spawn_age_file}" \
-  PM_TR_SPAWN_PLAN="${_tr_spawn_plan_file}" \
-  bash -c 'printf "%s\n%s\n%s\n" "$1" "$2" "$3" | python3 -' _ "${_TR_CORROB_PY}" "${_TR_CLOSE_PY}" "${_tr_spawn_plan_driver}" \
-  2>"${_tr_spawn_err_file}"; then
-  # Loud degrade (mirrors the auto-close driver): a plan-driver crash must
-  # never be a silent no-op -- one unmistakable surfaced row + stderr echo.
-  _tr_spawn_err_tail="$(tail -c 2000 "${_tr_spawn_err_file}" 2>/dev/null || true)"
-  if [[ -n "${_tr_spawn_err_tail}" ]]; then
-    {
-      echo "track: auto-spawn plan driver failed; stderr tail:"
-      printf '%s\n' "${_tr_spawn_err_tail}"
-    } >&2
-  fi
-  printf '{"spawn": [], "rows": [], "steady": {}, "age": {}, "ran": false}' >"${_tr_spawn_plan_file}"
-  DETAIL="${_tr_spawn_err_tail}" python3 -c '
-import json, os, sys
-row = {"d": "(auto-spawn)", "reason": "spawn-driver-error"}
-if os.environ.get("DETAIL"):
-    row["detail"] = os.environ["DETAIL"]
-with open(sys.argv[1]) as f:
-    rows = json.load(f)
-rows.append(row)
-with open(sys.argv[1], "w") as f:
-    json.dump(rows, f)
-' "${_tr_spawn_rows_file}" || true
-fi
-rm -f "${_tr_spawn_err_file}"
-
-# row/spawned append helpers (file-backed, matching the AC loop pattern --
-# a `| { while ...; }` subshell cannot mutate parent variables).
-_tr_sp_add_row() {
-  # _tr_sp_add_row <d> <reason> <detail>
-  python3 -c '
-import json, sys
-path, d, reason, detail = sys.argv[1:5]
-with open(path) as f:
-    rows = json.load(f)
-row = {"d": d, "reason": reason}
-if detail:
-    row["detail"] = detail
-rows.append(row)
-with open(path, "w") as f:
-    json.dump(rows, f)
-' "${_tr_spawn_rows_file}" "$@"
-}
-
-_tr_sp_add_spawned() {
-  # _tr_sp_add_spawned <d> <a> <worker> <tab> <mode>
-  python3 -c '
-import json, sys
-path, d, a, worker, tab, mode = sys.argv[1:7]
-with open(path) as f:
-    rows = json.load(f)
-rows.append({"d": d, "a": a, "worker": worker, "tab": tab, "mode": mode})
-with open(path, "w") as f:
-    json.dump(rows, f)
-' "${_tr_spawn_spawned_file}" "$@"
-}
-
-_tr_spawn_ran="$(python3 -c 'import json, sys; print("1" if json.load(open(sys.argv[1])).get("ran") else "0")' "${_tr_spawn_plan_file}")"
-# max_live_workers for the under-lock DURABLE capacity gate (validated by
-# the verdict above; only read when the stage actually runs).
-_tr_spawn_max_live="$(python3 -c 'import json, sys; print(json.loads(sys.argv[1]).get("max_live_workers", 1))' "${_tr_spawn_cfg}")"
-
-# _tr_sp_write_age <json-string-or-@planfile>: tmp-then-rename write of the
-# advisory age file, refusing to follow a symlinked destination (security
-# P3 -- .pm/ is operator territory, but a planted symlink must not turn an
-# advisory write into an arbitrary-file clobber). Advisory only: failure to
-# write is ignored (fails toward SURFACING sooner, never later, per the
-# corrupt-file rule in the plan driver).
-_tr_sp_write_age_from_plan() {
-  python3 -c '
-import json, os, sys
-plan_path, age_path = sys.argv[1], sys.argv[2]
-with open(plan_path) as f:
-    plan = json.load(f)
-if os.path.islink(age_path):
-    sys.exit(1)
-tmp = age_path + ".tmp"
-with open(tmp, "w") as f:
-    json.dump(plan.get("age", {}), f)
-os.replace(tmp, age_path)
-' "${_tr_spawn_plan_file}" "${_tr_spawn_age_file}" || true
-}
-
-# _tr_sp_note_cause <d> <a> <cause>: record the spawn-window failure cause
-# into the advisory age file entry for (d,a), so the eventual
-# suspected-orphan-intent row can say WHY the worker never appeared
-# (Red Team F2). Advisory only -- never gates state; same tmp-then-rename
-# + no-symlink hygiene as above.
-_tr_sp_note_cause() {
-  python3 -c '
-import json, os, sys
-age_path, d, a, cause = sys.argv[1:5]
-if os.path.islink(age_path):
-    sys.exit(1)
-try:
-    with open(age_path) as f:
-        age = json.load(f)
-    if not isinstance(age, dict):
-        age = {}
-except Exception:
-    age = {}
-key = f"{d}/{a}"
-prev = age.get(key)
-n = 0
-if isinstance(prev, dict) and isinstance(prev.get("n"), int) and prev["n"] >= 0:
-    n = prev["n"]
-elif isinstance(prev, int) and prev >= 0:
-    n = prev
-age[key] = {"n": n, "cause": cause}
-tmp = age_path + ".tmp"
-with open(tmp, "w") as f:
-    json.dump(age, f)
-os.replace(tmp, age_path)
-' "${_tr_spawn_age_file}" "$@" || true
-}
-
-if [[ "${_tr_spawn_ran}" == "1" ]]; then
-  # Persist the advisory intent-age map (drives ONLY the
-  # suspected-orphan-intent surface; a lost file fails toward surfacing).
-  _tr_sp_write_age_from_plan
-
-  # ---- Phase A produces SURFACES ONLY (spawn-ack-unconfirmed /
-  # ambiguous-spawn-ack / suspected-orphan-intent, all planned above);
-  # there is deliberately NO recovery-ACK execution path -- a name join is
-  # impostor-forgeable, so confirming a recovered worker is the operator's
-  # call via `bin/record dispatch <D> ACKED --tab <id>`.
-
-  # ---- Phase B execution: per planned candidate, the durability-before-
-  # effect ordering described in the stage header. The lock is NEVER held
-  # across the herdr calls.
-  python3 -c '
-import json, sys
-with open(sys.argv[1]) as f:
-    plan = json.load(f)
-for r in plan.get("spawn", []):
-    print(json.dumps(r))
-' "${_tr_spawn_plan_file}" | {
-    while IFS= read -r _tr_sp_line; do
-      [[ -z "${_tr_sp_line}" ]] && continue
-      _tr_sp_d="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["d"])' "${_tr_sp_line}")"
-      _tr_sp_a="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["a"])' "${_tr_sp_line}")"
-      _tr_sp_ref="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["ref"])' "${_tr_sp_line}")"
-      _tr_sp_label="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["label"])' "${_tr_sp_line}")"
-
-      # (i) under pm_lock: re-fold, re-check the candidate is STILL
-      # eligible, then append the spawn_intent DURABLY. Any deviation is a
-      # benign race (surface, skip), never an error.
-      # NOTE: no `trap _tr_cleanup` re-install here -- this loop runs in a
-      # pipeline SUBSHELL, and an EXIT trap installed in it would fire at
-      # subshell exit and delete the parent's shared temp files out from
-      # under STAGE 3. pm_lock/pm_unlock stay balanced within each
-      # iteration, which is all the subshell needs.
-      if ! pm_lock "${_tr_root}"; then
-        _tr_sp_add_row "${_tr_sp_d}" raced-refused "could not acquire the repo lock for the spawn intent"
-        continue
-      fi
-      if ! pm_fold "${_tr_root}" >/dev/null 2>&1; then
-        pm_unlock
-        _tr_sp_add_row "${_tr_sp_d}" raced-refused "re-fold failed under lock; spawn skipped this tick"
-        continue
-      fi
-      # Under-lock re-check, three verdicts (exit codes):
-      #   1 -- no longer eligible (benign race)
-      #   2 -- DURABLE capacity gate refused (security P2): the snapshot's
-      #        live-agent count is advisory and lock-free; two concurrent
-      #        track runs can both see live=0 while the log already
-      #        carries commitments. The authoritative count is what the
-      #        LOG supports under this lock: open spawn_intent leases +
-      #        ACKED automation dispatches. Fail direction: under-spawn.
-      #   3 -- prompt re-hash mismatch (security P2): the plan-time hash
-      #        ran outside the lock; re-hash the durable copy here so a
-      #        tamper in the plan->lock window cannot ride into a spawn.
-      _tr_sp_check_out="$(python3 -c '
-import hashlib, json, os, sys
-idx = json.load(open(sys.argv[1]))
-d, a, max_live, root = sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5]
-dispatches = idx.get("dispatches") or {}
-disp = dispatches.get(d) or {}
-issues = idx.get("issues") or {}
-dim = idx.get("dispatch_issue_map") or {}
-oq = idx.get("open_questions_by_issue") or {}
-ok = (
-    disp.get("state") == "DISPATCHED"
-    and disp.get("lane") == "automation"
-    and disp.get("tab") == "?"
-    and disp.get("attempt") == a
-    and not disp.get("superseded")
-    and a not in (disp.get("spawn_intent") or {})
-)
-issue = dim.get(d)
-ok = ok and bool(issue) and (issues.get(issue) or {}).get("state") not in ("NEEDS-USER", "BLOCKED") and not oq.get(issue)
-if not ok:
-    sys.exit(1)
-holders = []
-for od, other in dispatches.items():
-    if other.get("lane") != "automation":
-        continue
-    if other.get("state") == "ACKED":
-        holders.append(od)
-    elif (
-        other.get("state") == "DISPATCHED"
-        and not other.get("superseded")
-        and other.get("attempt")
-        and other.get("attempt") in (other.get("spawn_intent") or {})
-    ):
-        holders.append(od)
-if len(holders) >= max_live:
-    # name the slot holders so the operator can see WHICH dispatches hold
-    # capacity (e.g. a dead-worker ACKED dispatch at max_live_workers=1)
-    print(" ".join(sorted(holders)))
-    sys.exit(2)
-pref, psha = disp.get("prompt_ref"), disp.get("prompt_sha")
-if not pref or not psha:
-    sys.exit(3)
-try:
-    with open(os.path.join(root, pref), "rb") as f:
-        got = hashlib.sha256(f.read()).hexdigest()[:8]
-except OSError:
-    sys.exit(3)
-sys.exit(0 if got == psha else 3)
-' "${_tr_index}" "${_tr_sp_d}" "${_tr_sp_a}" "${_tr_spawn_max_live}" "${_tr_root}")"
-      _tr_sp_rc=$?
-      if [[ ${_tr_sp_rc} -ne 0 ]]; then
-        pm_unlock
-        case "${_tr_sp_rc}" in
-          2) _tr_sp_add_row "${_tr_sp_d}" capacity-exceeded "durable capacity gate: open leases + ACKED automation dispatches >= max_live_workers under lock (snapshot count was stale/optimistic); held by: ${_tr_sp_check_out}" ;;
-          3) _tr_sp_add_row "${_tr_sp_d}" prompt-sha-mismatch "under-lock re-hash of the durable prompt no longer matches the recorded prompt_sha (changed after planning); no intent appended" ;;
-          *) _tr_sp_add_row "${_tr_sp_d}" raced-refused "candidate no longer eligible under lock (benign race)" ;;
-        esac
-        continue
-      fi
-      if ! PM_ROOT="${_tr_root}" pm_apply spawn_intent d="${_tr_sp_d}" a="${_tr_sp_a}" ref="${_tr_sp_ref}" at="${_tr_spawn_now}" \
-        >/dev/null 2>"${_tr_root}/.pm/.track-spawn-err.tmp"; then
-        pm_unlock
-        _tr_sp_err="$(tr '\n' ' ' <"${_tr_root}/.pm/.track-spawn-err.tmp" 2>/dev/null || true)"
-        rm -f "${_tr_root}/.pm/.track-spawn-err.tmp"
-        _tr_sp_add_row "${_tr_sp_d}" raced-refused "spawn_intent refused under lock (benign race): ${_tr_sp_err}"
-        continue
-      fi
-      rm -f "${_tr_root}/.pm/.track-spawn-err.tmp"
-      pm_unlock
-
-      # (ii) OUTSIDE the lock: create the worker tab. On failure the
-      # durable intent stays and ages into Phase A recovery next ticks.
-      _tr_sp_tab_out="$(herdr tab create --workspace "${_tr_herdr_workspace}" \
-        --label "${_tr_sp_label}" --no-focus </dev/null 2>/dev/null)"
-      _tr_sp_rc=$?
-      if [[ ${_tr_sp_rc} -ne 0 ]]; then
-        _tr_sp_code="$(python3 -c '
-import json, sys
-try:
-    print(((json.loads(sys.argv[1]) or {}).get("error") or {}).get("code") or "unknown-error")
-except Exception:
-    print("unknown-error")
-' "${_tr_sp_tab_out}")"
-        _tr_sp_add_row "${_tr_sp_d}" herdr-tab-create-failed "herdr error code: ${_tr_sp_code}; durable intent left for recovery"
-        _tr_sp_note_cause "${_tr_sp_d}" "${_tr_sp_a}" "herdr-tab-create-failed (${_tr_sp_code})"
-        continue
-      fi
-      _tr_sp_tab_id="$(python3 -c '
-import json, sys
-try:
-    print((((json.loads(sys.argv[1]) or {}).get("result") or {}).get("tab") or {}).get("tab_id") or "")
-except Exception:
-    print("")
-' "${_tr_sp_tab_out}")"
-      if [[ -z "${_tr_sp_tab_id}" ]]; then
-        _tr_sp_add_row "${_tr_sp_d}" herdr-tab-create-failed "tab created but no result.tab.tab_id in herdr stdout; durable intent left for recovery"
-        _tr_sp_note_cause "${_tr_sp_d}" "${_tr_sp_a}" "herdr-tab-create-failed (no tab_id in stdout)"
-        continue
-      fi
-
-      # (iii) OUTSIDE the lock: start the worker agent in that tab.
-      mapfile -d '' -t _tr_sp_argv < <(python3 -c '
-import json, sys
-for el in json.loads(sys.argv[1])["argv"]:
-    sys.stdout.write(el + "\0")
-' "${_tr_sp_line}")
-      _tr_sp_start_out="$(herdr agent start "${_tr_sp_ref}" --workspace "${_tr_herdr_workspace}" \
-        --tab "${_tr_sp_tab_id}" --no-focus -- "${_tr_sp_argv[@]}" </dev/null 2>/dev/null)"
-      _tr_sp_rc=$?
-      if [[ ${_tr_sp_rc} -ne 0 ]]; then
-        _tr_sp_code="$(python3 -c '
-import json, sys
-try:
-    print(((json.loads(sys.argv[1]) or {}).get("error") or {}).get("code") or "unknown-error")
-except Exception:
-    print("unknown-error")
-' "${_tr_sp_start_out}")"
-        _tr_sp_add_row "${_tr_sp_d}" herdr-start-failed "herdr error code: ${_tr_sp_code}; durable intent left for recovery"
-        _tr_sp_note_cause "${_tr_sp_d}" "${_tr_sp_a}" "herdr-start-failed (${_tr_sp_code})"
-        # Best-effort cleanup of track-OWNED state (Red Team F3): track
-        # created this tab THIS tick, so closing it is not an auto-act on
-        # operator state. Ignore failure; no surface.
-        herdr tab close "${_tr_sp_tab_id}" </dev/null >/dev/null 2>&1 || true
-        continue
-      fi
-
-      # (iv) under pm_lock (inside pm_apply): re-fold + re-check via the
-      # strict engine, then the SAME-TICK DISPATCHED->ACKED with the
-      # created tab_id. A refusal here is a benign race -- the live agent
-      # is absorbed later by reconcile's unregistered_execution/adopt
-      # path; never killed, never an error.
-      if PM_ROOT="${_tr_root}" pm_apply dispatch_state d="${_tr_sp_d}" a="${_tr_sp_a}" from=DISPATCHED to=ACKED \
-        lane=automation tab="${_tr_sp_tab_id}" at="${_tr_spawn_now}" \
-        >/dev/null 2>"${_tr_root}/.pm/.track-spawn-err.tmp"; then
-        _tr_sp_add_spawned "${_tr_sp_d}" "${_tr_sp_a}" "${_tr_sp_ref}" "${_tr_sp_tab_id}" spawned
-      else
-        _tr_sp_err="$(tr '\n' ' ' <"${_tr_root}/.pm/.track-spawn-err.tmp" 2>/dev/null || true)"
-        _tr_sp_add_row "${_tr_sp_d}" raced-refused "same-tick ack refused (benign race; live agent will be absorbed by reconcile): ${_tr_sp_err}"
-      fi
-      rm -f "${_tr_root}/.pm/.track-spawn-err.tmp"
-    done
-  }
-
-  # Leave index.json fresh at end of stage: a benign raced ACK refusal
-  # commits nothing itself, but the RACING event is already durable on the
-  # log -- refold so the index reflects it rather than the pre-race read.
-  pm_fold "${_tr_root}" >/dev/null 2>&1 || true
-fi
+# SPAWN stage (B3, after STAGE 2.5): automation-lane auto-spawn; the whole
+# stage lives in the sourced component _track_spawn (I25).
+# shellcheck source=./_track_spawn
+# shellcheck disable=SC1091
+source "${_TR_SELF}/_track_spawn"
 
 # ---------------------------------------------------------------------------
 # STAGE 3 (outside lock): render TRACKER.md's `tracker` GENERATED block —
@@ -2621,22 +1031,12 @@ fi
 # every other row in _tr_final_file plus every stage-1 surface-only row is
 # listed with its reason.
 # ---------------------------------------------------------------------------
-PM_TR_ROOT="${_tr_root}" \
-  PM_TR_VERDICT="${_tr_verdict_file}" \
-  PM_TR_FINAL="${_tr_final_file}" \
-  PM_TR_RECORDED="${_tr_recorded_file}" \
-  PM_TR_AC_CLOSED="${_tr_ac_closed_file}" \
-  PM_TR_AC_SURFACED="${_tr_ac_surfaced_file}" \
-  PM_TR_SPAWN_PLAN="${_tr_spawn_plan_file}" \
-  PM_TR_SPAWN_ROWS="${_tr_spawn_rows_file}" \
-  PM_TR_SPAWN_SPAWNED="${_tr_spawn_spawned_file}" \
-  PM_TR_TRACKER_MD="${_tr_tracker_md}" \
-  PM_TR_NOW="${_tr_now}" \
-  PM_TR_HERDR_OK="${_tr_herdr_ok}" \
-  python3 <<'PYEOF'
+# I8: esc_md_inline/esc_md_cell and render_marker come prepended from
+# _lib.sh's _PM_MD_PY (the one shared copy), composed the same way the
+# _TR_CORROB_PY pipelines are.
+read -r -d '' _tr_render_driver <<'PYEOF' || true
 import json
 import os
-import re
 
 root = os.environ["PM_TR_ROOT"]
 verdict_path = os.environ["PM_TR_VERDICT"]
@@ -2684,27 +1084,8 @@ for row in stage2:
     if row.get("verdict") == "surface" and row["d"] not in recorded_ds:
         surfaced.append(row)
 
-# ---------------------------------------------------------------------------
-# Markdown-injection defenses (copy-adapted from `reconcile`'s inline
-# esc_md_cell/esc_md_inline; not shared library code, mirroring the pattern).
-# ---------------------------------------------------------------------------
-def esc_md_inline(value):
-    s = "" if value is None else str(value)
-    s = re.sub(r"([`*_\[\]()~])", r"\\\1", s)
-    s = re.sub(r"^([#>+-])", r"\\\1", s)
-    s = re.sub(r"^(\d+)\.", r"\1\\.", s)
-    return s
-
-
-def esc_md_cell(value):
-    s = "" if value is None else str(value)
-    s = s.replace("&", "&amp;")
-    s = s.replace("<", "&lt;").replace(">", "&gt;")
-    s = s.replace("|", "&#124;")
-    s = s.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
-    s = esc_md_inline(s)
-    return s
-
+# Markdown-injection defenses: esc_md_cell/esc_md_inline are provided by
+# the prepended _PM_MD_PY snippet (_lib.sh) -- the single shared copy (I8).
 
 lines = []
 if not herdr_ok:
@@ -2886,29 +1267,6 @@ body = "\n".join(lines)
 
 conflicts = []
 
-
-def render_marker(md_path, key, body):
-    if not os.path.isfile(md_path):
-        conflicts.append(f"{os.path.basename(md_path)}: file not found at {md_path} -- skipped")
-        return
-    with open(md_path, "r") as f:
-        content = f.read()
-    begin = f"<!-- GENERATED:BEGIN {key} -->"
-    end = f"<!-- GENERATED:END {key} -->"
-    pattern = re.compile(re.escape(begin) + r".*?" + re.escape(end), re.DOTALL)
-    if not pattern.search(content):
-        conflicts.append(
-            f"{os.path.basename(md_path)}: no '{key}' GENERATED markers found -- skipped "
-            f"(scaffold may not have materialized them yet)"
-        )
-        return
-    replacement = f"{begin}\n{body}\n{end}"
-    new_content = pattern.sub(lambda _m: replacement, content, count=1)
-    if new_content != content:
-        with open(md_path, "w") as f:
-            f.write(new_content)
-
-
 render_marker(tracker_md, "tracker", body)
 
 print("=== track ===")
@@ -2945,8 +1303,22 @@ for reason in sorted(spawn_steady):
     ids = spawn_steady[reason]
     print(f"  SPAWN-STEADY ({reason}) count={len(ids)} ids={ac_summarize_ids(ids)}")
 PYEOF
-_tr_render_rc=$?
-if [[ ${_tr_render_rc} -ne 0 ]]; then
+
+# shellcheck disable=SC2154  # _tr_ac_*/_tr_spawn_* files are assigned by the
+# sourced _track_autoclose/_track_spawn components before the render step runs
+if ! PM_TR_ROOT="${_tr_root}" \
+  PM_TR_VERDICT="${_tr_verdict_file}" \
+  PM_TR_FINAL="${_tr_final_file}" \
+  PM_TR_RECORDED="${_tr_recorded_file}" \
+  PM_TR_AC_CLOSED="${_tr_ac_closed_file}" \
+  PM_TR_AC_SURFACED="${_tr_ac_surfaced_file}" \
+  PM_TR_SPAWN_PLAN="${_tr_spawn_plan_file}" \
+  PM_TR_SPAWN_ROWS="${_tr_spawn_rows_file}" \
+  PM_TR_SPAWN_SPAWNED="${_tr_spawn_spawned_file}" \
+  PM_TR_TRACKER_MD="${_tr_tracker_md}" \
+  PM_TR_NOW="${_tr_now}" \
+  PM_TR_HERDR_OK="${_tr_herdr_ok}" \
+  bash -c 'printf "%s\n%s\n" "$1" "$2" | python3 -' _ "${_PM_MD_PY}" "${_tr_render_driver}"; then
   echo "track: render step failed" >&2
   exit 1
 fi

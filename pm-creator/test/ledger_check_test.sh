@@ -18,6 +18,7 @@ source "${LIB}"
 
 PASS=0
 FAIL=0
+SKIP=0
 FAILED_NAMES=()
 
 ok() {
@@ -32,6 +33,16 @@ fail() {
   FAIL=$((FAIL + 1))
   FAILED_NAMES+=("$name")
   printf 'FAIL %s -- %s\n' "$name" "$*"
+}
+
+# I20: a section that cannot run in this environment must be COUNTED, not
+# silently returned out of -- a vanished section otherwise shrinks the
+# assertion total while the suite still exits 0.
+skip() {
+  local name="$1"
+  shift
+  SKIP=$((SKIP + 1))
+  printf 'skip %s -- %s\n' "$name" "$*"
 }
 
 assert_eq() {
@@ -61,6 +72,7 @@ new_tmp_repo() {
   d="$(mktemp -d "${TMPDIR:-/tmp}/pm-creator-ledger-check-test.XXXXXX")"
   mkdir -p "$d/.pm" "$d/bin"
   cp "$LIB" "$d/bin/_lib.sh"
+  cp "${LIB%_lib.sh}_close_lib.sh" "$d/bin/_close_lib.sh"
   cp "$LEDGER_CHECK" "$d/bin/ledger-check"
   echo "$d"
 }
@@ -198,7 +210,7 @@ EOF
 # CLOSED-with-live-worktree is WARN only and never fails the exit code.
 section_closed_live_worktree_warns_only() {
   if ! command -v git >/dev/null 2>&1; then
-    echo "skip: git not available"
+    skip "section_closed_live_worktree_warns_only" "git not available"
     return
   fi
   local gitrepo repo
@@ -250,7 +262,7 @@ section_closed_live_worktree_warns_only
 
 echo
 echo "-----------------------------------------"
-echo "PASS: $PASS  FAIL: $FAIL"
+echo "PASS: $PASS  FAIL: $FAIL  SKIP: $SKIP"
 if [[ "$FAIL" -gt 0 ]]; then
   echo "Failed:"
   for n in "${FAILED_NAMES[@]}"; do

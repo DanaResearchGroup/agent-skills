@@ -68,8 +68,9 @@ v = {
   "MODEL_ROUTING": "| Sonnet | default worker |",
   "REMOTE_POLICY": "local-only",
   "UPLOAD_POLICY": "none (local-only)",
-  "CAPACITY_NOTE": " (single dev box).",
-  "OPTIONAL_SLOT_NOTE": ", `RUNS.md`",
+  "CAPACITY_NOTE": "- **Capacity profile:** see `MACHINE.md` (single dev box).",
+  "OPTIONAL_SLOT_NOTE": ", `RUNS.md`, `MACHINE.md`",
+  "OPTIONAL_SLOT_ROWS": "| `RUNS.md` | Long-running jobs registry (optional slot) |\n| `MACHINE.md` | Resource/capacity profile (optional slot) |",
   "ALWAYS_HUMAN_GATES": "merges to `main`, any push",
   "HARDWARE_TABLE": "| CPU | test box |",
   "CAPACITY_NOTES": "One generation at a time.",
@@ -78,7 +79,6 @@ v = {
     "name": "demo", "path": demo, "mainline": "main",
     "mainline_ref": "refs/heads/main", "fetch_policy": "local-only",
   }]),
-  "OPTIONAL_SLOTS_JSON": json.dumps({"runs": True, "machine": True}),
 }
 json.dump(v, open(sys.argv[1], "w"))
 PY
@@ -440,7 +440,23 @@ section_signal_cleanup() {
   bash "$SCAFFOLD" --values "$values" --out "$out" --templates "$badtemplates" \
     >"$WORK/s6.out" 2>"$WORK/s6.err" &
   local pid=$!
-  sleep 0.05
+  # I16: no fixed sleep -- a fast box can finish the whole scaffold before
+  # a blind 50ms timer fires, flipping the "no partial --out" assertion
+  # into a false failure. Poll for the .scaffold-tmp.* dir to APPEAR (it is
+  # created up front, before the slow interpolation pass), assert it was
+  # actually observed mid-run, and only then deliver SIGTERM.
+  local observed="" tries=0
+  while (( tries < 500 )); do
+    if compgen -G "$WORK/.scaffold-tmp.*" >/dev/null; then
+      observed=1
+      break
+    fi
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.01
+    tries=$((tries + 1))
+  done
+  [[ -n "$observed" ]] && ok "SIGTERM race: .scaffold-tmp.* observed mid-run before signalling" \
+    || fail "SIGTERM race: .scaffold-tmp.* observed mid-run before signalling" "never appeared (scaffold too fast/failed early?)"
   kill -TERM "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null
 
@@ -1231,6 +1247,53 @@ PY
     || ok "no partial --out dir left behind (missing STRATEGY key case)"
 }
 
+# ---------------------------------------------------------------------------
+# I12: `MACHINE.md` / `RUNS.md` are optional slots; a repo scaffolded with
+# them UN-activated (empty slot placeholders, slot files deleted per SKILL
+# step 3) must ship ZERO dangling references to them in the top-level
+# narrative markdown -- the references live entirely in the optional-slot
+# placeholders (OPTIONAL_SLOT_NOTE / OPTIONAL_SLOT_ROWS / CAPACITY_NOTE),
+# never hardcoded in a template.
+# ---------------------------------------------------------------------------
+section_optional_slots_inactive_no_dangling_refs() {
+  local demo values out
+  demo="$WORK/demo-slots"
+  mkdir -p "$demo"
+  (cd "$demo" && git init -q -b main && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init)
+
+  values="$WORK/values-slots.json"
+  write_full_values "$values" "$demo"
+  # Un-activate BOTH optional slots: every slot placeholder goes empty except
+  # the capacity bullet, which keeps its narrative but names no MACHINE.md.
+  python3 - "$values" <<'PY'
+import json, sys
+v = json.load(open(sys.argv[1]))
+v["OPTIONAL_SLOT_NOTE"] = ""
+v["OPTIONAL_SLOT_ROWS"] = ""
+v["CAPACITY_NOTE"] = "- **Capacity profile:** single dev box."
+json.dump(v, open(sys.argv[1], "w"))
+PY
+
+  out="$WORK/out-slots"
+  if bash "$SCAFFOLD" --values "$values" --out "$out" >/dev/null 2>"$WORK/slots.err"; then
+    ok "slots-inactive scaffold succeeds"
+  else
+    fail "slots-inactive scaffold succeeds" "$(cat "$WORK/slots.err")"
+    return
+  fi
+
+  # SKILL step 3: delete the un-activated slot files.
+  rm -f "$out/MACHINE.md" "$out/RUNS.md"
+
+  local dangling
+  dangling="$(find "$out" -maxdepth 1 -name '*.md' -exec grep -l 'MACHINE\.md\|RUNS\.md' {} + 2>/dev/null)"
+  if [[ -z "$dangling" ]]; then
+    ok "no dangling MACHINE.md/RUNS.md references in narrative markdown"
+  else
+    fail "no dangling MACHINE.md/RUNS.md references in narrative markdown" "found in: $dangling"
+  fi
+}
+
 echo "== JSON escaping of hostile values =="
 section_json_escaping
 echo "== no partial dir left on forced failure =="
@@ -1295,6 +1358,8 @@ echo "== round-21: {{...}}-shaped repo field data still trips the broad survivor
 section_repos_field_placeholder_token_still_guarded
 echo "== STRATEGY.md: missing new placeholder key fails loud =="
 section_strategy_missing_key_fails
+echo "== I12: un-activated optional slots leave no dangling references =="
+section_optional_slots_inactive_no_dangling_refs
 
 echo
 echo "-----------------------------------------"

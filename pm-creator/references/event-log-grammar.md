@@ -97,10 +97,14 @@ the schema version; existing keys never change meaning.
   dispatch is currently DISPATCHED, and its lane is `automation` (a spawn intent against
   a human-lane dispatch always quarantines). An accepted intent is stored per `(d, a)`
   (`dispatches[d].spawn_intent[a]`) and read ONLY by `track`'s spawn stage; it never
-  transitions dispatch state, never touches issue state, never ACKs by itself. A
-  conflicting second intent for the same `(d, a)` (different `ref`) is refused at write
-  and quarantined at fold — the FIRST accepted intent stands; an identical re-append is
-  accepted idempotently.
+  transitions dispatch state, never touches issue state, never ACKs by itself. The lease
+  is **exclusive**: ANY second intent for a `(d, a)` that already has an open intent is
+  refused at write and quarantined at fold — the FIRST accepted intent stands. Identical
+  `ref` included (the worker ref is deterministic, so two concurrent tracks always collide
+  on the same ref; accepting the duplicate "idempotently" would let the loser believe it
+  won the lease and spawn a second live agent). The identical-`ref` refusal opens with the
+  stable machine-readable token `spawn-lease-held`, which `track`'s spawn stage classifies
+  as "lease held elsewhere — do not spawn this tick".
 - `repo`/`branch`/`base_sha` are OPTIONAL git-corroboration metadata, set (if at all) at
   mint time: `repo` names a configured repo, `branch` is the expected branch
   (`i<num>-<slug>` per `CONVENTIONS.md` §7), `base_sha` is the mainline commit the dispatch

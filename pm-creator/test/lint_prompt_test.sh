@@ -95,6 +95,23 @@ section_secret_warn() {
     "token= assignment"
 }
 
+section_prefixed_secret_warn() {
+  # I23: `\bpassword`/`\btoken`-style patterns never match immediately
+  # after `_` (`_` is a \w char, so no boundary exists before "TOKEN" in
+  # "GH_TOKEN="). This fixture covers the four named prefixed-token
+  # shapes that used to slip past lint-prompt entirely.
+  local f="${FIXTURES}/lint_prompt_prefixed_secret.md"
+  assert_exit "prefixed secret prompt: exit 0 (WARN does not fail build)" 0 "$f"
+  assert_output_contains "prefixed secret prompt: warns on GH_TOKEN=ghp_... (known prefix)" "$f" \
+    "known secret-token prefix"
+  assert_output_contains "prefixed secret prompt: warns on github_pat_... value" "$f" \
+    "github_pat_"
+  assert_output_contains "prefixed secret prompt: warns on SLACK_BOT_TOKEN=xoxb-... value" "$f" \
+    "xoxb-"
+  assert_output_contains "prefixed secret prompt: warns on api_key: ... (key-style, colon syntax)" "$f" \
+    "key-style secret assignment"
+}
+
 section_no_marker() {
   local f="${FIXTURES}/lint_prompt_no_marker.md"
   assert_exit "no-marker prompt: exit 0" 0 "$f"
@@ -133,6 +150,8 @@ echo "== report/cite own-id exception =="
 section_report_cite_exception
 echo "== secret WARN =="
 section_secret_warn
+echo "== prefixed-token secret WARN (I23) =="
+section_prefixed_secret_warn
 echo "== no marker found =="
 section_no_marker
 echo "== usage errors =="

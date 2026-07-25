@@ -11,7 +11,7 @@
 # Usage: scaffold.sh --values <values.json> --out <target_dir> [--templates <dir>]
 #
 # The values JSON is a flat object mapping each placeholder name (without braces)
-# to its string value; structured placeholders (REPOS_JSON, OPTIONAL_SLOTS_JSON)
+# to its string value; structured placeholders (REPOS_JSON, AUTOMATION_JSON)
 # carry a JSON *string* the caller pre-rendered. Every {{PLACEHOLDER}} present in
 # any template MUST have a key, or scaffolding fails loudly (no silent blanks).
 set -euo pipefail
@@ -260,7 +260,7 @@ def interp(text, where, is_json):
             return m.group(0)
         v = str(values[k])
         # Keys ending in _JSON already carry a pre-rendered JSON value (e.g.
-        # REPOS_JSON, OPTIONAL_SLOTS_JSON) — interpolate raw, never re-escape.
+        # REPOS_JSON, AUTOMATION_JSON) — interpolate raw, never re-escape.
         if is_json and not k.endswith("_JSON"):
             # json.dumps a bare string and strip the surrounding quotes, so the
             # result drops in place of the placeholder inside the template's
@@ -346,7 +346,7 @@ if hits:
 PY
 
 # Parse every rendered *.json file to catch a malformed _JSON value (e.g. a
-# hostile REPOS_JSON/OPTIONAL_SLOTS_JSON) before it ever ships — those keys
+# hostile REPOS_JSON/AUTOMATION_JSON) before it ever ships — those keys
 # are dropped in raw, unescaped, so a bad input yields invalid JSON that
 # would otherwise only be discovered at campaign runtime.
 TMP_OUT="$TMP_OUT" python3 - <<'PY'

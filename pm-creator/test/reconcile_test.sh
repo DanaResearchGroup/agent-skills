@@ -17,6 +17,7 @@ source "${LIB}"
 
 PASS=0
 FAIL=0
+SKIP=0
 FAILED_NAMES=()
 
 ok() {
@@ -31,6 +32,16 @@ fail() {
   FAIL=$((FAIL + 1))
   FAILED_NAMES+=("$name")
   printf 'FAIL %s -- %s\n' "$name" "$*"
+}
+
+# I20: a section that cannot run in this environment must be COUNTED, not
+# silently returned out of -- a vanished section otherwise shrinks the
+# assertion total while the suite still exits 0.
+skip() {
+  local name="$1"
+  shift
+  SKIP=$((SKIP + 1))
+  printf 'skip %s -- %s\n' "$name" "$*"
 }
 
 assert_eq() {
@@ -146,6 +157,7 @@ new_tmp_repo() {
   d="$(mktemp -d "${TMPDIR:-/tmp}/pm-creator-reconcile-test.XXXXXX")"
   mkdir -p "$d/.pm" "$d/bin"
   cp "$LIB" "$d/bin/_lib.sh"
+  cp "${LIB%_lib.sh}_close_lib.sh" "$d/bin/_close_lib.sh"
   cp "$RECONCILE" "$d/bin/reconcile"
   chmod +x "$d/bin/reconcile"
   write_registry_files "$d"
@@ -258,7 +270,7 @@ EOF
 # not duplicate it.
 section_unregistered_branch_emits_once() {
   if ! command -v git >/dev/null 2>&1; then
-    echo "skip: git not available"
+    skip "section_unregistered_branch_emits_once" "git not available"
     return
   fi
   local gitrepo repo emit_count_1 emit_count_2
@@ -302,10 +314,114 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
+# I5: known_refs/known_question_ids must come from the FOLD (index.json),
+# never a second raw scan of events.log. A QUARANTINED line that happens to
+# carry ref=<branch> in its raw text (here: a duplicate-`ref=`-key
+# unregistered_execution the fold refused) must NOT count as "already
+# known" -- the real divergence for that branch still gets emitted.
+section_quarantined_ref_does_not_suppress_emission() {
+  if ! command -v git >/dev/null 2>&1; then
+    skip "section_quarantined_ref_does_not_suppress_emission" "git not available"
+    return
+  fi
+  local gitrepo repo emit_count
+  gitrepo="$(mktemp -d "${TMPDIR:-/tmp}/pm-creator-reconcile-gitrepo4.XXXXXX")"
+  (
+    cd "$gitrepo" || exit 1
+    git init -q -b main
+    git config user.email test@example.com
+    git config user.name test
+    touch a.txt
+    git add a.txt
+    git commit -qm init
+    git branch i008-y
+  )
+
+  repo="$(new_tmp_repo)"
+  # Seed a line the fold QUARANTINES (duplicate `ref=` key) whose raw text
+  # still carries ref=i008-y -- the exact line a raw-log regex scan would
+  # wrongly count into known_refs, suppressing the branch's real divergence.
+  cat > "$repo/.pm/events.log" <<'EOF'
+EVENT schema v=1
+EVENT unregistered_execution at=2026-07-23T18:00:00Z ref=i007-x ref=i008-y
+EOF
+  cat > "$repo/.pm/config.json" <<EOF
+{"repos": {"MyRepo": {"path": "${gitrepo}", "mainline": "main"}}, "herdr_workspace": ""}
+EOF
+  git -C "$gitrepo" worktree add -q "${gitrepo}-wt" i008-y >/dev/null
+
+  run_reconcile "$repo"
+  assert_eq "quarantined-ref: exit 0" "0" "$RC_RC"
+  # The emitted line's shape is `EVENT unregistered_execution at=<iso>
+  # ref=i008-y` -- the single-`ref=` anchor cannot match the seeded
+  # duplicate-key line.
+  emit_count="$(grep -cE '^EVENT unregistered_execution at=[^ ]+ ref=i008-y$' "$repo/.pm/events.log" || true)"
+  assert_eq "quarantined-ref: divergence for i008-y still emitted" "1" "$emit_count"
+  assert_true "quarantined-ref: CONFLICTS mentions i008-y" \
+    bash -c '[[ "$1" == *"unregistered execution"*"i008-y"* ]]' _ "$RC_OUT"
+
+  git -C "$gitrepo" worktree remove --force "${gitrepo}-wt" >/dev/null 2>&1 || true
+  rm -rf "$gitrepo" "${gitrepo}-wt" "$repo"
+}
+
+# ---------------------------------------------------------------------------
+# C7: a git-legal but pm-token-illegal branch name (comma, '=' in the
+# ticket-shaped remainder) must not silence reconcile permanently. It gets
+# reported as a conflict/surface line only -- never handed to pm_apply --
+# and every OTHER discovery in the same run still lands.
+section_pm_illegal_branch_does_not_abort_reconcile() {
+  if ! command -v git >/dev/null 2>&1; then
+    skip "section_pm_illegal_branch_does_not_abort_reconcile" "git not available"
+    return
+  fi
+  local gitrepo repo bad_branch good_branch
+  bad_branch="i099-mystery,work=x"
+  good_branch="i098-safe-work"
+  gitrepo="$(mktemp -d "${TMPDIR:-/tmp}/pm-creator-reconcile-gitrepo3.XXXXXX")"
+  (
+    cd "$gitrepo" || exit 1
+    git init -q -b main
+    git config user.email test@example.com
+    git config user.name test
+    touch a.txt
+    git add a.txt
+    git commit -qm init
+    git branch "$bad_branch"
+    git branch "$good_branch"
+  )
+
+  repo="$(new_tmp_repo)"
+  printf 'EVENT schema v=1\n' > "$repo/.pm/events.log"
+  cat > "$repo/.pm/config.json" <<EOF
+{"repos": {"MyRepo": {"path": "${gitrepo}", "mainline": "main"}}, "herdr_workspace": ""}
+EOF
+
+  # git worktree add for both branches so pm_git_probe's `git worktree
+  # list` surfaces them.
+  git -C "$gitrepo" worktree add -q "${gitrepo}-wt-bad" "$bad_branch" >/dev/null
+  git -C "$gitrepo" worktree add -q "${gitrepo}-wt-good" "$good_branch" >/dev/null
+
+  run_reconcile "$repo"
+  assert_eq "pm-illegal branch: reconcile completes (does not abort)" "0" "$RC_RC"
+  assert_true "pm-illegal branch: surfaced as a conflict/surface line" \
+    bash -c '[[ "$1" == *"mystery,work=x"* ]]' _ "$RC_OUT"
+  assert_true "pm-illegal branch: no unregistered_execution event for it" \
+    bash -c '! grep -q "^EVENT unregistered_execution ref=${2}" "$1/.pm/events.log"' \
+    _ "$repo" "$bad_branch"
+  assert_true "pm-illegal branch: other discoveries still land (good branch got its event)" \
+    bash -c 'grep -q "^EVENT unregistered_execution .*ref=${2}" "$1/.pm/events.log"' \
+    _ "$repo" "$good_branch"
+
+  git -C "$gitrepo" worktree remove --force "${gitrepo}-wt-bad" >/dev/null 2>&1 || true
+  git -C "$gitrepo" worktree remove --force "${gitrepo}-wt-good" >/dev/null 2>&1 || true
+  rm -rf "$gitrepo" "${gitrepo}-wt-bad" "${gitrepo}-wt-good" "$repo"
+}
+
+# ---------------------------------------------------------------------------
 # WORKTREES.md gets a real per-repo table rendered from pm_git_probe.
 section_worktrees_table_rendered() {
   if ! command -v git >/dev/null 2>&1; then
-    echo "skip: git not available"
+    skip "section_worktrees_table_rendered" "git not available"
     return
   fi
   local gitrepo repo
@@ -336,6 +452,115 @@ EOF
     bash -c 'grep -q "KEEP" "$1/WORKTREES.md"' _ "$repo"
 
   rm -rf "$gitrepo" "$repo"
+}
+
+# ---------------------------------------------------------------------------
+# I19: the `herdr worktree list` leg and the LIVE disposition it feeds --
+# a worktree whose path a (shadowed) herdr reports with an
+# open_workspace_id must render LIVE, while the mainline worktree in the
+# same table stays KEEP. Uses the pinned fixture shape
+# (test/fixtures/herdr_worktree_list.json; see herdr_README.md).
+section_worktree_live_disposition_from_herdr() {
+  if ! command -v git >/dev/null 2>&1; then
+    skip "section_worktree_live_disposition_from_herdr" "git not available"
+    return
+  fi
+  local gitrepo repo wt fixture_wt fixture_tabs fixture_ws
+  gitrepo="$(mktemp -d "${TMPDIR:-/tmp}/pm-creator-reconcile-gitrepo5.XXXXXX")"
+  (
+    cd "$gitrepo" || exit 1
+    git init -q -b main
+    git config user.email test@example.com
+    git config user.name test
+    touch a.txt
+    git add a.txt
+    git commit -qm init
+    git branch i042-live-work
+  )
+  wt="${gitrepo}-wt-live"
+  git -C "$gitrepo" worktree add -q "$wt" i042-live-work >/dev/null
+
+  repo="$(new_tmp_repo)"
+  printf 'EVENT schema v=1\nEVENT issue_state i=I-042 from=OPEN to=ACTIVE at=2026-07-23T18:00:00Z\n' > "$repo/.pm/events.log"
+  cat > "$repo/.pm/config.json" <<EOF
+{"repos": {"MyRepo": {"path": "${gitrepo}", "mainline": "main"}}, "herdr_workspace": "zzz-test-ws"}
+EOF
+
+  fixture_wt="$(mktemp "${TMPDIR:-/tmp}/pm-creator-herdr-wt.XXXXXX")"
+  fixture_tabs="$(mktemp "${TMPDIR:-/tmp}/pm-creator-herdr-tabs-live.XXXXXX")"
+  fixture_ws="$(mktemp "${TMPDIR:-/tmp}/pm-creator-herdr-ws-live.XXXXXX")"
+  sed -e "s|__WT_PATH__|${wt}|g" "${THIS_DIR}/fixtures/herdr_worktree_list.json" > "$fixture_wt"
+  sed -e "s|__LABEL__|zzz-live-tab|g" "${THIS_DIR}/fixtures/herdr_tab_list.json" > "$fixture_tabs"
+  cp "${THIS_DIR}/fixtures/herdr_workspace_list.json" "$fixture_ws"
+
+  HERDR_WT_FIXTURE="$fixture_wt" HERDR_TABS_FIXTURE="$fixture_tabs" HERDR_WS_FIXTURE="$fixture_ws"
+  export HERDR_WT_FIXTURE HERDR_TABS_FIXTURE HERDR_WS_FIXTURE
+  # shellcheck disable=SC2317,SC2329  # invoked indirectly by the nested reconcile process
+  herdr() {
+    case "$1 $2" in
+      "worktree list") cat "$HERDR_WT_FIXTURE" ;;
+      "tab list") cat "$HERDR_TABS_FIXTURE" ;;
+      "workspace list") cat "$HERDR_WS_FIXTURE" ;;
+      *) return 1 ;;
+    esac
+  }
+  export -f herdr
+
+  run_reconcile "$repo"
+
+  unset -f herdr
+  unset HERDR_WT_FIXTURE HERDR_TABS_FIXTURE HERDR_WS_FIXTURE
+
+  assert_eq "herdr LIVE: exit 0" "0" "$RC_RC"
+  assert_true "herdr LIVE: herdr-reported worktree row is LIVE" \
+    bash -c 'grep -E "^\|[^|]*wt-live[^|]*\|" "$1/WORKTREES.md" | grep -q "| LIVE |"' _ "$repo"
+  assert_true "herdr LIVE: mainline worktree row stays KEEP (not blanket-LIVE)" \
+    bash -c 'grep -E "^\| [^|]+ \| main \|" "$1/WORKTREES.md" | grep -q "| KEEP |"' _ "$repo"
+
+  git -C "$gitrepo" worktree remove --force "$wt" >/dev/null 2>&1 || true
+  rm -f "$fixture_wt" "$fixture_tabs" "$fixture_ws"
+  rm -rf "$gitrepo" "$wt" "$repo"
+}
+
+# ---------------------------------------------------------------------------
+# I21 drift check -- OPT-IN, OPERATOR-ONLY: gated behind PM_TEST_REAL_HERDR=1
+# (OFF by default; the default suite must NEVER touch a real herdr). When an
+# operator deliberately opts in on a box with a live herdr, assert the
+# promised key paths of `herdr tab list` / `herdr workspace list` (the
+# shapes pinned in test/fixtures/herdr_README.md) still hold. Read-only
+# herdr queries; no tab/agent is ever created.
+section_real_herdr_contract_opt_in() {
+  if [[ "${PM_TEST_REAL_HERDR:-0}" != "1" ]]; then
+    skip "section_real_herdr_contract_opt_in" "opt-in only (set PM_TEST_REAL_HERDR=1 on an operator box)"
+    return
+  fi
+  if ! command -v herdr >/dev/null 2>&1; then
+    skip "section_real_herdr_contract_opt_in" "PM_TEST_REAL_HERDR=1 but no herdr on PATH"
+    return
+  fi
+  local tabs_raw ws_raw
+  tabs_raw="$(herdr tab list 2>/dev/null)"
+  assert_eq "real-herdr contract: tab list exits 0" "0" "$?"
+  ws_raw="$(herdr workspace list 2>/dev/null)"
+  assert_eq "real-herdr contract: workspace list exits 0" "0" "$?"
+  assert_true "real-herdr contract: result.tabs[] with tab_id/label/agent_status/workspace_id" \
+    python3 -c '
+import json, sys
+tabs = json.loads(sys.argv[1])["result"]["tabs"]
+assert isinstance(tabs, list)
+for t in tabs:
+    for k in ("tab_id", "label", "agent_status", "workspace_id"):
+        assert k in t, f"missing {k}"
+' "$tabs_raw"
+  assert_true "real-herdr contract: result.workspaces[] with workspace_id/label" \
+    python3 -c '
+import json, sys
+ws = json.loads(sys.argv[1])["result"]["workspaces"]
+assert isinstance(ws, list)
+for w in ws:
+    for k in ("workspace_id", "label"):
+        assert k in w, f"missing {k}"
+' "$ws_raw"
 }
 
 # ---------------------------------------------------------------------------
@@ -550,7 +775,7 @@ EOF
 # after the first commits and sees the ref as already known.
 section_unregistered_race_no_duplicate_under_concurrency() {
   if ! command -v git >/dev/null 2>&1; then
-    echo "skip: git not available"
+    skip "section_unregistered_race_no_duplicate_under_concurrency" "git not available"
     return
   fi
   local gitrepo repo emit_count rc1 rc2
@@ -915,10 +1140,18 @@ echo "== reconcile: SESSIONS.md no-match herdr_workspace value escaped =="
 section_sessions_no_match_herdr_workspace_escaped
 echo "== reconcile: tmpmanifest itself reaped on early exit (trap-before-mktemp ordering) =="
 section_tmpmanifest_reaped_on_early_exit
+echo "== reconcile: pm-illegal branch name does not abort reconcile (C7) =="
+section_pm_illegal_branch_does_not_abort_reconcile
+echo "== reconcile: quarantined ref does not suppress emission (I5) =="
+section_quarantined_ref_does_not_suppress_emission
+echo "== reconcile: herdr-reported worktree renders LIVE (I19) =="
+section_worktree_live_disposition_from_herdr
+echo "== reconcile: real-herdr contract (opt-in, PM_TEST_REAL_HERDR=1) =="
+section_real_herdr_contract_opt_in
 
 echo
 echo "-----------------------------------------"
-echo "PASS: $PASS  FAIL: $FAIL"
+echo "PASS: $PASS  FAIL: $FAIL  SKIP: $SKIP"
 if [[ "$FAIL" -gt 0 ]]; then
   echo "Failed:"
   for n in "${FAILED_NAMES[@]}"; do

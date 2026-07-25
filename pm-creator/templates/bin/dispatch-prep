@@ -267,31 +267,22 @@ fi
 repo_path=""
 repo_mainline=""
 if [[ -n "$repo_name" ]]; then
-  mapfile -t _repo_info < <(REPO_NAME="$repo_name" python3 -c "
+  # I6: repos parsing is delegated to pm_config_repos (THE one shared
+  # parser); this step only SELECTS the wanted entry from its normalized
+  # JSON -- no shape tolerance of its own.
+  mapfile -t _repo_info < <(pm_config_repos "$config" | REPO_NAME="$repo_name" python3 -c "
 import json, os, sys
-cfg = json.load(open(sys.argv[1]))
-repos = cfg.get('repos') or []
 want = os.environ['REPO_NAME']
 path = ''
 mainline = ''
-# Canonical config schema: repos is a LIST of {name,path,mainline}
-# (matches config.json.tmpl and bin/reconcile). Tolerate a legacy dict too.
-if isinstance(repos, list):
-    for entry in repos:
-        if isinstance(entry, dict) and entry.get('name') == want:
-            path = entry.get('path') or ''
-            mainline = entry.get('mainline') or ''
-            break
-elif isinstance(repos, dict):
-    entry = repos.get(want)
-    if isinstance(entry, dict):
-        path = entry.get('path') or ''
-        mainline = entry.get('mainline') or ''
-    elif isinstance(entry, str):
-        path = entry
+for entry in json.load(sys.stdin):
+    if entry['name'] == want:
+        path = entry['path']
+        mainline = entry['mainline'] or ''
+        break
 print(path)
 print(mainline)
-" "$config")
+")
   repo_path="${_repo_info[0]:-}"
   repo_mainline="${_repo_info[1]:-}"
   if [[ -z "$repo_path" ]]; then

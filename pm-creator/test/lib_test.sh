@@ -168,6 +168,85 @@ section_fold_good() {
 }
 
 # ---------------------------------------------------------------------------
+# I6: pm_config_repos is THE one parser of config.json's `repos` -- every
+# tool formats/reshapes its normalized output instead of re-parsing, so
+# shape tolerance is uniform: canonical list-of-objects and the legacy dict
+# both normalize; anything without a non-empty name AND path is skipped
+# with a stderr warning (the old per-tool parsers diverged exactly here).
+# ---------------------------------------------------------------------------
+section_config_repos_parser() {
+  local cfg out err
+  cfg="$(mktemp "${TMPDIR:-/tmp}/pm-creator-cfg.XXXXXX")"
+
+  # canonical list form (scaffold output)
+  cat > "$cfg" <<'JSON'
+{"repos": [{"name": "demo", "path": "/x/demo", "mainline": "main",
+            "mainline_ref": "refs/heads/main", "fetch_policy": "local-only",
+            "merge_mode": "squash", "allow_marker_branch_deleted": true}]}
+JSON
+  out="$(pm_config_repos "$cfg" 2>/dev/null)"
+  assert_eq "config_repos: canonical list normalizes (name/path/mainline/merge_mode)" \
+    "demo|/x/demo|main|squash|True" \
+    "$(printf '%s' "$out" | python3 -c 'import json,sys; r=json.load(sys.stdin)[0]; print("|".join(str(r[k]) for k in ("name","path","mainline","merge_mode","allow_marker_branch_deleted")))')"
+
+  # legacy dict form, incl. bare-path value; absent keys arrive as null
+  cat > "$cfg" <<'JSON'
+{"repos": {"A": {"path": "/x/a", "mainline": "dev"}, "B": "/x/b"}}
+JSON
+  out="$(pm_config_repos "$cfg" 2>/dev/null)"
+  assert_eq "config_repos: legacy dict + bare-path value normalize" \
+    "A|/x/a|dev,B|/x/b|None" \
+    "$(printf '%s' "$out" | python3 -c 'import json,sys; rs=json.load(sys.stdin); print(",".join("|".join(str(r[k]) for k in ("name","path","mainline")) for r in sorted(rs, key=lambda r: r["name"])))')"
+
+  # the I6 divergence case: a list-of-strings entry has no name -> skipped
+  # WITH a warning, uniformly (ledger-check used to probe it silently,
+  # track used to drop it silently).
+  cat > "$cfg" <<'JSON'
+{"repos": ["/abs/path/demo", {"name": "ok", "path": "/x/ok"}, {"path": "/x/nameless"}]}
+JSON
+  out="$(pm_config_repos "$cfg" 2>/dev/null)"
+  err="$(pm_config_repos "$cfg" 2>&1 >/dev/null)"
+  assert_eq "config_repos: nameless entries skipped, named survive" "ok" \
+    "$(printf '%s' "$out" | python3 -c 'import json,sys; print(",".join(r["name"] for r in json.load(sys.stdin)))')"
+# shellcheck disable=SC2016  # $1 refers to the nested bash -c's own arg
+  assert_true "config_repos: skip is WARNED, never silent" \
+    bash -c '[[ "$1" == *"WARN"*"[0]"* && "$1" == *"WARN"*"[2]"* ]]' _ "$err"
+
+  # unreadable config: [] + warning, exit 0 (read-only surfaces stay up)
+  out="$(pm_config_repos "$cfg.does-not-exist" 2>/dev/null)"
+  assert_eq "config_repos: unreadable config yields []" "[]" "$out"
+
+  rm -f "$cfg"
+}
+
+# ---------------------------------------------------------------------------
+# I7: the fold VALIDATES the schema header's version -- `EVENT schema v=2`
+# (any v != 1) is quarantined loudly (which also flips
+# quarantine_unattributable, blocking every auto-close), never silently
+# accepted as if this tooling understood a future grammar revision.
+# ---------------------------------------------------------------------------
+section_schema_version_gate() {
+  local repo qc unattr
+  repo="$(new_tmp_repo)"
+  printf 'EVENT schema v=2\n' > "$repo/.pm/events.log"
+
+  assert_true "schema-gate: pm_fold exits 0 (quarantines, never crashes)" pm_fold "$repo"
+  qc="$(python3 -c "import json;d=json.load(open('$repo/.pm/index.json'));print(len(d['quarantined']))")"
+  assert_eq "schema-gate: v=2 header quarantined" "1" "$qc"
+  unattr="$(python3 -c "import json;d=json.load(open('$repo/.pm/index.json'));print(d['quarantine_unattributable'])")"
+  assert_eq "schema-gate: unattributable quarantine flag set (auto-close blocked)" "True" "$unattr"
+
+  # v=1 stays clean.
+  printf 'EVENT schema v=1\n' > "$repo/.pm/events.log"
+  rm -f "$repo/.pm/index.json" "$repo/.pm/quarantine.log"
+  assert_true "schema-gate: v=1 header still folds clean" pm_fold "$repo"
+  qc="$(python3 -c "import json;d=json.load(open('$repo/.pm/index.json'));print(len(d['quarantined']))")"
+  assert_eq "schema-gate: v=1 nothing quarantined" "0" "$qc"
+
+  rm -rf "$repo"
+}
+
+# ---------------------------------------------------------------------------
 # pm_fold: quarantine routing + no-silent-drop on corrupt.events.log
 # ---------------------------------------------------------------------------
 section_fold_corrupt() {
@@ -576,11 +655,16 @@ section_fold_spawn_intent_accepted() {
   assert_eq "fold spawn_intent: zero quarantined entries" \
     "0" "$(_idx_py "$repo" "len(d['quarantined'])")"
 
-  # identical re-append -> accepted idempotently (no quarantine, same intent)
+  # C4: the lease is EXCLUSIVE -- an identical re-append is QUARANTINED
+  # with the spawn-lease-held token (a duplicate never means the lease was
+  # won); the FIRST intent stands.
   echo "EVENT spawn_intent d=D-160 a=A-01 at=2026-07-25T18:03:00Z ref=i1-fix-D160A01" >> "$repo/.pm/events.log"
   pm_fold "$repo" >/dev/null
-  assert_eq "fold spawn_intent: identical re-append accepted idempotently (zero quarantined)" \
-    "0" "$(_idx_py "$repo" "len(d['quarantined'])")"
+  assert_eq "fold spawn_intent: identical re-append quarantined (exclusive lease)" \
+    "1" "$(_idx_py "$repo" "len(d['quarantined'])")"
+  # shellcheck disable=SC2016  # $1 is the nested bash -c's own arg
+  assert_true "fold spawn_intent: identical re-append quarantine reason carries spawn-lease-held" \
+    bash -c 'grep -q "spawn-lease-held" "$1/.pm/quarantine.log"' _ "$repo"
   assert_eq "fold spawn_intent: identical re-append leaves the FIRST intent standing" \
     "2026-07-25T18:02:00Z" "$(_idx_py "$repo" "d['dispatches']['D-160']['spawn_intent']['A-01']['at']")"
 
@@ -787,7 +871,10 @@ section_git_probe() {
 }
 
 # ---------------------------------------------------------------------------
-# escapers vs hostile inputs
+# escapers vs hostile inputs -- esc_shell only: the four dead escapers
+# (esc_md/esc_json/esc_path/esc_gitref) were deleted with their copied
+# tests (I14); the Markdown escapers live in _PM_MD_PY and are exercised
+# through track_test/reconcile_test's injection sections.
 # ---------------------------------------------------------------------------
 section_escapers() {
   # shellcheck disable=SC2016  # single-quoted hostile strings are intentionally literal
@@ -808,36 +895,129 @@ line'
   )
 
   for h in "${hostile[@]}"; do
-    local shq mdq jsq pq gq
+    local shq
     shq="$(esc_shell "$h")"
     # esc_shell output, when eval'd as a single word, must reproduce input exactly.
     local roundtrip
     roundtrip="$(eval "printf '%s' $shq")"
     assert_eq "esc_shell round-trips [$h]" "$h" "$roundtrip"
-
-    mdq="$(esc_md "$h")"
-    assert_true "esc_md produces output for [$h]" test -n "$mdq" -o -z "$h"
-
-    jsq="$(esc_json "$h")"
-    local jsround
-    jsround="$(python3 -c "import json,sys;print(json.loads(sys.argv[1]), end='')" "\"$jsq\"" 2>/dev/null || echo __JSON_ERR__)"
-    assert_true "esc_json produces parseable JSON string for [$h]" test "$jsround" != "__JSON_ERR__"
-
-    pq="$(esc_path "$h")"
-    # shellcheck disable=SC2016
-    assert_false "esc_path never leaves a leading dash (arg-injection guard) for [$h]" \
-      bash -c '[[ "$1" == -* ]]' _ "$pq"
-
-    gq="$(esc_gitref "$h")"
-    assert_true "esc_gitref check-ref-format accepts output for [$h]" \
-      git check-ref-format --allow-onelevel "refs/heads/$gq"
   done
 }
+
+# ---------------------------------------------------------------------------
+# review I1: pm_apply's python-side TOKEN_RE (pre-fix `^...$`) tolerates a
+# trailing embedded "\n" -- Python's $ matches just before a trailing "\n",
+# so a value ending in "\n" would validate as a clean token, then split one
+# committed event into two lines on append, corrupting line-oriented
+# parse/quarantine attribution downstream. \A/\Z anchors (plus the
+# belt-and-suspenders "\n" in rendered-line check) must refuse it outright.
+# ---------------------------------------------------------------------------
+section_apply_newline_refused() {
+  local repo
+  repo="$(new_tmp_repo)"
+  # shellcheck disable=SC2034  # dynamic scope pickup by pm_apply/_pm_root
+  local PM_ROOT="$repo"
+
+  # seed one legitimate event first so events.log exists with a known,
+  # stable line count to assert against.
+  assert_true "pm_apply: seed legitimate note accepted" \
+    pm_apply note at=2026-07-25T18:00:00Z ref=zzz-test-note-seed
+
+  local before_lines
+  before_lines="$(wc -l <"$repo/.pm/events.log" 2>/dev/null || echo 0)"
+
+  # shellcheck disable=SC2016  # $1/$2 are the nested bash -c's own positional args
+  assert_false "pm_apply: value with embedded trailing newline refused" \
+    env PM_ROOT="$repo" bash -c 'source "$1"; pm_apply note at=2026-07-25T18:00:00Z ref="$2"' \
+      _ "$LIB" $'zzz-test-note\n'
+
+  local after_lines
+  after_lines="$(wc -l <"$repo/.pm/events.log" 2>/dev/null || echo 0)"
+  assert_eq "pm_apply: refused newline value appends no line (no blank/split line)" \
+    "$before_lines" "$after_lines"
+
+  rm -rf "$repo"
+}
+
+# ---------------------------------------------------------------------------
+# C5/I3: the fold's writes are LOCKED and ATOMIC; the apply-driver's log
+# append is fsync'ed before success is reported.
+# ---------------------------------------------------------------------------
+section_fold_locked_and_atomic() {
+  local repo
+  repo="$(new_tmp_repo)"
+  PM_ROOT="$repo" pm_apply issue_state i=I-050 from=OPEN to=ACTIVE at=2026-07-25T18:00:00Z >/dev/null
+
+  # (1) C5: pm_fold must take the repo lock -- while another process holds
+  # it, a fold must FAIL (after timeout) instead of writing an index that
+  # can race the lock-holder's own refold.
+  bash -c '
+    source "$1"
+    pm_lock "$2" || exit 9
+    exec sleep 30
+  ' _ "$LIB" "$repo" &
+  local hp=$!
+  local i=0
+  while flock -n "$repo/.pm/.lock" true 2>/dev/null; do
+    i=$((i + 1)); [[ "$i" -ge 50 ]] && break; sleep 0.1
+  done
+  # shellcheck disable=SC2016  # $1/$2 are the nested bash -c's own args
+  assert_true "fold lock: holder observably held the lock" \
+    bash -c '[[ "$1" -lt 50 ]]' _ "$i"
+  # shellcheck disable=SC2016
+  assert_false "fold lock: pm_fold refuses while the lock is held elsewhere" \
+    env PM_LOCK_TIMEOUT=1 bash -c 'source "$1"; pm_fold "$2" 2>/dev/null' _ "$LIB" "$repo"
+  kill -9 "$hp" 2>/dev/null || true
+  wait "$hp" 2>/dev/null || true
+
+  # (2) C5: successful fold leaves a parseable index and NO .tmp leftovers
+  # (write goes to <path>.tmp then os.replace).
+  assert_true "fold atomic: pm_fold succeeds once the lock is free" \
+    pm_fold "$repo"
+  assert_true "fold atomic: index.json parses" \
+    python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$repo/.pm/index.json"
+  assert_false "fold atomic: no index.json.tmp leftover" \
+    test -e "$repo/.pm/index.json.tmp"
+  assert_false "fold atomic: no quarantine.log.tmp leftover" \
+    test -e "$repo/.pm/quarantine.log.tmp"
+
+  # (3) C5: a reader racing a fold loop must NEVER see a torn index --
+  # every concurrent read parses (old complete file or new complete file).
+  (
+    # shellcheck disable=SC1090
+    source "$LIB"
+    for _ in $(seq 1 30); do
+      pm_fold "$repo" >/dev/null 2>&1
+    done
+  ) &
+  local fp=$! torn=0
+  for _ in $(seq 1 60); do
+    python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$repo/.pm/index.json" 2>/dev/null || torn=$((torn + 1))
+  done
+  wait "$fp" 2>/dev/null || true
+  assert_eq "fold atomic: zero torn reads while a fold loop runs" "0" "$torn"
+
+  # (4) I3 (static bind, same pattern as track's reason-registry check):
+  # the apply driver must flush+fsync the log append before reporting
+  # success -- the commit point is durable, not a buffered write.
+  # shellcheck disable=SC2016
+  assert_true "apply driver: log append is fsync'ed before success" \
+    bash -c 'grep -A4 "with open(log_path, \"a\")" "$1" | grep -q "os.fsync"' _ "$LIB"
+
+  rm -rf "$repo"
+}
+
+echo "== pm_fold: locked + atomic writes; durable append (C5/I3) =="
+section_fold_locked_and_atomic
 
 echo "== pm_raw_append validation =="
 section_raw_append
 echo "== pm_fold: good.events.log =="
 section_fold_good
+echo "== pm_config_repos: one shared parser (I6) =="
+section_config_repos_parser
+echo "== pm_fold: schema version gate (I7) =="
+section_schema_version_gate
 echo "== pm_fold: corrupt.events.log =="
 section_fold_corrupt
 echo "== last-write-wins =="
@@ -870,6 +1050,8 @@ echo "== pm_git_probe =="
 section_git_probe
 echo "== escapers =="
 section_escapers
+echo "== review I1: pm_apply refuses value with embedded/trailing newline =="
+section_apply_newline_refused
 
 echo
 echo "-----------------------------------------"

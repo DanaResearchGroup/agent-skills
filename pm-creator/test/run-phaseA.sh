@@ -40,14 +40,25 @@ v = {
   "MODEL_ROUTING": "| Sonnet | default worker |\n| Opus | verdicts |",
   "REMOTE_POLICY": "local-only",
   "UPLOAD_POLICY": "none (local-only)",
-  "CAPACITY_NOTE": " (single dev box).",
-  "OPTIONAL_SLOT_NOTE": ", `RUNS.md`",
+  "CAPACITY_NOTE": "- **Capacity profile:** see `MACHINE.md` (single dev box).",
+  "OPTIONAL_SLOT_NOTE": ", `RUNS.md`, `MACHINE.md`",
+  "OPTIONAL_SLOT_ROWS": "| `RUNS.md` | Long-running jobs registry (optional slot) |\n| `MACHINE.md` | Resource/capacity profile (optional slot) |",
   "ALWAYS_HUMAN_GATES": "merges to `main`, any push",
   "HARDWARE_TABLE": "| CPU | test box |",
   "CAPACITY_NOTES": "One generation at a time.",
   "CAPACITY_RULES": "1. Don't stack heavy jobs.",
-  "REPOS_JSON": json.dumps([{"name":"demo","path":demo,"mainline":"main"}]),
-  "OPTIONAL_SLOTS_JSON": json.dumps({"runs": True, "machine": True}),
+  # local-only fetch_policy + refs/heads/ mainline_ref: this "demo" repo is
+  # a throwaway local sandbox with no origin remote (see DEMO setup above),
+  # so it must never be scaffold-defaulted to fetch_policy=fetch (which
+  # would derive mainline_ref=refs/remotes/origin/main -- a ref that can
+  # never resolve here since there is no remote to fetch from at all).
+  # track's C1 mainline-ancestry guard (tr_corroborate_git) resolves
+  # mainline_ref strictly locally and refuses (never passes) when it can't
+  # resolve -- correct fail-closed behavior against a real unfetched clone,
+  # but it would permanently block this smoke test's D-950 auto-record leg
+  # if left on the fetch-policy default, since nothing here will ever fetch
+  # successfully.
+  "REPOS_JSON": json.dumps([{"name":"demo","path":demo,"mainline":"main","mainline_ref":"refs/heads/main","fetch_policy":"local-only"}]),
 }
 json.dump(v, open(sys.argv[1], "w"))
 PY
@@ -65,10 +76,29 @@ grep -rIqE '\{\{[A-Z_]+\}\}' "$PM" && bad "unresolved placeholders remain" || ok
 ( cd "$PM" && git init -q -b main )
 export PM_ROOT="$PM"
 
+# --- herdr isolation (I19): the default suite must NEVER touch the real herdr
+# daemon. Every tool invocation that could reach herdr runs with either a
+# herdr-less PATH (reconcile, + --allow-degraded per SKILL step 4) or this
+# PATH-shadowing stub, which logs any invocation so "tool did not call herdr"
+# is asserted from evidence, not from an error-suppressed grep against the
+# developer's live daemon.
+STUBBIN="$WORK/stubbin"
+HERDR_CALL_LOG="$WORK/herdr-calls.log"
+mkdir -p "$STUBBIN"
+cat > "$STUBBIN/herdr" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$HERDR_CALL_LOG"
+exit 1
+EOF
+chmod +x "$STUBBIN/herdr"
+
 # --- 2. checks on the fresh repo ----------------------------------------------
 ( cd "$PM" && bin/ledger-check >/dev/null 2>&1 ) && ok "ledger-check clean on empty log" || bad "ledger-check failed on fresh repo"
-( cd "$PM" && bin/reconcile >/dev/null 2>&1 ) && ok "reconcile ran on fresh repo" || bad "reconcile failed on fresh repo"
-grep -q "GENERATED:BEGIN worktrees" "$PM/WORKTREES.md" && ok "WORKTREES has worktrees marker" || bad "WORKTREES marker missing"
+( cd "$PM" && PATH="/usr/bin:/bin" bin/reconcile --allow-degraded >/dev/null 2>&1 ) && ok "reconcile ran on fresh repo (--allow-degraded, herdr-less PATH)" || bad "reconcile failed on fresh repo"
+# I19: not the marker string (it ships verbatim in the template) -- assert
+# reconcile actually REPLACED the scaffold placeholder inside the markers.
+grep -q "run bin/reconcile to populate" "$PM/WORKTREES.md" && bad "WORKTREES still holds the scaffold placeholder (reconcile rendered nothing)" || ok "WORKTREES placeholder replaced by reconcile"
+grep -q "demo" "$PM/WORKTREES.md" && ok "WORKTREES worktrees block names the demo repo" || bad "WORKTREES block missing demo repo section"
 
 # --- 3. record an issue (via bin/record) + lint a prompt ----------------------
 ( cd "$PM" && bin/record issue I-001 ACTIVE >/dev/null 2>&1 ) && ok "record issue I-001 ACTIVE" || bad "record issue failed"
@@ -93,14 +123,19 @@ EOF
 ( cd "$PM" && bin/lint-prompt prompts/leaky.md >/dev/null 2>&1 ) && bad "lint-prompt missed a leak" || ok "lint-prompt catches a leaked I-005/tab"
 
 # --- 4. dispatch round-trip (human lane) --------------------------------------
-if ( cd "$PM" && bin/dispatch-prep --dispatch D-001 --issue I-001 --prompt prompts/I-001_demo.md --tab i001-demo --repo demo >/dev/null 2>&1 ); then
+# Runs under the PATH-shadowing herdr stub: if dispatch-prep ever invoked
+# herdr, the call would land in $HERDR_CALL_LOG (and never reach a real
+# daemon). I19: replaces the old check that queried the developer's REAL
+# herdr with its error path suppressed (which could never fail).
+if ( cd "$PM" && PATH="$STUBBIN:/usr/bin:/bin" bin/dispatch-prep --dispatch D-001 --issue I-001 --prompt prompts/I-001_demo.md --tab i001-demo --repo demo >/dev/null 2>&1 ); then
   ok "dispatch-prep emitted dispatch_new + DISPATCHED"
 else
   bad "dispatch-prep failed"
 fi
-# herdr must NOT have been spawned (dispatch-prep only prints)
-if command -v herdr >/dev/null 2>&1; then
-  herdr tab list --workspace zzz-phaseA-smoke 2>/dev/null | grep -q i001-demo && bad "dispatch-prep spawned a real herdr tab!" || ok "dispatch-prep did not spawn herdr (print-only)"
+if [ -s "$HERDR_CALL_LOG" ]; then
+  bad "dispatch-prep invoked herdr (print-only contract broken): $(tr '\n' ';' <"$HERDR_CALL_LOG")"
+else
+  ok "dispatch-prep did not invoke herdr (print-only; stub log empty)"
 fi
 
 # simulate the worker returning, driven through bin/record (auto from=/at=), per grammar §6
@@ -119,10 +154,16 @@ EOF
 cat > "$PM/messages/I-001_go_x_2026-07-24.md" <<'EOF'
 go x
 EOF
+# I19: seed a real report so "reports/ untouched" can actually fail -- the
+# old empty-dir find (errors suppressed) passed even if close DELETED the
+# directory. Pattern per close_test.sh's reports assertions.
+cat > "$PM/reports/R-001_v1_2026-07-24_smoke.md" <<'EOF'
+# R-001 — permanent audit report (must survive close)
+EOF
 ( cd "$PM" && bin/close I-001 >/dev/null 2>&1 ) && ok "bin/close I-001" || bad "bin/close I-001 failed"
 [ -f "$PM/archive/prompts/I-001_demo2.md" ] && ok "close archived prompts/I-001_demo2.md" || bad "close did not archive prompts/I-001_demo2.md"
 [ -f "$PM/archive/messages/I-001_go_x_2026-07-24.md" ] && ok "close archived messages/I-001_go_x_2026-07-24.md" || bad "close did not archive messages/I-001_go_x_2026-07-24.md"
-[ -z "$(find "$PM/reports" -mindepth 1 2>/dev/null)" ] && ok "close left reports/ untouched" || bad "close touched reports/"
+[ -f "$PM/reports/R-001_v1_2026-07-24_smoke.md" ] && ok "close left reports/R-001 in place (reports/ untouched)" || bad "close touched reports/ (seeded R-001 gone)"
 
 # --- 4c. bin/track --once: corroborated auto-record within phase-A lifecycle --
 # Proves track's intake dovetails with the existing human-gated verify/close flow:
@@ -149,7 +190,7 @@ cat > "$PM/prompts/I-950_corrob_2026-07-24.md" <<'EOF'
 Commit a trivial change on your assigned branch.
 EOF
 
-if ( cd "$PM" && bin/dispatch-prep --dispatch D-950 --issue I-950 --prompt prompts/I-950_corrob_2026-07-24.md --tab i950-corrob --repo demo >/dev/null 2>&1 ); then
+if ( cd "$PM" && PATH="$STUBBIN:/usr/bin:/bin" bin/dispatch-prep --dispatch D-950 --issue I-950 --prompt prompts/I-950_corrob_2026-07-24.md --tab i950-corrob --repo demo >/dev/null 2>&1 ); then
   ok "dispatch-prep D-950 emitted dispatch_new + DISPATCHED w/ git metadata"
 else
   bad "dispatch-prep D-950 failed"
@@ -200,7 +241,7 @@ grep -q "D-950" "$PM/TRACKER.md" && ok "TRACKER.md GENERATED block reflects D-95
 git -C "$DEMO" worktree remove --force "$WORK/wt-950" >/dev/null 2>&1 || true
 
 # --- 5. final integrity + fold ------------------------------------------------
-( cd "$PM" && bin/reconcile >/dev/null 2>&1 ) && ok "reconcile after round-trip" || bad "reconcile failed after round-trip"
+( cd "$PM" && PATH="/usr/bin:/bin" bin/reconcile --allow-degraded >/dev/null 2>&1 ) && ok "reconcile after round-trip" || bad "reconcile failed after round-trip"
 ( cd "$PM" && bin/ledger-check >/dev/null 2>&1 ) && ok "ledger-check clean after full VERIFIED round-trip" || bad "ledger-check failed after round-trip"
 if python3 - "$PM/.pm/index.json" <<'PY'
 import json, sys

@@ -575,7 +575,7 @@ section_lock_reentrancy_is_root_aware() {
       echo "REFUSED rc=$?"
     fi
     printf 'depth_after=%s lockA_present=%s\n' "$_PM_LOCK_DEPTH" \
-      "$([[ -d "$repoA/.pm/.lock" ]] && echo yes || echo no)"
+      "$(flock -n "$repoA/.pm/.lock" true 2>/dev/null && echo no || echo yes)"
     pm_unlock
   )"
   rc=$?

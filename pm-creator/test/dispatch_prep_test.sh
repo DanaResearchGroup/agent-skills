@@ -65,22 +65,23 @@ assert_contains() {
 # ---------------------------------------------------------------------------
 
 new_tmp_repo() {
+  # I18: demo-repo's configured path lives INSIDE this test's own sandbox
+  # ("$d/demo-repo") and is never created here, so "path does not exist /
+  # is not a git repo" holds by construction -- a fixed /tmp/demo-repo
+  # could be turned into a real git repo by anything else on the machine,
+  # silently flipping every "no base_sha=" assertion to test a foreign
+  # repo.
   local d
   d="$(mktemp -d "${TMPDIR:-/tmp}/pm-creator-dispatch-prep-test.XXXXXX")"
   mkdir -p "$d/.pm" "$d/prompts"
-  cat > "$d/.pm/config.json" <<'JSON'
+  cat > "$d/.pm/config.json" <<JSON
 {
   "campaign": "Test Campaign",
   "slug": "test-campaign",
-  "schema_version": 1,
   "herdr_workspace": "zzz-test-ws",
-  "worktree_root": "/tmp/worktrees",
-  "runs_root": "/tmp/runs",
-  "remote_policy": "local-only",
   "repos": {
-    "demo-repo": {"path": "/tmp/demo-repo", "mainline": "main"}
-  },
-  "optional_slots": {}
+    "demo-repo": {"path": "$d/demo-repo", "mainline": "main"}
+  }
 }
 JSON
   printf 'EVENT schema v=1\n' > "$d/.pm/events.log"
@@ -117,7 +118,7 @@ section_fresh_dispatch() {
   assert_contains "fresh dispatch: prints herdr command with quoted workspace" \
     "$out" "herdr tab create --workspace 'zzz-test-ws' --label 'zzz-test-tab'"
   assert_contains "fresh dispatch: prints --cwd for the resolved repo path" \
-    "$out" "--cwd '/tmp/demo-repo'"
+    "$out" "--cwd '$repo/demo-repo'"
 
   # The printed command must be exactly reproducible by eval (properly
   # quoted) WITHOUT ever invoking the real herdr binary: shadow it with a
@@ -132,7 +133,7 @@ section_fresh_dispatch() {
   captured="$(eval "$cmd_line")"
   unset -f herdr
   assert_eq "fresh dispatch: printed command round-trips through eval as separate argv words (no herdr binary invoked)" \
-    "tab$(printf '\x1f')create$(printf '\x1f')--workspace$(printf '\x1f')zzz-test-ws$(printf '\x1f')--label$(printf '\x1f')zzz-test-tab$(printf '\x1f')--cwd$(printf '\x1f')/tmp/demo-repo$(printf '\x1f')" \
+    "tab$(printf '\x1f')create$(printf '\x1f')--workspace$(printf '\x1f')zzz-test-ws$(printf '\x1f')--label$(printf '\x1f')zzz-test-tab$(printf '\x1f')--cwd$(printf '\x1f')$repo/demo-repo$(printf '\x1f')" \
     "$captured"
 
   rm -rf "$repo"
@@ -489,7 +490,11 @@ section_git_meta_repo_omitted() {
 section_git_meta_repo_path_not_a_git_repo() {
   local repo out rc
   repo="$(new_tmp_repo)"
-  mkdir -p /tmp/demo-repo 2>/dev/null || true
+  # The configured path must EXIST but not be a git work tree -- create it
+  # inside the sandbox, and fail loudly if that setup step fails (a
+  # swallowed mkdir would silently degrade this section's premise from
+  # "not a git repo" to "does not exist").
+  mkdir "$repo/demo-repo"
 
   out="$(PM_ROOT="$repo" "$DISPATCH_PREP" \
     --dispatch D-022 --issue I-004 \

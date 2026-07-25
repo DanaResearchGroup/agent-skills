@@ -104,42 +104,16 @@ if [[ ! -f "${_rc_index}" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# parse repos out of config.json (dict or list; extract name/path/mainline)
+# parse repos out of config.json -- delegated to pm_config_repos (THE one
+# shared parser, I6); this step only FORMATS the normalized JSON as
+# name<TAB>path<TAB>mainline rows, no shape tolerance of its own.
 # ---------------------------------------------------------------------------
 
-_rc_repo_rows="$(python3 -c '
+_rc_repo_rows="$(pm_config_repos "${_rc_config}" | python3 -c '
 import json, sys
-
-with open(sys.argv[1]) as f:
-    cfg = json.load(f)
-
-repos = cfg.get("repos")
-rows = []
-
-
-def add(name, val):
-    if isinstance(val, dict):
-        path = val.get("path") or ""
-        mainline = val.get("mainline") or ""
-    elif isinstance(val, str):
-        path, mainline = val, ""
-    else:
-        return
-    if path:
-        rows.append((name or "", path, mainline))
-
-
-if isinstance(repos, dict):
-    for name, val in repos.items():
-        add(name, val)
-elif isinstance(repos, list):
-    for val in repos:
-        if isinstance(val, dict):
-            add(val.get("name") or "", val)
-
-for name, path, mainline in rows:
-    print(f"{name}\t{path}\t{mainline}")
-' "${_rc_config}")"
+for r in json.load(sys.stdin):
+    print(r["name"] + "\t" + r["path"] + "\t" + (r["mainline"] or ""))
+')"
 
 herdr_workspace="$(python3 -c '
 import json, sys
@@ -246,9 +220,22 @@ _rc_cleanup() {
   pm_unlock 2>/dev/null || true
   return "${rc}"
 }
+# C6: INT/TERM must TERMINATE. _rc_cleanup ends in `return`, so trapping it
+# directly on INT/TERM would clean up and then let the script CONTINUE past
+# the interrupted command with its lock released and temp files deleted.
+# Clean up, restore default disposition, and re-raise (same shape as
+# scaffold.sh's cleanup): the process dies with 128+signum.
+# shellcheck disable=SC2329  # invoked indirectly via trap below
+_rc_cleanup_sig() {
+  _rc_cleanup
+  trap - EXIT INT TERM
+  kill -s "$1" "${BASHPID:-$$}"
+}
 # Trap installed BEFORE the manifest itself is created, so a crash in the
 # window while mktemp'ing the manifest can never leak it either.
-trap _rc_cleanup EXIT INT TERM
+trap _rc_cleanup EXIT
+trap '_rc_cleanup_sig INT' INT
+trap '_rc_cleanup_sig TERM' TERM
 
 _rc_tmpmanifest="$(mktemp "${TMPDIR:-/tmp}/pm-reconcile-tmpmanifest.XXXXXX")"
 
@@ -335,9 +322,12 @@ if ! pm_lock "${_rc_root}"; then
   echo "reconcile: failed to acquire repo lock" >&2
   exit 1
 fi
-# pm_lock installs its own EXIT/INT/TERM trap; re-install ours so temp files
-# still get cleaned up on abnormal exit.
-trap _rc_cleanup EXIT INT TERM
+# pm_lock installs its own EXIT/INT/TERM traps; re-install ours so temp
+# files still get cleaned up on abnormal exit (same terminate-on-signal
+# shape -- see the C6 note at the trap definitions).
+trap _rc_cleanup EXIT
+trap '_rc_cleanup_sig INT' INT
+trap '_rc_cleanup_sig TERM' TERM
 
 # Re-fold under the lock so known_refs/issues reflect any events a
 # concurrent process committed between our initial fold (above) and here.
@@ -346,19 +336,11 @@ if ! pm_fold "${_rc_root}"; then
   exit 1
 fi
 
-_rc_decide_out="$(
-  PM_RC_ROOT="${_rc_root}" \
-  PM_RC_INDEX="${_rc_index}" \
-  PM_RC_EVENTS="${_rc_events}" \
-  PM_RC_REPOS="${_rc_repos_json}" \
-  PM_RC_HERDR_WORKSPACE="${herdr_workspace}" \
-  PM_RC_HERDR_OK="${_rc_herdr_ok}" \
-  PM_RC_HERDR_TABS_FILE="${_rc_herdr_tabs_file}" \
-  PM_RC_HERDR_WORKSPACES_FILE="${_rc_herdr_ws_file}" \
-  PM_RC_EMIT_FILE="${_rc_emit_file}" \
-  PM_RC_DECIDE_OUT_FILE="${_rc_decide_file}" \
-  PM_RC_NOW="$(now_iso)" \
-  python3 <<'PYEOF'
+# I8: the esc_md_* helpers come prepended from _lib.sh's _PM_MD_PY (the one
+# shared copy), composed the same way track builds its _TR_CORROB_PY
+# pipelines. I15: the driver's stdout is deliberately NOT captured -- any
+# diagnostic it prints surfaces directly instead of being swallowed.
+read -r -d '' _rc_decide_driver <<'PYEOF' || true
 import json
 import os
 import re
@@ -366,7 +348,6 @@ import sys
 
 root = os.environ["PM_RC_ROOT"]
 index_path = os.environ["PM_RC_INDEX"]
-events_path = os.environ["PM_RC_EVENTS"]
 repos = json.loads(os.environ["PM_RC_REPOS"])
 herdr_workspace = os.environ["PM_RC_HERDR_WORKSPACE"]
 herdr_ok = os.environ["PM_RC_HERDR_OK"] == "1"
@@ -387,84 +368,44 @@ open_questions = index.get("open_questions", [])
 
 conflicts = []
 
-
-def esc_md_inline(s):
-    # Backslash-escape GFM inline-Markdown-active characters so a value we
-    # did not author cannot be reinterpreted as emphasis, code spans,
-    # links, or (if it lands at the very start of a line) a heading/list/
-    # blockquote marker. Must run AFTER the "&"/pipe HTML-entity escaping
-    # above so the backslashes it inserts are never themselves re-escaped.
-    s = re.sub(r'([`*_\[\]()~])', r'\\\1', s)
-    s = re.sub(r'^([#>+-])', r'\\\1', s)
-    # Ordered-list marker: backslash must precede the "." (CommonMark does
-    # not treat "\<digit>" as an escape — only "\." is), not the digits.
-    s = re.sub(r'^(\d+)\.', r'\1\\.', s)
-    return s
-
-
-def esc_md_cell(value):
-    # Sanitize a value for use inside a Markdown table cell: neutralize
-    # embedded HTML, pipes, line breaks, and inline Markdown syntax so a
-    # value we did not author (a repo path, branch name, herdr tab label,
-    # or status string) can never break out of its row/column, fabricate
-    # extra table rows, render as live HTML, or render as live Markdown
-    # (emphasis, code spans, links). Order matters: escape "&" first so the
-    # entities produced by the later replacements are not themselves
-    # re-escaped, then pipes, then the inline-Markdown backslash-escapes.
-    s = "" if value is None else str(value)
-    s = s.replace("&", "&amp;")
-    s = s.replace("<", "&lt;").replace(">", "&gt;")
-    # GFM table-cell pipe escaping via "\|" is ambiguous next to other
-    # backslashes; the HTML entity is unambiguous regardless of context.
-    s = s.replace("|", "&#124;")
-    s = s.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
-    s = esc_md_inline(s)
-    return s
-
-
-def esc_md_heading(value):
-    # Sanitize a value for use as Markdown heading text (e.g. "### {name}"):
-    # strip CR/LF so it cannot inject a new line that starts its own
-    # heading/fence, escape HTML so it cannot render as live markup,
-    # neutralize inline Markdown syntax (emphasis, code spans, links) so
-    # the value renders literally, and neutralize a leading "#" or
-    # backtick by escaping just that first character — CommonMark's
-    # ATX-heading rule only fires when "#" is the very first character of
-    # the line, so a leading "\#"/"\`" can never be reinterpreted as a
-    # heading marker or code-fence opener. Order matters: HTML entities
-    # first, then the inline-Markdown backslash-escapes, so the escaping
-    # backslashes are not themselves re-escaped.
-    s = "" if value is None else str(value)
-    s = s.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
-    s = s.replace("&", "&amp;")
-    s = s.replace("<", "&lt;").replace(">", "&gt;")
-    s = esc_md_inline(s)
-    return s
+# esc_md_inline / esc_md_cell / esc_md_heading are provided by the
+# prepended _PM_MD_PY snippet (_lib.sh) -- the single shared copy (I8).
 
 # ---------------------------------------------------------------------
-# known refs (idempotency: derived from the log itself, not a side file)
-# and known question ids (any question event ever logged, any state).
+# known refs (idempotency) and known question ids (any question event
+# ever logged, any state) -- read from the FOLD (index.json), the single
+# source of truth, per the "NEVER a second raw-log re-scan" rule
+# (_lib.sh / track). A raw regex scan of events.log would also count
+# QUARANTINED lines the fold excluded, so a hostile/corrupt line whose
+# raw text carries ref=<branch> could suppress that branch's real
+# divergence from ever being emitted (I5). The fold already dedupes
+# `unregistered[]`, records every accepted adopt as the dispatch's
+# `adopted_ref`, and keys `questions` by every question id ever folded.
 # ---------------------------------------------------------------------
 known_refs = set()
-known_question_ids = set()
-TOKEN_KV = re.compile(r'(\S+)=(\S+)')
-with open(events_path) as f:
-    for line in f:
-        line = line.strip()
-        if not line.startswith("EVENT "):
-            continue
-        parts = line.split(" ")
-        if len(parts) < 2:
-            continue
-        etype = parts[1]
-        kv = dict(TOKEN_KV.findall(" ".join(parts[2:])))
-        if etype in ("unregistered_execution", "adopt") and "ref" in kv:
-            known_refs.add(kv["ref"])
-        if etype == "question" and "q" in kv:
-            known_question_ids.add(kv["q"])
+for u in index.get("unregistered", []):
+    ref = u.get("ref")
+    if ref:
+        known_refs.add(ref)
+for disp in dispatches.values():
+    adopted = disp.get("adopted_ref")
+    if adopted:
+        known_refs.add(adopted)
+known_question_ids = set(index.get("questions", {}))
 
 ticket_re = re.compile(r'^(i\d+)-', re.IGNORECASE)
 question_re = re.compile(r'^(q\d+)-', re.IGNORECASE)
+
+# C7: same value-charset the grammar engine (and dispatch-prep's own
+# double-validation, see dispatch-prep's derived-branch check) enforces --
+# reused here, not reinvented, so this stays in lockstep with what
+# pm_apply will actually accept. `ticket_re` above only anchors the
+# `^i\d+-` PREFIX; a git-legal branch/label whose remainder falls outside
+# this charset (e.g. a comma or `=`) must never reach pm_apply as a `ref=`
+# value -- it would make the whole transaction (and thus this run) fail.
+# Such a name is surfaced as a CONFLICTS line only; see the branch loop
+# below.
+TOKEN_RE = re.compile(r'\A[A-Za-z0-9._:+/@?-]+\Z')
 
 
 def issue_id_for_token(token):
@@ -562,8 +503,22 @@ for repo in repos:
                 if issue_id and issue_id not in issues:
                     ref = branch
                     if ref not in known_refs:
-                        new_refs.append((ref, f"branch '{branch}' in repo '{name}' (no {issue_id} ever logged)"))
-                        known_refs.add(ref)  # de-dup within this same run too
+                        if not TOKEN_RE.match(ref):
+                            # C7: git accepts branch names (e.g. containing
+                            # ',' or '=') that the pm token charset does
+                            # not. Surface this as a conflict/surface line
+                            # ONLY -- never hand it to pm_apply, or one
+                            # hostile/typo'd branch would abort every
+                            # unregistered_execution emission this run.
+                            known_refs.add(ref)  # de-dup within this run too
+                            conflicts.append(
+                                f"unregistered execution: branch '{branch}' in repo '{name}' "
+                                f"(no {issue_id} ever logged) -- NOT recorded: branch name "
+                                f"contains characters outside the pm token charset"
+                            )
+                        else:
+                            new_refs.append((ref, f"branch '{branch}' in repo '{name}' (no {issue_id} ever logged)"))
+                            known_refs.add(ref)  # de-dup within this same run too
 
     worktree_sections.append("\n".join(lines))
 
@@ -720,10 +675,18 @@ with open(decide_out_file, "w") as f:
         f,
     )
 PYEOF
-)"
-_rc_decide_rc=$?
 
-if [[ ${_rc_decide_rc} -ne 0 ]]; then
+if ! PM_RC_ROOT="${_rc_root}" \
+  PM_RC_INDEX="${_rc_index}" \
+  PM_RC_REPOS="${_rc_repos_json}" \
+  PM_RC_HERDR_WORKSPACE="${herdr_workspace}" \
+  PM_RC_HERDR_OK="${_rc_herdr_ok}" \
+  PM_RC_HERDR_TABS_FILE="${_rc_herdr_tabs_file}" \
+  PM_RC_HERDR_WORKSPACES_FILE="${_rc_herdr_ws_file}" \
+  PM_RC_EMIT_FILE="${_rc_emit_file}" \
+  PM_RC_DECIDE_OUT_FILE="${_rc_decide_file}" \
+  PM_RC_NOW="$(now_iso)" \
+  bash -c 'printf "%s\n%s\n" "$1" "$2" | python3 -' _ "${_PM_MD_PY}" "${_rc_decide_driver}"; then
   echo "reconcile: reconcile/decide step failed" >&2
   exit 1
 fi
@@ -739,9 +702,14 @@ fi
 if [[ -s "${_rc_emit_file}" ]]; then
   while IFS= read -r _rc_ref; do
     [[ -z "${_rc_ref}" ]] && continue
+    # C7: one ref that pm_apply refuses (e.g. an unexpected engine-level
+    # rejection the decide step's own charset pre-check didn't catch) must
+    # never abort the whole run -- skip-and-warn, not exit 1, so every
+    # other newly-discovered ref still gets its unregistered_execution
+    # event and WORKTREES/SESSIONS/LEDGER/DISPATCHES/QUESTIONS still
+    # render below.
     pm_apply unregistered_execution at="$(now_iso)" ref="${_rc_ref}" || {
-      echo "reconcile: failed to emit unregistered_execution ref=${_rc_ref}" >&2
-      exit 1
+      echo "reconcile: WARN: failed to emit unregistered_execution ref=${_rc_ref}; skipping this ref, continuing" >&2
     }
   done < "${_rc_emit_file}"
 fi
@@ -760,13 +728,11 @@ pm_unlock
 # completed above.
 # ---------------------------------------------------------------------------
 
-_rc_report="$(
-  PM_RC_ROOT="${_rc_root}" \
-  PM_RC_DECIDE_IN="${_rc_decide_file}" \
-  python3 <<'PYEOF'
+# I8: render_marker comes prepended from _lib.sh's _PM_MD_PY (the one
+# shared copy, with the backslash-lambda rationale documented there).
+read -r -d '' _rc_render_driver <<'PYEOF' || true
 import json
 import os
-import re
 
 root = os.environ["PM_RC_ROOT"]
 with open(os.environ["PM_RC_DECIDE_IN"]) as f:
@@ -774,34 +740,6 @@ with open(os.environ["PM_RC_DECIDE_IN"]) as f:
 
 conflicts = list(decided["conflicts"])
 bodies = decided["bodies"]
-
-
-def render_marker(md_path, key, body):
-    if not os.path.isfile(md_path):
-        conflicts.append(f"{os.path.basename(md_path)}: file not found at {md_path} -- skipped")
-        return
-    with open(md_path, "r") as f:
-        content = f.read()
-    begin = f"<!-- GENERATED:BEGIN {key} -->"
-    end = f"<!-- GENERATED:END {key} -->"
-    pattern = re.compile(re.escape(begin) + r".*?" + re.escape(end), re.DOTALL)
-    if not pattern.search(content):
-        conflicts.append(
-            f"{os.path.basename(md_path)}: no '{key}' GENERATED markers found -- skipped "
-            f"(scaffold may not have materialized them yet)"
-        )
-        return
-    replacement = f"{begin}\n{body}\n{end}"
-    # NOTE: pass the replacement via a lambda so re.sub treats it as a
-    # literal string -- it must NOT go through re.sub's plain-string
-    # replacement path (which interprets backslash escapes / \g<...>
-    # group references and would corrupt any literal backslash in a
-    # label or path inside `body`).
-    new_content = pattern.sub(lambda _m: replacement, content, count=1)
-    if new_content != content:
-        with open(md_path, "w") as f:
-            f.write(new_content)
-
 
 render_marker(os.path.join(root, "WORKTREES.md"), "worktrees", bodies["worktrees"])
 render_marker(os.path.join(root, "LEDGER.md"), "ledger-summary", bodies["ledger-summary"])
@@ -823,13 +761,12 @@ if conflicts:
 else:
     print("\nCONFLICTS: none")
 PYEOF
-)"
-_rc_report_rc=$?
 
-if [[ ${_rc_report_rc} -ne 0 ]]; then
+if ! PM_RC_ROOT="${_rc_root}" \
+  PM_RC_DECIDE_IN="${_rc_decide_file}" \
+  bash -c 'printf "%s\n%s\n" "$1" "$2" | python3 -' _ "${_PM_MD_PY}" "${_rc_render_driver}"; then
   echo "reconcile: rendering step failed" >&2
   exit 1
 fi
 
-printf '%s\n' "${_rc_report}"
 exit 0
