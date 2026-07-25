@@ -55,6 +55,15 @@ assert_true() {
   fi
 }
 
+assert_contains() {
+  local name="$1" haystack="$2" needle="$3"
+  if [[ "$haystack" == *"$needle"* ]]; then
+    ok "$name"
+  else
+    fail "$name" "expected output to contain [$needle]"
+  fi
+}
+
 now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
 # git_or_die <label> <git-args...> -- runs a single fixture-building git
@@ -326,12 +335,66 @@ run_track() {
     TR_OUT="$(
       cd "$repo" && \
       HERDR_SNAPSHOT_FIXTURE="$fixture_file" \
+      HERDR_CALL_LOG="${HERDR_CALL_LOG:-}" \
+      HERDR_TAB_CREATE_MODE="${HERDR_TAB_CREATE_MODE:-ok}" \
+      HERDR_AGENT_START_MODE="${HERDR_AGENT_START_MODE:-ok}" \
+      HERDR_RACE_APPEND="${HERDR_RACE_APPEND:-}" \
+      HERDR_TAMPER_PROMPT="${HERDR_TAMPER_PROMPT:-}" \
       PATH="/usr/bin:/bin" \
       bash -c '
+        # herdr shadow (B3-extended): `api snapshot` returns the fixture;
+        # `tab create` / `agent start` / `tab close` emit the EXACT
+        # live-probed herdr JSON shapes (success and error variants), log
+        # their full argv to HERDR_CALL_LOG, and never touch the real herdr
+        # binary or a live workspace. HERDR_RACE_APPEND injects a raw
+        # event-log line during `tab create` -- inside track own
+        # intent->ack window -- to reproduce the TOCTOU race
+        # deterministically; HERDR_TAMPER_PROMPT appends junk to the named
+        # file during `tab create`, landing in the NEXT candidate
+        # plan->lock window (the under-lock re-hash TOCTOU).
+        # HERDR_TAB_CREATE_MODE=ok_no_id returns exit 0 with the tab_id
+        # field missing.
         # shellcheck disable=SC2317,SC2329  # invoked indirectly by bin/track
         herdr() {
           case "$1 $2" in
             "api snapshot") cat "$HERDR_SNAPSHOT_FIXTURE" ;;
+            "tab create")
+              if [[ -n "${HERDR_CALL_LOG:-}" ]]; then printf "%s\n" "$*" >>"$HERDR_CALL_LOG"; fi
+              if [[ -n "${HERDR_RACE_APPEND:-}" ]]; then printf "%s\n" "$HERDR_RACE_APPEND" >>.pm/events.log; fi
+              if [[ -n "${HERDR_TAMPER_PROMPT:-}" ]]; then printf "tampered mid-window\n" >>"$HERDR_TAMPER_PROMPT"; fi
+              if [[ "${HERDR_TAB_CREATE_MODE:-ok}" == "fail" ]]; then
+                printf "{\"error\":{\"code\":\"workspace_not_found\",\"message\":\"zzz-test tab create failure\"},\"id\":\"cli:tab:create\"}\n"
+                return 1
+              fi
+              if [[ "${HERDR_TAB_CREATE_MODE:-ok}" == "ok_no_id" ]]; then
+                printf "{\"id\":\"cli:tab:create\",\"result\":{\"root_pane\":{},\"tab\":{\"agent_status\":\"unknown\",\"label\":\"x\",\"workspace_id\":\"zzz-test-ws\"},\"type\":\"tab_created\"}}\n"
+                return 0
+              fi
+              local label="" prev="" arg n=1
+              for arg in "$@"; do
+                if [[ "$prev" == "--label" ]]; then label="$arg"; fi
+                prev="$arg"
+              done
+              if [[ -n "${HERDR_CALL_LOG:-}" ]]; then n="$(grep -c "^tab create" "$HERDR_CALL_LOG" 2>/dev/null || echo 1)"; fi
+              printf "{\"id\":\"cli:tab:create\",\"result\":{\"root_pane\":{\"pane_id\":\"zzz-test-ws:p8%s\"},\"tab\":{\"agent_status\":\"unknown\",\"label\":\"%s\",\"tab_id\":\"zzz-test-ws:t9%s\",\"workspace_id\":\"zzz-test-ws\"},\"type\":\"tab_created\"}}\n" "$n" "$label" "$n"
+              ;;
+            "tab close")
+              if [[ -n "${HERDR_CALL_LOG:-}" ]]; then printf "%s\n" "$*" >>"$HERDR_CALL_LOG"; fi
+              printf "{\"id\":\"cli:tab:close\",\"result\":{\"type\":\"tab_closed\"}}\n"
+              ;;
+            "agent start")
+              if [[ -n "${HERDR_CALL_LOG:-}" ]]; then printf "%s\n" "$*" >>"$HERDR_CALL_LOG"; fi
+              if [[ "${HERDR_AGENT_START_MODE:-ok}" == "fail" ]]; then
+                printf "{\"error\":{\"code\":\"agent_placement_not_found\",\"message\":\"zzz-test agent start failure\"},\"id\":\"cli:agent:start\"}\n"
+                return 1
+              fi
+              local name="$3" tab="" prev="" arg
+              for arg in "$@"; do
+                if [[ "$prev" == "--tab" ]]; then tab="$arg"; fi
+                prev="$arg"
+              done
+              printf "{\"id\":\"cli:agent:start\",\"result\":{\"agent\":{\"agent_status\":\"unknown\",\"name\":\"%s\",\"pane_id\":\"zzz-test-ws:p77\",\"tab_id\":\"%s\",\"workspace_id\":\"zzz-test-ws\"},\"argv\":[\"%s\"],\"type\":\"agent_started\"}}\n" "$name" "$tab" "$name"
+              ;;
             *) return 1 ;;
           esac
         }
@@ -382,17 +445,90 @@ run_track_with_git_wrapper() {
 }
 
 snapshot_json() {
-  # snapshot_json <tab_id> <agent_status> [<label>]
+  # snapshot_json <tab_id> <agent_status> [<label>] [<panes_json>]
   # Every tab is always embedded in the "zzz-test-ws" workspace (matching
   # every fixture's configured herdr_workspace) so plain status/existence
-  # cases don't also have to fight the F5 workspace filter.
-  local tab="$1" status="$2" label="${3:-}"
+  # cases don't also have to fight the F5 workspace filter. B3: the
+  # snapshot additionally carries panes[] (empty by default; override with
+  # the 4th arg).
+  local tab="$1" status="$2" label="${3:-}" panes="${4:-[]}"
   if [[ -n "$label" ]]; then
-    printf '{"result": {"tabs": [{"tab_id": "%s", "agent_status": "%s", "label": "%s", "workspace_id": "zzz-test-ws"}]}}' \
-      "$tab" "$status" "$label"
+    printf '{"result": {"tabs": [{"tab_id": "%s", "agent_status": "%s", "label": "%s", "workspace_id": "zzz-test-ws"}], "panes": %s}}' \
+      "$tab" "$status" "$label" "$panes"
   else
-    printf '{"result": {"tabs": [{"tab_id": "%s", "agent_status": "%s", "workspace_id": "zzz-test-ws"}]}}' "$tab" "$status"
+    printf '{"result": {"tabs": [{"tab_id": "%s", "agent_status": "%s", "workspace_id": "zzz-test-ws"}], "panes": %s}}' \
+      "$tab" "$status" "$panes"
   fi
+}
+
+# ---------------------------------------------------------------------------
+# B3 auto-spawn fixtures
+# ---------------------------------------------------------------------------
+
+spawn_snapshot_json() {
+  # spawn_snapshot_json [<panes_json>] [<agents_json>] [<tabs_json>]
+  # A snapshot with no interesting tabs (STAGE 1 idle) but explicit panes[]
+  # and agents[] arrays for the B3 spawn stage.
+  printf '{"result": {"tabs": %s, "panes": %s, "agents": %s}}' \
+    "${3:-[]}" "${1:-[]}" "${2:-[]}"
+}
+
+pane_json() {
+  # pane_json <name> <pane_id> <tab_id> [<workspace_id>]
+  printf '{"name": "%s", "pane_id": "%s", "tab_id": "%s", "workspace_id": "%s"}' \
+    "$1" "$2" "$3" "${4:-zzz-test-ws}"
+}
+
+agent_json() {
+  # agent_json <pane_id> <tab_id> [<agent_status>] -- name is null, exactly
+  # as the live-probed snapshot shape carries it.
+  printf '{"name": null, "agent_status": "%s", "pane_id": "%s", "tab_id": "%s"}' \
+    "${3:-working}" "$1" "$2"
+}
+
+# new_tmp_repo_spawn [auto_spawn=true] [max_live=2] [timeout=1] [argv_json]
+# A fixture repo whose config carries the full B3 automation block.
+new_tmp_repo_spawn() {
+  local auto_spawn="${1:-true}" max_live="${2:-2}" timeout="${3:-1}"
+  # NOTE: default assigned separately -- a literal `}` inside `${4:-...}`
+  # would terminate the parameter expansion early.
+  local argv_json="${4:-}"
+  if [[ -z "$argv_json" ]]; then
+    argv_json='["zzz-test-runner", "{prompt}"]'
+  fi
+  local d
+  d="$(new_tmp_repo)"
+  mkdir -p "$d/prompts"
+  cat >"$d/.pm/config.json" <<JSON
+{"repos": {}, "herdr_workspace": "zzz-test-ws", "automation": {"auto_close": false, "auto_spawn": $auto_spawn, "max_live_workers": $max_live, "spawn_ack_timeout_ticks": $timeout, "spawn_argv": $argv_json}}
+JSON
+  echo "$d"
+}
+
+# seed_automation_dispatch <repo> <d> <issue> <slug>
+# Seeds an ACTIVE issue + an automation-lane dispatch via the REAL
+# dispatch-prep --lane automation round trip (durable prompt copy + note
+# binding + lane=automation tab=? mint), so the folded state is exactly
+# what production would produce. Echoes nothing.
+seed_automation_dispatch() {
+  local repo="$1" d="$2" issue="$3" slug="$4"
+  local base="I-${issue#I-}_${slug}_2026-07-25.md"
+  printf 'Automation prompt for %s (%s).\n' "$d" "$slug" >"$repo/prompts/$base"
+  seed_issue_state "$repo" "$issue" OPEN ACTIVE
+  if ! PM_ROOT="$repo" "${PM_CREATOR_DIR}/templates/bin/dispatch-prep" \
+    --dispatch "$d" --issue "$issue" --lane automation \
+    --prompt "$repo/prompts/$base" >/dev/null 2>&1; then
+    echo "FATAL: seed_automation_dispatch failed for $d" >&2
+    exit 1
+  fi
+}
+
+# seed_spawn_intent <repo> <d> <a> <ref>
+# Appends a fold-accepted spawn_intent lease via the real engine (pm_apply)
+# -- simulating a PRIOR tick's durable intent for crash-recovery tests.
+seed_spawn_intent() {
+  local repo="$1" d="$2" a="$3" ref="$4"
+  PM_ROOT="$repo" pm_apply spawn_intent d="$d" a="$a" ref="$ref" at="$(now_iso)" >/dev/null
 }
 
 # ---------------------------------------------------------------------------
@@ -4085,6 +4221,962 @@ echo "== track: B2.2 fix-pass-6 T7 per-repo config blast radius =="
 section_ac_marker_config_invalid_per_repo
 echo "== track: B2.2 fix-pass-6 T9 marker via not-descendant leg =="
 section_ac_marker_via_not_descendant
+
+# ---------------------------------------------------------------------------
+# B3 auto-spawn: helpers + sections
+# ---------------------------------------------------------------------------
+
+sp_idx() {
+  # sp_idx <repo> <python-expr over d(=index)>
+  python3 -c "import json;d=json.load(open('$1/.pm/index.json'));print($2)" 2>/dev/null
+}
+
+# 30. Happy-path spawn: intent -> tab create -> agent start -> same-tick ACK.
+section_spawn_happy_path() {
+  local repo call_log
+  repo="$(new_tmp_repo_spawn true 2 1)"
+  seed_automation_dispatch "$repo" D-001 I-001 widget
+  call_log="$(mktemp "${TMPDIR:-/tmp}/pm-creator-spawn-calls.XXXXXX")"
+
+  HERDR_CALL_LOG="$call_log" run_track "$repo" "$(spawn_snapshot_json)"
+  assert_eq "spawn happy: exit 0" "0" "$TR_RC"
+
+  assert_eq "spawn happy: herdr tab create argv exact (workspace + ticket label + --no-focus)" \
+    "tab create --workspace zzz-test-ws --label i001-widget --no-focus" \
+    "$(sed -n '1p' "$call_log")"
+  assert_eq "spawn happy: herdr agent start argv exact (name, tab from tab-create stdout, --no-focus, argv w/ substituted prompt path)" \
+    "agent start i001-widget-D001A01 --workspace zzz-test-ws --tab zzz-test-ws:t91 --no-focus -- zzz-test-runner $repo/prompts/I-001_widget_2026-07-25.md" \
+    "$(sed -n '2p' "$call_log")"
+  assert_eq "spawn happy: exactly two herdr side-effect calls" "2" "$(wc -l < "$call_log" | tr -d ' ')"
+
+  assert_eq "spawn happy: exactly ONE durable spawn_intent line" \
+    "1" "$(grep -c '^EVENT spawn_intent d=D-001 a=A-01 ' "$repo/.pm/events.log")"
+  assert_contains "spawn happy: intent carries the deterministic worker ref" \
+    "$(grep '^EVENT spawn_intent' "$repo/.pm/events.log")" "ref=i001-widget-D001A01"
+  assert_eq "spawn happy: same-tick ACK recorded" "ACKED" "$(sp_idx "$repo" "d['dispatches']['D-001']['state']")"
+  assert_eq "spawn happy: ACK carries the tab-create stdout tab_id" \
+    "zzz-test-ws:t91" "$(sp_idx "$repo" "d['dispatches']['D-001']['tab']")"
+  assert_contains "spawn happy: stdout reports the spawn" "$TR_OUT" "SPAWNED D-001 a=A-01"
+  assert_true "spawn happy: TRACKER.md automation section lists D-001" \
+    bash -c "grep -q 'D-001' '$repo/TRACKER.md'"
+
+  rm -f "$call_log"
+  rm -rf "$repo"
+}
+
+# 31. auto_spawn off + non-empty queue -> zero herdr spawn calls + steady count.
+section_spawn_disabled_steady() {
+  local repo call_log
+  repo="$(new_tmp_repo_spawn false 2 1)"
+  seed_automation_dispatch "$repo" D-011 I-011 widget
+  call_log="$(mktemp "${TMPDIR:-/tmp}/pm-creator-spawn-calls.XXXXXX")"
+
+  HERDR_CALL_LOG="$call_log" run_track "$repo" "$(spawn_snapshot_json)"
+  assert_eq "spawn disabled: exit 0" "0" "$TR_RC"
+  assert_eq "spawn disabled: zero herdr spawn calls" "0" "$(wc -l < "$call_log" | tr -d ' ')"
+  assert_eq "spawn disabled: no spawn_intent appended" \
+    "0" "$(grep -c '^EVENT spawn_intent' "$repo/.pm/events.log")"
+  assert_eq "spawn disabled: dispatch stays DISPATCHED" \
+    "DISPATCHED" "$(sp_idx "$repo" "d['dispatches']['D-011']['state']")"
+  assert_contains "spawn disabled: steady-state auto-spawn-disabled count surfaced" \
+    "$TR_OUT" "auto-spawn-disabled"
+
+  rm -f "$call_log"
+  rm -rf "$repo"
+}
+
+# 32. capacity at/over -> no spawn + steady capacity-exceeded count.
+section_spawn_capacity() {
+  local repo call_log panes agents
+  repo="$(new_tmp_repo_spawn true 1 1)"
+  seed_automation_dispatch "$repo" D-021 I-021 widget
+  call_log="$(mktemp "${TMPDIR:-/tmp}/pm-creator-spawn-calls.XXXXXX")"
+  panes="[$(pane_json zzz-test-other-worker zzz-test-ws:p1 zzz-test-ws:t1)]"
+  agents="[$(agent_json zzz-test-ws:p1 zzz-test-ws:t1)]"
+
+  HERDR_CALL_LOG="$call_log" run_track "$repo" "$(spawn_snapshot_json "$panes" "$agents")"
+  assert_eq "spawn capacity: exit 0" "0" "$TR_RC"
+  assert_eq "spawn capacity: zero herdr spawn calls at capacity" "0" "$(wc -l < "$call_log" | tr -d ' ')"
+  assert_eq "spawn capacity: no spawn_intent appended" \
+    "0" "$(grep -c '^EVENT spawn_intent' "$repo/.pm/events.log")"
+  assert_contains "spawn capacity: steady-state capacity-exceeded count surfaced" \
+    "$TR_OUT" "capacity-exceeded"
+  assert_eq "spawn capacity: dispatch stays DISPATCHED" \
+    "DISPATCHED" "$(sp_idx "$repo" "d['dispatches']['D-021']['state']")"
+
+  rm -f "$call_log"
+  rm -rf "$repo"
+}
+
+# 33. Queue exclusions: NEEDS-USER issue, BLOCKED issue, open question,
+# human-lane dispatch, open spawn_intent -- none picked.
+section_spawn_queue_exclusions() {
+  local repo call_log
+  repo="$(new_tmp_repo_spawn true 5 5)"
+  # (a) issue NEEDS-USER
+  seed_automation_dispatch "$repo" D-101 I-101 widgeta
+  seed_issue_state "$repo" I-101 ACTIVE NEEDS-USER
+  # (b) issue BLOCKED
+  seed_automation_dispatch "$repo" D-102 I-102 widgetb
+  seed_issue_state "$repo" I-102 ACTIVE BLOCKED
+  # (c) open question on the issue
+  seed_automation_dispatch "$repo" D-103 I-103 widgetc
+  seed_question "$repo" Q-103 OPEN I-103
+  # (d) human-lane dispatch (still tab=?)
+  seed_issue_state "$repo" I-104 OPEN ACTIVE
+  PM_ROOT="$repo" pm_apply dispatch_new d=D-104 i=I-104 at="$(now_iso)" >/dev/null
+  PM_ROOT="$repo" pm_apply dispatch_state d=D-104 from=READY to=DISPATCHED lane=human \
+    at="$(now_iso)" tab="?" >/dev/null
+  # (e) open spawn_intent (prior tick)
+  seed_automation_dispatch "$repo" D-105 I-105 widgete
+  seed_spawn_intent "$repo" D-105 A-01 i105-widgete-D105A01
+  call_log="$(mktemp "${TMPDIR:-/tmp}/pm-creator-spawn-calls.XXXXXX")"
+
+  HERDR_CALL_LOG="$call_log" run_track "$repo" "$(spawn_snapshot_json)"
+  assert_eq "spawn exclusions: exit 0" "0" "$TR_RC"
+  assert_eq "spawn exclusions: zero herdr spawn calls" "0" "$(wc -l < "$call_log" | tr -d ' ')"
+  local d
+  for d in D-101 D-102 D-103 D-104 D-105; do
+    assert_eq "spawn exclusions: $d stays DISPATCHED" \
+      "DISPATCHED" "$(sp_idx "$repo" "d['dispatches']['$d']['state']")"
+  done
+  assert_eq "spawn exclusions: only the pre-seeded intent line exists (no new intents)" \
+    "1" "$(grep -c '^EVENT spawn_intent' "$repo/.pm/events.log")"
+
+  rm -f "$call_log"
+  rm -rf "$repo"
+}
+
+# 34. prompt-sha mismatch -> surface, NO herdr calls, NO durable intent.
+section_spawn_prompt_sha_mismatch() {
+  local repo call_log
+  repo="$(new_tmp_repo_spawn true 2 1)"
+  seed_automation_dispatch "$repo" D-031 I-031 widget
+  printf 'tampered after prep\n' >>"$repo/prompts/I-031_widget_2026-07-25.md"
+  call_log="$(mktemp "${TMPDIR:-/tmp}/pm-creator-spawn-calls.XXXXXX")"
+
+  HERDR_CALL_LOG="$call_log" run_track "$repo" "$(spawn_snapshot_json)"
+  assert_eq "spawn sha-mismatch: exit 0" "0" "$TR_RC"
+  assert_contains "spawn sha-mismatch: prompt-sha-mismatch surfaced" "$TR_OUT" "prompt-sha-mismatch"
+  assert_eq "spawn sha-mismatch: zero herdr spawn calls" "0" "$(wc -l < "$call_log" | tr -d ' ')"
+  assert_eq "spawn sha-mismatch: no spawn_intent appended" \
+    "0" "$(grep -c '^EVENT spawn_intent' "$repo/.pm/events.log")"
+  assert_eq "spawn sha-mismatch: dispatch stays DISPATCHED" \
+    "DISPATCHED" "$(sp_idx "$repo" "d['dispatches']['D-031']['state']")"
+
+  rm -f "$call_log"
+  rm -rf "$repo"
+}
+
+# 35. Intended worker name already present in panes[] -> name-collision.
+section_spawn_name_collision() {
+  local repo call_log panes
+  repo="$(new_tmp_repo_spawn true 2 1)"
+  seed_automation_dispatch "$repo" D-041 I-041 widget
+  panes="[$(pane_json i041-widget-D041A01 zzz-test-ws:p2 zzz-test-ws:t2)]"
+  call_log="$(mktemp "${TMPDIR:-/tmp}/pm-creator-spawn-calls.XXXXXX")"
+
+  HERDR_CALL_LOG="$call_log" run_track "$repo" "$(spawn_snapshot_json "$panes")"
+  assert_eq "spawn name-collision: exit 0" "0" "$TR_RC"
+  assert_contains "spawn name-collision: name-collision surfaced" "$TR_OUT" "name-collision"
+  assert_eq "spawn name-collision: zero herdr spawn calls" "0" "$(wc -l < "$call_log" | tr -d ' ')"
+  assert_eq "spawn name-collision: no spawn_intent appended" \
+    "0" "$(grep -c '^EVENT spawn_intent' "$repo/.pm/events.log")"
+
+  rm -f "$call_log"
+  rm -rf "$repo"
+}
+
+# 36. tab create fails -> surfaced with the herdr error code, NO agent
+# start, intent stays durable (ages into recovery next ticks).
+section_spawn_tab_create_failure() {
+  local repo call_log
+  repo="$(new_tmp_repo_spawn true 2 5)"
+  seed_automation_dispatch "$repo" D-051 I-051 widget
+  call_log="$(mktemp "${TMPDIR:-/tmp}/pm-creator-spawn-calls.XXXXXX")"
+
+  HERDR_CALL_LOG="$call_log" HERDR_TAB_CREATE_MODE=fail run_track "$repo" "$(spawn_snapshot_json)"
+  assert_eq "spawn tab-create-fail: exit 0" "0" "$TR_RC"
+  assert_contains "spawn tab-create-fail: herdr-tab-create-failed surfaced" "$TR_OUT" "herdr-tab-create-failed"
+  assert_contains "spawn tab-create-fail: herdr error code carried in detail" "$TR_OUT" "workspace_not_found"
+  assert_eq "spawn tab-create-fail: only the tab create call happened (no agent start)" \
+    "1" "$(wc -l < "$call_log" | tr -d ' ')"
+  assert_eq "spawn tab-create-fail: intent is DURABLE despite the failure" \
+    "1" "$(grep -c '^EVENT spawn_intent d=D-051 ' "$repo/.pm/events.log")"
+  assert_eq "spawn tab-create-fail: dispatch stays DISPATCHED (no ACK)" \
+    "DISPATCHED" "$(sp_idx "$repo" "d['dispatches']['D-051']['state']")"
+
+  rm -f "$call_log"
+  rm -rf "$repo"
+}
+
+# 37. agent start fails -> surfaced with the herdr error code, NO ACK.
+section_spawn_agent_start_failure() {
+  local repo call_log
+  repo="$(new_tmp_repo_spawn true 2 5)"
+  seed_automation_dispatch "$repo" D-061 I-061 widget
+  call_log="$(mktemp "${TMPDIR:-/tmp}/pm-creator-spawn-calls.XXXXXX")"
+
+  HERDR_CALL_LOG="$call_log" HERDR_AGENT_START_MODE=fail run_track "$repo" "$(spawn_snapshot_json)"
+  assert_eq "spawn agent-start-fail: exit 0" "0" "$TR_RC"
+  assert_contains "spawn agent-start-fail: herdr-start-failed surfaced" "$TR_OUT" "herdr-start-failed"
+  assert_contains "spawn agent-start-fail: herdr error code carried in detail" "$TR_OUT" "agent_placement_not_found"
+  assert_eq "spawn agent-start-fail: create + start + best-effort close of the leaked tab" \
+    "3" "$(wc -l < "$call_log" | tr -d ' ')"
+  assert_contains "spawn agent-start-fail: the close targets the tab track created this tick" \
+    "$(sed -n '3p' "$call_log")" "tab close zzz-test-ws:t91"
+  assert_eq "spawn agent-start-fail: no ACK recorded" \
+    "DISPATCHED" "$(sp_idx "$repo" "d['dispatches']['D-061']['state']")"
+  assert_eq "spawn agent-start-fail: intent is DURABLE despite the failure" \
+    "1" "$(grep -c '^EVENT spawn_intent d=D-061 ' "$repo/.pm/events.log")"
+  assert_eq "spawn agent-start-fail: no ACKED transition appended" \
+    "0" "$(grep -c 'to=ACKED' "$repo/.pm/events.log")"
+
+  rm -f "$call_log"
+  rm -rf "$repo"
+}
+
+# 38. Crash recovery: PRIOR-tick intent + exactly one matching live pane ->
+# track NEVER auto-ACKs on a name join (herdr allows duplicate names and
+# the deterministic worker name is derivable from events.log, so a single
+# impostor pane could otherwise silence the orphan surface forever).
+# Instead: a `spawn-ack-unconfirmed` row naming the candidate pane and the
+# exact manual record command. Dispatch stays DISPATCHED; intent stays open.
+section_spawn_recovery_ack() {
+  local repo call_log panes
+  repo="$(new_tmp_repo_spawn true 2 5)"
+  seed_automation_dispatch "$repo" D-301 I-301 widget
+  seed_spawn_intent "$repo" D-301 A-01 i301-widget-D301A01
+  panes="[$(pane_json i301-widget-D301A01 zzz-test-ws:p5 zzz-test-tab-777)]"
+  call_log="$(mktemp "${TMPDIR:-/tmp}/pm-creator-spawn-calls.XXXXXX")"
+
+  HERDR_CALL_LOG="$call_log" run_track "$repo" "$(spawn_snapshot_json "$panes")"
+  assert_eq "spawn recovery: exit 0" "0" "$TR_RC"
+  assert_contains "spawn recovery: spawn-ack-unconfirmed surfaced" "$TR_OUT" "spawn-ack-unconfirmed"
+  assert_eq "spawn recovery: dispatch NOT auto-acked (stays DISPATCHED)" \
+    "DISPATCHED" "$(sp_idx "$repo" "d['dispatches']['D-301']['state']")"
+  assert_eq "spawn recovery: no ACKED transition appended" \
+    "0" "$(grep -c 'to=ACKED' "$repo/.pm/events.log")"
+  assert_contains "spawn recovery: row names the candidate pane name" "$TR_OUT" "i301-widget-D301A01"
+  assert_contains "spawn recovery: row names the candidate pane tab_id" "$TR_OUT" "zzz-test-tab-777"
+  assert_contains "spawn recovery: row names the candidate pane pane_id" "$TR_OUT" "zzz-test-ws:p5"
+  assert_contains "spawn recovery: row carries the exact manual confirm command" \
+    "$TR_OUT" "bin/record dispatch D-301 ACKED --tab zzz-test-tab-777"
+  assert_eq "spawn recovery: zero new herdr side-effect calls" "0" "$(wc -l < "$call_log" | tr -d ' ')"
+
+  rm -f "$call_log"
+  rm -rf "$repo"
+}
+
+# 38b. Single-impostor hardening: ONE pane matching the (derivable) worker
+# name in the worker-absent window must NOT be auto-acked -- surfaced only,
+# and the intent stays open (the impostor cannot silence the orphan path).
+section_spawn_recovery_single_impostor() {
+  local repo call_log panes
+  repo="$(new_tmp_repo_spawn true 2 5)"
+  seed_automation_dispatch "$repo" D-302 I-302 widget
+  seed_spawn_intent "$repo" D-302 A-01 i302-widget-D302A01
+  # the impostor: a pane whose name matches exactly (herdr allows dup names)
+  panes="[$(pane_json i302-widget-D302A01 zzz-test-ws:p66 zzz-test-tab-666)]"
+  call_log="$(mktemp "${TMPDIR:-/tmp}/pm-creator-spawn-calls.XXXXXX")"
+
+  HERDR_CALL_LOG="$call_log" run_track "$repo" "$(spawn_snapshot_json "$panes")"
+  assert_eq "spawn impostor: exit 0" "0" "$TR_RC"
+  assert_contains "spawn impostor: surfaced (spawn-ack-unconfirmed), never acked" \
+    "$TR_OUT" "spawn-ack-unconfirmed"
+  assert_eq "spawn impostor: dispatch stays DISPATCHED" \
+    "DISPATCHED" "$(sp_idx "$repo" "d['dispatches']['D-302']['state']")"
+  assert_eq "spawn impostor: no ACKED transition appended" \
+    "0" "$(grep -c 'to=ACKED' "$repo/.pm/events.log")"
+  assert_eq "spawn impostor: zero herdr side-effect calls" "0" "$(wc -l < "$call_log" | tr -d ' ')"
+  # the intent is still OPEN in the fold -- a later panes-absent tick still
+  # ages it into suspected-orphan-intent
+  assert_eq "spawn impostor: intent still open in the fold" \
+    "True" "$(sp_idx "$repo" "'A-01' in d['dispatches']['D-302']['spawn_intent']")"
+
+  rm -f "$call_log"
+  rm -rf "$repo"
+}
+
+# 39. Two live panes with the intent's name -> ambiguous-spawn-ack, no ACK.
+section_spawn_recovery_ambiguous() {
+  local repo call_log panes
+  repo="$(new_tmp_repo_spawn true 2 5)"
+  seed_automation_dispatch "$repo" D-311 I-311 widget
+  seed_spawn_intent "$repo" D-311 A-01 i311-widget-D311A01
+  panes="[$(pane_json i311-widget-D311A01 zzz-test-ws:p5 zzz-test-tab-771), $(pane_json i311-widget-D311A01 zzz-test-ws:p6 zzz-test-tab-772)]"
+  call_log="$(mktemp "${TMPDIR:-/tmp}/pm-creator-spawn-calls.XXXXXX")"
+
+  HERDR_CALL_LOG="$call_log" run_track "$repo" "$(spawn_snapshot_json "$panes")"
+  assert_eq "spawn ambiguous: exit 0" "0" "$TR_RC"
+  assert_contains "spawn ambiguous: ambiguous-spawn-ack surfaced" "$TR_OUT" "ambiguous-spawn-ack"
+  assert_eq "spawn ambiguous: dispatch NOT acked" \
+    "DISPATCHED" "$(sp_idx "$repo" "d['dispatches']['D-311']['state']")"
+  assert_eq "spawn ambiguous: zero herdr side-effect calls" "0" "$(wc -l < "$call_log" | tr -d ' ')"
+
+  rm -f "$call_log"
+  rm -rf "$repo"
+}
+
+# 40. Open intent, pane ABSENT, intent aged >= spawn_ack_timeout_ticks ->
+# suspected-orphan-intent; track NEVER auto-abandons.
+section_spawn_orphan_aged() {
+  local repo call_log
+  repo="$(new_tmp_repo_spawn true 2 1)"
+  seed_automation_dispatch "$repo" D-321 I-321 widget
+  seed_spawn_intent "$repo" D-321 A-01 i321-widget-D321A01
+  call_log="$(mktemp "${TMPDIR:-/tmp}/pm-creator-spawn-calls.XXXXXX")"
+
+  HERDR_CALL_LOG="$call_log" run_track "$repo" "$(spawn_snapshot_json)"
+  assert_eq "spawn orphan aged: exit 0" "0" "$TR_RC"
+  assert_contains "spawn orphan aged: suspected-orphan-intent surfaced" "$TR_OUT" "suspected-orphan-intent"
+  assert_eq "spawn orphan aged: dispatch NOT auto-abandoned (stays DISPATCHED)" \
+    "DISPATCHED" "$(sp_idx "$repo" "d['dispatches']['D-321']['state']")"
+  assert_eq "spawn orphan aged: no ABANDONED transition appended" \
+    "0" "$(grep -c 'to=ABANDONED' "$repo/.pm/events.log")"
+  assert_eq "spawn orphan aged: no re-spawn while the intent is open" \
+    "0" "$(wc -l < "$call_log" | tr -d ' ')"
+
+  rm -f "$call_log"
+  rm -rf "$repo"
+}
+
+# 41. Open intent, pane ABSENT, younger than the timeout -> no row at all.
+section_spawn_orphan_young() {
+  local repo call_log
+  repo="$(new_tmp_repo_spawn true 2 2)"
+  seed_automation_dispatch "$repo" D-331 I-331 widget
+  seed_spawn_intent "$repo" D-331 A-01 i331-widget-D331A01
+  call_log="$(mktemp "${TMPDIR:-/tmp}/pm-creator-spawn-calls.XXXXXX")"
+
+  HERDR_CALL_LOG="$call_log" run_track "$repo" "$(spawn_snapshot_json)"
+  assert_eq "spawn orphan young: exit 0" "0" "$TR_RC"
+  if [[ "$TR_OUT" == *"suspected-orphan-intent"* ]]; then
+    fail "spawn orphan young: NO orphan row before the timeout" "row surfaced early"
+  else
+    ok "spawn orphan young: NO orphan row before the timeout"
+  fi
+  assert_eq "spawn orphan young: dispatch left for next tick (DISPATCHED)" \
+    "DISPATCHED" "$(sp_idx "$repo" "d['dispatches']['D-331']['state']")"
+
+  rm -f "$call_log"
+  rm -rf "$repo"
+}
+
+# 42. TOCTOU race: state changes between the durable intent and the ACK
+# (injected during the herdr tab create call) -> benign surface, no crash,
+# no ACK, the racing event stands.
+section_spawn_toctou_race() {
+  local repo call_log
+  repo="$(new_tmp_repo_spawn true 2 5)"
+  seed_automation_dispatch "$repo" D-401 I-401 widget
+  call_log="$(mktemp "${TMPDIR:-/tmp}/pm-creator-spawn-calls.XXXXXX")"
+
+  HERDR_CALL_LOG="$call_log" \
+    HERDR_RACE_APPEND="EVENT dispatch_state d=D-401 a=A-01 from=DISPATCHED to=FAILED lane=automation at=2026-07-25T19:00:00Z" \
+    run_track "$repo" "$(spawn_snapshot_json)"
+  assert_eq "spawn toctou: exit 0 (benign, never a crash)" "0" "$TR_RC"
+  assert_contains "spawn toctou: benign raced-refused surface" "$TR_OUT" "raced-refused"
+  assert_eq "spawn toctou: racing FAILED transition stands" \
+    "FAILED" "$(sp_idx "$repo" "d['dispatches']['D-401']['state']")"
+  assert_eq "spawn toctou: no ACKED transition appended" \
+    "0" "$(grep -c 'to=ACKED' "$repo/.pm/events.log")"
+
+  rm -f "$call_log"
+  rm -rf "$repo"
+}
+
+# 43. Runtime-invalid spawn config (auto_spawn on, empty spawn_argv) ->
+# fail-closed skip + spawn-config-invalid row, zero herdr side effects.
+section_spawn_config_invalid() {
+  local repo call_log
+  repo="$(new_tmp_repo_spawn true 2 1 '[]')"
+  seed_automation_dispatch "$repo" D-501 I-501 widget
+  call_log="$(mktemp "${TMPDIR:-/tmp}/pm-creator-spawn-calls.XXXXXX")"
+
+  HERDR_CALL_LOG="$call_log" run_track "$repo" "$(spawn_snapshot_json)"
+  assert_eq "spawn config-invalid: exit 0" "0" "$TR_RC"
+  assert_contains "spawn config-invalid: spawn-config-invalid surfaced" "$TR_OUT" "spawn-config-invalid"
+  assert_eq "spawn config-invalid: zero herdr spawn calls (fail-closed skip)" \
+    "0" "$(wc -l < "$call_log" | tr -d ' ')"
+  assert_eq "spawn config-invalid: no spawn_intent appended" \
+    "0" "$(grep -c '^EVENT spawn_intent' "$repo/.pm/events.log")"
+  assert_eq "spawn config-invalid: dispatch stays DISPATCHED" \
+    "DISPATCHED" "$(sp_idx "$repo" "d['dispatches']['D-501']['state']")"
+
+  rm -f "$call_log"
+  rm -rf "$repo"
+}
+
+# 45. Two free slots, two candidates -> BOTH spawn, FIFO by dispatch
+# number, each ACKed with its OWN tab id.
+section_spawn_fifo_two_slots() {
+  local repo call_log
+  repo="$(new_tmp_repo_spawn true 2 1)"
+  # seeded out of numeric order on purpose: FIFO must sort by dispatch number
+  seed_automation_dispatch "$repo" D-602 I-602 gadget
+  seed_automation_dispatch "$repo" D-601 I-601 widget
+  call_log="$(mktemp "${TMPDIR:-/tmp}/pm-creator-spawn-calls.XXXXXX")"
+
+  HERDR_CALL_LOG="$call_log" run_track "$repo" "$(spawn_snapshot_json)"
+  assert_eq "spawn fifo: exit 0" "0" "$TR_RC"
+  assert_eq "spawn fifo: four herdr side-effect calls (2 tabs + 2 starts)" \
+    "4" "$(wc -l < "$call_log" | tr -d ' ')"
+  assert_contains "spawn fifo: D-601 tab created FIRST (FIFO by dispatch number)" \
+    "$(sed -n '1p' "$call_log")" "--label i601-widget"
+  assert_contains "spawn fifo: D-602 tab created second" \
+    "$(sed -n '3p' "$call_log")" "--label i602-gadget"
+  assert_eq "spawn fifo: D-601 ACKED" "ACKED" "$(sp_idx "$repo" "d['dispatches']['D-601']['state']")"
+  assert_eq "spawn fifo: D-602 ACKED" "ACKED" "$(sp_idx "$repo" "d['dispatches']['D-602']['state']")"
+  assert_eq "spawn fifo: distinct tabs per worker" \
+    "True" "$(sp_idx "$repo" "d['dispatches']['D-601']['tab'] != d['dispatches']['D-602']['tab']")"
+
+  rm -f "$call_log"
+  rm -rf "$repo"
+}
+
+# 46. Inner (per-slot) capacity guard: 2 slots, 3 queued -> exactly 2
+# spawned FIFO + 1 capacity-exceeded + exactly 4 herdr calls.
+section_spawn_inner_capacity() {
+  local repo call_log
+  repo="$(new_tmp_repo_spawn true 2 5)"
+  seed_automation_dispatch "$repo" D-701 I-701 widgeta
+  seed_automation_dispatch "$repo" D-702 I-702 widgetb
+  seed_automation_dispatch "$repo" D-703 I-703 widgetc
+  call_log="$(mktemp "${TMPDIR:-/tmp}/pm-creator-spawn-calls.XXXXXX")"
+
+  HERDR_CALL_LOG="$call_log" run_track "$repo" "$(spawn_snapshot_json)"
+  assert_eq "spawn inner-capacity: exit 0" "0" "$TR_RC"
+  assert_eq "spawn inner-capacity: exactly 4 herdr calls (2 creates + 2 starts)" \
+    "4" "$(wc -l < "$call_log" | tr -d ' ')"
+  assert_eq "spawn inner-capacity: D-701 ACKED" "ACKED" "$(sp_idx "$repo" "d['dispatches']['D-701']['state']")"
+  assert_eq "spawn inner-capacity: D-702 ACKED" "ACKED" "$(sp_idx "$repo" "d['dispatches']['D-702']['state']")"
+  assert_eq "spawn inner-capacity: D-703 NOT spawned" \
+    "DISPATCHED" "$(sp_idx "$repo" "d['dispatches']['D-703']['state']")"
+  assert_contains "spawn inner-capacity: capacity-exceeded steady names D-703" \
+    "$TR_OUT" "SPAWN-STEADY (capacity-exceeded) count=1 ids=D-703"
+  assert_eq "spawn inner-capacity: exactly two intent lines" \
+    "2" "$(grep -c '^EVENT spawn_intent' "$repo/.pm/events.log")"
+
+  rm -f "$call_log"
+  rm -rf "$repo"
+}
+
+# 47. Multi-tick orphan aging at a >1 timeout: the accumulator and the age
+# file round-trip. timeout=3: no surface on ticks 1-2, surface on tick 3,
+# age file accumulates 1 -> 2 -> 3.
+section_spawn_orphan_multitick() {
+  local repo
+  repo="$(new_tmp_repo_spawn true 2 3)"
+  seed_automation_dispatch "$repo" D-711 I-711 widget
+  seed_spawn_intent "$repo" D-711 A-01 i711-widget-D711A01
+
+  local tick n
+  for tick in 1 2 3; do
+    run_track "$repo" "$(spawn_snapshot_json)"
+    assert_eq "spawn multitick: tick $tick exit 0" "0" "$TR_RC"
+    n="$(python3 -c "import json;print(json.load(open('$repo/.pm/spawn-intent-age.json'))['D-711/A-01']['n'])" 2>/dev/null)"
+    assert_eq "spawn multitick: age file accumulates to $tick on tick $tick" "$tick" "$n"
+    if [[ "$tick" -lt 3 ]]; then
+      if [[ "$TR_OUT" == *"suspected-orphan-intent"* ]]; then
+        fail "spawn multitick: NO orphan surface on tick $tick" "surfaced early"
+      else
+        ok "spawn multitick: NO orphan surface on tick $tick"
+      fi
+    else
+      assert_contains "spawn multitick: orphan surfaces on tick 3 (timeout reached)" \
+        "$TR_OUT" "suspected-orphan-intent"
+    fi
+  done
+  assert_eq "spawn multitick: dispatch never auto-abandoned" \
+    "DISPATCHED" "$(sp_idx "$repo" "d['dispatches']['D-711']['state']")"
+
+  rm -rf "$repo"
+}
+
+# 48. DURABLE under-lock capacity gate: the log already carries an ACKED
+# automation dispatch, but the snapshot (lying/stale) shows zero live
+# agents. Plan-time capacity would spawn; the under-lock durable count must
+# refuse -- fail direction is UNDER-spawn.
+section_spawn_durable_capacity_gate() {
+  local repo call_log
+  repo="$(new_tmp_repo_spawn true 1 5)"
+  seed_automation_dispatch "$repo" D-801 I-801 widgeta
+  PM_ROOT="$repo" pm_apply dispatch_state d=D-801 a=A-01 from=DISPATCHED to=ACKED \
+    lane=automation tab=zzz-test-tab-801 at="$(now_iso)" >/dev/null
+  seed_automation_dispatch "$repo" D-802 I-802 widgetb
+  call_log="$(mktemp "${TMPDIR:-/tmp}/pm-creator-spawn-calls.XXXXXX")"
+
+  HERDR_CALL_LOG="$call_log" run_track "$repo" "$(spawn_snapshot_json)"
+  assert_eq "spawn durable-gate: exit 0" "0" "$TR_RC"
+  assert_eq "spawn durable-gate: ZERO herdr calls despite the optimistic snapshot" \
+    "0" "$(wc -l < "$call_log" | tr -d ' ')"
+  assert_contains "spawn durable-gate: capacity-exceeded surfaced via the durable count" \
+    "$TR_OUT" "durable capacity gate"
+  assert_contains "spawn durable-gate: row names the slot holder" \
+    "$TR_OUT" "held by: D-801"
+  assert_eq "spawn durable-gate: no intent appended for D-802" \
+    "0" "$(grep -c '^EVENT spawn_intent d=D-802 ' "$repo/.pm/events.log")"
+  assert_eq "spawn durable-gate: D-802 stays DISPATCHED" \
+    "DISPATCHED" "$(sp_idx "$repo" "d['dispatches']['D-802']['state']")"
+
+  rm -f "$call_log"
+  rm -rf "$repo"
+}
+
+# 49. Under-lock prompt re-hash (plan->lock TOCTOU): the prompt is tampered
+# DURING the previous candidate's tab create -- after D-902's plan-time
+# hash passed, before its under-lock re-check. Must surface, no intent.
+section_spawn_prompt_rehash_under_lock() {
+  local repo call_log
+  repo="$(new_tmp_repo_spawn true 2 5)"
+  seed_automation_dispatch "$repo" D-901 I-901 widget
+  seed_automation_dispatch "$repo" D-902 I-902 gadget
+  call_log="$(mktemp "${TMPDIR:-/tmp}/pm-creator-spawn-calls.XXXXXX")"
+
+  HERDR_CALL_LOG="$call_log" \
+    HERDR_TAMPER_PROMPT="$repo/prompts/I-902_gadget_2026-07-25.md" \
+    run_track "$repo" "$(spawn_snapshot_json)"
+  assert_eq "spawn rehash: exit 0" "0" "$TR_RC"
+  assert_eq "spawn rehash: D-901 spawned normally" \
+    "ACKED" "$(sp_idx "$repo" "d['dispatches']['D-901']['state']")"
+  assert_contains "spawn rehash: D-902 surfaced prompt-sha-mismatch from the under-lock re-hash" \
+    "$TR_OUT" "under-lock re-hash"
+  assert_eq "spawn rehash: no intent appended for D-902" \
+    "0" "$(grep -c '^EVENT spawn_intent d=D-902 ' "$repo/.pm/events.log")"
+  assert_eq "spawn rehash: only D-901's herdr calls happened" \
+    "2" "$(wc -l < "$call_log" | tr -d ' ')"
+  assert_eq "spawn rehash: D-902 stays DISPATCHED" \
+    "DISPATCHED" "$(sp_idx "$repo" "d['dispatches']['D-902']['state']")"
+
+  rm -f "$call_log"
+  rm -rf "$repo"
+}
+
+# 50. Stuck-intent lifecycle: tab create fails on tick 1; later ticks age
+# the intent; the timeout tick surfaces the orphan WITH the known cause.
+section_spawn_stuck_intent_cause() {
+  local repo call_log
+  repo="$(new_tmp_repo_spawn true 2 2)"
+  seed_automation_dispatch "$repo" D-721 I-721 widget
+  call_log="$(mktemp "${TMPDIR:-/tmp}/pm-creator-spawn-calls.XXXXXX")"
+
+  # tick 1: intent appended durably, tab create fails, cause recorded
+  HERDR_CALL_LOG="$call_log" HERDR_TAB_CREATE_MODE=fail run_track "$repo" "$(spawn_snapshot_json)"
+  assert_eq "spawn stuck-cause: tick 1 exit 0" "0" "$TR_RC"
+  assert_contains "spawn stuck-cause: tick 1 surfaces the create failure" "$TR_OUT" "herdr-tab-create-failed"
+  # tick 2: ages (n=1 < 2), no orphan yet
+  run_track "$repo" "$(spawn_snapshot_json)"
+  if [[ "$TR_OUT" == *"suspected-orphan-intent"* ]]; then
+    fail "spawn stuck-cause: no orphan before the timeout" "surfaced early"
+  else
+    ok "spawn stuck-cause: no orphan before the timeout"
+  fi
+  # tick 3: n=2 >= timeout -> orphan WITH the recorded cause
+  run_track "$repo" "$(spawn_snapshot_json)"
+  assert_contains "spawn stuck-cause: orphan surfaces at the timeout" "$TR_OUT" "suspected-orphan-intent"
+  assert_contains "spawn stuck-cause: orphan row carries the known cause" \
+    "$TR_OUT" "last known cause: herdr-tab-create-failed (workspace_not_found)"
+  assert_eq "spawn stuck-cause: dispatch never auto-abandoned" \
+    "DISPATCHED" "$(sp_idx "$repo" "d['dispatches']['D-721']['state']")"
+
+  rm -f "$call_log"
+  rm -rf "$repo"
+}
+
+# 51. tab create exit 0 but NO result.tab.tab_id -> herdr-tab-create-failed,
+# no agent start, intent durable.
+section_spawn_tab_create_no_id() {
+  local repo call_log
+  repo="$(new_tmp_repo_spawn true 2 5)"
+  seed_automation_dispatch "$repo" D-731 I-731 widget
+  call_log="$(mktemp "${TMPDIR:-/tmp}/pm-creator-spawn-calls.XXXXXX")"
+
+  HERDR_CALL_LOG="$call_log" HERDR_TAB_CREATE_MODE=ok_no_id run_track "$repo" "$(spawn_snapshot_json)"
+  assert_eq "spawn no-id: exit 0" "0" "$TR_RC"
+  assert_contains "spawn no-id: herdr-tab-create-failed surfaced" "$TR_OUT" "herdr-tab-create-failed"
+  assert_contains "spawn no-id: detail names the missing tab_id" "$TR_OUT" "no result.tab.tab_id"
+  assert_eq "spawn no-id: only the tab create call happened (no agent start)" \
+    "1" "$(wc -l < "$call_log" | tr -d ' ')"
+  assert_eq "spawn no-id: intent is DURABLE" \
+    "1" "$(grep -c '^EVENT spawn_intent d=D-731 ' "$repo/.pm/events.log")"
+  assert_eq "spawn no-id: dispatch stays DISPATCHED" \
+    "DISPATCHED" "$(sp_idx "$repo" "d['dispatches']['D-731']['state']")"
+
+  rm -f "$call_log"
+  rm -rf "$repo"
+}
+
+# 52. Under-lock pre-append re-check refusal: the owning issue flips to
+# NEEDS-USER inside the plan->lock window (injected during the PREVIOUS
+# candidate's tab create) -> raced-refused, ZERO herdr calls for that
+# candidate, no intent.
+section_spawn_underlock_recheck_refusal() {
+  local repo call_log
+  repo="$(new_tmp_repo_spawn true 5 5)"
+  seed_automation_dispatch "$repo" D-911 I-911 widget
+  seed_automation_dispatch "$repo" D-912 I-912 gadget
+  call_log="$(mktemp "${TMPDIR:-/tmp}/pm-creator-spawn-calls.XXXXXX")"
+
+  HERDR_CALL_LOG="$call_log" \
+    HERDR_RACE_APPEND="EVENT issue_state i=I-912 from=ACTIVE to=NEEDS-USER at=2026-07-25T19:00:00Z" \
+    run_track "$repo" "$(spawn_snapshot_json)"
+  assert_eq "spawn recheck-refusal: exit 0" "0" "$TR_RC"
+  assert_eq "spawn recheck-refusal: D-911 spawned normally" \
+    "ACKED" "$(sp_idx "$repo" "d['dispatches']['D-911']['state']")"
+  assert_contains "spawn recheck-refusal: D-912 benignly raced-refused" "$TR_OUT" "raced-refused"
+  assert_eq "spawn recheck-refusal: zero herdr calls for D-912 (only D-911's two)" \
+    "2" "$(wc -l < "$call_log" | tr -d ' ')"
+  assert_eq "spawn recheck-refusal: no intent appended for D-912" \
+    "0" "$(grep -c '^EVENT spawn_intent d=D-912 ' "$repo/.pm/events.log")"
+  assert_eq "spawn recheck-refusal: D-912 stays DISPATCHED" \
+    "DISPATCHED" "$(sp_idx "$repo" "d['dispatches']['D-912']['state']")"
+
+  rm -f "$call_log"
+  rm -rf "$repo"
+}
+
+# 53. Plan-driver crash -> spawn-driver-error loud degrade: exit 0, row
+# surfaced, stderr echoed, zero herdr side effects. (The FIXTURE's copy of
+# bin/track is poisoned -- the source tree is never touched.)
+section_spawn_driver_error() {
+  local repo call_log
+  repo="$(new_tmp_repo_spawn true 2 5)"
+  seed_automation_dispatch "$repo" D-741 I-741 widget
+  sed -i 's/^_sp_plan = {"spawn": \[\], "rows": \[\], "steady": {}, "age": {}, "ran": False}$/raise RuntimeError("zzz-test poison")/' \
+    "$repo/bin/track"
+  call_log="$(mktemp "${TMPDIR:-/tmp}/pm-creator-spawn-calls.XXXXXX")"
+
+  HERDR_CALL_LOG="$call_log" run_track "$repo" "$(spawn_snapshot_json)"
+  assert_eq "spawn driver-error: exit 0 (loud degrade, not a crash)" "0" "$TR_RC"
+  assert_contains "spawn driver-error: spawn-driver-error row surfaced" "$TR_OUT" "spawn-driver-error"
+  assert_contains "spawn driver-error: stderr tail echoed loudly" "$TR_OUT" "auto-spawn plan driver failed"
+  assert_contains "spawn driver-error: the actual poison message is visible" "$TR_OUT" "zzz-test poison"
+  assert_eq "spawn driver-error: zero herdr side-effect calls" "0" "$(wc -l < "$call_log" | tr -d ' ')"
+  assert_eq "spawn driver-error: no intent appended" \
+    "0" "$(grep -c '^EVENT spawn_intent' "$repo/.pm/events.log")"
+
+  rm -f "$call_log"
+  rm -rf "$repo"
+}
+
+# 53b. Registry drift through the spawn surface path: an unregistered
+# reason forced through _sp_surface must crash the driver into the
+# spawn-driver-error degrade (never render an unregistered token).
+section_spawn_unregistered_reason() {
+  local repo call_log
+  repo="$(new_tmp_repo_spawn true 2 1)"
+  seed_automation_dispatch "$repo" D-751 I-751 widget
+  seed_spawn_intent "$repo" D-751 A-01 i751-widget-D751A01
+  sed -i 's/_sp_surface(_sp_d, "suspected-orphan-intent", _sp_detail)/_sp_surface(_sp_d, "zzz-unregistered-reason", _sp_detail)/' \
+    "$repo/bin/track"
+  call_log="$(mktemp "${TMPDIR:-/tmp}/pm-creator-spawn-calls.XXXXXX")"
+
+  HERDR_CALL_LOG="$call_log" run_track "$repo" "$(spawn_snapshot_json)"
+  assert_eq "spawn unregistered-reason: exit 0" "0" "$TR_RC"
+  assert_contains "spawn unregistered-reason: degraded to spawn-driver-error" \
+    "$TR_OUT" "spawn-driver-error"
+  assert_contains "spawn unregistered-reason: names the drift" "$TR_OUT" "unregistered reason"
+  assert_eq "spawn unregistered-reason: zero herdr side-effect calls" \
+    "0" "$(wc -l < "$call_log" | tr -d ' ')"
+
+  rm -f "$call_log"
+  rm -rf "$repo"
+}
+
+# 53c. Static registry check: every reason literal the BASH side of the
+# spawn stage emits (not covered by the python-side runtime check) is a
+# member of the REASONS frozenset in the same file.
+section_spawn_reason_literals_registered() {
+  local reasons_block r
+  reasons_block="$(sed -n '/^REASONS = frozenset({/,/^})/p' "$TRACK")"
+  for r in raced-refused herdr-tab-create-failed herdr-start-failed \
+    capacity-exceeded prompt-sha-mismatch spawn-driver-error spawn-ack-unconfirmed; do
+    if [[ "$reasons_block" == *"\"$r\""* ]]; then
+      ok "spawn registry: bash-emitted reason '$r' is registered in REASONS"
+    else
+      fail "spawn registry: bash-emitted reason '$r' is registered in REASONS" "missing from REASONS"
+    fi
+  done
+}
+
+# 54. Prompt binding failures: (a) durable prompt deleted -> unreadable
+# surface, no spawn; (b) automation dispatch with NO folded note binding ->
+# "no folded prompt binding" surface, no spawn.
+section_spawn_prompt_binding_failures() {
+  local repo call_log
+  repo="$(new_tmp_repo_spawn true 5 5)"
+  # (a) deleted durable prompt
+  seed_automation_dispatch "$repo" D-761 I-761 widget
+  rm -f "$repo/prompts/I-761_widget_2026-07-25.md"
+  # (b) no note binding at all (seeded via pm_apply, not dispatch-prep)
+  seed_issue_state "$repo" I-762 OPEN ACTIVE
+  PM_ROOT="$repo" pm_apply dispatch_new d=D-762 i=I-762 at="$(now_iso)" >/dev/null
+  PM_ROOT="$repo" pm_apply dispatch_state d=D-762 from=READY to=DISPATCHED lane=automation \
+    at="$(now_iso)" tab="?" prompt_sha=deadbeef >/dev/null
+  call_log="$(mktemp "${TMPDIR:-/tmp}/pm-creator-spawn-calls.XXXXXX")"
+
+  HERDR_CALL_LOG="$call_log" run_track "$repo" "$(spawn_snapshot_json)"
+  assert_eq "spawn binding-failures: exit 0" "0" "$TR_RC"
+  assert_contains "spawn binding-failures: deleted prompt surfaces unreadable" \
+    "$TR_OUT" "unreadable"
+  assert_contains "spawn binding-failures: missing note binding surfaces" \
+    "$TR_OUT" "no folded prompt binding"
+  assert_eq "spawn binding-failures: zero herdr side-effect calls" \
+    "0" "$(wc -l < "$call_log" | tr -d ' ')"
+  assert_eq "spawn binding-failures: no intents appended" \
+    "0" "$(grep -c '^EVENT spawn_intent' "$repo/.pm/events.log")"
+
+  rm -f "$call_log"
+  rm -rf "$repo"
+}
+
+# 55. Corrupt age file fails TOWARD surfacing: garbage in the advisory file
+# + an open intent -> orphan surfaces immediately (never indefinitely
+# suppressed by re-wiping the counter).
+section_spawn_age_file_corrupt() {
+  local repo
+  repo="$(new_tmp_repo_spawn true 2 5)"
+  seed_automation_dispatch "$repo" D-771 I-771 widget
+  seed_spawn_intent "$repo" D-771 A-01 i771-widget-D771A01
+  printf 'not json at all' >"$repo/.pm/spawn-intent-age.json"
+
+  run_track "$repo" "$(spawn_snapshot_json)"
+  assert_eq "spawn age-corrupt: exit 0" "0" "$TR_RC"
+  assert_contains "spawn age-corrupt: orphan surfaces IMMEDIATELY despite timeout=5" \
+    "$TR_OUT" "suspected-orphan-intent"
+  assert_contains "spawn age-corrupt: row explains the corrupt counter" \
+    "$TR_OUT" "age counter file was corrupt"
+  assert_eq "spawn age-corrupt: dispatch never auto-abandoned" \
+    "DISPATCHED" "$(sp_idx "$repo" "d['dispatches']['D-771']['state']")"
+
+  rm -rf "$repo"
+}
+
+# 56. auto_spawn=true with an EMPTY herdr_workspace -> spawn-config-invalid
+# (pane joins/capacity would run cross-workspace otherwise).
+section_spawn_requires_workspace() {
+  local repo call_log
+  repo="$(new_tmp_repo_spawn true 2 5)"
+  # seed FIRST (dispatch-prep itself requires a configured herdr_workspace),
+  # then blank the workspace to exercise track's config verdict.
+  seed_automation_dispatch "$repo" D-781 I-781 widget
+  cat >"$repo/.pm/config.json" <<'JSON'
+{"repos": {}, "herdr_workspace": "", "automation": {"auto_close": false, "auto_spawn": true, "max_live_workers": 2, "spawn_ack_timeout_ticks": 5, "spawn_argv": ["zzz-test-runner", "{prompt}"]}}
+JSON
+  call_log="$(mktemp "${TMPDIR:-/tmp}/pm-creator-spawn-calls.XXXXXX")"
+
+  HERDR_CALL_LOG="$call_log" run_track "$repo" "$(spawn_snapshot_json)"
+  assert_eq "spawn requires-ws: exit 0" "0" "$TR_RC"
+  assert_contains "spawn requires-ws: spawn-config-invalid surfaced" "$TR_OUT" "spawn-config-invalid"
+  assert_contains "spawn requires-ws: detail names herdr_workspace" "$TR_OUT" "herdr_workspace"
+  assert_eq "spawn requires-ws: zero herdr side-effect calls" "0" "$(wc -l < "$call_log" | tr -d ' ')"
+  assert_eq "spawn requires-ws: no intent appended" \
+    "0" "$(grep -c '^EVENT spawn_intent' "$repo/.pm/events.log")"
+
+  rm -f "$call_log"
+  rm -rf "$repo"
+}
+
+# 57. Paste-injection guard: a hostile snapshot tab_id must never ride
+# into the copy-pasteable confirm command of a spawn-ack-unconfirmed row.
+section_spawn_ack_unconfirmed_hostile_id() {
+  local repo panes
+  repo="$(new_tmp_repo_spawn true 2 5)"
+  seed_automation_dispatch "$repo" D-341 I-341 widget
+  seed_spawn_intent "$repo" D-341 A-01 i341-widget-D341A01
+  # hostile tab_id: shell metacharacters that would execute on paste
+  panes='[{"name": "i341-widget-D341A01", "pane_id": "zzz-test-ws:p7", "tab_id": "zzz-evil;touch /tmp/pwned", "workspace_id": "zzz-test-ws"}]'
+
+  run_track "$repo" "$(spawn_snapshot_json "$panes")"
+  assert_eq "spawn hostile-id: exit 0" "0" "$TR_RC"
+  assert_contains "spawn hostile-id: still surfaced spawn-ack-unconfirmed" \
+    "$TR_OUT" "spawn-ack-unconfirmed"
+  assert_contains "spawn hostile-id: row says the charset check failed" \
+    "$TR_OUT" "charset check"
+  if [[ "$TR_OUT" == *"bin/record dispatch D-341 ACKED"* ]]; then
+    fail "spawn hostile-id: NO ready-to-paste command in the row" "command text present"
+  else
+    ok "spawn hostile-id: NO ready-to-paste command in the row"
+  fi
+  if [[ "$TR_OUT" == *"--tab zzz-evil"* ]]; then
+    fail "spawn hostile-id: hostile id absent from the command position" "hostile id embedded after --tab"
+  else
+    ok "spawn hostile-id: hostile id absent from the command position"
+  fi
+  assert_eq "spawn hostile-id: dispatch NOT acked" \
+    "DISPATCHED" "$(sp_idx "$repo" "d['dispatches']['D-341']['state']")"
+
+  rm -rf "$repo"
+}
+
+# 58. Superseded dispatch with an open durable intent: the spawn stage must
+# neither surface nor ACK it (human adjudication owns superseded work), and
+# reconcile's unregistered_execution path must independently discover the
+# live worker tab -- the backstop that makes the exclusion safe.
+section_spawn_superseded_open_intent() {
+  local repo call_log panes
+  repo="$(new_tmp_repo_spawn true 2 1)"
+  # DELIBERATELY no issue_state seed: reconcile's ticket-label discovery
+  # keys on "no I-### ever logged", which is exactly the shape where the
+  # unregistered_execution backstop fires.
+  printf 'Automation prompt for D-905 (widget).\n' >"$repo/prompts/I-905_widget_2026-07-25.md"
+  PM_ROOT="$repo" "${PM_CREATOR_DIR}/templates/bin/dispatch-prep" \
+    --dispatch D-905 --issue I-905 --lane automation \
+    --prompt "$repo/prompts/I-905_widget_2026-07-25.md" >/dev/null 2>&1 \
+    || { echo "FATAL: superseded-intent fixture prep failed" >&2; exit 1; }
+  seed_spawn_intent "$repo" D-905 A-01 i905-widget-D905A01
+  # supersede it (registers D-906 READY and marks D-905 superseded)
+  PM_ROOT="$repo" pm_apply dispatch_new d=D-906 i=I-905 at="$(now_iso)" supersedes=D-905 >/dev/null
+  panes="[$(pane_json i905-widget-D905A01 zzz-test-ws:p9 zzz-test-tab-905)]"
+  call_log="$(mktemp "${TMPDIR:-/tmp}/pm-creator-spawn-calls.XXXXXX")"
+
+  HERDR_CALL_LOG="$call_log" run_track "$repo" "$(spawn_snapshot_json "$panes")"
+  assert_eq "spawn superseded-intent: exit 0" "0" "$TR_RC"
+  if [[ "$TR_OUT" == *"spawn-ack-unconfirmed"* || "$TR_OUT" == *"suspected-orphan-intent"* || "$TR_OUT" == *"ambiguous-spawn-ack"* ]]; then
+    fail "spawn superseded-intent: NO Phase A row for a superseded dispatch" "row surfaced"
+  else
+    ok "spawn superseded-intent: NO Phase A row for a superseded dispatch"
+  fi
+  assert_eq "spawn superseded-intent: not acked" \
+    "0" "$(grep -c 'to=ACKED' "$repo/.pm/events.log")"
+  assert_eq "spawn superseded-intent: zero herdr side-effect calls" \
+    "0" "$(wc -l < "$call_log" | tr -d ' ')"
+  assert_eq "spawn superseded-intent: D-905 still DISPATCHED (human adjudication owns it)" \
+    "DISPATCHED" "$(sp_idx "$repo" "d['dispatches']['D-905']['state']")"
+
+  # --- the backstop: reconcile independently discovers the live tab ---
+  cp "${PM_CREATOR_DIR}/templates/bin/reconcile" "$repo/bin/reconcile"
+  chmod +x "$repo/bin/reconcile"
+  local f marker
+  for f in WORKTREES LEDGER DISPATCHES QUESTIONS SESSIONS; do
+    case "$f" in
+      WORKTREES) marker="worktrees" ;;
+      LEDGER) marker="ledger-summary" ;;
+      DISPATCHES) marker="dispatch-summary" ;;
+      QUESTIONS) marker="open-questions" ;;
+      SESSIONS) marker="sessions" ;;
+    esac
+    cat >"$repo/$f.md" <<EOF
+# $f
+
+<!-- GENERATED:BEGIN $marker -->
+(empty)
+<!-- GENERATED:END $marker -->
+EOF
+  done
+  local tabs_fx ws_fx rc_out rc_rc
+  tabs_fx="$(mktemp "${TMPDIR:-/tmp}/pm-creator-rc-tabs.XXXXXX")"
+  ws_fx="$(mktemp "${TMPDIR:-/tmp}/pm-creator-rc-ws.XXXXXX")"
+  printf '{"result": {"tabs": [{"tab_id": "zzz-test-tab-905", "label": "i905-widget", "agent_status": "working", "workspace_id": "zzz-test-ws"}]}}' >"$tabs_fx"
+  printf '{"result": {"workspaces": [{"workspace_id": "zzz-test-ws", "label": "zzz-test-ws"}]}}' >"$ws_fx"
+  # shellcheck disable=SC2034  # rc_out kept for ad-hoc debugging on failure
+  rc_out="$(
+    cd "$repo" && \
+    HERDR_TABS_FIXTURE="$tabs_fx" HERDR_WS_FIXTURE="$ws_fx" \
+    PATH="/usr/bin:/bin" \
+    bash -c '
+      # shellcheck disable=SC2317,SC2329  # invoked indirectly by bin/reconcile
+      herdr() {
+        case "$1 $2" in
+          "tab list") cat "$HERDR_TABS_FIXTURE" ;;
+          "workspace list") cat "$HERDR_WS_FIXTURE" ;;
+          *) return 1 ;;
+        esac
+      }
+      export -f herdr
+      bash bin/reconcile
+    ' 2>&1
+  )"
+  rc_rc=$?
+  assert_eq "spawn superseded-intent: reconcile backstop exits 0" "0" "$rc_rc"
+  assert_eq "spawn superseded-intent: reconcile emitted unregistered_execution for the live tab" \
+    "1" "$(grep -c '^EVENT unregistered_execution .*ref=zzz-test-tab-905' "$repo/.pm/events.log")"
+
+  rm -f "$call_log" "$tabs_fx" "$ws_fx"
+  rm -rf "$repo"
+}
+
+# 44. herdr unavailable + auto_spawn on -> spawn stage skips like STAGE 1.
+section_spawn_herdr_unavailable() {
+  local repo
+  repo="$(new_tmp_repo_spawn true 2 1)"
+  seed_automation_dispatch "$repo" D-511 I-511 widget
+
+  run_track "$repo"
+  assert_eq "spawn herdr-unavailable: exit 0" "0" "$TR_RC"
+  assert_eq "spawn herdr-unavailable: no spawn_intent appended" \
+    "0" "$(grep -c '^EVENT spawn_intent' "$repo/.pm/events.log")"
+  assert_eq "spawn herdr-unavailable: dispatch stays DISPATCHED" \
+    "DISPATCHED" "$(sp_idx "$repo" "d['dispatches']['D-511']['state']")"
+
+  rm -rf "$repo"
+}
+
+echo "== 30. B3: happy-path auto-spawn (intent -> tab -> start -> same-tick ACK) =="
+section_spawn_happy_path
+echo "== 31. B3: auto_spawn disabled -> steady count, zero spawns =="
+section_spawn_disabled_steady
+echo "== 32. B3: capacity at/over -> steady count, zero spawns =="
+section_spawn_capacity
+echo "== 33. B3: queue exclusions (NEEDS-USER/BLOCKED/open-question/human-lane/open-intent) =="
+section_spawn_queue_exclusions
+echo "== 34. B3: prompt-sha mismatch -> surface, no spawn =="
+section_spawn_prompt_sha_mismatch
+echo "== 35. B3: name collision -> surface, no spawn =="
+section_spawn_name_collision
+echo "== 36. B3: tab create failure -> surfaced code, durable intent =="
+section_spawn_tab_create_failure
+echo "== 37. B3: agent start failure -> surfaced code, no ACK =="
+section_spawn_agent_start_failure
+echo "== 38. B3: crash recovery surfaces spawn-ack-unconfirmed (never auto-acks) =="
+section_spawn_recovery_ack
+echo "== 38b. B3: single impostor pane cannot buy an ACK =="
+section_spawn_recovery_single_impostor
+echo "== 39. B3: ambiguous recovery (two same-name panes) =="
+section_spawn_recovery_ambiguous
+echo "== 40. B3: aged orphan intent -> suspected-orphan-intent (never auto-abandon) =="
+section_spawn_orphan_aged
+echo "== 41. B3: young orphan intent -> no row yet =="
+section_spawn_orphan_young
+echo "== 42. B3: TOCTOU race between intent and ACK -> benign surface =="
+section_spawn_toctou_race
+echo "== 43. B3: runtime-invalid spawn config -> fail-closed skip + row =="
+section_spawn_config_invalid
+echo "== 44. B3: herdr unavailable -> spawn stage skips =="
+section_spawn_herdr_unavailable
+echo "== 45. B3: two free slots -> FIFO double spawn =="
+section_spawn_fifo_two_slots
+echo "== 46. B3 fix: inner per-slot capacity guard (2 slots, 3 queued) =="
+section_spawn_inner_capacity
+echo "== 47. B3 fix: multi-tick orphan aging at timeout=3 =="
+section_spawn_orphan_multitick
+echo "== 48. B3 fix: durable under-lock capacity gate vs lying snapshot =="
+section_spawn_durable_capacity_gate
+echo "== 49. B3 fix: under-lock prompt re-hash (plan->lock tamper) =="
+section_spawn_prompt_rehash_under_lock
+echo "== 50. B3 fix: stuck intent carries its failure cause into the orphan row =="
+section_spawn_stuck_intent_cause
+echo "== 51. B3 fix: tab create ok but no tab_id =="
+section_spawn_tab_create_no_id
+echo "== 52. B3 fix: under-lock re-check refusal (zero herdr calls) =="
+section_spawn_underlock_recheck_refusal
+echo "== 53. B3 fix: plan-driver crash -> loud spawn-driver-error degrade =="
+section_spawn_driver_error
+echo "== 53b. B3 fix: unregistered reason through the surface path degrades loudly =="
+section_spawn_unregistered_reason
+echo "== 53c. B3 fix: bash-emitted reason literals are REASONS members (static) =="
+section_spawn_reason_literals_registered
+echo "== 54. B3 fix: prompt binding failures (deleted copy / no note binding) =="
+section_spawn_prompt_binding_failures
+echo "== 55. B3 fix: corrupt age file fails toward surfacing =="
+section_spawn_age_file_corrupt
+echo "== 56. B3 fix: auto_spawn requires a non-empty herdr_workspace =="
+section_spawn_requires_workspace
+echo "== 57. B3 fix: hostile snapshot id withheld from the paste command =="
+section_spawn_ack_unconfirmed_hostile_id
+echo "== 58. B3 fix: superseded open intent excluded + reconcile backstop =="
+section_spawn_superseded_open_intent
 
 echo
 echo "-----------------------------------------"

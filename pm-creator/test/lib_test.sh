@@ -540,6 +540,219 @@ section_fold_auto_close_notes() {
 }
 
 # ---------------------------------------------------------------------------
+# B3: `spawn_intent` events -- durable spawn-intent lease records for the
+# automation lane. The fold must (a) accept a valid intent into
+# dispatches[d].spawn_intent[a] WITHOUT transitioning dispatch/issue state,
+# (b) accept an identical re-append idempotently, (c) fold prompt_sha and
+# the prompts/ note binding queryably (track's D2 re-hash guard reads BOTH
+# from the fold, never from a raw-log re-parse).
+# ---------------------------------------------------------------------------
+section_fold_spawn_intent_accepted() {
+  local repo
+  repo="$(new_tmp_repo)"
+  {
+    echo "EVENT schema v=1"
+    echo "EVENT issue_state i=I-001 from=OPEN to=ACTIVE at=2026-07-25T18:00:00Z"
+    echo "EVENT dispatch_new d=D-160 i=I-001 at=2026-07-25T18:00:00Z"
+    echo "EVENT dispatch_state d=D-160 a=A-01 from=READY to=DISPATCHED lane=automation at=2026-07-25T18:01:00Z tab=? prompt_sha=ab12cd34"
+    echo "EVENT note at=2026-07-25T18:01:00Z ref=prompts/I-001_fix_2026-07-25.md d=D-160"
+    echo "EVENT spawn_intent d=D-160 a=A-01 at=2026-07-25T18:02:00Z ref=i1-fix-D160A01"
+  } > "$repo/.pm/events.log"
+
+  pm_fold "$repo" >/dev/null
+
+  assert_eq "fold spawn_intent: intent stored per (d,a) -- ref" \
+    "i1-fix-D160A01" "$(_idx_py "$repo" "d['dispatches']['D-160']['spawn_intent']['A-01']['ref']")"
+  assert_eq "fold spawn_intent: intent stored per (d,a) -- at" \
+    "2026-07-25T18:02:00Z" "$(_idx_py "$repo" "d['dispatches']['D-160']['spawn_intent']['A-01']['at']")"
+  assert_eq "fold spawn_intent: dispatch state untouched (still DISPATCHED)" \
+    "DISPATCHED" "$(_idx_py "$repo" "d['dispatches']['D-160']['state']")"
+  assert_eq "fold spawn_intent: issue state untouched (still ACTIVE)" \
+    "ACTIVE" "$(_idx_py "$repo" "d['issues']['I-001']['state']")"
+  assert_eq "fold spawn_intent: prompt_sha folded queryably" \
+    "ab12cd34" "$(_idx_py "$repo" "d['dispatches']['D-160']['prompt_sha']")"
+  assert_eq "fold spawn_intent: prompts/ note binding folded queryably" \
+    "prompts/I-001_fix_2026-07-25.md" "$(_idx_py "$repo" "d['dispatches']['D-160']['prompt_ref']")"
+  assert_eq "fold spawn_intent: zero quarantined entries" \
+    "0" "$(_idx_py "$repo" "len(d['quarantined'])")"
+
+  # identical re-append -> accepted idempotently (no quarantine, same intent)
+  echo "EVENT spawn_intent d=D-160 a=A-01 at=2026-07-25T18:03:00Z ref=i1-fix-D160A01" >> "$repo/.pm/events.log"
+  pm_fold "$repo" >/dev/null
+  assert_eq "fold spawn_intent: identical re-append accepted idempotently (zero quarantined)" \
+    "0" "$(_idx_py "$repo" "len(d['quarantined'])")"
+  assert_eq "fold spawn_intent: identical re-append leaves the FIRST intent standing" \
+    "2026-07-25T18:02:00Z" "$(_idx_py "$repo" "d['dispatches']['D-160']['spawn_intent']['A-01']['at']")"
+
+  rm -rf "$repo"
+}
+
+# ---------------------------------------------------------------------------
+# B3: a CONFLICTING second spawn_intent for the same (d,a) -- different ref
+# -- quarantines the LATER line; the first accepted intent stands (conflict
+# = surface, never silently replace -- mirrors `merged`).
+# ---------------------------------------------------------------------------
+section_fold_spawn_intent_conflict() {
+  local repo
+  repo="$(new_tmp_repo)"
+  {
+    echo "EVENT schema v=1"
+    echo "EVENT issue_state i=I-001 from=OPEN to=ACTIVE at=2026-07-25T18:00:00Z"
+    echo "EVENT dispatch_new d=D-161 i=I-001 at=2026-07-25T18:00:00Z"
+    echo "EVENT dispatch_state d=D-161 a=A-01 from=READY to=DISPATCHED lane=automation at=2026-07-25T18:01:00Z tab=?"
+    echo "EVENT spawn_intent d=D-161 a=A-01 at=2026-07-25T18:02:00Z ref=i1-fix-D161A01"
+    echo "EVENT spawn_intent d=D-161 a=A-01 at=2026-07-25T18:03:00Z ref=i1-fix-D161A01-other"
+  } > "$repo/.pm/events.log"
+
+  pm_fold "$repo" >/dev/null
+
+  assert_eq "fold spawn_intent conflict: later conflicting intent quarantined" \
+    "1" "$(_idx_py "$repo" "len(d['quarantined'])")"
+  assert_eq "fold spawn_intent conflict: FIRST intent stands (never silently replaced)" \
+    "i1-fix-D161A01" "$(_idx_py "$repo" "d['dispatches']['D-161']['spawn_intent']['A-01']['ref']")"
+  # shellcheck disable=SC2016  # $1 expands inside the nested bash -c, not here
+  assert_true "fold spawn_intent conflict: conflict attributed to owning issue I-001" \
+    bash -c '[[ "$1" == *issue-related-quarantine* ]]' _ \
+    "$(_idx_py "$repo" "d['quarantine_by_issue'].get('I-001')")"
+
+  rm -rf "$repo"
+}
+
+# ---------------------------------------------------------------------------
+# B3: spawn_intent violations quarantine (never fold, never transition) with
+# issue-scoped attribution via the dispatch bucket -- unregistered d, wrong
+# attempt, human-lane dispatch, not-currently-DISPATCHED dispatch.
+# ---------------------------------------------------------------------------
+section_fold_spawn_intent_violations() {
+  local repo
+  repo="$(new_tmp_repo)"
+  {
+    echo "EVENT schema v=1"
+    echo "EVENT issue_state i=I-001 from=OPEN to=ACTIVE at=2026-07-25T18:00:00Z"
+    # D-162: automation lane, DISPATCHED -- wrong-attempt target
+    echo "EVENT dispatch_new d=D-162 i=I-001 at=2026-07-25T18:00:00Z"
+    echo "EVENT dispatch_state d=D-162 a=A-01 from=READY to=DISPATCHED lane=automation at=2026-07-25T18:01:00Z tab=?"
+    # D-163: HUMAN lane, DISPATCHED -- lane violation target
+    echo "EVENT dispatch_new d=D-163 i=I-001 at=2026-07-25T18:00:00Z"
+    echo "EVENT dispatch_state d=D-163 a=A-01 from=READY to=DISPATCHED lane=human at=2026-07-25T18:01:00Z tab=?"
+    # D-164: automation lane but already ACKED -- state violation target
+    echo "EVENT dispatch_new d=D-164 i=I-001 at=2026-07-25T18:00:00Z"
+    echo "EVENT dispatch_state d=D-164 a=A-01 from=READY to=DISPATCHED lane=automation at=2026-07-25T18:01:00Z tab=?"
+    echo "EVENT dispatch_state d=D-164 a=A-01 from=DISPATCHED to=ACKED lane=automation at=2026-07-25T18:02:00Z tab=zzz-test-tab-164"
+    # violation 1: unregistered dispatch -> globally unattributable
+    echo "EVENT spawn_intent d=D-999 a=A-01 at=2026-07-25T18:03:00Z ref=zzz-test-worker"
+    # violation 2: wrong attempt (A-07 is not D-162's current attempt)
+    echo "EVENT spawn_intent d=D-162 a=A-07 at=2026-07-25T18:04:00Z ref=zzz-test-worker"
+    # violation 3: human-lane dispatch
+    echo "EVENT spawn_intent d=D-163 a=A-01 at=2026-07-25T18:05:00Z ref=zzz-test-worker"
+    # violation 4: dispatch not currently DISPATCHED (ACKED)
+    echo "EVENT spawn_intent d=D-164 a=A-01 at=2026-07-25T18:06:00Z ref=zzz-test-worker"
+  } > "$repo/.pm/events.log"
+
+  pm_fold "$repo" >/dev/null
+
+  assert_eq "fold spawn_intent violations: all four bad intents quarantined" \
+    "4" "$(_idx_py "$repo" "len(d['quarantined'])")"
+  assert_eq "fold spawn_intent violations: no intent folded into standing state (D-162)" \
+    "0" "$(_idx_py "$repo" "len((d['dispatches']['D-162'].get('spawn_intent') or {}))")"
+  assert_eq "fold spawn_intent violations: no intent folded into standing state (D-163)" \
+    "0" "$(_idx_py "$repo" "len((d['dispatches']['D-163'].get('spawn_intent') or {}))")"
+  assert_eq "fold spawn_intent violations: no intent folded into standing state (D-164)" \
+    "0" "$(_idx_py "$repo" "len((d['dispatches']['D-164'].get('spawn_intent') or {}))")"
+  assert_eq "fold spawn_intent violations: dispatch state untouched (D-162 still DISPATCHED)" \
+    "DISPATCHED" "$(_idx_py "$repo" "d['dispatches']['D-162']['state']")"
+  assert_eq "fold spawn_intent violations: dispatch state untouched (D-164 still ACKED)" \
+    "ACKED" "$(_idx_py "$repo" "d['dispatches']['D-164']['state']")"
+  # shellcheck disable=SC2016  # $1 expands inside the nested bash -c, not here
+  assert_true "fold spawn_intent violations: attributed to owning issue I-001 (issue-related-quarantine)" \
+    bash -c '[[ "$1" == *issue-related-quarantine* ]]' _ \
+    "$(_idx_py "$repo" "d['quarantine_by_issue'].get('I-001')")"
+  assert_eq "fold spawn_intent violations: unregistered-dispatch intent is globally unattributable" \
+    "True" "$(_idx_py "$repo" "d['quarantine_unattributable']")"
+
+  # strict-mode (pm_apply) parity: the write path refuses what the fold
+  # quarantines -- a wrong-attempt intent and a human-lane intent both fail.
+  if PM_ROOT="$repo" pm_apply spawn_intent d=D-162 a=A-07 at=2026-07-25T18:07:00Z ref=zzz-test-worker >/dev/null 2>&1; then
+    fail "pm_apply spawn_intent: wrong attempt refused at write" "unexpectedly accepted"
+  else
+    ok "pm_apply spawn_intent: wrong attempt refused at write"
+  fi
+  if PM_ROOT="$repo" pm_apply spawn_intent d=D-163 a=A-01 at=2026-07-25T18:07:00Z ref=zzz-test-worker >/dev/null 2>&1; then
+    fail "pm_apply spawn_intent: human-lane dispatch refused at write" "unexpectedly accepted"
+  else
+    ok "pm_apply spawn_intent: human-lane dispatch refused at write"
+  fi
+  if PM_ROOT="$repo" pm_apply spawn_intent d=D-162 a=A-01 at=2026-07-25T18:07:00Z ref=zzz-test-worker >/dev/null 2>&1; then
+    ok "pm_apply spawn_intent: valid intent accepted at write"
+  else
+    fail "pm_apply spawn_intent: valid intent accepted at write" "unexpectedly refused"
+  fi
+
+  rm -rf "$repo"
+}
+
+# ---------------------------------------------------------------------------
+# B3: bash grammar tables and the embedded-python engine tables MUST stay in
+# lockstep (same event types, same required/optional/key-order per type) --
+# the two are kept in sync by hand, so this is the tripwire.
+# ---------------------------------------------------------------------------
+section_tables_lockstep() {
+  local py_tables
+  py_tables="$(printf '%s' "$_PM_ENGINE_PY" | python3 -c '
+import json, sys
+g = {}
+exec(sys.stdin.read(), g)
+print(json.dumps({
+    "REQUIRED": {k: " ".join(v) for k, v in g["REQUIRED"].items()},
+    "OPTIONAL": {k: " ".join(v) for k, v in g["OPTIONAL"].items()},
+    "KEY_ORDER": {k: " ".join(v) for k, v in g["KEY_ORDER"].items()},
+}))
+')" || { fail "tables lockstep: python engine tables extract" "exec failed"; return; }
+
+  local etype expected
+  for etype in "${!_PM_REQUIRED_KEYS[@]}"; do
+    expected="$(python3 -c "import json,sys; t=json.loads(sys.argv[1]); print(t['REQUIRED'].get('$etype', '<MISSING>'))" "$py_tables")"
+    assert_eq "tables lockstep: REQUIRED[$etype] bash==python" "${_PM_REQUIRED_KEYS[$etype]}" "$expected"
+    expected="$(python3 -c "import json,sys; t=json.loads(sys.argv[1]); print(t['OPTIONAL'].get('$etype', '<MISSING>'))" "$py_tables")"
+    assert_eq "tables lockstep: OPTIONAL[$etype] bash==python" "${_PM_OPTIONAL_KEYS[$etype]}" "$expected"
+    expected="$(python3 -c "import json,sys; t=json.loads(sys.argv[1]); print(t['KEY_ORDER'].get('$etype', '<MISSING>'))" "$py_tables")"
+    assert_eq "tables lockstep: KEY_ORDER[$etype] bash==python" "${_PM_KEY_ORDER[$etype]}" "$expected"
+  done
+
+  # both directions: no python-only event type either
+  local py_only
+  py_only="$(BASH_TYPES="${!_PM_REQUIRED_KEYS[*]}" python3 -c "
+import json, os, sys
+t = json.loads(sys.argv[1])
+bash_types = set(os.environ['BASH_TYPES'].split())
+extra = sorted(set(t['REQUIRED']) - bash_types)
+print(' '.join(extra) if extra else 'none')
+" "$py_tables")"
+  assert_eq "tables lockstep: no python-only event types" "none" "$py_only"
+
+  # B3: spawn_intent is actually present in the grammar (red-first anchor)
+  assert_eq "tables lockstep: spawn_intent registered with required 'd a at'" \
+    "d a at" "${_PM_REQUIRED_KEYS[spawn_intent]:-<MISSING>}"
+}
+
+# ---------------------------------------------------------------------------
+# B3: the grammar doc carries the spawn_intent row + a rev 1.2 migration
+# note with the same blast-radius warning pattern rev 1.1 established.
+# ---------------------------------------------------------------------------
+section_grammar_doc_spawn_intent() {
+  local doc="${PM_CREATOR_DIR}/references/event-log-grammar.md"
+  # shellcheck disable=SC2016  # literal backticks in the markdown row, not expansion
+  assert_true "grammar doc: spawn_intent row present with required 'd a at' + optional 'ref'" \
+    grep -q -- '| `spawn_intent` | `d a at` | `ref` |' "$doc"
+  assert_true "grammar doc: revision 1.2 note present" \
+    grep -qi 'revision \*\*1\.2\*\*' "$doc"
+  assert_true "grammar doc: rev 1.2 note names spawn_intent in its migration warning" \
+    bash -c "grep -i -B2 -A8 'revision \*\*1\.2\*\*' '$doc' | grep -qi 'spawn_intent'"
+  assert_true "grammar doc: rev 1.2 warning keeps the unattributable/auto-close-freeze blast radius" \
+    bash -c "grep -i -A10 'revision \*\*1\.2\*\*' '$doc' | grep -qi 'unattributable'"
+}
+
+# ---------------------------------------------------------------------------
 # pm_git_probe on a throwaway temp git repo
 # ---------------------------------------------------------------------------
 section_git_probe() {
@@ -643,6 +856,16 @@ echo "== pm_fold: merged sha shape gate (B2.2 F3) =="
 section_fold_merged_shape_gate
 echo "== pm_fold: auto-close provenance notes folded queryably (B2.2 F1) =="
 section_fold_auto_close_notes
+echo "== pm_fold: spawn_intent accepted (B3) =="
+section_fold_spawn_intent_accepted
+echo "== pm_fold: conflicting spawn_intent quarantined (B3) =="
+section_fold_spawn_intent_conflict
+echo "== pm_fold: spawn_intent violations quarantined (B3) =="
+section_fold_spawn_intent_violations
+echo "== grammar tables lockstep (bash == embedded python) =="
+section_tables_lockstep
+echo "== grammar doc: spawn_intent row + rev 1.2 note (B3) =="
+section_grammar_doc_spawn_intent
 echo "== pm_git_probe =="
 section_git_probe
 echo "== escapers =="

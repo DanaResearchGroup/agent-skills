@@ -1,6 +1,9 @@
 # Derived / transient PM state (regenerable — never authoritative)
 .pm/index.json
 .pm/.lock
+# B3: advisory spawn-intent tick-age counter (drives only the
+# suspected-orphan-intent surface; losing it merely restarts the count)
+.pm/spawn-intent-age.json
 
 # Authoritative + audit records ARE tracked (do not ignore):
 #   .pm/events.log       <- single source of truth for state

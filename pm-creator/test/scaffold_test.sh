@@ -923,6 +923,126 @@ PY
     || ok "no partial --out dir left behind (bad allow_marker case)"
 }
 
+# ---------------------------------------------------------------------------
+# B3: automation config normalization (AUTOMATION_JSON optional, defaults
+# derived, FAIL LOUD on bad types -- mirrors the repos normalization).
+# ---------------------------------------------------------------------------
+_automation_scaffold() {
+  # _automation_scaffold <tag> [<automation_json>] -- scaffolds with the
+  # standard values (plus AUTOMATION_JSON when given) into $WORK/out-<tag>.
+  # Echoes nothing; caller reads $WORK/s<tag>.err and $WORK/out-<tag>.
+  local tag="$1" automation_json="${2:-}"
+  local demo="$WORK/demo-$tag" values="$WORK/values-$tag.json"
+  mkdir -p "$demo"
+  (cd "$demo" && git init -q -b main && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init)
+  write_full_values "$values" "$demo"
+  if [[ -n "$automation_json" ]]; then
+    AUTOMATION_JSON="$automation_json" python3 - "$values" <<'PY'
+import json, os, sys
+p = sys.argv[1]
+v = json.load(open(p))
+v["AUTOMATION_JSON"] = os.environ["AUTOMATION_JSON"]
+json.dump(v, open(p, "w"))
+PY
+  fi
+  bash "$SCAFFOLD" --values "$values" --out "$WORK/out-$tag" >"$WORK/s$tag.out" 2>"$WORK/s$tag.err"
+}
+
+section_automation_defaults() {
+  _automation_scaffold b3def \
+    || { fail "automation defaults: scaffold succeeds without AUTOMATION_JSON" "$(cat "$WORK/sb3def.err")"; return; }
+  ok "automation defaults: scaffold succeeds without AUTOMATION_JSON"
+  local cfg="$WORK/out-b3def/.pm/config.json" got
+  got="$(python3 -c "import json; a=json.load(open('$cfg'))['automation']; print(a['auto_close'], a['auto_spawn'], a['max_live_workers'], a['spawn_ack_timeout_ticks'], a['spawn_argv'])" 2>/dev/null)"
+  [[ "$got" == "False False 1 3 []" ]] \
+    && ok "automation defaults: auto_close=false auto_spawn=false max_live_workers=1 spawn_ack_timeout_ticks=3 spawn_argv=[]" \
+    || fail "automation defaults: auto_close=false auto_spawn=false max_live_workers=1 spawn_ack_timeout_ticks=3 spawn_argv=[]" "got [$got]"
+}
+
+section_automation_json_explicit() {
+  _automation_scaffold b3exp '{"auto_spawn": true, "max_live_workers": 3, "spawn_ack_timeout_ticks": 5, "spawn_argv": ["claude", "-p", "{prompt}"]}' \
+    || { fail "automation explicit: scaffold succeeds with AUTOMATION_JSON" "$(cat "$WORK/sb3exp.err")"; return; }
+  ok "automation explicit: scaffold succeeds with AUTOMATION_JSON"
+  local cfg="$WORK/out-b3exp/.pm/config.json" got
+  got="$(python3 -c "import json; a=json.load(open('$cfg'))['automation']; print(a['auto_close'], a['auto_spawn'], a['max_live_workers'], a['spawn_ack_timeout_ticks'], a['spawn_argv'])" 2>/dev/null)"
+  [[ "$got" == "False True 3 5 ['claude', '-p', '{prompt}']" ]] \
+    && ok "automation explicit: supplied keys render; auto_close still defaults false" \
+    || fail "automation explicit: supplied keys render; auto_close still defaults false" "got [$got]"
+}
+
+# B3 fix P3-13: scaffold/track validation parity -- a config that track's
+# runtime verdict would fail-closed refuse must not scaffold as valid.
+section_automation_auto_spawn_requires_argv() {
+  if _automation_scaffold b3par1 '{"auto_spawn": true}'; then
+    fail "automation parity: auto_spawn=true with default empty spawn_argv refused" "scaffold unexpectedly succeeded"
+  else
+    ok "automation parity: auto_spawn=true with default empty spawn_argv refused"
+  fi
+  grep -q "spawn_argv" "$WORK/sb3par1.err" \
+    && ok "automation parity: error names spawn_argv" \
+    || fail "automation parity: error names spawn_argv" "$(cat "$WORK/sb3par1.err")"
+  if _automation_scaffold b3par2 '{"auto_spawn": true, "spawn_argv": ["zzz-runner", "{prompt}"]}'; then
+    ok "automation parity: auto_spawn=true with a complete spawn_argv scaffolds"
+  else
+    fail "automation parity: auto_spawn=true with a complete spawn_argv scaffolds" "$(cat "$WORK/sb3par2.err")"
+  fi
+}
+
+section_automation_bad_auto_spawn_fails() {
+  if _automation_scaffold b3bad1 '{"auto_spawn": "yes"}'; then
+    fail "automation bad auto_spawn: non-bool refused" "scaffold unexpectedly succeeded"
+  else
+    ok "automation bad auto_spawn: non-bool refused"
+  fi
+  grep -q "auto_spawn" "$WORK/sb3bad1.err" \
+    && ok "automation bad auto_spawn: error names the key" \
+    || fail "automation bad auto_spawn: error names the key" "$(cat "$WORK/sb3bad1.err")"
+  [[ ! -e "$WORK/out-b3bad1" ]] && ok "automation bad auto_spawn: no --out published" \
+    || fail "automation bad auto_spawn: no --out published" "out dir exists"
+}
+
+section_automation_bad_max_live_workers_fails() {
+  # true is a bool, NOT an int -- a common JSON footgun that must not pass
+  if _automation_scaffold b3bad2 '{"max_live_workers": true}'; then
+    fail "automation bad max_live_workers: bool refused" "scaffold unexpectedly succeeded"
+  else
+    ok "automation bad max_live_workers: bool refused"
+  fi
+  grep -q "max_live_workers" "$WORK/sb3bad2.err" \
+    && ok "automation bad max_live_workers: error names the key" \
+    || fail "automation bad max_live_workers: error names the key" "$(cat "$WORK/sb3bad2.err")"
+  if _automation_scaffold b3bad2b '{"max_live_workers": 0}'; then
+    fail "automation bad max_live_workers: zero refused (must be >= 1)" "scaffold unexpectedly succeeded"
+  else
+    ok "automation bad max_live_workers: zero refused (must be >= 1)"
+  fi
+}
+
+section_automation_bad_spawn_argv_fails() {
+  # a bare string is not a list
+  if _automation_scaffold b3bad3 '{"spawn_argv": "claude -p {prompt}"}'; then
+    fail "automation bad spawn_argv: bare string refused" "scaffold unexpectedly succeeded"
+  else
+    ok "automation bad spawn_argv: bare string refused"
+  fi
+  grep -q "spawn_argv" "$WORK/sb3bad3.err" \
+    && ok "automation bad spawn_argv: error names the key" \
+    || fail "automation bad spawn_argv: error names the key" "$(cat "$WORK/sb3bad3.err")"
+  # a non-empty argv without the {prompt} placeholder token can never carry
+  # the prompt to the worker -- refuse at scaffold time
+  if _automation_scaffold b3bad4 '{"spawn_argv": ["claude", "-p"]}'; then
+    fail "automation bad spawn_argv: non-empty argv without {prompt} token refused" "scaffold unexpectedly succeeded"
+  else
+    ok "automation bad spawn_argv: non-empty argv without {prompt} token refused"
+  fi
+  # a non-string element
+  if _automation_scaffold b3bad5 '{"spawn_argv": ["claude", 7, "{prompt}"]}'; then
+    fail "automation bad spawn_argv: non-string element refused" "scaffold unexpectedly succeeded"
+  else
+    ok "automation bad spawn_argv: non-string element refused"
+  fi
+}
+
 section_repos_null_merge_mode_fails() {
   # fix-pass-6 T9 (scaffold half): an EXPLICIT "merge_mode": null is not
   # "absent" -- it fails loud rather than silently defaulting.
@@ -1123,6 +1243,18 @@ echo "== B2.2: non-bool allow_marker_branch_deleted fails loud =="
 section_repos_bad_allow_marker_fails
 echo "== B2.2 fix-pass-6 T9: explicit merge_mode=null fails loud =="
 section_repos_null_merge_mode_fails
+echo "== B3: automation keys default (auto_spawn/max_live_workers/spawn_ack_timeout_ticks/spawn_argv) =="
+section_automation_defaults
+echo "== B3: explicit AUTOMATION_JSON normalizes + renders =="
+section_automation_json_explicit
+echo "== B3 fix: auto_spawn=true requires a complete spawn_argv (track parity) =="
+section_automation_auto_spawn_requires_argv
+echo "== B3: bad automation.auto_spawn type fails loud =="
+section_automation_bad_auto_spawn_fails
+echo "== B3: bad automation.max_live_workers type fails loud =="
+section_automation_bad_max_live_workers_fails
+echo "== B3: bad automation.spawn_argv fails loud =="
+section_automation_bad_spawn_argv_fails
 echo "== round-21: hostile repo field round-trips through normalization =="
 section_repos_hostile_field_round_trips
 echo "== round-21: {{...}}-shaped repo field data still trips the broad survivor guard =="

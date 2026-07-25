@@ -24,6 +24,21 @@ auto-closes for that repo. Rows below always say which path closed an issue
 and every marker close leaves a durable `auto-close:*` audit note on the event log before
 the close itself. Everything else is surfaced with a reason, never closed.
 
+The tick's final pass is the automation-lane auto-spawn stage (config-gated on
+`automation.auto_spawn`, default OFF): queued automation-lane dispatches are spawned as herdr
+workers under a durable `spawn_intent` lease and ACKed in the same tick. Its section below
+lists what was spawned plus every anomaly as an actionable row —
+`spawn-ack-unconfirmed` (an open lease matched exactly one live pane by worker name; a name
+join is impostor-forgeable, so the row carries the exact `bin/record dispatch <D> ACKED
+--tab <id>` command instead of an automatic ACK), `suspected-orphan-intent` (an open lease
+with no live pane after the configured timeout, carrying the last known spawn-window failure
+cause when one was recorded; operator adjudication, never auto-abandoned),
+`herdr-tab-create-failed` / `herdr-start-failed` (with the herdr error code; the durable
+lease is left for recovery), `name-collision`, `ambiguous-spawn-ack`, `prompt-sha-mismatch`
+(the durable prompt copy no longer hashes to the recorded `prompt_sha`), and
+`spawn-config-invalid` (fail-closed skip) — with steady-state counts for `capacity-exceeded`
+and `auto-spawn-disabled`.
+
 > Human narrative only. Authoritative state is the event log; `bin/track` renders the block
 > below fresh on every `--once` tick (pure function of index/snapshot/git — unchanged state
 > re-renders byte-identical).

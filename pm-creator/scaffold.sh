@@ -183,6 +183,72 @@ if "REPOS_JSON" in values:
         norm_repos.append(repo)
     values["REPOS_JSON"] = json.dumps(norm_repos)
 
+# --- B3: automation normalization (complete-by-construction) ---
+# AUTOMATION_JSON is an OPTIONAL caller-supplied JSON object; absent means
+# "all defaults". Downstream (track's spawn stage) needs every key present
+# and correctly typed, so this pass makes the config complete-by-
+# construction with fail-safe defaults (everything OFF / minimal), and
+# FAILS LOUD on any wrong type rather than letting a truthy string or a
+# bool-masquerading-as-int silently widen an automation gate. Unknown extra
+# keys are preserved (additive tolerance, same as repos normalization).
+try:
+    automation = json.loads(values.get("AUTOMATION_JSON") or "{}")
+except (TypeError, json.JSONDecodeError) as e:
+    print(f"scaffold.sh: AUTOMATION_JSON is not valid JSON: {e}", file=sys.stderr)
+    sys.exit(3)
+if not isinstance(automation, dict):
+    print("scaffold.sh: AUTOMATION_JSON must be a JSON object", file=sys.stderr)
+    sys.exit(3)
+automation.setdefault("auto_close", False)
+automation.setdefault("auto_spawn", False)
+automation.setdefault("max_live_workers", 1)
+automation.setdefault("spawn_ack_timeout_ticks", 3)
+automation.setdefault("spawn_argv", [])
+for _bkey in ("auto_close", "auto_spawn"):
+    if not isinstance(automation[_bkey], bool):
+        print(
+            f"scaffold.sh: automation.{_bkey}={automation[_bkey]!r} must be a JSON boolean",
+            file=sys.stderr,
+        )
+        sys.exit(3)
+for _ikey in ("max_live_workers", "spawn_ack_timeout_ticks"):
+    _ival = automation[_ikey]
+    # bool is an int subclass in Python -- exclude it explicitly.
+    if isinstance(_ival, bool) or not isinstance(_ival, int) or _ival < 1:
+        print(
+            f"scaffold.sh: automation.{_ikey}={_ival!r} must be a JSON integer >= 1",
+            file=sys.stderr,
+        )
+        sys.exit(3)
+_argv = automation["spawn_argv"]
+if not isinstance(_argv, list) or any(not isinstance(el, str) or el == "" for el in _argv):
+    print(
+        f"scaffold.sh: automation.spawn_argv={_argv!r} must be a JSON array of "
+        "non-empty strings",
+        file=sys.stderr,
+    )
+    sys.exit(3)
+if _argv and "{prompt}" not in _argv:
+    print(
+        "scaffold.sh: automation.spawn_argv must contain the literal element "
+        "\"{prompt}\" (whole-element placeholder the durable prompt path "
+        "substitutes into at spawn time)",
+        file=sys.stderr,
+    )
+    sys.exit(3)
+# scaffold/track validation parity (B3 fix P3-13): track's runtime verdict
+# fail-closed refuses auto_spawn with an empty/placeholder-less spawn_argv,
+# so that combination must not scaffold as valid either.
+if automation["auto_spawn"] and (not _argv or "{prompt}" not in _argv):
+    print(
+        "scaffold.sh: automation.auto_spawn=true requires a non-empty "
+        "automation.spawn_argv containing the literal \"{prompt}\" element "
+        "(track would fail-closed refuse this config at runtime)",
+        file=sys.stderr,
+    )
+    sys.exit(3)
+values["AUTOMATION_JSON"] = json.dumps(automation)
+
 PH = re.compile(r"\{\{([A-Za-z0-9_]+)\}\}")
 missing = set()
 

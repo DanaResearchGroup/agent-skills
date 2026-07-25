@@ -18,6 +18,17 @@ the schema version; existing keys never change meaning.
 > attribution is never narrowed for unknown event types — using a `d=` token from a
 > line the engine cannot parse to scope the blast radius would weaken the fail-safe.)
 
+> **Version note.** Grammar revision **1.2** (B3) ADDITIVELY introduces the
+> `spawn_intent` event type (§3) — the automation lane's durable spawn-intent lease.
+> The wire header stays `EVENT schema v=1`: no existing key changed meaning and
+> pre-1.2 logs remain valid unchanged. The reverse direction is NOT benign, exactly
+> as with rev 1.1: a pre-1.2 engine folding a 1.2 log quarantines every
+> `spawn_intent` line as an unknown event type, and an unknown-type quarantine is
+> UNATTRIBUTABLE — which trips the global G1.5 fail-safe and freezes auto-close
+> REPO-WIDE (every issue, not just the intent's dispatch) until the lines are
+> removed from the log. Upgrade all engines that read a log BEFORE enabling
+> `automation.auto_spawn` (or otherwise recording `spawn_intent` events) in it.
+
 ## 1. Record format
 
 - One event per line, no wrapping:
@@ -58,6 +69,7 @@ the schema version; existing keys never change meaning.
 | `unregistered_execution` | `at ref` | — | reconcile found work with no dispatch |
 | `adopt` | `d a at ref` | — | operator absorbs unregistered work into a dispatch |
 | `note` | `at ref` | `d i` | pointer to a prose anchor (never parsed for state) |
+| `spawn_intent` | `d a at` | `ref` | automation-lane durable spawn-intent lease (B3, grammar revision 1.2) |
 
 - `lane` ∈ {`human`, `automation`}. `tab` is a herdr tab id or `?` (unknown at dispatch,
   resolved at ACK). `a` is `A-##`.
@@ -76,6 +88,19 @@ the schema version; existing keys never change meaning.
   A conflicting second marker for the same `(d, a)` (different `merge_sha`/`result_sha`)
   is refused at write and quarantined at fold — the FIRST accepted marker stands; an
   identical re-append is accepted idempotently.
+- `spawn_intent` (grammar revision 1.2, ADDITIVE — see the version note above) is the
+  automation lane's **durable spawn-intent lease**, appended by `track` under the repo
+  lock BEFORE any herdr side effect (durability-before-effect): it records "track is
+  about to spawn worker `ref=` for attempt `(d, a)`", so a crash between the intent and
+  the spawn/ACK is recoverable next tick instead of silently double-spawning. The fold
+  accepts it only when `d` is a registered dispatch, `a` is d's CURRENT attempt, the
+  dispatch is currently DISPATCHED, and its lane is `automation` (a spawn intent against
+  a human-lane dispatch always quarantines). An accepted intent is stored per `(d, a)`
+  (`dispatches[d].spawn_intent[a]`) and read ONLY by `track`'s spawn stage; it never
+  transitions dispatch state, never touches issue state, never ACKs by itself. A
+  conflicting second intent for the same `(d, a)` (different `ref`) is refused at write
+  and quarantined at fold — the FIRST accepted intent stands; an identical re-append is
+  accepted idempotently.
 - `repo`/`branch`/`base_sha` are OPTIONAL git-corroboration metadata, set (if at all) at
   mint time: `repo` names a configured repo, `branch` is the expected branch
   (`i<num>-<slug>` per `CONVENTIONS.md` §7), `base_sha` is the mainline commit the dispatch

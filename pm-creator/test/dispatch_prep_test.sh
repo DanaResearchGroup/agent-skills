@@ -139,6 +139,176 @@ section_fresh_dispatch() {
 }
 
 # ---------------------------------------------------------------------------
+# section: B3 automation lane -- `--lane automation` mints lane=automation
+# tab=?, copies the prompt to the durable prompts/ path, emits the note
+# binding, and SUPPRESSES the manual herdr/paste instructions. Prep still
+# never spawns anything.
+# ---------------------------------------------------------------------------
+
+section_automation_lane_mint() {
+  local repo out rc
+  repo="$(new_tmp_repo)"
+
+  out="$(PM_ROOT="$repo" "$DISPATCH_PREP" \
+    --dispatch D-007 --issue I-004 --lane automation \
+    --prompt "$repo/prompts/I-004_foo_2026-07-23.md" 2>&1)"
+  rc=$?
+  assert_eq "automation mint: exits 0 (no --tab required)" "0" "$rc"
+
+  local log
+  log="$(cat "$repo/.pm/events.log")"
+  assert_contains "automation mint: emits dispatch_new for D-007/I-004" \
+    "$log" "EVENT dispatch_new d=D-007 i=I-004 at="
+  assert_contains "automation mint: emits DISPATCHED transition lane=automation at A-01" \
+    "$log" "EVENT dispatch_state d=D-007 a=A-01 from=READY to=DISPATCHED lane=automation"
+  assert_contains "automation mint: DISPATCHED event carries tab=? prompt_sha=" \
+    "$log" "tab=? prompt_sha="
+  assert_contains "automation mint: emits the durable prompt-copy note binding" \
+    "$log" "ref=prompts/I-004_foo_2026-07-23.md d=D-007"
+
+  # recorded prompt_sha matches a fresh hash of the durable prompts/ copy
+  local want_sha got_sha
+  want_sha="$(python3 -c "
+import hashlib
+print(hashlib.sha256(open('$repo/prompts/I-004_foo_2026-07-23.md','rb').read()).hexdigest()[:8])")"
+  got_sha="$(printf '%s\n' "$log" | grep -o 'prompt_sha=[0-9a-f]*' | head -n1 | cut -d= -f2)"
+  assert_eq "automation mint: prompt_sha equals hash of the durable prompts/ copy" \
+    "$want_sha" "$got_sha"
+
+  # the fold exposes the binding queryably (track's D2 guard reads these)
+  assert_eq "automation mint: fold carries prompt_ref" \
+    "prompts/I-004_foo_2026-07-23.md" \
+    "$(python3 -c "import json;print(json.load(open('$repo/.pm/index.json'))['dispatches']['D-007']['prompt_ref'])")"
+  assert_eq "automation mint: fold carries prompt_sha" \
+    "$want_sha" \
+    "$(python3 -c "import json;print(json.load(open('$repo/.pm/index.json'))['dispatches']['D-007']['prompt_sha'])")"
+
+  # manual herdr/paste instructions are SUPPRESSED for the automation lane
+  if [[ "$out" == *"herdr tab create"* ]]; then
+    fail "automation mint: manual herdr command suppressed" "output contains herdr tab create"
+  else
+    ok "automation mint: manual herdr command suppressed"
+  fi
+  if [[ "$out" == *"paste"* || "$out" == *"Paste"* ]]; then
+    fail "automation mint: paste instruction suppressed" "output mentions paste"
+  else
+    ok "automation mint: paste instruction suppressed"
+  fi
+  assert_contains "automation mint: summary names the automation lane" "$out" "lane=automation"
+
+  rm -rf "$repo"
+}
+
+section_automation_lane_copies_external_prompt() {
+  local repo out rc
+  repo="$(new_tmp_repo)"
+  mkdir -p "$repo/drafts"
+  printf 'Automation prompt body.\n' > "$repo/drafts/I-004_bar_2026-07-25.md"
+
+  out="$(PM_ROOT="$repo" "$DISPATCH_PREP" \
+    --dispatch D-008 --issue I-004 --lane automation \
+    --prompt "$repo/drafts/I-004_bar_2026-07-25.md" 2>&1)"
+  rc=$?
+  assert_eq "automation copy: exits 0" "0" "$rc"
+  assert_true "automation copy: prompt copied to durable prompts/ path" \
+    test -f "$repo/prompts/I-004_bar_2026-07-25.md"
+  assert_true "automation copy: copy content identical to source" \
+    cmp -s "$repo/drafts/I-004_bar_2026-07-25.md" "$repo/prompts/I-004_bar_2026-07-25.md"
+  assert_contains "automation copy: note binds the RELATIVE prompts/ path" \
+    "$(cat "$repo/.pm/events.log")" "ref=prompts/I-004_bar_2026-07-25.md d=D-008"
+
+  rm -rf "$repo"
+}
+
+section_automation_lane_refusals() {
+  local repo out rc
+  repo="$(new_tmp_repo)"
+
+  # bad --lane value refused, nothing emitted
+  out="$(PM_ROOT="$repo" "$DISPATCH_PREP" \
+    --dispatch D-009 --issue I-004 --lane bogus \
+    --prompt "$repo/prompts/I-004_foo_2026-07-23.md" 2>&1)"
+  rc=$?
+  assert_true "automation refusals: unknown --lane value exits non-zero" test "$rc" -ne 0
+  assert_eq "automation refusals: unknown --lane emits no events" \
+    "1" "$(wc -l < "$repo/.pm/events.log" | tr -d ' ')"
+
+  # automation lane REQUIRES the conventional prompt filename (the durable
+  # copy path + worker name derive from it) -- a human-lane warning becomes
+  # an automation-lane refusal.
+  printf 'body\n' > "$repo/badname.md"
+  out="$(PM_ROOT="$repo" "$DISPATCH_PREP" \
+    --dispatch D-009 --issue I-004 --lane automation \
+    --prompt "$repo/badname.md" 2>&1)"
+  rc=$?
+  assert_true "automation refusals: unconventional prompt filename exits non-zero" test "$rc" -ne 0
+  assert_eq "automation refusals: unconventional filename emits no events" \
+    "1" "$(wc -l < "$repo/.pm/events.log" | tr -d ' ')"
+
+  # prompt filename's issue number must match --issue
+  printf 'body\n' > "$repo/I-005_baz_2026-07-25.md"
+  out="$(PM_ROOT="$repo" "$DISPATCH_PREP" \
+    --dispatch D-009 --issue I-004 --lane automation \
+    --prompt "$repo/I-005_baz_2026-07-25.md" 2>&1)"
+  rc=$?
+  assert_true "automation refusals: prompt/issue number mismatch exits non-zero" test "$rc" -ne 0
+  assert_eq "automation refusals: prompt/issue mismatch emits no events" \
+    "1" "$(wc -l < "$repo/.pm/events.log" | tr -d ' ')"
+
+  rm -rf "$repo"
+}
+
+section_automation_prompt_collision() {
+  local repo out rc
+  repo="$(new_tmp_repo)"
+  mkdir -p "$repo/drafts"
+  # an EARLIER dispatch already owns this durable path with other content
+  printf 'original prompt body\n' > "$repo/prompts/I-004_qux_2026-07-25.md"
+  printf 'different prompt body\n' > "$repo/drafts/I-004_qux_2026-07-25.md"
+
+  out="$(PM_ROOT="$repo" "$DISPATCH_PREP" \
+    --dispatch D-011 --issue I-004 --lane automation \
+    --prompt "$repo/drafts/I-004_qux_2026-07-25.md" 2>&1)"
+  rc=$?
+  assert_true "prompt collision: differing-content overwrite REFUSED" test "$rc" -ne 0
+  assert_eq "prompt collision: no events emitted on refusal" \
+    "1" "$(wc -l < "$repo/.pm/events.log" | tr -d ' ')"
+  assert_eq "prompt collision: existing durable copy left untouched" \
+    "original prompt body" "$(cat "$repo/prompts/I-004_qux_2026-07-25.md")"
+  assert_contains "prompt collision: refusal names the conflicting path" \
+    "$out" "prompts/I-004_qux_2026-07-25.md"
+
+  # identical content is NOT a collision -- proceeds normally
+  printf 'original prompt body\n' > "$repo/drafts/I-004_qux_2026-07-25.md"
+  out="$(PM_ROOT="$repo" "$DISPATCH_PREP" \
+    --dispatch D-011 --issue I-004 --lane automation \
+    --prompt "$repo/drafts/I-004_qux_2026-07-25.md" 2>&1)"
+  rc=$?
+  assert_eq "prompt collision: identical-content re-prep succeeds" "0" "$rc"
+
+  rm -rf "$repo"
+}
+
+section_human_lane_flag_explicit() {
+  local repo out rc
+  repo="$(new_tmp_repo)"
+
+  # `--lane human` behaves exactly like the default (instructions printed)
+  out="$(PM_ROOT="$repo" "$DISPATCH_PREP" \
+    --dispatch D-010 --issue I-004 --lane human \
+    --prompt "$repo/prompts/I-004_foo_2026-07-23.md" \
+    --tab zzz-test-tab 2>&1)"
+  rc=$?
+  assert_eq "explicit human lane: exits 0" "0" "$rc"
+  assert_contains "explicit human lane: emits lane=human transition" \
+    "$(cat "$repo/.pm/events.log")" "from=READY to=DISPATCHED lane=human"
+  assert_contains "explicit human lane: still prints the manual herdr command" \
+    "$out" "herdr tab create"
+
+  rm -rf "$repo"
+}
+
+# ---------------------------------------------------------------------------
 # section: refuse double dispatch (same D, still active)
 # ---------------------------------------------------------------------------
 
@@ -640,6 +810,11 @@ json.dump(cfg, open(p, 'w'))
 # ---------------------------------------------------------------------------
 
 section_fresh_dispatch
+section_automation_lane_mint
+section_automation_lane_copies_external_prompt
+section_automation_lane_refusals
+section_automation_prompt_collision
+section_human_lane_flag_explicit
 section_refuse_double_dispatch
 section_retry_after_failed
 section_git_meta_resolvable_repo

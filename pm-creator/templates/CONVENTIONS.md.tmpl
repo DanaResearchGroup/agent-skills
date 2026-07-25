@@ -69,6 +69,51 @@ short.
   `auto-closed-marker` (or `auto-closed-marker-branch-deleted`, which also needs the
   per-repo `allow_marker_branch_deleted: true` opt-in) instead of `auto-closed-strict`,
   and each one leaves a durable `auto-close:*` audit note on the event log.
+- **Automation-lane auto-spawn (B3, opt-in `automation.auto_spawn`, default OFF).** The
+  human still authors the prompt and prepares the dispatch —
+  `bin/dispatch-prep --lane automation` mints `lane=automation tab=?`, COPIES the prompt to
+  the durable `prompts/I-###_<slug>_YYYY-MM-DD.md` path, and emits a
+  `note d=<D> ref=prompts/...` binding; prep never spawns. Each `bin/track --once` tick
+  then works the queue (automation-lane `DISPATCHED` dispatches with `tab=?`, FIFO by
+  dispatch number, excluding NEEDS-USER/BLOCKED issues, issues with open questions,
+  superseded dispatches, and dispatches with an open intent) under a **durable
+  spawn-intent lease**: per free capacity slot (live agents in the configured workspace vs
+  `automation.max_live_workers`), track re-resolves the prompt from the folded note
+  binding, RE-HASHES it against the recorded `prompt_sha` (mismatch ⇒ surface, never
+  spawn), then — durability BEFORE effect — (i) appends a `spawn_intent` event under the
+  repo lock, (ii) `herdr tab create` (label `i###-<slug>`), (iii) `herdr agent start`
+  (worker name `i###-<slug>-D###A##`, argv from `automation.spawn_argv`, a list whose
+  literal `{prompt}` element is replaced by the durable prompt path), (iv) records the
+  `DISPATCHED→ACKED` with the created tab id in the SAME tick (this same-tick ACK is the
+  ONLY automated ACK — track created that tab itself, so the join is corroborated).
+  Alongside the snapshot-based capacity check, the under-lock re-check enforces a
+  **durable capacity count** (open `spawn_intent` leases + ACKED automation dispatches on
+  the log) so a stale/optimistic snapshot or a concurrent tick can only UNDER-spawn, never
+  overshoot `max_live_workers`. A crash mid-sequence leaves the durable intent: the next
+  tick's recovery pass re-joins it to live panes by worker name but **NEVER auto-ACKs on
+  that name join** (herdr allows duplicate pane names, and the deterministic worker name is
+  derivable — a name match is impostor-forgeable). Exactly one matching pane surfaces
+  `spawn-ack-unconfirmed` with the candidate pane and the exact
+  `bin/record dispatch <D> ACKED --tab <id>` command for the operator; several matches
+  surface `ambiguous-spawn-ack`; none — after `automation.spawn_ack_timeout_ticks`
+  herdr-visible ticks — surfaces `suspected-orphan-intent`, carrying the last known
+  spawn-window failure cause when one was recorded (track NEVER auto-abandons and never
+  re-spawns while an intent is open). **A transient herdr error in the spawn window
+  (tab-create/agent-start failure) therefore requires manual adjudication to re-queue:**
+  abandon the attempt (`FAILED`) by hand and re-prep — track never auto-retries a
+  dispatch whose lease is open. ACKED is the ceiling: results, verification, merges, and
+  closes keep their existing gates. All spawn anomalies surface in `TRACKER.md`
+  (`prompt-sha-mismatch`, `name-collision`, `herdr-tab-create-failed`,
+  `herdr-start-failed`, `spawn-ack-unconfirmed`, `ambiguous-spawn-ack`,
+  `suspected-orphan-intent`, `spawn-config-invalid`; steady-state counts
+  `capacity-exceeded`, `auto-spawn-disabled`).
+  **Prompt-integrity residual (documented deliberately):** the recorded `prompt_sha` is
+  re-hashed against the durable copy at plan time AND again under the repo lock
+  immediately before the intent is appended — but delivery to the worker is **by path**:
+  herdr's worker reads `prompts/…` from disk after `agent start`, so the guard binds the
+  spawn-time bytes only, not what the file contains when the worker later reads it.
+  `prompts/` is git-tracked and treated as operator-trust territory; a write there after
+  spawn is an operator action, not something track can or should police.
 
 ## 5. herdr workspace + tab naming
 

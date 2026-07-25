@@ -281,6 +281,7 @@ declare -gA _PM_REQUIRED_KEYS=(
   [unregistered_execution]="at ref"
   [adopt]="d a at ref"
   [note]="at ref"
+  [spawn_intent]="d a at"
 )
 
 declare -gA _PM_OPTIONAL_KEYS=(
@@ -294,6 +295,7 @@ declare -gA _PM_OPTIONAL_KEYS=(
   [unregistered_execution]=""
   [adopt]=""
   [note]="d i"
+  [spawn_intent]="ref"
 )
 
 # canonical key order for emitted lines (readability only; order is not
@@ -309,6 +311,7 @@ declare -gA _PM_KEY_ORDER=(
   [unregistered_execution]="at ref"
   [adopt]="d a at ref"
   [note]="at ref d i"
+  [spawn_intent]="d a at ref"
 )
 
 # NOTE (grammar ambiguity): §1 lists the value charset as
@@ -363,6 +366,7 @@ REQUIRED = {
     "unregistered_execution": ["at", "ref"],
     "adopt": ["d", "a", "at", "ref"],
     "note": ["at", "ref"],
+    "spawn_intent": ["d", "a", "at"],
 }
 
 # Relaxed requirement set for brand-new CANDIDATE events proposed to
@@ -383,6 +387,7 @@ REQUIRED_FOR_APPLY = {
     "unregistered_execution": ["at", "ref"],
     "adopt": ["d", "a", "at", "ref"],
     "note": ["at", "ref"],
+    "spawn_intent": ["d", "a", "at"],
 }
 
 OPTIONAL = {
@@ -396,6 +401,7 @@ OPTIONAL = {
     "unregistered_execution": [],
     "adopt": [],
     "note": ["d", "i"],
+    "spawn_intent": ["ref"],
 }
 
 # canonical key order for rendered log lines (readability only; order is not
@@ -411,6 +417,7 @@ KEY_ORDER = {
     "unregistered_execution": ["at", "ref"],
     "adopt": ["d", "a", "at", "ref"],
     "note": ["at", "ref", "d", "i"],
+    "spawn_intent": ["d", "a", "at", "ref"],
 }
 
 TERMINAL = {"VERIFIED", "ABANDONED"}
@@ -557,7 +564,7 @@ def _quarantine_attribution(state, etype, kv):
         if i:
             affected.add(i)
         return affected, category
-    elif etype in ("dispatch_new", "dispatch_state", "result", "merged"):
+    elif etype in ("dispatch_new", "dispatch_state", "result", "merged", "spawn_intent"):
         category = "issue"
         d = kv.get("d")
         if d:
@@ -696,6 +703,16 @@ def apply_event(state, etype, kv, line_no, raw, mode):
             # attempt id -- {a: {merge_sha, result_sha}}. Read ONLY by
             # track's G4 marker arm.
             "merged": {},
+            # B3: accepted `spawn_intent` lease records, keyed by attempt
+            # id -- {a: {ref, at, line}}. A PURE record read ONLY by
+            # track's spawn stage; never transitions dispatch/issue state.
+            "spawn_intent": {},
+            # B3: the last recorded prompt hash (dispatch_state
+            # prompt_sha=) and durable prompt copy binding (note
+            # ref=prompts/... d=), folded queryably for track's D2
+            # re-hash guard.
+            "prompt_sha": None,
+            "prompt_ref": None,
             "child_of": kv.get("child_of"),
             "supersedes": kv.get("supersedes"),
             "adopted_ref": None,
@@ -845,6 +862,12 @@ def apply_event(state, etype, kv, line_no, raw, mode):
             disp["attempt"] = kv["a"]
         if "tab" in kv:
             disp["tab"] = kv["tab"]
+        # B3: fold prompt_sha queryably (last write wins per dispatch --
+        # each mint records the CURRENT attempt's finalized prompt hash,
+        # and track's spawn stage only ever reads it for the current
+        # attempt). Pure metadata: never gates the transition itself.
+        if "prompt_sha" in kv:
+            disp["prompt_sha"] = kv["prompt_sha"]
         for meta_key in ("repo", "branch"):
             if kv.get(meta_key) is not None:
                 disp[meta_key] = kv[meta_key]
@@ -1036,6 +1059,53 @@ def apply_event(state, etype, kv, line_no, raw, mode):
             disp["adopted_ref"] = kv["ref"]
         return True
 
+    if etype == "spawn_intent":
+        # B3: a PURE spawn-intent lease record for the automation lane --
+        # appended durably by track BEFORE any herdr side effect, read ONLY
+        # by track's spawn stage (crash recovery / duplicate-spawn
+        # exclusion). It NEVER transitions dispatch or issue state. Legal
+        # only when `d` is a registered dispatch, `a` is d's CURRENT
+        # attempt, the dispatch is currently DISPATCHED, and its lane is
+        # `automation` (the automation-lane guard: a spawn intent against a
+        # human-lane dispatch is always a violation). A second intent for
+        # the same (d, a): identical ref -> accepted idempotently;
+        # different ref -> refused/quarantined, the FIRST stands (conflict
+        # = surface, never silently replace -- mirrors `merged`).
+        d = kv["d"]
+        disp = dispatches.get(d)
+        if disp is None:
+            return fail(f"spawn_intent for unregistered dispatch '{d}'")
+        a = kv["a"]
+        if disp["state"] != "DISPATCHED":
+            return fail(
+                f"spawn_intent for '{d}' refused: current state is "
+                f"{disp['state']}, must be DISPATCHED"
+            )
+        if a != disp["attempt"]:
+            return fail(
+                f"spawn_intent attempt mismatch for '{d}': current "
+                f"attempt={disp['attempt']}, got {a}"
+            )
+        if disp.get("lane") != "automation":
+            return fail(
+                f"spawn_intent for '{d}' refused: lane={disp.get('lane')}, "
+                "spawn intents are automation-lane only"
+            )
+        prior = (disp.get("spawn_intent") or {}).get(a)
+        if prior is not None:
+            if prior.get("ref") == kv.get("ref"):
+                return True
+            return fail(
+                f"conflicting spawn_intent for {d}/{a}: prior "
+                f"ref={prior.get('ref')}, got ref={kv.get('ref')}"
+            )
+        disp.setdefault("spawn_intent", {})[a] = {
+            "ref": kv.get("ref"),
+            "at": kv["at"],
+            "line": line_no,
+        }
+        return True
+
     if etype == "note":
         # Never parsed for ISSUE/DISPATCH state. Sole exception (fix-pass-6
         # F1): auto-close provenance notes (ref=auto-close:* with an i=)
@@ -1048,6 +1118,16 @@ def apply_event(state, etype, kv, line_no, raw, mode):
             refs = state["auto_close_notes"].setdefault(i, [])
             if ref not in refs:
                 refs.append(ref)
+        # B3 second exception, same pattern: a durable prompt-copy binding
+        # (ref=prompts/... with a d= naming a REGISTERED dispatch) is
+        # folded queryably into dispatches[d].prompt_ref so track's spawn
+        # stage re-resolves the prompt path from the FOLD (then re-hashes
+        # it against the recorded prompt_sha) -- never from a raw-log
+        # re-parse. Last write wins (a retry mint re-binds the same path).
+        # Still never parsed for issue/dispatch STATE.
+        d = kv.get("d")
+        if d and ref.startswith("prompts/") and d in dispatches:
+            dispatches[d]["prompt_ref"] = ref
         return True
 
     return fail(f"unhandled event type '{etype}'")
