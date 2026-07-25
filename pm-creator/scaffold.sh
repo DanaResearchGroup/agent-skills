@@ -70,11 +70,104 @@ mkdir -p "$TMP_OUT/.pm" "$TMP_OUT/bin" "$TMP_OUT/reports" "$TMP_OUT/prompts" \
 # Interpolate all templates + write config, via one python pass (robust to
 # multi-line / special-char values; fails if any placeholder lacks a value).
 TEMPLATES="$TEMPLATES" OUT="$TMP_OUT" VALUES="$VALUES" python3 - <<'PY'
-import json, os, re, sys, stat
+import json, os, re, subprocess, sys, stat
 
 templates = os.environ["TEMPLATES"]
 out = os.environ["OUT"]
 values = json.load(open(os.environ["VALUES"], encoding="utf-8"))
+
+
+def _git(path, *args):
+    """Run a read-only git command in `path`; return stdout, or None on any failure."""
+    try:
+        p = subprocess.run(
+            ("git", "-C", path) + args,
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return p.stdout if p.returncode == 0 else None
+
+
+def _die(msg):
+    print(f"scaffold.sh: {msg}", file=sys.stderr)
+    sys.exit(3)
+
+
+def _derive_mainline_ref(name, repo, mainline):
+    """Derive a full mainline ref by PROBING the repo -- never by guessing a
+    remote name. Returns the ref, or exits non-zero with an actionable message.
+
+    Rules, in order:
+      - exactly one `refs/remotes/<remote>/<mainline>` -> that ref;
+      - several  -> FAIL LOUD with the candidates. Which remote is canonical
+        is a judgment call (canonical org vs personal fork) and picking one
+        silently is how work gets pushed to, or corroborated against, the
+        wrong place;
+      - none, but `refs/heads/<mainline>` exists -> local-only workflow;
+      - none at all -> FAIL LOUD (the branch does not exist under that name).
+    """
+    path = repo.get("path")
+    if not path:
+        _die(
+            f"repo '{name}' has no 'mainline_ref' and no 'path' to probe -- supply one "
+            "of them (a full ref such as 'refs/remotes/<remote>/"
+            f"{mainline}', or the repo path so the ref can be derived)"
+        )
+    if not os.path.isdir(path) or _git(path, "rev-parse", "--git-dir") is None:
+        _die(
+            f"repo '{name}' path {path!r} is not a git repository, so 'mainline_ref' "
+            "cannot be derived -- create/clone the repo first, or supply 'mainline_ref' "
+            "explicitly"
+        )
+
+    remote_refs = _git(path, "for-each-ref", "--format=%(refname)", f"refs/remotes/*/{mainline}")
+    candidates = [r for r in (remote_refs or "").split("\n") if r.strip()]
+    # `refs/remotes/<remote>/HEAD` is a symbolic pointer, not a branch.
+    candidates = [r for r in candidates if not r.endswith("/HEAD")]
+
+    if len(candidates) == 1:
+        return candidates[0]
+    if len(candidates) > 1:
+        remotes = ", ".join(sorted(c.split("/")[2] for c in candidates))
+        _die(
+            f"repo '{name}': branch {mainline!r} exists on MORE THAN ONE remote "
+            f"({remotes}) -- refusing to guess which is canonical. Set 'mainline_ref' "
+            f"explicitly, e.g. \"mainline_ref\": \"{candidates[0]}\". "
+            "This is usually a canonical-org remote alongside a personal fork; pick the "
+            "one work actually lands on."
+        )
+
+    if _git(path, "show-ref", "--verify", "--quiet", f"refs/heads/{mainline}") is not None:
+        return f"refs/heads/{mainline}"
+    _die(
+        f"repo '{name}': no ref matches branch {mainline!r} -- neither "
+        f"refs/remotes/*/{mainline} nor refs/heads/{mainline} exists in {path}. Check the "
+        "mainline branch name (it is NOT always 'main' -- long-lived integration branches "
+        "are common), or fetch the remote first."
+    )
+
+
+def _check_ref_resolves(name, repo, mainline_ref):
+    """WARN (never fatal) when an operator-supplied ref does not resolve today.
+
+    Not fatal: declaring a repo before its first push is legitimate. Loud,
+    because a ref that never resolves corroborates nothing and says nothing --
+    the exact silent failure mode this pass exists to surface.
+    """
+    path = repo.get("path")
+    if not path or not os.path.isdir(path):
+        return
+    if _git(path, "rev-parse", "--git-dir") is None:
+        return
+    if _git(path, "show-ref", "--verify", "--quiet", mainline_ref) is None:
+        print(
+            f"scaffold.sh: WARNING: repo '{name}' mainline_ref={mainline_ref!r} does not "
+            f"resolve in {path} today. Nothing will corroborate against it until it does "
+            "-- and it will fail silently, not loudly. Fetch the remote, push the branch, "
+            "or fix the ref.",
+            file=sys.stderr,
+        )
 
 # --- B2.0b: repos normalization (complete-by-construction mainline_ref) ---
 # REPOS_JSON is a caller-supplied JSON array of repo objects. Downstream
@@ -119,10 +212,23 @@ if "REPOS_JSON" in values:
         repo = dict(repo)
         mainline_ref = repo.get("mainline_ref")
         if mainline_ref is None:
-            # Default for pushed workflows (event-log-grammar.md / B2 design):
-            # fetch `origin/<mainline>` and compare against it.
-            repo["mainline_ref"] = f"refs/remotes/origin/{mainline}"
-            repo.setdefault("fetch_policy", "fetch")
+            # B2.3: NEVER guess `origin`. Assuming the canonical remote is
+            # named `origin` is the silent-failure bug this block exists to
+            # prevent: if the remote is actually called something else, the
+            # configured ref simply never resolves, so auto-close's ancestry
+            # corroboration never fires -- and it never fires QUIETLY. The
+            # campaign looks healthy and corroborates nothing. (Observed on a
+            # 16-repo campaign where 7 repos used `official`, not `origin`.)
+            #
+            # So: probe the real repo and derive the ref from what is actually
+            # there, failing loud on anything ambiguous rather than picking a
+            # winner. Probing is only reached when the operator omitted
+            # `mainline_ref`; an explicit ref is always honoured verbatim.
+            repo["mainline_ref"] = _derive_mainline_ref(name, repo, mainline)
+            repo.setdefault(
+                "fetch_policy",
+                "fetch" if repo["mainline_ref"].startswith("refs/remotes/") else "local-only",
+            )
         elif not isinstance(mainline_ref, str):
             print(
                 f"scaffold.sh: repo '{name}' has a non-string 'mainline_ref' "
@@ -148,6 +254,9 @@ if "REPOS_JSON" in values:
                 "fetch_policy",
                 "fetch" if mainline_ref.startswith("refs/remotes/") else "local-only",
             )
+            # B2.3: honoured verbatim, but say so out loud if it is already
+            # dead on arrival.
+            _check_ref_resolves(name, repo, mainline_ref)
         if repo.get("fetch_policy") not in FETCH_POLICIES:
             print(
                 f"scaffold.sh: repo '{name}' has fetch_policy={repo.get('fetch_policy')!r}, "

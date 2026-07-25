@@ -129,7 +129,15 @@ short.
 ## 5. herdr workspace + tab naming
 
 - **Workspace:** `{{HERDR_WORKSPACE}}` for all campaign work; the manager tab stays
-  `{{CAMPAIGN_SLUG}}-PM`.
+  `{{CAMPAIGN_SLUG}}-PM`. **Prefer the workspace id** (`herdr workspace list` →
+  `workspace_id`) over its label. `herdr`'s CLI resolves `--workspace` by id only; `track`
+  resolves a configured label to an id from the snapshot's `workspaces[]` before spawning, so
+  a label normally works. But that array is not a documented guarantee of the snapshot shape,
+  and when it is absent track falls back to passing the configured value through unchanged —
+  at which point a label fails every spawn (`herdr-tab-create-failed` / `workspace_not_found`)
+  while `reconcile`, which accepts either, keeps looking healthy. An id needs no resolution
+  and so cannot reach that fallback. If spawns start failing that way, re-read the id and
+  update `herdr_workspace` in `.pm/config.json`.
 - **Tab label = the ticket handle:** `i###-<slug>`, short, lowercase. For pure questions use
   the `Q` number: `q003-<slug>`.
 - **One tab ↔ one ticket (or one Q).** Close a ticket's tab when it closes; don't let stale

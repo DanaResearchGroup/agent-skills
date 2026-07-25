@@ -313,16 +313,25 @@ printf '{}' >"${_tr_snapshot_file}"
 # stage's capacity gate). The tabs map STAGE 1 depends on is untouched.
 _tr_panes_file="$(_tr_mktemp "${TMPDIR:-/tmp}/pm-track-panes.XXXXXX")"
 printf '{"panes": [], "live_agents": 0}' >"${_tr_panes_file}"
+# B3 fix: third ADDITIVE output of the same parse -- the configured
+# `herdr_workspace` RESOLVED to a workspace_id. The snapshot filter already
+# accepted a label or an id; the SPAWN stage did not, because it hands the
+# configured value straight to `herdr tab create --workspace`, and herdr's CLI
+# resolves that by id ONLY. A label therefore filtered correctly and then made
+# every spawn fail with workspace_not_found. Resolve once, here, and let the
+# spawn stage use the id.
+_tr_ws_id_file="$(_tr_mktemp "${TMPDIR:-/tmp}/pm-track-wsid.XXXXXX")"
+printf '%s' "${_tr_herdr_workspace}" >"${_tr_ws_id_file}"
 _tr_herdr_ok=0
 
 if command -v herdr >/dev/null 2>&1; then
   _tr_snap_raw="$(_tr_mktemp "${TMPDIR:-/tmp}/pm-track-snapshot-raw.XXXXXX")"
   if herdr api snapshot >"${_tr_snap_raw}" 2>/dev/null; then
-    if python3 - "${_tr_snap_raw}" "${_tr_snapshot_file}" "${_tr_herdr_workspace}" "${_tr_panes_file}" <<'PYEOF'
+    if python3 - "${_tr_snap_raw}" "${_tr_snapshot_file}" "${_tr_herdr_workspace}" "${_tr_panes_file}" "${_tr_ws_id_file}" <<'PYEOF'
 import json
 import sys
 
-raw_path, out_path, herdr_workspace, panes_out_path = sys.argv[1:5]
+raw_path, out_path, herdr_workspace, panes_out_path, ws_id_out_path = sys.argv[1:6]
 tabs = {}
 panes_out = {"panes": [], "live_agents": 0}
 
@@ -345,6 +354,7 @@ try:
     # (matching `tab list`/`workspace list`'s shapes) or bare top-level keys.
     # Any tab missing tab_id is skipped; agent_status/label/workspace_id are
     # read as-is (None if absent).
+    resolved_ws_id = herdr_workspace
     result = data.get("result", data) if isinstance(data, dict) else {}
     raw_tabs = result.get("tabs", []) if isinstance(result, dict) else []
     raw_workspaces = result.get("workspaces", []) if isinstance(result, dict) else []
@@ -364,6 +374,7 @@ try:
                 break
     if ws_id is None:
         ws_id = herdr_workspace
+    resolved_ws_id = ws_id
 
     if isinstance(raw_tabs, list):
         for t in raw_tabs:
@@ -433,14 +444,21 @@ try:
 except Exception:
     tabs = {}
     panes_out = {"panes": [], "live_agents": 0}
+    resolved_ws_id = herdr_workspace
 
 with open(out_path, "w") as f:
     json.dump(tabs, f)
 with open(panes_out_path, "w") as f:
     json.dump(panes_out, f)
+# Never empty: falls back to the configured value, which is what the spawn
+# stage used before this resolution existed.
+with open(ws_id_out_path, "w") as f:
+    f.write(resolved_ws_id or herdr_workspace or "")
 PYEOF
     then
       _tr_herdr_ok=1
+      _tr_herdr_workspace_id="$(cat "${_tr_ws_id_file}" 2>/dev/null || true)"
+      [[ -n "${_tr_herdr_workspace_id}" ]] || _tr_herdr_workspace_id="${_tr_herdr_workspace}"
     fi
   fi
 fi

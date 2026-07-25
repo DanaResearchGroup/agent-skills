@@ -5,6 +5,12 @@ on:
     branches: [main]
   pull_request:
 
+# A new push to a PR makes the in-flight run pointless; the suites are minutes
+# long, so cancel rather than queue.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   skill-lint:
     name: Skill lint
@@ -16,3 +22,54 @@ jobs:
           python-version: "3.x"
       - name: Lint skills
         run: python3 bin/lint-skills.py
+
+  # Discover which skills ship tests, so adding a suite to a new skill never
+  # requires editing this workflow. The convention is one file: `test/ci.sh` at
+  # the skill root, exiting 0 only when everything passed.
+  discover-tests:
+    name: Discover skill test suites
+    runs-on: ubuntu-latest
+    outputs:
+      skills: ${{ steps.find.outputs.skills }}
+      any: ${{ steps.find.outputs.any }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: find
+        name: Find skills with a test/ci.sh
+        run: |
+          set -euo pipefail
+          # One convention, one glob: <skill>/test/ci.sh. Sorted for a stable
+          # matrix order; dotdirs excluded so .github never matches.
+          mapfile -t found < <(find . -type f -path './*/test/ci.sh' -not -path './.*' \
+            | sed 's|^\./||; s|/test/ci\.sh$||' | sort)
+          printf 'found %d skill(s) with tests: %s\n' "${#found[@]}" "${found[*]-none}"
+          if [ "${#found[@]}" -eq 0 ]; then
+            echo 'any=false' >>"$GITHUB_OUTPUT"
+            echo 'skills=[]' >>"$GITHUB_OUTPUT"
+          else
+            echo 'any=true' >>"$GITHUB_OUTPUT"
+            printf 'skills=%s\n' "$(printf '%s\n' "${found[@]}" | jq -R . | jq -sc .)" >>"$GITHUB_OUTPUT"
+          fi
+
+  skill-tests:
+    name: "Tests: ${{ matrix.skill }}"
+    needs: discover-tests
+    if: needs.discover-tests.outputs.any == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        skill: ${{ fromJSON(needs.discover-tests.outputs.skills) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Show tool versions
+        run: |
+          bash --version | head -1
+          python3 --version
+          git --version
+      - name: Run ${{ matrix.skill }} test suites
+        run: bash "${{ matrix.skill }}/test/ci.sh"

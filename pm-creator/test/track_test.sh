@@ -4324,6 +4324,52 @@ section_ac_marker_via_not_descendant
 # ---------------------------------------------------------------------------
 # B3 auto-spawn: helpers + sections
 # ---------------------------------------------------------------------------
+# 30b. B3 fix: a herdr_workspace LABEL is resolved to a workspace_id before it
+# reaches `herdr tab create --workspace`.
+#
+# herdr's CLI resolves --workspace by ID ONLY -- `--workspace <label>` returns
+# workspace_not_found. The snapshot filter has always accepted either, so a
+# configured label filtered correctly and then made EVERY spawn fail. The
+# resolution now happens once, in the shared snapshot parse.
+# ---------------------------------------------------------------------------
+section_spawn_workspace_label_resolves_to_id() {
+  local repo call_log snapshot
+  repo="$(new_tmp_repo_spawn true 2 1)"
+  # Reconfigure with the human-readable LABEL rather than the id.
+  REPO="$repo" python3 - <<'RECONF'
+import json, os
+p = os.path.join(os.environ["REPO"], ".pm", "config.json")
+cfg = json.load(open(p))
+cfg["herdr_workspace"] = "zzz-test-label"
+json.dump(cfg, open(p, "w"))
+RECONF
+  seed_automation_dispatch "$repo" D-001 I-001 widget
+  call_log="$(mktemp "${TMPDIR:-/tmp}/pm-creator-spawn-calls.XXXXXX")"
+
+  # Snapshot carries the label -> id mapping, and the panes/agents live under
+  # the ID (which is how herdr actually reports them).
+  snapshot='{"result": {"tabs": [], "panes": [], "agents": [],
+    "workspaces": [{"label": "zzz-test-label", "workspace_id": "zzz-test-ws"}]}}'
+
+  HERDR_CALL_LOG="$call_log" run_track "$repo" "$snapshot"
+
+  assert_eq "spawn ws-label: exit 0" "0" "$TR_RC"
+  assert_eq "spawn ws-label: tab create used the resolved ID, not the label" \
+    "tab create --workspace zzz-test-ws --label i001-widget --no-focus" \
+    "$(sed -n '1p' "$call_log")"
+  assert_contains "spawn ws-label: agent start also used the resolved ID" \
+    "$(sed -n '2p' "$call_log")" "--workspace zzz-test-ws"
+  # The whole point: the label must never reach herdr.
+  if grep -q -- "--workspace zzz-test-label" "$call_log"; then
+    fail "spawn ws-label: the raw label never reaches a herdr call" "$(cat "$call_log")"
+  else
+    ok "spawn ws-label: the raw label never reaches a herdr call"
+  fi
+  assert_eq "spawn ws-label: same-tick ACK still recorded" \
+    "ACKED" "$(sp_idx "$repo" "d['dispatches']['D-001']['state']")"
+}
+
+# ---------------------------------------------------------------------------
 
 sp_idx() {
   # sp_idx <repo> <python-expr over d(=index)>
@@ -5216,6 +5262,8 @@ section_spawn_herdr_unavailable() {
 
 echo "== 30. B3: happy-path auto-spawn (intent -> tab -> start -> same-tick ACK) =="
 section_spawn_happy_path
+echo "== 30b. B3 fix: herdr_workspace label resolves to an id before spawn =="
+section_spawn_workspace_label_resolves_to_id
 echo "== 31. B3: auto_spawn disabled -> steady count, zero spawns =="
 section_spawn_disabled_steady
 echo "== 32. B3: capacity at/over -> steady count, zero spawns =="
