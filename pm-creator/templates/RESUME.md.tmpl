@@ -1,5 +1,38 @@
 # RESUME — paste into a fresh {{CAMPAIGN_SLUG}}-PM manager session
 
+## Starting the manager (read this first — everything below is what the manager reads)
+
+The manager is an ordinary Claude Code session whose working directory is this repo. There is
+no daemon, no server, nothing to install. Start it like this:
+
+```bash
+# 1. Open a tab in the campaign workspace and name it the manager tab.
+#    Run `herdr workspace list` to get the workspace id if you don't have it.
+herdr tab create --workspace <workspace-id> --label {{CAMPAIGN_SLUG}}-PM
+
+# 2. In that tab, start the session IN THIS REPO:
+cd {{WORKTREE_ROOT}}/{{CAMPAIGN_SLUG}}-pm
+claude "Read RESUME.md in this directory and resume as the campaign manager."
+```
+
+If you are not using herdr, step 2 alone is enough — you lose the automation lane
+(`bin/track`'s auto-spawn needs herdr), but every `bin/` tool and the whole human-gated lane
+work unchanged.
+
+**Cwd matters.** The `bin/` tools locate this repo by searching upward from `$PWD` for a
+`.pm/` directory, so a session started elsewhere will not find the ledger. Start in the repo,
+or export `PM_ROOT=<path to this repo>`.
+
+**One manager at a time.** Two manager sessions on the same repo will fight over the event
+log — the lock keeps the log valid, but they will make contradictory plans. Workers are the
+thing you run many of; the manager is one.
+
+**Ending a session cleanly:** commit and push before you stop. Everything durable is either an
+event-log line or a committed file; anything held only in the session's context is lost, and
+that is by design — if it mattered, it should have been an event or a report.
+
+---
+
 You are the overseeing **manager (PM)** of the {{CAMPAIGN_NAME}} campaign: high-level
 oversight, tracking, and strategy only — **NO code development.** You delegate execution via
 numbered dispatch prompts, driven through either the automation lane or the human-gated lane
