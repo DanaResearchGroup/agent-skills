@@ -970,6 +970,38 @@ section_automation_json_explicit() {
     || fail "automation explicit: supplied keys render; auto_close still defaults false" "got [$got]"
 }
 
+# Verifier contract (narrative/template-level): the scaffolded repo must
+# carry the per-issue Verifier / Approval-gates fields, the worker-return
+# structure (Completed / Verification / Remaining Work), and the VERIFY
+# pointer at the declared verifier. Markdown-only -- never parsed for state.
+section_verifier_contract_renders() {
+  _automation_scaffold vc1 \
+    || { fail "verifier contract: scaffold succeeds" "$(cat "$WORK/svc1.err")"; return; }
+  ok "verifier contract: scaffold succeeds"
+  local out="$WORK/out-vc1"
+  grep -q "Verifier:" "$out/LEDGER.md" \
+    && ok "verifier contract: LEDGER.md carries the Verifier: issue field" \
+    || fail "verifier contract: LEDGER.md carries the Verifier: issue field" "missing"
+  grep -q "Approval gates:" "$out/LEDGER.md" \
+    && ok "verifier contract: LEDGER.md carries the Approval gates: issue field" \
+    || fail "verifier contract: LEDGER.md carries the Approval gates: issue field" "missing"
+  grep -q "command, check, or artifact that proves" "$out/LEDGER.md" \
+    && ok "verifier contract: LEDGER.md explains what a verifier is" \
+    || fail "verifier contract: LEDGER.md explains what a verifier is" "missing"
+  grep -q "Completed / Verification / Remaining Work" "$out/CONVENTIONS.md" \
+    && ok "verifier contract: CONVENTIONS.md documents the worker-return structure" \
+    || fail "verifier contract: CONVENTIONS.md documents the worker-return structure" "missing"
+  grep -qi "verifier contract" "$out/CONVENTIONS.md" \
+    && ok "verifier contract: CONVENTIONS.md documents the contract itself" \
+    || fail "verifier contract: CONVENTIONS.md documents the contract itself" "missing"
+  grep -q "declared verifier" "$out/TRACKER.md" \
+    && ok "verifier contract: TRACKER.md points VERIFY at the declared verifier" \
+    || fail "verifier contract: TRACKER.md points VERIFY at the declared verifier" "missing"
+  grep -q "declared verifier" "$out/CONVENTIONS.md" \
+    && ok "verifier contract: CONVENTIONS.md prompt flow carries the declared verifier" \
+    || fail "verifier contract: CONVENTIONS.md prompt flow carries the declared verifier" "missing"
+}
+
 # B3 fix P3-13: scaffold/track validation parity -- a config that track's
 # runtime verdict would fail-closed refuse must not scaffold as valid.
 section_automation_auto_spawn_requires_argv() {
@@ -1247,6 +1279,8 @@ echo "== B3: automation keys default (auto_spawn/max_live_workers/spawn_ack_time
 section_automation_defaults
 echo "== B3: explicit AUTOMATION_JSON normalizes + renders =="
 section_automation_json_explicit
+echo "== verifier contract renders in the scaffolded narrative surfaces =="
+section_verifier_contract_renders
 echo "== B3 fix: auto_spawn=true requires a complete spawn_argv (track parity) =="
 section_automation_auto_spawn_requires_argv
 echo "== B3: bad automation.auto_spawn type fails loud =="

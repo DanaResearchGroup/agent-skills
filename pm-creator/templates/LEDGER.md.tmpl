@@ -16,7 +16,15 @@ Mainlines: {{REPO_LIST}}.
 ## Open
 
 (file the first issue here as `### I-001 [<repo>] · OPEN — <title>` and append an
-`issue_state` event with `bin/` — see CONVENTIONS §9)
+`issue_state` event with `bin/` — see CONVENTIONS §9. Every issue declares up front:
+
+- `Verifier:` — the concrete command, check, or artifact that proves it's done
+  (e.g. a test command + expected outcome, a reproducible build, a rendered artifact).
+- `Approval gates:` — the actions on this issue that require explicit user approval
+  (merges, pushes, deletions, anything listed in the always-human gates).
+
+Both are devised WITH the user, carried into every dispatch prompt, answered by the
+worker's Verification section, and checked at human VERIFY — see CONVENTIONS §4.)
 
 ## Closed / history
 

@@ -49,10 +49,21 @@ short.
   bypass; it does not pretend to prevent it.
 - **Always-human gates (both lanes):** merges to shared/mainline branches, pushes/uploads,
   and any `NEEDS-USER` item NEVER auto-execute.
-- **Result contract** — every dispatched worker returns: PASS/FAIL · dispatch id · touched
-  files · commit SHAs/branches · tests run + outcome · did-it-change-product-code ·
-  escalated findings · user-action-required. This is a disciplined intake + audit trail,
-  corroborated by `reconcile`'s independent git read — NOT a security guarantee.
+- **Verifier contract** — every issue declares, at grill/issue creation and WITH the user:
+  its **Verifier** (the concrete command, check, or artifact that proves it's done) and its
+  **Approval gates** (the actions requiring explicit user approval). Both live on the
+  `LEDGER.md` issue, are carried — grounded per §8, never as a ticket number — into every
+  dispatch prompt for that issue, are answered by the worker's Verification section, and are
+  what the human VERIFY step checks: verification means running/inspecting the pre-agreed
+  verifier, not re-deriving from scratch what would prove the work.
+- **Result contract (verification-first)** — every dispatched worker structures its return
+  as three sections: **Completed** (what was done: touched files, commit SHAs/branches,
+  did-it-change-product-code) · **Verification** (the declared verifier from the prompt,
+  run/produced, with its outcome — PASS/FAIL; "could not run it" is said plainly, never
+  papered over) · **Remaining Work** (anything undone, blocked, escalated, or
+  user-action-required), plus the dispatch id as the report-back label. This is a
+  disciplined intake + audit trail, corroborated by `reconcile`'s independent git read —
+  NOT a security guarantee.
 - **`bin/track --once`** — a manager-triggered stateless reconciliation tick. It takes one
   fresh `herdr api snapshot`, and for every `ACKED` dispatch whose recorded tab now shows
   `done`, checks the worker's branch tip against git: fully corroborated cases are
@@ -169,10 +180,15 @@ scope — the exact miscommunication this repo exists to prevent.
 
 ## 9. Request flow
 
-1. File/update the ticket (`LEDGER.md`) and append the state event to the log.
+1. File/update the ticket (`LEDGER.md`) — including its `Verifier:` and `Approval gates:`
+   fields (§4) — and append the state event to the log.
 2. Write a self-contained prompt file `prompts/<ticket>_<slug>_YYYY-MM-DD.md` with an
    operator-facing header (Ticket, Target repo + worktree, herdr workspace + tab, Model,
-   Effort, Deliverable, Report-back format) and a self-contained body (§8).
+   Effort, Deliverable, Report-back format) and a self-contained body (§8). The body MUST
+   carry the issue's declared verifier and approval gates — grounded per §8 (commands,
+   paths, SHAs; never a ticket number) — and MUST instruct the worker to structure its
+   return as **Completed / Verification / Remaining Work**, with Verification answering
+   the declared verifier (§4).
 3. For persistent work orders, append a pointer to the target repo's `REQUESTS.md`.
 4. Dispatch via the chosen lane; record the `dispatch_state` event.
 5. Results return through the lane; record the result + verify; update the ticket.

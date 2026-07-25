@@ -36,6 +36,11 @@ a glossary. Extract every value the templates need:
 - capacity profile (hardware, parallelism ceiling) → `MACHINE.md`
 - the campaign's path (its through-line/end state), high-level milestones, and an initial
   workplan — devise these WITH the user, not for them; seeds `STRATEGY.md`
+- per-issue **verifiers** and **approval gates** for the initial issues (and as the standing
+  habit for every issue filed later): a verifier is the concrete command, check, or artifact
+  that proves the issue is done; approval gates are the actions that require explicit user
+  approval — devise these WITH the user, not for them; they live on each `LEDGER.md` issue
+  and are carried into every dispatch prompt (`CONVENTIONS.md` §4/§9)
 - remote policy for THIS PM repo: local-only, or a **private** GitHub repo
 - per-repo upload policy + always-human gates (merges to shared branches, pushes, NEEDS-USER)
 - which optional slots are active: `RUNS.md` (long jobs), `MACHINE.md` (heavy compute)

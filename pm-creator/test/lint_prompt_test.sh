@@ -102,6 +102,16 @@ section_no_marker() {
     "no 'paste below this line' marker found"
 }
 
+# Verifier-contract regression: a prompt body carrying the declared
+# verifier, approval gates, and the Completed / Verification / Remaining
+# Work return structure (CONVENTIONS §8-9) must lint clean -- the contract
+# phrasing itself must never trip the leak checks. Only the dispatch's own
+# id may appear, as the report-back label.
+section_verifier_contract_shape() {
+  local f="${FIXTURES}/lint_prompt_verifier_contract.md"
+  assert_exit "verifier-contract prompt: exit 0 (contract phrasing lints clean)" 0 "$f"
+}
+
 section_usage() {
   if "$LINT_PROMPT" >/dev/null 2>&1; then
     fail "usage: no args exits non-zero" "unexpectedly succeeded"
@@ -127,6 +137,8 @@ echo "== no marker found =="
 section_no_marker
 echo "== usage errors =="
 section_usage
+echo "== verifier-contract prompt shape lints clean =="
+section_verifier_contract_shape
 
 echo
 echo "-----------------------------------------"

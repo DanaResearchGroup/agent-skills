@@ -5,7 +5,11 @@
 strict git-corroboration predicate: fully corroborated tabs are auto-recorded as `RETURNED`
 (intake only — never auto-verified); everything else is surfaced below with the reason it was
 NOT auto-recorded, so the operator can act. Working/blocked tabs are not evaluated and do not
-appear here.
+appear here. When you VERIFY a `RETURNED` dispatch, check the issue's **declared verifier**
+(the `Verifier:` field on its `LEDGER.md` entry, answered by the worker's
+Verification section) rather than re-deriving what would prove the work — see
+`CONVENTIONS.md` §4. This is narrative guidance only: the rows below are rendered from the
+fold and carry no verifier state.
 
 The same tick also runs the auto-close pass (config-gated on `automation.auto_close`, default
 OFF): an issue closes only when it passes the human-state gates (VERIFIED dispatch, no open
