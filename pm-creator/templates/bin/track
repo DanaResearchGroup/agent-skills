@@ -356,6 +356,21 @@ try:
     # read as-is (None if absent).
     resolved_ws_id = herdr_workspace
     result = data.get("result", data) if isinstance(data, dict) else {}
+    # REAL `herdr api snapshot` nests every array ONE LEVEL DEEPER, under
+    # `result.snapshot` -- unlike `tab list`/`workspace list`, which put them
+    # at `result` directly. Reading only the shallow level made this whole
+    # parse silently yield nothing on a live box (0 tabs / 0 panes / 0
+    # agents), which degrades rather than errors: every ACKED dispatch reads
+    # as tab-unknown and surfaces instead of auto-recording, the capacity
+    # gate sees 0 live agents, and the orphan-intent pane-name recovery join
+    # never matches. Descend only when the shallow level plainly is not the
+    # container, so every existing (shallow) shape keeps working untouched.
+    if (
+        isinstance(result, dict)
+        and not any(k in result for k in ("tabs", "panes", "agents"))
+        and isinstance(result.get("snapshot"), dict)
+    ):
+        result = result["snapshot"]
     raw_tabs = result.get("tabs", []) if isinstance(result, dict) else []
     raw_workspaces = result.get("workspaces", []) if isinstance(result, dict) else []
 

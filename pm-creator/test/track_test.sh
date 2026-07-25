@@ -4370,6 +4370,96 @@ RECONF
 }
 
 # ---------------------------------------------------------------------------
+# 30c. The REAL `herdr api snapshot` shape: every array nests ONE LEVEL DEEPER,
+# under `result.snapshot` -- unlike `tab list`/`workspace list`, whose arrays
+# sit at `result` directly. Every mock in this file used the shallow shape, so
+# nothing caught that tabs[] and workspaces[] were read at the wrong level and
+# came back EMPTY against a live herdr. That degrades instead of erroring:
+# STAGE 1 reads every ACKED tab as unknown and surfaces rather than
+# auto-recording, and a configured workspace label never resolves.
+#
+# Shape captured from a live herdr on 2026-07-25:
+#   {"id":..,"result":{"type":"snapshot","snapshot":{
+#      "tabs":[..],"panes":[..],"agents":[..],"workspaces":[..]}}}
+#
+# (panes[]/agents[] were already read through a containers walk that tolerated
+# both levels; tabs[]/workspaces[] were not. These tests pin both.)
+# ---------------------------------------------------------------------------
+nested_snapshot_json() {
+  # nested_snapshot_json <tabs_json> [<panes_json>] [<agents_json>] [<workspaces_json>]
+  printf '{"id": "cli:api:snapshot", "result": {"type": "snapshot", "snapshot": {"tabs": %s, "panes": %s, "agents": %s, "workspaces": %s}}}' \
+    "$1" "${2:-[]}" "${3:-[]}" "${4:-[]}"
+}
+
+section_nested_snapshot_tabs_are_seen() {
+  # STAGE 1 against the real shape: a `done` tab must still be SEEN, so the
+  # dispatch auto-records RETURNED instead of surfacing as status-unknown.
+  local repo tip state base_sha gitrepo
+  repo="$(new_tmp_repo_with_git)"
+  gitrepo="$repo/target-repo"
+  base_sha="$(git -C "$gitrepo" rev-parse HEAD)"
+
+  git_or_die "nested-tabs: branch i902-widget" -C "$gitrepo" branch i902-widget
+  git_or_die "nested-tabs: worktree add wt-902" -C "$gitrepo" worktree add -q "$repo/wt-902" i902-widget
+  (
+    set -e
+    cd "$repo/wt-902" || exit 1
+    printf 'more\n' >>README.md
+    git add README.md
+    git commit -q -m 'widget work'
+  ) >&2 || { echo "FATAL: fixture git setup failed (nested-tabs)" >&2; exit 1; }
+  tip="$(git -C "$repo/wt-902" rev-parse HEAD)"
+
+  seed_acked_dispatch "$repo" D-902 I-902 zzz-test-tab-902 i902-widget "$base_sha"
+
+  run_track "$repo" "$(nested_snapshot_json \
+    '[{"tab_id": "zzz-test-tab-902", "agent_status": "done", "label": "i902-widget", "workspace_id": "zzz-test-ws"}]')"
+
+  assert_eq "nested snapshot: exit 0" "0" "$TR_RC"
+  state="$(python3 -c "
+import json
+print(json.load(open('$repo/.pm/index.json'))['dispatches']['D-902']['state'])
+" 2>/dev/null)"
+  assert_eq "nested snapshot: tabs[] at result.snapshot was SEEN -> auto-recorded RETURNED" \
+    "RETURNED" "$state"
+  assert_eq "nested snapshot: result_sha == branch tip" "$tip" "$(python3 -c "
+import json
+print(json.load(open('$repo/.pm/index.json'))['dispatches']['D-902'].get('result_sha',''))
+" 2>/dev/null)"
+}
+
+section_nested_snapshot_workspace_resolves() {
+  # workspaces[] is reachable ONLY by descending, so a resolved id here proves
+  # the descent happened.
+  local repo call_log snapshot
+  repo="$(new_tmp_repo_spawn true 2 1)"
+  REPO="$repo" python3 - <<'RECONF'
+import json, os
+p = os.path.join(os.environ["REPO"], ".pm", "config.json")
+cfg = json.load(open(p))
+cfg["herdr_workspace"] = "zzz-test-label"
+json.dump(cfg, open(p, "w"))
+RECONF
+  seed_automation_dispatch "$repo" D-001 I-001 widget
+  call_log="$(mktemp "${TMPDIR:-/tmp}/pm-creator-spawn-calls.XXXXXX")"
+
+  snapshot="$(nested_snapshot_json '[]' '[]' '[]' \
+    '[{"label": "zzz-test-label", "workspace_id": "zzz-test-ws"}]')"
+
+  HERDR_CALL_LOG="$call_log" run_track "$repo" "$snapshot"
+
+  assert_eq "nested workspaces: exit 0" "0" "$TR_RC"
+  assert_eq "nested workspaces: label resolved to id from result.snapshot.workspaces" \
+    "tab create --workspace zzz-test-ws --label i001-widget --no-focus" \
+    "$(sed -n '1p' "$call_log")"
+  if grep -q -- "--workspace zzz-test-label" "$call_log"; then
+    fail "nested workspaces: unresolved label never reaches herdr" "$(cat "$call_log")"
+  else
+    ok "nested workspaces: unresolved label never reaches herdr"
+  fi
+}
+
+# ---------------------------------------------------------------------------
 
 sp_idx() {
   # sp_idx <repo> <python-expr over d(=index)>
@@ -5264,6 +5354,9 @@ echo "== 30. B3: happy-path auto-spawn (intent -> tab -> start -> same-tick ACK)
 section_spawn_happy_path
 echo "== 30b. B3 fix: herdr_workspace label resolves to an id before spawn =="
 section_spawn_workspace_label_resolves_to_id
+echo "== 30c. real herdr api snapshot shape (arrays nested under result.snapshot) =="
+section_nested_snapshot_tabs_are_seen
+section_nested_snapshot_workspace_resolves
 echo "== 31. B3: auto_spawn disabled -> steady count, zero spawns =="
 section_spawn_disabled_steady
 echo "== 32. B3: capacity at/over -> steady count, zero spawns =="
