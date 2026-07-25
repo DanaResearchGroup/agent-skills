@@ -111,6 +111,31 @@ SECRET_PATTERNS = [
      re.compile(r"(?:ghp_|gho_|ghs_|ghu_|github_pat_|xox[baprs]-|sk-ant-|AIza|glpat-)[A-Za-z0-9_-]{8,}")),
 ]
 
+
+def _is_path_shaped(blob):
+    """True when a 'long hex/base64 blob' match is really a filesystem path.
+
+    The blob pattern's char class includes `/`, so an ordinary absolute path
+    like `home/alon/Code/ARC/arc/job/adapters/ts/linear` matches as 45
+    unbroken "blob" characters and warns. That is the single most common
+    thing a well-formed prompt contains -- CONVENTIONS §8 rule 4 requires
+    grounding every reference in absolute paths -- so the warning fired on
+    almost every compliant prompt and trained the operator to skim past
+    lint-prompt output, which is how a real leak gets waved through.
+
+    Suppress ONLY when the slashes are what created the length: three or
+    more `/`-delimited segments, none of which is long enough (>= 32) to
+    have tripped the pattern on its own. A leaked base64 secret with one
+    stray `/` still has a 32+ run, or too few segments, and still warns.
+    """
+    if "/" not in blob:
+        return False
+    segments = [s for s in blob.split("/") if s]
+    if len(segments) < 3:
+        return False
+    return all(len(s) < 32 for s in segments)
+
+
 report_cite_exception_used = False
 
 for line, lineno in zip(region, region_line_nos):
@@ -136,6 +161,8 @@ for line, lineno in zip(region, region_line_nos):
     # secret-shapes (WARN)
     for name, pat in SECRET_PATTERNS:
         for m in pat.finditer(line):
+            if name == "long hex/base64 blob" and _is_path_shaped(m.group(0)):
+                continue
             warnings.append((lineno, "WARN", f"possible secret ({name}): {m.group(0)}"))
 
 for lineno, level, msg in sorted(errors + warnings, key=lambda t: t[0]):
