@@ -507,6 +507,13 @@ section_multiline_survivor() {
 #    {name, path, mainline} shape (no mainline_ref/fetch_policy at all) must
 #    have scaffold DERIVE the full mainline_ref + a default fetch_policy --
 #    config must be complete-by-construction, not pass-through.
+#
+#    B2.3 changed WHAT is derived, not WHETHER: the derivation now probes the
+#    repo instead of assuming a remote named `origin`. `demo8` has no remotes,
+#    so the correct derivation is the local-only pair. (This assertion used to
+#    expect refs/remotes/origin/main -- i.e. it encoded the very guess that
+#    made auto-close silently never fire on repos whose remote is called
+#    something else. See the B2.3 sections below.)
 # ---------------------------------------------------------------------------
 section_repos_derive_default() {
   local demo values out
@@ -535,11 +542,11 @@ PY
   local mainline_ref fetch_policy
   mainline_ref="$(python3 -c "import json; print(json.load(open('$out/.pm/config.json'))['repos'][0]['mainline_ref'])" 2>/dev/null)"
   fetch_policy="$(python3 -c "import json; print(json.load(open('$out/.pm/config.json'))['repos'][0]['fetch_policy'])" 2>/dev/null)"
-  [[ "$mainline_ref" == "refs/remotes/origin/main" ]] && \
-    ok "config.json repos[0].mainline_ref derived as refs/remotes/origin/main when absent" \
-    || fail "config.json repos[0].mainline_ref derived as refs/remotes/origin/main when absent" "got [$mainline_ref]"
-  [[ "$fetch_policy" == "fetch" ]] && ok "config.json repos[0].fetch_policy defaults to fetch when absent" \
-    || fail "config.json repos[0].fetch_policy defaults to fetch when absent" "got [$fetch_policy]"
+  [[ "$mainline_ref" == "refs/heads/main" ]] && \
+    ok "config.json repos[0].mainline_ref derived by PROBING (remoteless demo -> refs/heads/main)" \
+    || fail "config.json repos[0].mainline_ref derived by PROBING (remoteless demo -> refs/heads/main)" "got [$mainline_ref]"
+  [[ "$fetch_policy" == "local-only" ]] && ok "config.json repos[0].fetch_policy follows the probed ref shape" \
+    || fail "config.json repos[0].fetch_policy follows the probed ref shape" "got [$fetch_policy]"
 
   python3 -c "import json; json.load(open('$out/.pm/config.json'))" 2>"$WORK/s8.parse.err" \
     && ok "config.json still valid JSON with derived repo fields" \
@@ -1358,8 +1365,211 @@ echo "== round-21: {{...}}-shaped repo field data still trips the broad survivor
 section_repos_field_placeholder_token_still_guarded
 echo "== STRATEGY.md: missing new placeholder key fails loud =="
 section_strategy_missing_key_fails
+# ---------------------------------------------------------------------------
+# B2.3. mainline_ref is DERIVED BY PROBING, never guessed as `origin`.
+#
+# The bug being fixed: scaffold used to default an omitted mainline_ref to
+# `refs/remotes/origin/<mainline>`. When the canonical remote is named
+# anything else (`official`, `upstream`, ...) that ref never resolves, so
+# auto-close's ancestry corroboration never fires -- silently. The campaign
+# looks healthy and corroborates nothing.
+# ---------------------------------------------------------------------------
+
+# Replace values.json's REPOS_JSON in place.
+set_repos_json() {
+  local values="$1"
+  REPOS="$2" python3 - "$values" <<'SETREPOS'
+import json, os, sys
+v = json.load(open(sys.argv[1]))
+v["REPOS_JSON"] = os.environ["REPOS"]
+json.dump(v, open(sys.argv[1], "w"))
+SETREPOS
+}
+
+# Build a one-repo REPOS_JSON with the given extra fields.
+mk_repos_json() {
+  PROBE_PATH="$1" PROBE_MAINLINE="$2" PROBE_REF="${3:-}" python3 - <<'MKREPOS'
+import json, os
+repo = {
+    "name": "demo",
+    "path": os.environ["PROBE_PATH"],
+    "mainline": os.environ["PROBE_MAINLINE"],
+}
+if os.environ.get("PROBE_REF"):
+    repo["mainline_ref"] = os.environ["PROBE_REF"]
+print(json.dumps([repo]))
+MKREPOS
+}
+
+# Echo a config.json field for repos[0].
+repo0_field() {
+  FIELD="$2" python3 - "$1" <<'REPOFIELD'
+import json, os, sys
+print(json.load(open(sys.argv[1]))["repos"][0].get(os.environ["FIELD"], ""))
+REPOFIELD
+}
+
+# A git repo with one empty commit on <branch>.
+mk_git_repo() {
+  local dir="$1" branch="${2:-main}"
+  mkdir -p "$dir"
+  git -C "$dir" init -q -b "$branch"
+  git -C "$dir" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
+}
+
+section_mainline_ref_probed_from_non_origin_remote() {
+  local demo values out bare
+  bare="$WORK/b23-bare.git"
+  git init -q --bare -b main "$bare"
+  demo="$WORK/b23-official"
+  mk_git_repo "$demo"
+  git -C "$demo" remote add official "$bare"
+  git -C "$demo" push -q official main
+
+  values="$WORK/values-b23a.json"
+  write_full_values "$values" "$demo"
+  set_repos_json "$values" "$(mk_repos_json "$demo" main)"
+  out="$WORK/out-b23a"
+
+  if bash "$SCAFFOLD" --values "$values" --out "$out" >/dev/null 2>"$WORK/b23a.err"; then
+    local ref policy
+    ref="$(repo0_field "$out/.pm/config.json" mainline_ref)"
+    policy="$(repo0_field "$out/.pm/config.json" fetch_policy)"
+    [[ "$ref" == "refs/remotes/official/main" ]] \
+      && ok "omitted mainline_ref probes the real remote (official, not origin)" \
+      || fail "omitted mainline_ref probes the real remote (official, not origin)" "got [$ref]"
+    [[ "$ref" != *"/origin/"* ]] \
+      && ok "probed ref never silently assumes 'origin'" \
+      || fail "probed ref never silently assumes 'origin'" "got [$ref]"
+    [[ "$policy" == "fetch" ]] \
+      && ok "probed remote ref implies fetch_policy=fetch" \
+      || fail "probed remote ref implies fetch_policy=fetch" "got [$policy]"
+  else
+    fail "scaffold succeeds when mainline_ref is derived by probing" "$(cat "$WORK/b23a.err")"
+  fi
+}
+
+section_mainline_ref_ambiguous_remote_fails_loud() {
+  local demo values out bare1 bare2
+  bare1="$WORK/b23-bare1.git"
+  bare2="$WORK/b23-bare2.git"
+  git init -q --bare -b main "$bare1"
+  git init -q --bare -b main "$bare2"
+  demo="$WORK/b23-ambiguous"
+  mk_git_repo "$demo"
+  git -C "$demo" remote add official "$bare1"
+  git -C "$demo" push -q official main
+  git -C "$demo" remote add myfork "$bare2"
+  git -C "$demo" push -q myfork main
+
+  values="$WORK/values-b23b.json"
+  write_full_values "$values" "$demo"
+  set_repos_json "$values" "$(mk_repos_json "$demo" main)"
+  out="$WORK/out-b23b"
+
+  if bash "$SCAFFOLD" --values "$values" --out "$out" >/dev/null 2>"$WORK/b23b.err"; then
+    fail "ambiguous mainline_ref (branch on 2 remotes) fails loud" "unexpectedly succeeded"
+  else
+    ok "ambiguous mainline_ref (branch on 2 remotes) fails loud"
+    grep -q "MORE THAN ONE remote" "$WORK/b23b.err" \
+      && ok "ambiguity error says the branch is on more than one remote" \
+      || fail "ambiguity error says the branch is on more than one remote" "$(cat "$WORK/b23b.err")"
+    grep -q "official" "$WORK/b23b.err" && grep -q "myfork" "$WORK/b23b.err" \
+      && ok "ambiguity error names both candidate remotes" \
+      || fail "ambiguity error names both candidate remotes" "$(cat "$WORK/b23b.err")"
+    [[ ! -e "$out" ]] \
+      && ok "ambiguity leaves no published --out behind" \
+      || fail "ambiguity leaves no published --out behind" "$out exists"
+  fi
+}
+
+section_mainline_ref_local_only_probe() {
+  local demo values out
+  demo="$WORK/b23-local"
+  mk_git_repo "$demo"
+
+  values="$WORK/values-b23c.json"
+  write_full_values "$values" "$demo"
+  set_repos_json "$values" "$(mk_repos_json "$demo" main)"
+  out="$WORK/out-b23c"
+
+  if bash "$SCAFFOLD" --values "$values" --out "$out" >/dev/null 2>"$WORK/b23c.err"; then
+    local ref policy
+    ref="$(repo0_field "$out/.pm/config.json" mainline_ref)"
+    policy="$(repo0_field "$out/.pm/config.json" fetch_policy)"
+    [[ "$ref" == "refs/heads/main" ]] \
+      && ok "remoteless repo probes to refs/heads/<mainline>" \
+      || fail "remoteless repo probes to refs/heads/<mainline>" "got [$ref]"
+    [[ "$policy" == "local-only" ]] \
+      && ok "remoteless repo implies fetch_policy=local-only" \
+      || fail "remoteless repo implies fetch_policy=local-only" "got [$policy]"
+  else
+    fail "scaffold succeeds for a remoteless repo" "$(cat "$WORK/b23c.err")"
+  fi
+}
+
+section_mainline_ref_missing_branch_fails_loud() {
+  local demo values out
+  demo="$WORK/b23-nobranch"
+  mk_git_repo "$demo"
+
+  values="$WORK/values-b23d.json"
+  write_full_values "$values" "$demo"
+  # `polymer` exists nowhere -- the RMG-Py-shaped trap, where the mainline is a
+  # long-lived integration branch rather than `main`.
+  set_repos_json "$values" "$(mk_repos_json "$demo" polymer)"
+  out="$WORK/out-b23d"
+
+  if bash "$SCAFFOLD" --values "$values" --out "$out" >/dev/null 2>"$WORK/b23d.err"; then
+    fail "a mainline branch that exists nowhere fails loud" "unexpectedly succeeded"
+  else
+    ok "a mainline branch that exists nowhere fails loud"
+    grep -q "no ref matches branch" "$WORK/b23d.err" \
+      && ok "missing-branch error names the branch and where it looked" \
+      || fail "missing-branch error names the branch and where it looked" "$(cat "$WORK/b23d.err")"
+  fi
+}
+
+section_supplied_unresolvable_ref_warns_but_proceeds() {
+  local demo values out
+  demo="$WORK/b23-warn"
+  mk_git_repo "$demo"
+
+  values="$WORK/values-b23e.json"
+  write_full_values "$values" "$demo"
+  set_repos_json "$values" "$(mk_repos_json "$demo" main refs/remotes/origin/main)"
+  out="$WORK/out-b23e"
+
+  # Declaring a repo before its first push is legitimate, so this must NOT be
+  # fatal -- but it must be loud, because the failure it predicts is silent.
+  if bash "$SCAFFOLD" --values "$values" --out "$out" >/dev/null 2>"$WORK/b23e.err"; then
+    ok "an explicit ref that does not resolve yet is honoured, not fatal"
+    grep -q "WARNING" "$WORK/b23e.err" && grep -q "does not resolve" "$WORK/b23e.err" \
+      && ok "unresolvable explicit ref warns loudly on stderr" \
+      || fail "unresolvable explicit ref warns loudly on stderr" "$(cat "$WORK/b23e.err")"
+    local ref
+    ref="$(repo0_field "$out/.pm/config.json" mainline_ref)"
+    [[ "$ref" == "refs/remotes/origin/main" ]] \
+      && ok "explicit ref is preserved verbatim despite the warning" \
+      || fail "explicit ref is preserved verbatim despite the warning" "got [$ref]"
+  else
+    fail "an explicit ref that does not resolve yet is honoured, not fatal" "$(cat "$WORK/b23e.err")"
+  fi
+}
+
 echo "== I12: un-activated optional slots leave no dangling references =="
 section_optional_slots_inactive_no_dangling_refs
+
+echo "== B2.3: mainline_ref probed from the real remote, never guessed as origin =="
+section_mainline_ref_probed_from_non_origin_remote
+echo "== B2.3: branch on several remotes is ambiguous and fails loud =="
+section_mainline_ref_ambiguous_remote_fails_loud
+echo "== B2.3: remoteless repo probes to a local-only ref =="
+section_mainline_ref_local_only_probe
+echo "== B2.3: a mainline branch that exists nowhere fails loud =="
+section_mainline_ref_missing_branch_fails_loud
+echo "== B2.3: an explicit ref that does not resolve warns but proceeds =="
+section_supplied_unresolvable_ref_warns_but_proceeds
 
 echo
 echo "-----------------------------------------"
