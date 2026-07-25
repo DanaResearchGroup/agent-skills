@@ -69,6 +69,7 @@ v = {
   "REMOTE_POLICY": "local-only",
   "UPLOAD_POLICY": "none (local-only)",
   "CAPACITY_NOTE": "- **Capacity profile:** see `MACHINE.md` (single dev box).",
+  "START_GATE_NOTE": "\n## ⛔ Read this before doing anything else\n\n**Nothing starts without a go.**\n",
   "OPTIONAL_SLOT_NOTE": ", `RUNS.md`, `MACHINE.md`",
   "OPTIONAL_SLOT_ROWS": "| `RUNS.md` | Long-running jobs registry (optional slot) |\n| `MACHINE.md` | Resource/capacity profile (optional slot) |",
   "ALWAYS_HUMAN_GATES": "merges to `main`, any push",
@@ -1262,6 +1263,104 @@ PY
 # placeholders (OPTIONAL_SLOT_NOTE / OPTIONAL_SLOT_ROWS / CAPACITY_NOTE),
 # never hardcoded in a template.
 # ---------------------------------------------------------------------------
+section_start_gate_note_renders_and_is_optional() {
+  # START_GATE_NOTE carries the standing "nothing starts without approval"
+  # rule into RESUME.md, which is what a freshly-compacted manager reads
+  # first. SKILL.md instructs the scaffolder to write that rule; without a
+  # placeholder the only way to obey was to hand-edit the generated repo,
+  # which Step 3 forbids ("materialization is deterministic -- do NOT
+  # hand-interpolate"). Both arms matter: a campaign that wants the gate must
+  # get it, and one that does not must not ship a dangling `{{...}}`.
+  local demo values out
+  demo="$WORK/demo-gate"
+  mkdir -p "$demo"
+  (cd "$demo" && git init -q -b main && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init)
+
+  # --- arm 1: gate ON -> the rule lands in RESUME.md ---
+  values="$WORK/values-gate.json"
+  write_full_values "$values" "$demo"
+  out="$WORK/out-gate-on"
+  if bash "$SCAFFOLD" --values "$values" --out "$out" >/dev/null 2>"$WORK/gate.err"; then
+    ok "start-gate scaffold succeeds"
+  else
+    fail "start-gate scaffold succeeds" "$(cat "$WORK/gate.err")"
+    return
+  fi
+  if grep -q "Read this before doing anything else" "$out/RESUME.md"; then
+    ok "START_GATE_NOTE renders into RESUME.md"
+  else
+    fail "START_GATE_NOTE renders into RESUME.md" "$(head -45 "$out/RESUME.md")"
+  fi
+  # It must sit in the MANAGER's reading, not the operator preamble -- i.e.
+  # after the `---` divider that ends "Starting the manager".
+  local divider_line gate_line
+  divider_line="$(grep -n '^---$' "$out/RESUME.md" | head -1 | cut -d: -f1)"
+  gate_line="$(grep -n 'Read this before doing anything else' "$out/RESUME.md" | head -1 | cut -d: -f1)"
+  if [[ -n "$divider_line" && -n "$gate_line" && "$gate_line" -gt "$divider_line" ]]; then
+    ok "START_GATE_NOTE sits in the manager's own reading, after the operator preamble"
+  else
+    fail "START_GATE_NOTE sits in the manager's own reading, after the operator preamble" \
+      "divider at $divider_line, gate at $gate_line"
+  fi
+
+  # --- arm 1b: a note authored WITHOUT a trailing newline still separates ---
+  # The placeholder sits directly above "You are the overseeing manager...".
+  # SKILL.md tells whoever scaffolds to author this prose freely, so it must
+  # not depend on them remembering a trailing newline: without the blank line
+  # in the template, a note ending mid-paragraph glues the manager intro onto
+  # the gate's last line as one Markdown paragraph.
+  values="$WORK/values-gate-nonl.json"
+  write_full_values "$values" "$demo"
+  python3 - "$values" <<'PY'
+import json, sys
+v = json.load(open(sys.argv[1]))
+v["START_GATE_NOTE"] = "\n## Gate\n\n**Nothing starts without a go.**"  # no trailing \n
+json.dump(v, open(sys.argv[1], "w"))
+PY
+  out="$WORK/out-gate-nonl"
+  if bash "$SCAFFOLD" --values "$values" --out "$out" >/dev/null 2>"$WORK/gate3.err"; then
+    local gate_end_line intro_line
+    gate_end_line="$(grep -n 'Nothing starts without a go' "$out/RESUME.md" | head -1 | cut -d: -f1)"
+    intro_line="$(grep -n 'You are the overseeing' "$out/RESUME.md" | head -1 | cut -d: -f1)"
+    if [[ -n "$gate_end_line" && -n "$intro_line" && "$intro_line" -gt $((gate_end_line + 1)) ]]; then
+      ok "note without trailing newline still separated from the manager intro"
+    else
+      fail "note without trailing newline still separated from the manager intro" \
+        "gate ends line $gate_end_line, intro at line $intro_line (need a blank line between)"
+    fi
+  else
+    fail "no-trailing-newline scaffold succeeds" "$(cat "$WORK/gate3.err")"
+  fi
+
+  # --- arm 2: gate OFF -> no placeholder, no stray heading ---
+  values="$WORK/values-nogate.json"
+  write_full_values "$values" "$demo"
+  python3 - "$values" <<'PY'
+import json, sys
+v = json.load(open(sys.argv[1]))
+v["START_GATE_NOTE"] = ""
+json.dump(v, open(sys.argv[1], "w"))
+PY
+  out="$WORK/out-gate-off"
+  if bash "$SCAFFOLD" --values "$values" --out "$out" >/dev/null 2>"$WORK/gate2.err"; then
+    ok "no-start-gate scaffold succeeds"
+  else
+    fail "no-start-gate scaffold succeeds" "$(cat "$WORK/gate2.err")"
+    return
+  fi
+  if grep -q '{{' "$out/RESUME.md"; then
+    fail "empty START_GATE_NOTE leaves no unrendered placeholder" \
+      "$(grep -n '{{' "$out/RESUME.md")"
+  else
+    ok "empty START_GATE_NOTE leaves no unrendered placeholder"
+  fi
+  if grep -q "Read this before doing anything else" "$out/RESUME.md"; then
+    fail "empty START_GATE_NOTE leaves no stray gate heading" "found the heading"
+  else
+    ok "empty START_GATE_NOTE leaves no stray gate heading"
+  fi
+}
+
 section_optional_slots_inactive_no_dangling_refs() {
   local demo values out
   demo="$WORK/demo-slots"
@@ -1558,6 +1657,7 @@ section_supplied_unresolvable_ref_warns_but_proceeds() {
 }
 
 echo "== I12: un-activated optional slots leave no dangling references =="
+section_start_gate_note_renders_and_is_optional
 section_optional_slots_inactive_no_dangling_refs
 
 echo "== B2.3: mainline_ref probed from the real remote, never guessed as origin =="
