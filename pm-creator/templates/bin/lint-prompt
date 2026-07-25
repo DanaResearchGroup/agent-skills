@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+# lint-prompt — floor check for prompt self-containment (CONVENTIONS.md §8).
+#
+# This is a TEMPLATE file: it is copied verbatim into a generated PM repo's
+# `bin/` directory. Standalone (bash + python3 only, no jq); does not source
+# _lib.sh (no .pm/ state is touched or needed).
+#
+# Usage: bin/lint-prompt <prompt-file.md>
+#
+# A dispatched worker session sees ONLY the text pasted below a
+# "paste below this line" marker in a prompt file — never the repo, never
+# CONVENTIONS.md, never the PM's internal I/Q/R/D-### numbering. This script
+# scans that below-marker region and flags anything that leaks an internal
+# label the worker cannot resolve.
+#
+# ERRORS (exit non-zero):
+#   - bare internal ticket tokens: I-###, Q-###, R-###, D-### — one single
+#     occurrence, on a line containing "report" or "cite", is allowed (the
+#     dispatch citing its own id as a report-back label); every other
+#     occurrence is flagged.
+#   - herdr tab-name shapes: i###-slug, q###-slug
+#   - phrases implying the worker can reach the manager's context:
+#     "the ledger", "the PM", "the manager tracks", "per CONVENTIONS",
+#     "this repo"
+#
+# WARN (does not fail the build):
+#   - secret-shaped strings: AWS-key-like tokens, long hex/base64 blobs,
+#     PEM headers, password=/token= assignments.
+#
+# lint-prompt is necessary-not-sufficient: see the final output line.
+set -euo pipefail
+
+if [[ $# -ne 1 ]]; then
+  echo "usage: lint-prompt <prompt-file.md>" >&2
+  exit 2
+fi
+
+prompt_file="$1"
+
+if [[ ! -f "$prompt_file" ]]; then
+  echo "lint-prompt: no such file: $prompt_file" >&2
+  exit 2
+fi
+
+PROMPT_FILE="$prompt_file" python3 - <<'PYEOF'
+import os
+import re
+import sys
+
+path = os.environ["PROMPT_FILE"]
+with open(path, encoding="utf-8", errors="replace") as f:
+    lines = f.read().splitlines()
+
+MARKER_RE = re.compile(r"paste below this line", re.IGNORECASE)
+
+marker_idx = None
+for i, line in enumerate(lines):
+    if MARKER_RE.search(line):
+        marker_idx = i
+        break
+
+warnings = []
+errors = []
+
+if marker_idx is None:
+    warnings.append((0, "WARN", "no 'paste below this line' marker found; treating whole file as below-marker"))
+    region_start = 0
+else:
+    region_start = marker_idx + 1
+
+region = lines[region_start:]
+# line numbers are 1-based against the original file
+region_line_nos = list(range(region_start + 1, region_start + 1 + len(region)))
+
+TICKET_RE = re.compile(r"\b[IQRD]-[0-9]{3}\b")
+TAB_RE = re.compile(r"\b[iq][0-9]{3}-[a-z0-9-]+\b")
+REPORT_CITE_RE = re.compile(r"report|cite", re.IGNORECASE)
+
+PHRASES = [
+    "the ledger",
+    "the pm",
+    "the manager tracks",
+    "per conventions",
+    "this repo",
+]
+
+# secret-shape patterns (WARN only)
+SECRET_PATTERNS = [
+    ("AWS-key-like token", re.compile(r"AKIA[0-9A-Z]{16}")),
+    ("PEM header", re.compile(r"-----BEGIN [A-Z ]+-----")),
+    # I23: `\bpassword` / `\btoken` never match after `_` (`_` is a \w char,
+    # so e.g. GH_TOKEN=... has no boundary immediately before "TOKEN") --
+    # these two stay as a cheap common-case catch; the key-style pattern
+    # below is what actually covers underscore-prefixed key names.
+    ("password= assignment", re.compile(r"\bpassword\s*=\s*\S+", re.IGNORECASE)),
+    ("token= assignment", re.compile(r"\btoken\s*=\s*\S+", re.IGNORECASE)),
+    ("long hex/base64 blob", re.compile(r"\b[A-Za-z0-9+/]{32,}={0,2}\b")),
+    # I23: key-style assignment/mapping covering both `=` and `:` syntax,
+    # and (unlike \bpassword.../\btoken... above) matching regardless of
+    # what precedes the key name -- so GH_TOKEN=..., api_key: ..., and
+    # AUTH_TOKEN: ... are all caught, not just a bare leading "token"/
+    # "password".
+    ("key-style secret assignment",
+     re.compile(r"(?:token|secret|api[_-]?key|passwd|password)\s*[:=]\s*\S+", re.IGNORECASE)),
+    # I23: known provider token prefixes are unambiguous secret shapes on
+    # their own, independent of any preceding assignment syntax -- and
+    # critically, these must be found even when directly preceded by `_`
+    # (GH_TOKEN=ghp_xxx) where the \b-anchored patterns above cannot see
+    # them, since regex \b never matches immediately after a word char.
+    ("known secret-token prefix",
+     re.compile(r"(?:ghp_|gho_|ghs_|ghu_|github_pat_|xox[baprs]-|sk-ant-|AIza|glpat-)[A-Za-z0-9_-]{8,}")),
+]
+
+report_cite_exception_used = False
+
+for line, lineno in zip(region, region_line_nos):
+    # 1. bare internal ticket tokens
+    for m in TICKET_RE.finditer(line):
+        token = m.group(0)
+        if not report_cite_exception_used and REPORT_CITE_RE.search(line):
+            report_cite_exception_used = True
+            continue
+        errors.append((lineno, "ERROR", f"internal ticket token leaked: {token}"))
+
+    # 2. herdr tab-name shapes
+    for m in TAB_RE.finditer(line):
+        token = m.group(0)
+        errors.append((lineno, "ERROR", f"herdr tab-name leaked: {token}"))
+
+    # 3. manager-context phrases
+    lower = line.lower()
+    for phrase in PHRASES:
+        if phrase in lower:
+            errors.append((lineno, "ERROR", f"manager-context phrase leaked: \"{phrase}\""))
+
+    # secret-shapes (WARN)
+    for name, pat in SECRET_PATTERNS:
+        for m in pat.finditer(line):
+            warnings.append((lineno, "WARN", f"possible secret ({name}): {m.group(0)}"))
+
+for lineno, level, msg in sorted(errors + warnings, key=lambda t: t[0]):
+    print(f"{level} line {lineno}: {msg}")
+
+print(
+    "lint-prompt is necessary-not-sufficient: passing means no leaked tokens "
+    "were found, NOT that the prompt is cold-resolvable."
+)
+
+sys.exit(1 if errors else 0)
+PYEOF

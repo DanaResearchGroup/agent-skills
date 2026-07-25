@@ -1,0 +1,534 @@
+#!/usr/bin/env bash
+# dispatch-prep — human-gated-lane dispatch preparation (CONVENTIONS.md §9,
+# event-log-grammar.md §4.2).
+#
+# This is a TEMPLATE file: it is copied verbatim into a generated PM repo's
+# `bin/` directory and run from that repo's root. Standalone entrypoint that
+# `source`s `_lib.sh` (bash + python3 only, no jq).
+#
+# PHASE A (human-gated lane, the default): this script PREPARES a dispatch —
+# it validates, refuses illegal double-dispatch, records the state
+# transition, and PRINTS the herdr command the operator runs by hand. It
+# never spawns herdr itself.
+#
+# B3 (`--lane automation`): same preparation flow, but the dispatch is
+# minted lane=automation tab=?, the human-authored prompt is COPIED to the
+# durable deterministic path `prompts/I-###_<slug>_YYYY-MM-DD.md` (the
+# archive convention), a `note d=<D> ref=prompts/...` binding is emitted so
+# `track` can re-resolve + re-hash the prompt from the fold, and the manual
+# herdr/paste instructions are SUPPRESSED — `track`'s spawn stage (gated on
+# `automation.auto_spawn`) performs the actual spawn. Prep STILL never
+# spawns anything itself, in either lane.
+#
+# Usage:
+#   bin/dispatch-prep --dispatch D-### --issue I-### --prompt <path> \
+#                      --tab <label> [--repo <name>] [--lane human|automation]
+#
+# What it does, in order:
+#   1. Validates the prompt file exists; hashes its FINALIZED contents into
+#      prompt_sha (sha256, first 8 hex chars — matches the grammar's example
+#      shape, e.g. `ab12cd34`).
+#   2. pm_fold's the event log, then reads the dispatch's current folded
+#      state from .pm/index.json. Refuses (non-zero exit, no events emitted)
+#      unless the dispatch is brand-new, or currently READY, or currently
+#      FAILED (a legal retry) — any other state (DISPATCHED/ACKED/RETURNED/
+#      QUARANTINED/VERIFIED/ABANDONED) means it is already active or
+#      terminal, and a second DISPATCHED transition would violate the
+#      dispatch lifecycle (event-log-grammar.md §4.2).
+#   3. Emits `dispatch_new` (only if this D has never been registered), then
+#      `dispatch_state ... from=<READY|FAILED> to=DISPATCHED lane=human
+#      tab=? prompt_sha=<hash>` under the next attempt number (A-01, or the
+#      prior attempt + 1 on a FAILED retry).
+#   4. Assembles (but does NOT run) the herdr command to spawn the worker
+#      tab, with every interpolated value passed through esc_shell so a
+#      hostile campaign/repo/tab name can't break the printed command.
+#   5. Prints a summary: D, attempt, prompt_sha, tab, and the ready-to-run
+#      command plus a one-line paste instruction.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./_lib.sh
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/_lib.sh"
+
+usage() {
+  cat <<'EOF'
+usage: dispatch-prep --dispatch D-### --issue I-### --prompt <path> --tab <label> [--repo <name>] [--lane human|automation]
+
+Prepares (but does not execute) a dispatch:
+  - validates the prompt file and hashes its contents (prompt_sha)
+  - refuses cross-lane / double dispatch for an already-active or terminal D
+  - emits dispatch_new (if new) and a READY|FAILED -> DISPATCHED transition
+
+--lane human (default): prints the herdr command to run plus a one-line
+  manual instruction. This is the human-gated lane: this script prepares,
+  the operator executes. --tab <label> is required.
+
+--lane automation (B3): mints lane=automation tab=?, copies the prompt to
+  the durable prompts/I-###_<slug>_YYYY-MM-DD.md path, and emits a
+  `note d=<D> ref=prompts/...` binding; the manual herdr instructions are
+  suppressed (bin/track auto-spawns when automation.auto_spawn is true).
+  The prompt filename MUST match I-###_<slug>_YYYY-MM-DD.md and its issue
+  number MUST match --issue. --tab is ignored (the worker tab is created
+  by track at spawn time).
+
+Neither lane ever spawns herdr from this script.
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# arg parsing
+# ---------------------------------------------------------------------------
+
+dispatch_id=""
+issue_id=""
+prompt_path=""
+tab_label=""
+repo_name=""
+lane="human"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --lane)
+      lane="${2:-}"
+      shift 2
+      ;;
+    --dispatch)
+      dispatch_id="${2:-}"
+      shift 2
+      ;;
+    --issue)
+      issue_id="${2:-}"
+      shift 2
+      ;;
+    --prompt)
+      prompt_path="${2:-}"
+      shift 2
+      ;;
+    --tab)
+      tab_label="${2:-}"
+      shift 2
+      ;;
+    --repo)
+      repo_name="${2:-}"
+      shift 2
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "dispatch-prep: unknown argument '$1'" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+case "$lane" in
+  human | automation) ;;
+  *)
+    echo "dispatch-prep: --lane must be 'human' or 'automation' (got '$lane')" >&2
+    usage >&2
+    exit 2
+    ;;
+esac
+
+if [[ -z "$dispatch_id" || -z "$issue_id" || -z "$prompt_path" ]]; then
+  echo "dispatch-prep: --dispatch, --issue, and --prompt are all required" >&2
+  usage >&2
+  exit 2
+fi
+if [[ "$lane" == "human" && -z "$tab_label" ]]; then
+  echo "dispatch-prep: --tab is required for the human lane" >&2
+  usage >&2
+  exit 2
+fi
+
+if [[ ! "$dispatch_id" =~ ^D-[0-9]+$ ]]; then
+  echo "dispatch-prep: --dispatch must look like D-### (got '$dispatch_id')" >&2
+  exit 2
+fi
+if [[ ! "$issue_id" =~ ^I-[0-9]+$ ]]; then
+  echo "dispatch-prep: --issue must look like I-### (got '$issue_id')" >&2
+  exit 2
+fi
+
+if [[ ! -f "$prompt_path" ]]; then
+  echo "dispatch-prep: no such prompt file: $prompt_path" >&2
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# locate the repo root (mirrors _lib.sh's _pm_root search, kept local rather
+# than reaching into that frozen file's underscore-prefixed internals)
+# ---------------------------------------------------------------------------
+
+_find_root() {
+  if [[ -n "${PM_ROOT:-}" ]]; then
+    printf '%s\n' "$PM_ROOT"
+    return 0
+  fi
+  local dir="$PWD"
+  while [[ "$dir" != "/" ]]; do
+    if [[ -d "$dir/.pm" ]]; then
+      printf '%s\n' "$dir"
+      return 0
+    fi
+    dir="$(dirname "$dir")"
+  done
+  echo "dispatch-prep: could not locate .pm/ (searched upward from $PWD; set \$PM_ROOT to override)" >&2
+  return 1
+}
+
+root="$(_find_root)" || exit 1
+config="$root/.pm/config.json"
+log="$root/.pm/events.log"
+index="$root/.pm/index.json"
+
+if [[ ! -f "$config" ]]; then
+  echo "dispatch-prep: missing $config (not a pm-creator repo?)" >&2
+  exit 1
+fi
+if [[ ! -f "$log" ]]; then
+  echo "dispatch-prep: missing $log (not a pm-creator repo?)" >&2
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# prompt filename convention (parsed ONCE; shared by the automation-lane
+# durable copy below and the branch derivation further down):
+# I-###_<slug>_YYYY-MM-DD.md, whose issue number must match --issue.
+# ---------------------------------------------------------------------------
+
+prompt_base="$(basename "$prompt_path")"
+prompt_name_ok=0
+prompt_issue_num=""
+slug=""
+if [[ "$prompt_base" =~ ^I-([0-9]+)_(.+)_[0-9]{4}-[0-9]{2}-[0-9]{2}\.md$ ]]; then
+  prompt_name_ok=1
+  prompt_issue_num="${BASH_REMATCH[1]}"
+  slug="${BASH_REMATCH[2]}"
+fi
+issue_num="${issue_id#I-}"
+
+# ---------------------------------------------------------------------------
+# B3 automation lane: copy the human-authored prompt to the durable
+# deterministic path prompts/<basename> BEFORE hashing/emitting anything —
+# the recorded prompt_sha and the `note` binding must both describe the
+# durable copy that track's spawn stage will re-resolve + re-hash. What is
+# a warn-and-omit on the human lane (unconventional filename, issue
+# mismatch) is a REFUSAL here: the durable path and the worker name both
+# derive from the filename, so a non-conforming prompt cannot be spawned.
+# ---------------------------------------------------------------------------
+
+prompt_rel=""
+if [[ "$lane" == "automation" ]]; then
+  if [[ "$prompt_name_ok" -ne 1 ]]; then
+    echo "dispatch-prep: --lane automation requires the prompt basename to match I-###_<slug>_YYYY-MM-DD.md (got '$prompt_base'). No event was emitted." >&2
+    exit 1
+  fi
+  if [[ "$prompt_issue_num" != "$issue_num" ]]; then
+    echo "dispatch-prep: prompt '$prompt_base' is for I-$prompt_issue_num but --issue is $issue_id. No event was emitted." >&2
+    exit 1
+  fi
+  prompt_rel="prompts/$prompt_base"
+  prompt_dest="$root/$prompt_rel"
+  mkdir -p "$root/prompts"
+  if [[ -e "$prompt_dest" ]] && ! cmp -s "$prompt_path" "$prompt_dest"; then
+    # REFUSE, never overwrite (security P3): a dispatch that already binds
+    # this durable path would be silently bricked by new content -- its
+    # spawn would fail prompt-sha-mismatch forever. The operator must pick
+    # a different slug/date (or deliberately remove the old copy first).
+    echo "dispatch-prep: $prompt_rel already exists with DIFFERENT content; refusing to overwrite (an earlier dispatch may bind it -- overwriting would brick its spawn with a permanent prompt-sha-mismatch). Use a different slug/date, or remove the old copy deliberately. No event was emitted." >&2
+    exit 1
+  fi
+  if [[ "$(cd "$(dirname "$prompt_path")" && pwd)/$prompt_base" != "$(cd "$(dirname "$prompt_dest")" && pwd)/$prompt_base" ]]; then
+    cp "$prompt_path" "$prompt_dest" || {
+      echo "dispatch-prep: failed to copy prompt to $prompt_rel. No event was emitted." >&2
+      exit 1
+    }
+  fi
+  # From here on, the DURABLE copy is the finalized prompt.
+  prompt_path="$prompt_dest"
+fi
+
+herdr_workspace="$(python3 -c "
+import json, sys
+cfg = json.load(open(sys.argv[1]))
+print(cfg.get('herdr_workspace') or '')
+" "$config")"
+
+if [[ -z "$herdr_workspace" ]]; then
+  echo "dispatch-prep: .pm/config.json has no herdr_workspace set" >&2
+  exit 1
+fi
+
+repo_path=""
+repo_mainline=""
+if [[ -n "$repo_name" ]]; then
+  # I6: repos parsing is delegated to pm_config_repos (THE one shared
+  # parser); this step only SELECTS the wanted entry from its normalized
+  # JSON -- no shape tolerance of its own.
+  mapfile -t _repo_info < <(pm_config_repos "$config" | REPO_NAME="$repo_name" python3 -c "
+import json, os, sys
+want = os.environ['REPO_NAME']
+path = ''
+mainline = ''
+for entry in json.load(sys.stdin):
+    if entry['name'] == want:
+        path = entry['path']
+        mainline = entry['mainline'] or ''
+        break
+print(path)
+print(mainline)
+")
+  repo_path="${_repo_info[0]:-}"
+  repo_mainline="${_repo_info[1]:-}"
+  if [[ -z "$repo_path" ]]; then
+    echo "dispatch-prep: warning: repo '$repo_name' not found in .pm/config.json repos; omitting --cwd" >&2
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# git-corroboration metadata (B1.1, optional + schema-additive): when --repo
+# resolved to a config entry, capture base_sha (the repo's mainline HEAD at
+# mint time) and the expected branch (CONVENTIONS.md §7: `i<num>-<slug>`).
+# Each of repo/branch/base_sha is validated LOCALLY here; a failure OMITS
+# just that one field and prints a one-line warning — it must never abort
+# the dispatch (dispatch_state's repo/branch/base_sha are OPTIONAL,
+# event-log-grammar.md §3, and pm_apply would otherwise REFUSE the whole
+# transaction on a malformed value, e.g. one containing a space/newline/`=`).
+# ---------------------------------------------------------------------------
+
+# repo: the config name, but only if it's clean of pm_apply's kv delimiters
+# (space, newline, '=') and any other char outside the safe token charset.
+repo_meta=""
+if [[ -n "$repo_name" && -n "$repo_path" ]]; then
+  if [[ "$repo_name" =~ ^[A-Za-z0-9._:+/@-]+$ ]]; then
+    repo_meta="$repo_name"
+  else
+    echo "dispatch-prep: warning: repo name '$repo_name' contains characters outside the safe token charset; omitting repo" >&2
+  fi
+fi
+
+# base_sha: resolve the repo's mainline HEAD to a single commit SHA. Reject
+# anything that isn't exactly one line of hex (SHA-1 -> 40 chars, SHA-256
+# repos -> 64 chars); a multi-line rev-parse (ambiguous revision) or a
+# non-commit ref must not leak into the log.
+base_sha=""
+if [[ -n "$repo_path" && -z "$repo_mainline" ]]; then
+  echo "dispatch-prep: warning: repo '$repo_name' has no 'mainline' field in .pm/config.json; omitting base_sha" >&2
+elif [[ -n "$repo_path" && -n "$repo_mainline" ]] && git -C "$repo_path" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  resolved="$(git -C "$repo_path" rev-parse --verify --end-of-options "${repo_mainline}^{commit}" 2>/dev/null)" || resolved=""
+  if [[ "$(printf '%s\n' "$resolved" | wc -l)" -eq 1 && "$resolved" =~ ^[0-9a-f]{40}$|^[0-9a-f]{64}$ ]]; then
+    base_sha="$resolved"
+  else
+    echo "dispatch-prep: warning: could not resolve a single commit for base_sha (repo '$repo_name' mainline '$repo_mainline'); omitting base_sha" >&2
+  fi
+fi
+
+# branch: derive `i<num>-<slug>` from the prompt filename, then validate it
+# is a legal git ref name AND that the prompt's leading I-### matches
+# --issue (a mismatch means this is the wrong prompt for this issue).
+branch=""
+if [[ -n "$repo_path" ]]; then
+  if [[ "$prompt_name_ok" -eq 1 ]]; then
+    if [[ "$prompt_issue_num" != "$issue_num" ]]; then
+      echo "dispatch-prep: warning: prompt '$prompt_base' is for I-$prompt_issue_num but --issue is $issue_id; omitting branch" >&2
+    else
+      candidate_branch="i${issue_num}-${slug}"
+      # Double validation (round-10 blocker): check-ref-format passing does
+      # NOT imply the pm event TOKEN charset accepts it (e.g. a comma or
+      # space is git-legal in a branch name but outside
+      # `[A-Za-z0-9._:+/@-]`, which would make pm_apply REFUSE the whole
+      # dispatch). Require BOTH the token charset AND git ref legality
+      # before emitting; on either failure, omit + warn (never abort).
+      _pm_branch_charset_ok=0
+      if printf '%s' "$candidate_branch" | grep -qE '^[A-Za-z0-9._:+/@-]+$'; then
+        _pm_branch_charset_ok=1
+      fi
+      _pm_branch_gitref_ok=0
+      if command -v git >/dev/null 2>&1; then
+        if git check-ref-format --branch "$candidate_branch" >/dev/null 2>&1; then
+          _pm_branch_gitref_ok=1
+        fi
+      else
+        # git binary absent: strict fallback. Must NOT accept names that
+        # git itself would reject (`..`, a trailing `.lock`, leading/
+        # trailing `.`/`-`) — a lax regex here would record an impossible
+        # corroboration target.
+        if [[ "$candidate_branch" =~ ^[A-Za-z0-9._-]+$ ]] \
+           && [[ "$candidate_branch" != *..* ]] \
+           && [[ "$candidate_branch" != *.lock ]] \
+           && [[ "$candidate_branch" != .* ]] \
+           && [[ "$candidate_branch" != -* ]] \
+           && [[ "$candidate_branch" != *. ]] \
+           && [[ "$candidate_branch" != *- ]]; then
+          _pm_branch_gitref_ok=1
+        fi
+      fi
+      if [[ "$_pm_branch_charset_ok" -eq 1 && "$_pm_branch_gitref_ok" -eq 1 ]]; then
+        branch="$candidate_branch"
+      else
+        echo "dispatch-prep: warning: derived branch '$candidate_branch' failed validation (pm token charset or git ref format); omitting branch" >&2
+      fi
+    fi
+  else
+    echo "dispatch-prep: warning: prompt basename '$prompt_base' does not match I-###_<slug>_YYYY-MM-DD.md; omitting branch" >&2
+  fi
+fi
+
+extra_kv=()
+if [[ -n "$repo_meta" ]]; then
+  extra_kv+=("repo=$repo_meta")
+  if [[ -n "$branch" ]]; then
+    extra_kv+=("branch=$branch")
+  fi
+  if [[ -n "$base_sha" ]]; then
+    extra_kv+=("base_sha=$base_sha")
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# hash the finalized prompt
+# ---------------------------------------------------------------------------
+
+prompt_sha="$(python3 -c "
+import hashlib, sys
+h = hashlib.sha256()
+with open(sys.argv[1], 'rb') as f:
+    h.update(f.read())
+print(h.hexdigest()[:8])
+" "$prompt_path")"
+
+# ---------------------------------------------------------------------------
+# fold the log, read this dispatch's current state + attempt
+# ---------------------------------------------------------------------------
+
+pm_fold "$root" || {
+  echo "dispatch-prep: pm_fold failed; refusing to dispatch against an unfoldable log" >&2
+  exit 1
+}
+
+mapfile -t _disp_info < <(D_ID="$dispatch_id" python3 -c "
+import json, os, sys
+idx = json.load(open(sys.argv[1]))
+d = os.environ['D_ID']
+disp = idx.get('dispatches', {}).get(d)
+if disp is None:
+    print('NONE')
+else:
+    print(disp.get('state') or 'NONE')
+" "$index")
+
+current_state="${_disp_info[0]:-NONE}"
+
+# ---------------------------------------------------------------------------
+# refuse cross-lane / double dispatch
+# ---------------------------------------------------------------------------
+
+case "$current_state" in
+  NONE | READY | FAILED)
+    # brand-new D, first dispatch of a registered-but-undispatched D, or a
+    # legal retry after FAILED — all allowed to proceed.
+    ;;
+  *)
+    echo "dispatch-prep: refusing to dispatch $dispatch_id: current folded state is '$current_state'." >&2
+    echo "  Only a brand-new dispatch, a READY dispatch, or a retry after FAILED may be prepared here." >&2
+    echo "  $dispatch_id is already dispatched/terminal; a second DISPATCHED transition would be illegal" >&2
+    echo "  (event-log-grammar.md §4.2). No event was emitted." >&2
+    exit 1
+    ;;
+esac
+
+now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+# Single atomic transaction: pm_apply/pm_apply_batch mints the attempt (A-0N)
+# for the READY->DISPATCHED / FAILED->DISPATCHED edge, so we must NOT pass
+# a=. If the dispatch is brand-new, dispatch_new + dispatch_state are one
+# batch transaction; otherwise (retry after FAILED, or first dispatch of an
+# already-registered READY dispatch) it's just the dispatch_state event.
+# B3: on the automation lane, the durable prompt-copy binding (`note d=<D>
+# ref=prompts/...`) rides in the SAME atomic batch as the mint — a crash can
+# never leave an automation mint without its prompt binding.
+if [[ "$current_state" == "NONE" ]]; then
+  if [[ "$lane" == "automation" ]]; then
+    batch_out="$(pm_apply_batch \
+      -- dispatch_new d="$dispatch_id" i="$issue_id" at="$(now_iso)" \
+      -- dispatch_state d="$dispatch_id" from=READY to=DISPATCHED lane="$lane" at="$(now_iso)" tab="?" prompt_sha="$prompt_sha" "${extra_kv[@]}" \
+      -- note at="$(now_iso)" ref="$prompt_rel" d="$dispatch_id" \
+    )" || {
+      echo "dispatch-prep: refused to prepare $dispatch_id (dispatch_new + dispatch_state + note transaction failed)" >&2
+      exit 1
+    }
+  else
+    batch_out="$(pm_apply_batch \
+      -- dispatch_new d="$dispatch_id" i="$issue_id" at="$(now_iso)" \
+      -- dispatch_state d="$dispatch_id" from=READY to=DISPATCHED lane="$lane" at="$(now_iso)" tab="?" prompt_sha="$prompt_sha" "${extra_kv[@]}" \
+    )" || {
+      echo "dispatch-prep: refused to prepare $dispatch_id (dispatch_new + dispatch_state transaction failed)" >&2
+      exit 1
+    }
+  fi
+else
+  if [[ "$lane" == "automation" ]]; then
+    batch_out="$(pm_apply_batch \
+      -- dispatch_state d="$dispatch_id" from="$current_state" to=DISPATCHED lane="$lane" at="$(now_iso)" tab="?" prompt_sha="$prompt_sha" "${extra_kv[@]}" \
+      -- note at="$(now_iso)" ref="$prompt_rel" d="$dispatch_id" \
+    )" || {
+      echo "dispatch-prep: refused to prepare $dispatch_id (dispatch_state from=$current_state transition failed)" >&2
+      exit 1
+    }
+  else
+    batch_out="$(pm_apply dispatch_state d="$dispatch_id" from="$current_state" to=DISPATCHED lane="$lane" at="$(now_iso)" tab="?" prompt_sha="$prompt_sha" "${extra_kv[@]}")" || {
+      echo "dispatch-prep: refused to prepare $dispatch_id (dispatch_state from=$current_state transition failed)" >&2
+      exit 1
+    }
+  fi
+fi
+
+next_attempt="$(printf '%s\n' "$batch_out" | grep '^EVENT dispatch_state ' | tail -n1 | grep -o ' a=A-[0-9]\+' | cut -d= -f2)"
+if [[ -z "$next_attempt" ]]; then
+  echo "dispatch-prep: could not determine the minted attempt from pm_apply output" >&2
+  exit 1
+fi
+
+if [[ "$lane" == "automation" ]]; then
+  # B3: NO manual herdr/paste instructions on the automation lane — the
+  # spawn is track's job (gated on automation.auto_spawn), never prep's.
+  echo "dispatch-prep: prepared $dispatch_id attempt $next_attempt (lane=automation)"
+  echo "  issue:      $issue_id"
+  echo "  prompt:     $prompt_rel (durable copy)"
+  echo "  prompt_sha: $prompt_sha"
+  echo "  tab:        ? (assigned by bin/track at spawn time)"
+  echo
+  echo "Queued for the automation lane. bin/track --once will auto-spawn the"
+  echo "worker when automation.auto_spawn is true (and capacity allows), then"
+  echo "record the ACK itself. Nothing was spawned by this command."
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# assemble (do not run) the herdr spawn command
+# ---------------------------------------------------------------------------
+
+cmd="herdr tab create --workspace $(esc_shell "$herdr_workspace") --label $(esc_shell "$tab_label")"
+if [[ -n "$repo_path" ]]; then
+  cmd+=" --cwd $(esc_shell "$repo_path")"
+fi
+
+echo "dispatch-prep: prepared $dispatch_id attempt $next_attempt (lane=human)"
+echo "  issue:      $issue_id"
+echo "  prompt:     $prompt_path"
+echo "  prompt_sha: $prompt_sha"
+echo "  tab:        $tab_label"
+echo
+echo "Run this to spawn the worker tab (NOT executed automatically):"
+echo
+echo "  $cmd"
+echo
+echo "Then paste the contents of '$prompt_path' into the new tab's agent pane."
+echo
+echo "Once the tab is confirmed, record the ACK by hand, e.g.:"
+echo "  bin/record dispatch $dispatch_id ACKED --tab <real-tab-id>"

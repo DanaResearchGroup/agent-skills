@@ -1,0 +1,19 @@
+# DISPATCHES — numbered dispatches (narrative surface)
+
+`D-###` = one dispatch (a unit of work sent to a worker); `A-##` = an attempt within it.
+Lifecycle: READY → DISPATCHED → ACKED → RETURNED → VERIFIED (terminals FAILED/ABANDONED;
+catch-all QUARANTINED). See `CONVENTIONS.md` §4 and `.pm/events.log`.
+
+> Human narrative only. Authoritative state is the event log; `bin/reconcile` renders the
+> table below.
+
+<!-- GENERATED:BEGIN dispatch-summary -->
+(no dispatches yet)
+<!-- GENERATED:END dispatch-summary -->
+
+---
+
+## Log (newest first)
+
+(one short block per dispatch: `### D-001 [I-###] → <repo>/<tab>` with lane, prompt file,
+current state; the machine record is the event log, this is for humans)

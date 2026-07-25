@@ -1,0 +1,281 @@
+#!/usr/bin/env bash
+# ledger-check — health check over .pm/events.log (via .pm/index.json).
+#
+# This is a TEMPLATE file: copied verbatim into a generated PM repo's `bin/`
+# directory. Run from the generated repo root (or anywhere under it, or with
+# $PM_ROOT set) — root resolution matches `_lib.sh` (`$PM_ROOT` override, else
+# search upward from $PWD for a directory containing `.pm/`).
+#
+# What it does (references/event-log-grammar.md is the authoritative source):
+#   1. (Re)fold .pm/events.log -> .pm/index.json via `pm_fold`.
+#   2. FAIL (non-zero exit) if:
+#      - quarantined[] is non-empty (grammar §5 level-1/2 violations that
+#        `pm_fold` already routed to quarantine — a failure surface for
+#        ledger-check even though fold itself tolerates and records them);
+#      - a parent/child roll-up violation exists (grammar §4.4): a parent
+#        dispatch (child_of nobody, but referenced as child_of by others) is
+#        VERIFIED while a child is non-terminal, or a child is
+#        FAILED/QUARANTINED while its parent is VERIFIED.
+#   3. WARN (reported, does not affect exit code) on CLOSED issues that still
+#      have a live worktree in a configured repo (branch/worktree-dir name
+#      convention `i###-<slug>` / `<RepoName>-i###-<slug>` per
+#      CONVENTIONS.md.tmpl §7 — see NOTE below).
+#   4. INFO-report (does not affect exit code) any dispatch left in a
+#      non-terminal state — this is a health check, not a completeness gate.
+#   5. Print a terse summary: issues by state, dispatches by state,
+#      quarantined N, warnings N.
+#
+# Exit code contract:
+#   0  — no quarantine entries, no roll-up violations (WARN/INFO do not
+#        affect exit code).
+#   1  — quarantined[] non-empty and/or a roll-up violation was found.
+#   2  — usage/environment error (can't locate .pm/, pm_fold itself failed,
+#        e.g. missing events.log).
+#
+# NOTE (grammar ambiguity, resolved here): the grammar and _lib.sh define no
+# field linking an `issue` to a repo or to a git branch/worktree, so
+# "CLOSED-with-live-worktree" cross-referencing cannot be done by a stored
+# join key. CONVENTIONS.md.tmpl §7 fixes the naming law instead: branch
+# `i###-<slug>` and worktree dir `<RepoName>-i###-<slug>`. This script uses
+# that naming convention as the join: for each CLOSED issue, normalize its id
+# (`I-001` -> `i001`) and look for a `pm_git_probe` worktree/branch on a
+# configured repo whose branch or worktree-dir basename starts with
+# `i001-` or equals `i001`. This is a heuristic (a human could name a branch
+# differently) so it is WARN-only, never a failure, per the task spec.
+
+set -u
+
+_LC_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./_lib.sh
+# shellcheck disable=SC1091
+source "${_LC_SELF}/_lib.sh"
+
+# ---------------------------------------------------------------------------
+# resolve root, fold
+# ---------------------------------------------------------------------------
+
+_lc_root="$(_pm_root "${PM_ROOT:-}")" || exit 2
+
+if ! pm_fold "${_lc_root}"; then
+  echo "ledger-check: pm_fold failed (see above)" >&2
+  exit 2
+fi
+
+_lc_index="${_lc_root}/.pm/index.json"
+_lc_config="${_lc_root}/.pm/config.json"
+
+if [[ ! -f "${_lc_index}" ]]; then
+  echo "ledger-check: no index at ${_lc_index} after fold" >&2
+  exit 2
+fi
+
+# ---------------------------------------------------------------------------
+# analysis (python3; no jq per _lib.sh convention)
+# ---------------------------------------------------------------------------
+
+_lc_worktrees_json="[]"
+if [[ -f "${_lc_config}" ]]; then
+  # I6: repos parsing is delegated to pm_config_repos (THE one shared
+  # parser); this step only FORMATS its normalized JSON as name<TAB>path
+  # rows -- no shape tolerance of its own.
+  _lc_repo_paths="$(pm_config_repos "${_lc_config}" | python3 -c '
+import json, sys
+for r in json.load(sys.stdin):
+    print(r["name"] + "\t" + r["path"])
+')"
+
+  _lc_wt_entries=()
+  if [[ -n "${_lc_repo_paths}" ]]; then
+    while IFS=$'\t' read -r _lc_rname _lc_rpath; do
+      [[ -z "${_lc_rpath}" ]] && continue
+      _lc_probe="$(pm_git_probe "${_lc_rpath}" 2>/dev/null)" || _lc_probe='{"is_repo": false}'
+      _lc_wt_entries+=("$(python3 -c '
+import json, sys
+name = sys.argv[1]
+probe = json.loads(sys.argv[2])
+print(json.dumps({"repo": name, "probe": probe}))
+' "${_lc_rname}" "${_lc_probe}")")
+    done <<< "${_lc_repo_paths}"
+  fi
+
+  if [[ "${#_lc_wt_entries[@]}" -gt 0 ]]; then
+    _lc_worktrees_json="$(printf '%s\n' "${_lc_wt_entries[@]}" | python3 -c '
+import json, sys
+print(json.dumps([json.loads(line) for line in sys.stdin if line.strip()]))
+')"
+  fi
+fi
+
+PM_LC_INDEX="${_lc_index}" PM_LC_WORKTREES="${_lc_worktrees_json}" python3 - <<'PYEOF'
+import json
+import os
+import sys
+
+index_path = os.environ["PM_LC_INDEX"]
+worktrees = json.loads(os.environ["PM_LC_WORKTREES"])
+
+with open(index_path) as f:
+    index = json.load(f)
+
+issues = index.get("issues", {})
+dispatches = index.get("dispatches", {})
+quarantined = index.get("quarantined", [])
+
+TERMINAL = {"VERIFIED", "ABANDONED"}
+FAILURE = False
+warnings = []
+rollup_violations = []
+
+# ---------------------------------------------------------------------
+# parent/child roll-up (grammar §4.4)
+# ---------------------------------------------------------------------
+# a "parent" is a dispatch that is child_of nobody but is referenced as
+# child_of by at least one other dispatch.
+referenced_as_child_of = {
+    d.get("child_of") for d in dispatches.values() if d.get("child_of")
+}
+children_of = {}
+for d_id, d in dispatches.items():
+    parent = d.get("child_of")
+    if parent:
+        children_of.setdefault(parent, []).append(d_id)
+
+for parent_id in referenced_as_child_of:
+    parent = dispatches.get(parent_id)
+    if parent is None:
+        continue
+    if parent.get("child_of"):
+        # not a top-level parent per the grammar's definition; skip (a
+        # multi-level chain is out of scope for this check).
+        continue
+    for child_id in children_of.get(parent_id, []):
+        child = dispatches[child_id]
+        child_state = child.get("state")
+        parent_state = parent.get("state")
+        if parent_state == "VERIFIED" and child_state not in TERMINAL:
+            if child_state in ("FAILED", "QUARANTINED"):
+                reason = (
+                    f"parent {parent_id} is VERIFIED but child {child_id} is "
+                    f"{child_state} (parent should be reopened to RETURNED)"
+                )
+            else:
+                reason = (
+                    f"parent {parent_id} is VERIFIED but child {child_id} is "
+                    f"non-terminal ({child_state})"
+                )
+            rollup_violations.append(reason)
+
+if rollup_violations:
+    FAILURE = True
+
+# ---------------------------------------------------------------------
+# non-terminal dispatches (INFO only)
+# ---------------------------------------------------------------------
+non_terminal = sorted(
+    d_id for d_id, d in dispatches.items() if d.get("state") not in TERMINAL
+)
+
+# ---------------------------------------------------------------------
+# CLOSED-with-live-worktree (WARN only) — see file-header NOTE for the
+# branch/worktree-dir naming convention used as the join key.
+# ---------------------------------------------------------------------
+closed_issues = sorted(i for i, v in issues.items() if v.get("state") == "CLOSED")
+
+
+def issue_token(issue_id):
+    # "I-001" -> "i001"
+    return issue_id.lower().replace("-", "")
+
+
+def matches(token, name):
+    if not name:
+        return False
+    base = name.rsplit("/", 1)[-1].lower()
+    if base == token:
+        return True
+    if base.startswith(token + "-"):
+        return True
+    # worktree dir convention: <RepoName>-i###-<slug>
+    if f"-{token}-" in base or base.endswith(f"-{token}"):
+        return True
+    return False
+
+
+for issue_id in closed_issues:
+    token = issue_token(issue_id)
+    for entry in worktrees:
+        repo_name = entry.get("repo") or ""
+        probe = entry.get("probe") or {}
+        if not probe.get("is_repo"):
+            continue
+        for wt in probe.get("worktrees", []):
+            branch = wt.get("branch", "")
+            if branch.startswith("refs/heads/"):
+                branch = branch[len("refs/heads/"):]
+            wt_path = wt.get("worktree", "")
+            if matches(token, branch) or matches(token, wt_path):
+                warnings.append(
+                    f"CLOSED issue {issue_id} has a live worktree matching it "
+                    f"in repo '{repo_name}': branch='{branch}' path='{wt_path}'"
+                )
+
+# ---------------------------------------------------------------------
+# report
+# ---------------------------------------------------------------------
+print("=== ledger-check ===")
+
+if quarantined:
+    FAILURE = True
+    print(f"\nFAIL: {len(quarantined)} quarantined event(s):")
+    for q in quarantined:
+        print(f"  line {q.get('line')}: {q.get('reason')}")
+else:
+    print("\nOK: no quarantined events")
+
+if rollup_violations:
+    print(f"\nFAIL: {len(rollup_violations)} parent/child roll-up violation(s):")
+    for r in rollup_violations:
+        print(f"  {r}")
+else:
+    print("OK: no parent/child roll-up violations")
+
+if non_terminal:
+    print(f"\nINFO: {len(non_terminal)} dispatch(es) in a non-terminal state:")
+    for d_id in non_terminal:
+        print(f"  {d_id}: {dispatches[d_id].get('state')}")
+else:
+    print("INFO: no non-terminal dispatches")
+
+if warnings:
+    print(f"\nWARN: {len(warnings)} CLOSED issue(s) with a possible live worktree:")
+    for w in warnings:
+        print(f"  {w}")
+else:
+    print("WARN: none")
+
+# ---------------------------------------------------------------------
+# summary
+# ---------------------------------------------------------------------
+issue_states = {}
+for v in issues.values():
+    st = v.get("state")
+    issue_states[st] = issue_states.get(st, 0) + 1
+
+dispatch_states = {}
+for v in dispatches.values():
+    st = v.get("state")
+    dispatch_states[st] = dispatch_states.get(st, 0) + 1
+
+print("\n--- summary ---")
+print(f"issues:      {len(issues)} total  " + ", ".join(
+    f"{k}={v}" for k, v in sorted(issue_states.items())
+))
+print(f"dispatches:  {len(dispatches)} total  " + ", ".join(
+    f"{k}={v}" for k, v in sorted(dispatch_states.items())
+))
+print(f"quarantined: {len(quarantined)}")
+print(f"warnings:    {len(warnings)}")
+
+sys.exit(1 if FAILURE else 0)
+PYEOF
+exit $?

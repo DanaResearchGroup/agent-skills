@@ -1,0 +1,1326 @@
+#!/usr/bin/env bash
+# track --once — stateless-reconciliation tick, auto-records only strictly
+# git-corroborated `done` worker tabs (intake only), surfaces everything else.
+#
+# TEMPLATE file: copied verbatim into generated PM repo's `bin/` directory.
+# Standalone entrypoint that `source`s `_lib.sh` (bash + python3 only, no jq).
+#
+# THIS IS THE FIRST pm-creator COMPONENT THAT WRITES TO THE EVENT LOG
+# AUTONOMOUSLY. It never auto-verifies (RETURNED -> VERIFIED stays a human
+# gate) and never guesses: any deviation from the strict corroboration
+# predicate below is surfaced in TRACKER.md, never recorded.
+#
+# One tick == one `herdr api snapshot` (full live-runtime-state JSON, parsed
+# DEFENSIVELY — if herdr is missing/errors/has an unexpected shape, every
+# affected tab degrades to "unknown" and the tick surfaces instead of
+# recording; unlike `reconcile`, herdr is NOT mandated here by design, since
+# `track`'s whole safety model is "when in doubt, surface, never act").
+#
+# For every dispatch currently ACKED in .pm/index.json whose recorded `tab`
+# shows `done` in that snapshot, evaluate a STRICT corroboration predicate.
+# PASS iff ALL of:
+#   (a) the snapshot tab POSITIVELY binds to D: the tab must be present in
+#       the snapshot filtered to the configured `herdr_workspace`, AND its
+#       `label` must be present and share D's branch's ticket prefix (e.g.
+#       branch `i900-widget` <-> label `i900-...`) — absent-from-workspace,
+#       reused, renamed, or unlabeled tabs are treated as an unconfirmed
+#       binding and surfaced, never recorded. RESIDUAL (accepted, B1): this
+#       identity is workspace + tab-id + ticket-prefix, NOT an unforgeable
+#       per-(D,attempt) token — herdr does not currently expose one, so a tab
+#       reused for a different dispatch on the SAME ticket prefix within the
+#       same workspace could in principle satisfy (a) without being the real
+#       worker tab. This is narrowed, not eliminated, by every OTHER
+#       corroboration leg below (branch-issue match, base_sha ancestry, clean
+#       worktree, lock-time re-check) still having to ALSO hold, plus
+#       `track`'s overall "when in doubt, surface" posture; revisit if/when
+#       herdr exposes a stable per-session token;
+#   (b) `base_sha` is a literal, lowercase-hex git object name (never a
+#       revision expression like `HEAD`/`main`/`branch~2`, which would
+#       resolve DYNAMICALLY instead of anchoring a fixed point);
+#   (c) `branch` is NOT the repo's configured `mainline`, and DOES match the
+#       dispatch's own ticket-branch convention (`i<issue-num>-...`, derived
+#       from the dispatch's own `dispatch_new i=I-<num>` in the raw event
+#       log — never guessed from the branch string alone);
+#   (d) in the dispatch's `<repo>`, the recorded `<branch>` tip DESCENDS FROM
+#       the *current attempt's* `base_sha` (real new work on the right
+#       branch) — `repo`/`branch`/`base_sha` in index.json are CLAIMS
+#       (forgeable via pm_apply), so `track` independently re-resolves the
+#       repo's real path from .pm/config.json and runs git itself; the
+#       index's metadata is used only as names/anchors to verify against
+#       real git, never trusted directly;
+#   (e) the worktree that has that branch checked out is CLEAN — no
+#       dirty/untracked changes (a second, worktree-specific `pm_git_probe`
+#       is required here: the primary repo-path probe's own `worktrees`
+#       array entries do NOT carry per-worktree dirty/untracked data — see
+#       `reconcile`'s WORKTREES.md rendering for the same limitation, which
+#       `track` must NOT copy given its stricter correctness bar);
+#   (f) D is STILL ACKED at attempt `a`, RE-CHECKED under `pm_lock`
+#       immediately before the write (closes the TOCTOU race with a human
+#       acting concurrently; a `pm_apply` refusal here is BENIGN — the human
+#       raced us — and is surfaced, never treated as an error); AND the full
+#       git corroboration in (d)/(e) is RE-RUN under that same lock — stage 1
+#       (outside the lock) is only a cheap pre-filter, stage 2's re-run is
+#       authoritative, and the `result_sha` actually recorded is the
+#       LOCK-TIME branch tip, never a stale stage-1 read. If the branch
+#       advanced/rebased/went dirty between the two stages, the recheck
+#       itself decides pass/fail on the fresh state; only a genuine
+#       divergence (no longer clean, no longer a descendant, tip vanished)
+#       surfaces `corroboration-changed-under-lock`. A residual cross-repo,
+#       cross-process micro-window still exists between stage 2's git reads
+#       and the `pm_apply` write a few lines later; this is accepted as
+#       intake-only, human-gated exposure (RETURNED -> VERIFIED still
+#       requires a human), not closed further here.
+# PASS -> `pm_apply result d=D a=a status=RETURNED result_sha=<branch tip>
+# at=<now>` — INTAKE ONLY. ANY deviation -> surfaced in TRACKER.md's
+# `tracker` GENERATED block (regenerated fresh every tick; unchanged state
+# re-renders byte-identical) under one of these enumerated reasons, never
+# guessed, never silently dropped:
+#   missing-metadata, base_sha-not-a-sha, tab-binding-unconfirmed,
+#   status-unknown, herdr-unavailable, branch-is-mainline,
+#   branch-not-a-ticket-branch, branch-issue-mismatch, repo-not-configured,
+#   repo-not-on-disk, base-sha-wrong-length-for-repo, base-sha-unreachable,
+#   branch-missing, worktree-missing, dirty-worktree, no-new-commit,
+#   not-descendant, corroboration-changed-under-lock, already-recorded,
+#   raced-refused.
+#
+# TRUST BOUNDARY (round-9 design, restated here): `repo`'s real path,
+# `mainline`, and `herdr_workspace` all come from `.pm/config.json`, which is
+# the OPERATOR-OWNED trust root for this tool (same status as the code
+# itself) — a corrupted or malicious config.json is operator error, out of
+# `track`'s threat model. What `track` DOES defend against is index.json's
+# per-dispatch `repo`/`branch`/`base_sha`, which are written via `pm_apply`
+# by dispatch-prep/workers and are treated as forgeable CLAIMS re-verified
+# against real git and the operator-owned config on every tick.
+#
+# Usage: bin/track [--once]   (--once is the only mode for now; bare `track`
+#                               defaults to --once)
+set -u
+
+_TR_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./_lib.sh
+# shellcheck disable=SC1091
+source "${_TR_SELF}/_lib.sh"
+
+now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+usage() {
+  cat <<'EOF'
+usage: bin/track [--once]
+
+Stateless-reconciliation tick. Auto-records only strictly git-corroborated
+`done` worker tabs (RETURNED intake only, never auto-verify); surfaces
+everything else into TRACKER.md's generated block. --once is the only mode
+for now (bare `track` defaults to it).
+EOF
+}
+
+_tr_mode="--once"
+if [[ $# -gt 0 ]]; then
+  case "$1" in
+    --once) _tr_mode="--once" ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "track: unknown argument '$1'" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+fi
+
+# ---------------------------------------------------------------------------
+# resolve root, fold
+# ---------------------------------------------------------------------------
+_tr_root="$(_pm_root "${PM_ROOT:-}")" || exit 1
+_tr_config="${_tr_root}/.pm/config.json"
+_tr_events="${_tr_root}/.pm/events.log"
+_tr_index="${_tr_root}/.pm/index.json"
+_tr_tracker_md="${_tr_root}/TRACKER.md"
+
+if [[ ! -f "${_tr_config}" ]]; then
+  echo "track: missing ${_tr_config} (not a pm-creator repo?)" >&2
+  exit 1
+fi
+if [[ ! -f "${_tr_events}" ]]; then
+  echo "track: missing ${_tr_events} (not a pm-creator repo?)" >&2
+  exit 1
+fi
+if ! pm_fold "${_tr_root}"; then
+  echo "track: pm_fold failed (see above)" >&2
+  exit 1
+fi
+if [[ ! -f "${_tr_index}" ]]; then
+  echo "track: no index at ${_tr_index} after fold" >&2
+  exit 1
+fi
+
+# herdr_workspace (trust-root config, see header) -- used to filter the
+# snapshot below to only the tabs that live in the configured workspace.
+_tr_herdr_workspace="$(python3 -c '
+import json, sys
+with open(sys.argv[1]) as f:
+    cfg = json.load(f)
+print(cfg.get("herdr_workspace") or "")
+' "${_tr_config}")"
+
+# automation.auto_close (trust-root config, default OFF): gates whether the
+# B2.1 auto-close pass below actually CLOSES a fully-gated issue, or merely
+# surfaces it as a candidate (`auto-close-disabled`). Re-read fresh every
+# tick -- never cached across ticks, since the operator can flip this
+# between runs.
+_tr_auto_close_enabled="$(python3 -c '
+import json, sys
+with open(sys.argv[1]) as f:
+    cfg = json.load(f)
+automation = cfg.get("automation")
+val = automation.get("auto_close") if isinstance(automation, dict) else None
+print("1" if val is True else "0")
+' "${_tr_config}")"
+
+# B3 spawn config (trust-root config, re-read fresh every tick, same policy
+# as auto_close). Missing keys take fail-safe defaults (auto_spawn OFF,
+# max_live_workers 1, spawn_ack_timeout_ticks 3, spawn_argv []); ANY
+# invalid type/value marks the whole verdict invalid, which the spawn stage
+# below treats as a FAIL-CLOSED skip with a surfaced `spawn-config-invalid`
+# row -- never a guess, never a spawn.
+_tr_spawn_cfg="$(python3 - "${_tr_config}" <<'PYEOF'
+import json
+import sys
+
+try:
+    with open(sys.argv[1]) as f:
+        cfg = json.load(f)
+except Exception:
+    cfg = {}
+automation = cfg.get("automation")
+if not isinstance(automation, dict):
+    automation = {}
+
+out = {"enabled": False, "valid": True, "detail": "",
+       "max_live_workers": 1, "timeout": 3, "argv": []}
+
+
+def invalid(msg):
+    if out["valid"]:
+        out["valid"] = False
+        out["detail"] = msg
+
+
+auto_spawn = automation.get("auto_spawn", False)
+if not isinstance(auto_spawn, bool):
+    invalid(f"automation.auto_spawn must be a boolean (got {auto_spawn!r})")
+else:
+    out["enabled"] = auto_spawn
+
+for key, target in (("max_live_workers", "max_live_workers"),
+                    ("spawn_ack_timeout_ticks", "timeout")):
+    val = automation.get(key, out[target])
+    if isinstance(val, bool) or not isinstance(val, int) or val < 1:
+        invalid(f"automation.{key} must be an integer >= 1 (got {val!r})")
+    else:
+        out[target] = val
+
+argv = automation.get("spawn_argv", [])
+if not isinstance(argv, list) or any(not isinstance(el, str) or el == "" for el in argv):
+    invalid(f"automation.spawn_argv must be an array of non-empty strings (got {argv!r})")
+elif out["enabled"] and (not argv or "{prompt}" not in argv):
+    invalid("automation.spawn_argv must be non-empty and contain the literal "
+            "\"{prompt}\" element when auto_spawn is enabled")
+else:
+    out["argv"] = argv
+
+# hunter P1 amplifier: with no herdr_workspace the snapshot pane filter is
+# DISABLED -- name joins and capacity counts would run globally across all
+# workspaces. auto_spawn is cross-workspace-fenced, so that config cannot
+# be valid.
+ws = cfg.get("herdr_workspace")
+if out["enabled"] and not (isinstance(ws, str) and ws.strip()):
+    invalid("automation.auto_spawn requires a non-empty herdr_workspace "
+            "(pane joins and capacity would be cross-workspace otherwise)")
+
+print(json.dumps(out))
+PYEOF
+)"
+
+# ---------------------------------------------------------------------------
+# temp-file bookkeeping (mirrors reconcile: manifest FILE, not a bash array,
+# since array mutations inside a $(...) subshell never reach this script;
+# trap installed BEFORE the manifest itself is mktemp'd, to avoid a
+# chicken-and-egg leak on an early crash).
+# ---------------------------------------------------------------------------
+_tr_tmpmanifest=""
+_tr_mktemp() {
+  local out
+  out="$(mktemp "$1")" || return 1
+  printf '%s\n' "${out}" >>"${_tr_tmpmanifest}"
+  printf '%s\n' "${out}"
+}
+
+# shellcheck disable=SC2329  # invoked indirectly via trap below
+_tr_cleanup() {
+  local rc=$?
+  if [[ -n "${_tr_tmpmanifest}" && -f "${_tr_tmpmanifest}" ]]; then
+    while IFS= read -r f; do
+      [[ -n "${f}" ]] && rm -f "${f}"
+    done <"${_tr_tmpmanifest}"
+    rm -f "${_tr_tmpmanifest}"
+  fi
+  pm_unlock 2>/dev/null || true
+  return "${rc}"
+}
+
+# C6: INT/TERM must TERMINATE. _tr_cleanup ends in `return`, so trapping it
+# directly on INT/TERM would clean up and then let the script CONTINUE past
+# the interrupted command -- a Ctrl-C'd track could run its stale critical
+# section to completion and still reach the SPAWN stage. Clean up, restore
+# default disposition, and re-raise (same shape as scaffold.sh's cleanup):
+# the process dies with 128+signum and no later stage runs.
+# shellcheck disable=SC2329  # invoked indirectly via trap below
+_tr_cleanup_sig() {
+  _tr_cleanup
+  trap - EXIT INT TERM
+  kill -s "$1" "${BASHPID:-$$}"
+}
+trap _tr_cleanup EXIT
+trap '_tr_cleanup_sig INT' INT
+trap '_tr_cleanup_sig TERM' TERM
+
+_tr_tmpmanifest="$(mktemp "${TMPDIR:-/tmp}/pm-track-tmpmanifest.XXXXXX")"
+
+# fix-pass-5b#2 classify helper + the whole B2.1 auto-close pass (the
+# _TR_CLOSE_PY python routines with the REASONS registry, the pre-fetch
+# phase and the stage-2.5 pass) live in the sourced component
+# _track_autoclose (I25); its two entry points are invoked at the original
+# stage positions below.
+# shellcheck source=./_track_autoclose
+# shellcheck disable=SC1091
+source "${_TR_SELF}/_track_autoclose"
+
+# ---------------------------------------------------------------------------
+# one herdr api snapshot (defensive, centralized parse). Raw herdr stdout is
+# written to a FILE, not passed via env var/argv — a busy live snapshot can
+# exceed ARG_MAX (the same real bug `reconcile` fixed for `tab list`). Any
+# failure (herdr missing, non-zero exit, unexpected shape) degrades: the tabs
+# map stays empty, every dispatch's tab reads as "unknown" this tick, and the
+# tick surfaces rather than records — it never hard-fails.
+# ---------------------------------------------------------------------------
+_tr_snapshot_file="$(_tr_mktemp "${TMPDIR:-/tmp}/pm-track-snapshot.XXXXXX")"
+printf '{}' >"${_tr_snapshot_file}"
+# B3: second, ADDITIVE output of the same single snapshot parse -- the
+# workspace-filtered live panes[] (+ a live-agent count for the spawn
+# stage's capacity gate). The tabs map STAGE 1 depends on is untouched.
+_tr_panes_file="$(_tr_mktemp "${TMPDIR:-/tmp}/pm-track-panes.XXXXXX")"
+printf '{"panes": [], "live_agents": 0}' >"${_tr_panes_file}"
+_tr_herdr_ok=0
+
+if command -v herdr >/dev/null 2>&1; then
+  _tr_snap_raw="$(_tr_mktemp "${TMPDIR:-/tmp}/pm-track-snapshot-raw.XXXXXX")"
+  if herdr api snapshot >"${_tr_snap_raw}" 2>/dev/null; then
+    if python3 - "${_tr_snap_raw}" "${_tr_snapshot_file}" "${_tr_herdr_workspace}" "${_tr_panes_file}" <<'PYEOF'
+import json
+import sys
+
+raw_path, out_path, herdr_workspace, panes_out_path = sys.argv[1:5]
+tabs = {}
+panes_out = {"panes": [], "live_agents": 0}
+
+# json.load failure (malformed/unparseable snapshot) is distinct from a
+# well-formed-but-sparse/odd shape below: an unparseable snapshot means
+# herdr itself is effectively unavailable this tick, so it exits non-zero
+# and the caller must NOT treat any tab as corroborated -- everything
+# should surface as herdr-unavailable, not per-tab status-unknown. A
+# parsed-but-sparse shape (missing keys, tabs without tab_id, etc.) is
+# legitimate and still exits 0 with whatever tabs could be extracted.
+try:
+    with open(raw_path) as f:
+        data = json.load(f)
+except (ValueError, OSError):
+    sys.exit(3)
+
+try:
+    # Centralized field mapping (easy to adjust if herdr's snapshot shape
+    # changes): tolerate {"result": {"tabs": [...], "workspaces": [...]}}
+    # (matching `tab list`/`workspace list`'s shapes) or bare top-level keys.
+    # Any tab missing tab_id is skipped; agent_status/label/workspace_id are
+    # read as-is (None if absent).
+    result = data.get("result", data) if isinstance(data, dict) else {}
+    raw_tabs = result.get("tabs", []) if isinstance(result, dict) else []
+    raw_workspaces = result.get("workspaces", []) if isinstance(result, dict) else []
+
+    # Resolve the configured herdr_workspace (a label OR a literal
+    # workspace_id) to a workspace_id the same way `reconcile` does. If the
+    # snapshot doesn't carry a "workspaces" array (its exact shape is not
+    # documented -- `herdr api snapshot` is test-mocked only), fall back to
+    # treating the configured value as a literal workspace_id directly.
+    ws_id = None
+    if isinstance(raw_workspaces, list):
+        for w in raw_workspaces:
+            if not isinstance(w, dict):
+                continue
+            if w.get("label") == herdr_workspace or w.get("workspace_id") == herdr_workspace:
+                ws_id = w.get("workspace_id")
+                break
+    if ws_id is None:
+        ws_id = herdr_workspace
+
+    if isinstance(raw_tabs, list):
+        for t in raw_tabs:
+            if not isinstance(t, dict):
+                continue
+            tid = t.get("tab_id")
+            if not tid:
+                continue
+            # Filter to the configured workspace (mirrors `reconcile`'s
+            # SESSIONS.md filtering): a tab outside the configured workspace
+            # is treated identically to a tab absent from the snapshot
+            # entirely -- both surface as `status-unknown` downstream.
+            if herdr_workspace and t.get("workspace_id") != ws_id:
+                continue
+            tabs[tid] = {
+                "agent_status": t.get("agent_status"),
+                "label": t.get("label"),
+                "workspace_id": t.get("workspace_id"),
+            }
+
+    # B3 (ADDITIVE -- never alters the tabs read above): extract panes[]
+    # and agents[] for the spawn stage. The live-probed snapshot nests
+    # them either directly under result or under result.snapshot; tolerate
+    # both. panes are workspace-filtered the same way tabs are; the
+    # live-agent count joins agents[] to the workspace via their own
+    # workspace_id or their pane/tab appearing among the workspace's panes.
+    containers = [result]
+    snap = result.get("snapshot") if isinstance(result, dict) else None
+    if isinstance(snap, dict):
+        containers.append(snap)
+    raw_panes = []
+    raw_agents = []
+    for c in containers:
+        if not raw_panes and isinstance(c.get("panes"), list):
+            raw_panes = c["panes"]
+        if not raw_agents and isinstance(c.get("agents"), list):
+            raw_agents = c["agents"]
+    ws_pane_ids = set()
+    ws_tab_ids = set()
+    for p in raw_panes:
+        if not isinstance(p, dict):
+            continue
+        if herdr_workspace and p.get("workspace_id") != ws_id:
+            continue
+        panes_out["panes"].append({
+            "name": p.get("name"),
+            "pane_id": p.get("pane_id"),
+            "tab_id": p.get("tab_id"),
+            "workspace_id": p.get("workspace_id"),
+        })
+        if p.get("pane_id"):
+            ws_pane_ids.add(p["pane_id"])
+        if p.get("tab_id"):
+            ws_tab_ids.add(p["tab_id"])
+    live = 0
+    for a in raw_agents:
+        if not isinstance(a, dict):
+            continue
+        in_ws = (
+            (herdr_workspace and a.get("workspace_id") == ws_id)
+            or a.get("pane_id") in ws_pane_ids
+            or a.get("tab_id") in ws_tab_ids
+        )
+        if in_ws:
+            live += 1
+    panes_out["live_agents"] = live
+except Exception:
+    tabs = {}
+    panes_out = {"panes": [], "live_agents": 0}
+
+with open(out_path, "w") as f:
+    json.dump(tabs, f)
+with open(panes_out_path, "w") as f:
+    json.dump(panes_out, f)
+PYEOF
+    then
+      _tr_herdr_ok=1
+    fi
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# parse repos out of config.json (dict or list; extract name -> {path,
+# mainline}), same defensive shape-tolerance as `reconcile`. `mainline` is
+# optional per repo entry; if absent, the branch-is-mainline check below
+# simply cannot trigger for that repo (never mistaken for a pass -- it just
+# means this particular guard is a no-op until `mainline` is configured).
+# ---------------------------------------------------------------------------
+# I6: repos parsing is delegated to pm_config_repos (THE one shared
+# parser); this step only RESHAPES its normalized list into the
+# name-keyed map track's stages consume. mainline_ref/fetch_policy/
+# merge_mode/allow_marker_branch_deleted are passed through raw here --
+# config.json is operator-editable post-scaffold, so B2.1's auto-close
+# pass performs its OWN runtime fail-closed validation of these VALUES
+# (never trusts scaffold-time validity survived; absent keys arrive as
+# null and mean the defaults "merge"/false downstream).
+_tr_repos_json="$(pm_config_repos "${_tr_config}" | python3 -c '
+import json, sys
+out = {}
+for r in json.load(sys.stdin):
+    name = r.pop("name")
+    out[name] = r
+print(json.dumps(out))
+')"
+
+# ---------------------------------------------------------------------------
+# Shared git-corroboration python routines (F2: the SAME logic is re-run
+# fresh in both stage 1's cheap pre-filter and stage 2's authoritative
+# post-lock recheck — never duplicated, never drifting between the two —
+# via `printf '%s\n%s\n' "$_TR_CORROB_PY" "$driver" | python3 -`).
+# ---------------------------------------------------------------------------
+read -r -d '' _TR_CORROB_PY <<'PYEOF' || true
+import json
+import os
+import re
+import subprocess
+
+TICKET_RE = re.compile(r"^(i\d+)-", re.IGNORECASE)
+# F1: the dispatch's own linked issue id, as persisted in the raw event log
+# (`dispatch_new i=I-<num>`) -- always the literal `I-<digits>` form.
+# \A/\Z (not ^/$): see BASE_SHA_RE above -- $ tolerates a trailing "\n".
+ISSUE_RE = re.compile(r"\AI-(\d+)\Z", re.IGNORECASE)
+# F3: a literal, FULL-LENGTH lowercase-hex git object name only -- never a
+# revision expression (HEAD/main/branch~2/...), which would resolve
+# DYNAMICALLY instead of anchoring a fixed point, and never a SHORT hex
+# prefix, which is *also* a valid git ref name and would let
+# `<base_sha>^{commit}` resolve a moving branch/tag instead of an immutable
+# object. 40 hex == sha-1 object name; 64 hex == sha-256 object name
+# (dispatch-prep records 64-hex on sha256-object-format repos). Checked
+# BEFORE any git use of the value.
+#
+# \A/\Z (not ^/$): Python's $ matches just before a trailing "\n", so a
+# value with an embedded trailing newline would validate here without the
+# char class ever accepting \n, then corrupt a rendered grammar line on
+# append. \A/\Z anchor to the true start/end of the string.
+BASE_SHA_RE = re.compile(r"\A(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
+
+
+# P3-2: repo-redirecting git environment variables are scrubbed from the
+# inherited environment before EVERY git invocation this module makes -- a
+# GIT_DIR/GIT_WORK_TREE/... leaking in from track's caller would silently
+# point corroboration at a DIFFERENT repository than the configured
+# repo_path (a decoy repo could then satisfy every topology check and
+# false-close). Lives here, next to GIT_NO_REPLACE_OBJECTS, so the whole
+# git env policy has exactly one home (tr_run); tr_g4_check's local run()
+# is a thin delegate to tr_run for the same reason.
+GIT_ENV_SCRUB = (
+    "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR", "GIT_GRAFT_FILE",
+)
+
+
+def tr_run(args, cwd, timeout=10):
+    # GIT_NO_REPLACE_OBJECTS=1 unconditionally on every git invocation this
+    # module makes (not just the ones inside tr_g4_check's own local `run()`)
+    # -- identity-anchoring (tr_verify_commit) and graft-probing
+    # (tr_repo_has_grafts) are called via tr_run from tr_g4_check and are
+    # just as replace-ref-sensitive as the calls tr_g4_check makes directly,
+    # so the neutralization must hold for the whole G4 code path, not just
+    # part of it.
+    env = dict(os.environ)
+    for _k in GIT_ENV_SCRUB:
+        env.pop(_k, None)
+    env["GIT_NO_REPLACE_OBJECTS"] = "1"
+    try:
+        r = subprocess.run(
+            ["git"] + args, cwd=cwd, capture_output=True, text=True, timeout=timeout,
+            env=env,
+        )
+        return r.returncode, r.stdout.strip(), r.stderr.strip()
+    except Exception:
+        return 1, "", "exec-failed"
+
+
+def tr_worktree_list(repo_path):
+    rc, out, _ = tr_run(["worktree", "list", "--porcelain"], repo_path)
+    if rc != 0:
+        return []
+    trees = []
+    cur = {}
+    for line in out.splitlines():
+        if not line.strip():
+            if cur:
+                trees.append(cur)
+                cur = {}
+            continue
+        if " " in line:
+            k, v = line.split(" ", 1)
+            cur[k] = v
+        else:
+            cur[line] = True
+    if cur:
+        trees.append(cur)
+    return trees
+
+
+def tr_is_dirty(path):
+    rc, status, _ = tr_run(["status", "--porcelain"], path)
+    if rc != 0:
+        # Can't determine cleanliness -> caller must treat this as dirty
+        # (never assume clean when the probe itself failed).
+        return True
+    return bool(status.strip())
+
+
+def tr_corroborate_git(repo_path, branch, base_sha, mainline_ref=None, mainline=None):
+    # Returns (reason, result_sha): reason is None (full pass, result_sha ==
+    # lock-time branch tip) or one of base-sha-wrong-length-for-repo/
+    # base-sha-unreachable/branch-missing/worktree-missing/dirty-worktree/
+    # no-new-commit/not-descendant/mainline-ref-not-configured/
+    # mainline-ref-missing/branch-contains-no-new-work.
+    #
+    # BASE_SHA_RE only gates *shape* (40 or 64 hex). A 64-hex string is a
+    # valid SHA-1 *object* length mismatch in a sha1 repo, but nothing stops
+    # it from also being a *branch/ref name* -- and vice versa (40-hex ref
+    # name in a sha256 repo). If base_sha were treated as a rev in that case,
+    # `rev-parse "<base_sha>^{commit}"` and `merge-base --is-ancestor` would
+    # resolve a moving ref instead of the immutable object, reopening the
+    # dynamic-ref bypass this function exists to close. Guard against that
+    # two ways: (1) require base_sha's length to match this repo's actual
+    # object format, and (2) require the resolved `^{commit}` object id to
+    # equal base_sha exactly -- a real object peels to itself; a ref name
+    # peels to a *different* id (the commit it points at).
+    rc, obj_format, _ = tr_run(["rev-parse", "--show-object-format"], repo_path)
+    if rc != 0:
+        return "base-sha-unreachable", None
+    obj_format = obj_format.strip()
+    expected_len = {"sha1": 40, "sha256": 64}.get(obj_format)
+    if expected_len is None or len(base_sha) != expected_len:
+        return "base-sha-wrong-length-for-repo", None
+
+    rc, resolved, _ = tr_run(
+        ["rev-parse", "--verify", "--end-of-options", base_sha + "^{commit}"], repo_path
+    )
+    if rc != 0:
+        return "base-sha-unreachable", None
+    if resolved.strip() != base_sha:
+        return "base-sha-unreachable", None
+
+    rc, _, _ = tr_run(["show-ref", "--verify", "--quiet", "refs/heads/" + branch], repo_path)
+    if rc != 0:
+        return "branch-missing", None
+
+    trees = tr_worktree_list(repo_path)
+    match = None
+    for t in trees:
+        wt_branch = t.get("branch", "")
+        if wt_branch.startswith("refs/heads/") and wt_branch[len("refs/heads/"):] == branch:
+            match = t
+            break
+    if match is None:
+        return "worktree-missing", None
+
+    worktree_path = match.get("worktree")
+    branch_tip = match.get("HEAD")
+    if not worktree_path or not branch_tip:
+        return "worktree-missing", None
+
+    if tr_is_dirty(worktree_path):
+        return "dirty-worktree", None
+
+    if branch_tip == base_sha:
+        return "no-new-commit", None
+
+    rc, _, _ = tr_run(["merge-base", "--is-ancestor", base_sha, branch_tip], repo_path)
+    if rc != 0:
+        return "not-descendant", None
+
+    # C1 fix: the two checks above only relate branch_tip to base_sha --
+    # they say nothing about whether branch_tip is ALSO already reachable
+    # from the repo's mainline. A worker that does zero real work and
+    # simply points its ticket branch at (or descended from) mainline's
+    # current tip -- e.g. `git reset --hard main` in its worktree -- passes
+    # both: branch_tip != base_sha (base_sha is stale relative to a mainline
+    # that has since advanced past it from OTHER work), and base_sha IS an
+    # ancestor of branch_tip (mainline only moves forward). Without this
+    # check that forged tip would strictly-git-corroborate as though it
+    # were the worker's own result. Refuse (never pass) whenever branch_tip
+    # is itself reachable from mainline: the branch carries no commit of
+    # its own beyond what mainline already has.
+    #
+    # Both mainline_ref and mainline are optional per repo -- if this repo
+    # has neither configured, this guard is simply a no-op for it, same as
+    # elsewhere in this file. A repo with neither can then also never reach
+    # G4/marker auto-close (both require mainline_ref), so leaving this
+    # guard inert in that specific case doesn't open an auto-close path.
+    #
+    # Local-only lookup, deliberately: stage 1 runs pre-lock, before
+    # track's separate pre-fetch phase, so mainline is resolved exactly as
+    # it stands in this local clone right now -- never fetched here.
+    #
+    # Edge case (a): in merge_mode=merge repos, a legitimately-merged
+    # branch's tip becomes an ancestor of mainline the moment a human
+    # merges it. If a slow/delayed track tick corroborates AFTER that
+    # merge, this guard fires and the row surfaces under
+    # branch-contains-no-new-work instead of auto-recording. That is
+    # fail-closed and acceptable (a human can still `bin/record` it
+    # manually) -- surfacing a merged branch under this reason is a false
+    # negative on legibility, never a false positive on safety.
+    #
+    # Edge case (b): mainline_ref may be configured but simply not resolve
+    # in this particular worker repo clone (e.g. never fetched here) --
+    # that is cannot-corroborate, not pass, so it refuses via
+    # mainline-ref-missing rather than silently skipping the check.
+    #
+    # Resolution order: prefer the fully-qualified `mainline_ref` (refs/...)
+    # when configured -- it is the form G4/marker auto-close itself trusts.
+    # Fall back to the plain `mainline` branch-name field (e.g. "main", the
+    # same field F1's branch-is-mainline guard already reads) resolved as
+    # refs/heads/<mainline> in THIS local clone: most repos configure only
+    # `mainline`, not `mainline_ref` (mainline_ref is reserved for fetch-
+    # policy repos), and RECORD-stage forgery is exploitable regardless of
+    # whether auto-close is reachable for this repo, so this guard must not
+    # go inert just because mainline_ref specifically is unset.
+    resolved_mainline_ref = None
+    if mainline_ref:
+        if not isinstance(mainline_ref, str) or not mainline_ref.startswith("refs/"):
+            return "mainline-ref-not-configured", None
+        resolved_mainline_ref = mainline_ref
+    elif mainline and isinstance(mainline, str):
+        resolved_mainline_ref = "refs/heads/" + mainline
+
+    if resolved_mainline_ref:
+        rc, mainline_sha, _ = tr_run(
+            ["rev-parse", "--verify", "--end-of-options", resolved_mainline_ref + "^{commit}"],
+            repo_path,
+        )
+        if rc != 0:
+            return "mainline-ref-missing", None
+        mainline_sha = mainline_sha.strip()
+        rc, _, _ = tr_run(
+            ["merge-base", "--is-ancestor", "--end-of-options", branch_tip, mainline_sha],
+            repo_path,
+        )
+        if rc == 0:
+            return "branch-contains-no-new-work", None
+
+    return None, branch_tip
+PYEOF
+
+
+# ---------------------------------------------------------------------------
+# STAGE 1 (outside any lock, read-only): identify candidate dispatches (ACKED
+# + recorded tab shows "done" in the snapshot) against the fold taken above,
+# and evaluate the strict corroboration predicate for each — independent
+# repo-path re-resolution from config.json (never trusting index.json's repo/
+# branch/base_sha as anything but names/anchors), base_sha shape/reachability,
+# mainline/ticket-branch checks, branch/worktree location, worktree
+# cleanliness, and tip-vs-base_sha ancestry. Slow git/herdr probing happens
+# here, OUTSIDE the lock, matching reconcile's pattern; stage 2 below RE-RUNS
+# the git corroboration under the lock (F2) rather than trusting this pass.
+# ---------------------------------------------------------------------------
+_tr_verdict_file="$(_tr_mktemp "${TMPDIR:-/tmp}/pm-track-verdict.XXXXXX")"
+
+read -r -d '' _tr_stage1_driver <<'PYEOF' || true
+index_path = os.environ["PM_TR_INDEX"]
+snapshot_path = os.environ["PM_TR_SNAPSHOT"]
+repos = json.loads(os.environ["PM_TR_REPOS"])
+herdr_ok = os.environ["PM_TR_HERDR_OK"] == "1"
+out_path = os.environ["PM_TR_OUT"]
+
+with open(index_path) as f:
+    index = json.load(f)
+with open(snapshot_path) as f:
+    snapshot = json.load(f)
+
+# Authoritative dispatch_new -> issue map, fold-derived (index.json key
+# "dispatch_issue_map", built ONLY from ACCEPTED -- successfully-applied,
+# never quarantined -- dispatch_new events; P3-5). STAGE 1's F1
+# branch-issue-mismatch check below reads this map instead of re-parsing
+# the raw event log itself -- a second raw-log parser here would diverge
+# from the fold's strict grammar (e.g. accepting a duplicate-key line the
+# fold quarantines) and could mis-join a dispatch to the wrong issue.
+dispatch_issue_map = dict(index.get("dispatch_issue_map") or {})
+
+results = []  # list of dicts: d, a, tab, branch, verdict("pass"/"surface"), reason/result_sha
+
+dispatches = index.get("dispatches", {})
+for d, disp in sorted(dispatches.items()):
+    if disp.get("state") != "ACKED":
+        continue
+    tab = disp.get("tab")
+    if not tab or tab == "?":
+        continue
+
+    a = disp.get("attempt")
+    repo_name = disp.get("repo")
+    branch = disp.get("branch")
+    attempts = disp.get("attempts") or {}
+    base_sha = (attempts.get(a) or {}).get("base_sha")
+
+    row = {"d": d, "a": a, "tab": tab, "repo": repo_name, "branch": branch}
+
+    def surface(reason):
+        row["verdict"] = "surface"
+        row["reason"] = reason
+        results.append(row)
+
+    # (F6) tab must positively appear in this tick's workspace-filtered
+    # snapshot at all -- if the WHOLE tick's herdr call failed, every such
+    # dispatch degrades to herdr-unavailable; if herdr is fine but this
+    # specific tab is simply absent (never labeled, wrong workspace, not
+    # yet created), it degrades to status-unknown. Neither is silently
+    # skipped.
+    snap_entry = snapshot.get(tab)
+    if snap_entry is None:
+        surface("herdr-unavailable" if not herdr_ok else "status-unknown")
+        continue
+
+    status = snap_entry.get("agent_status")
+    if status != "done":
+        continue  # working/blocked/etc -- ignored entirely this tick
+
+    if not repo_name or not branch or not base_sha:
+        surface("missing-metadata")
+        continue
+
+    # F3: base_sha shape, checked before ANY git use of the value.
+    if not BASE_SHA_RE.match(base_sha):
+        surface("base_sha-not-a-sha")
+        continue
+
+    repo_entry = repos.get(repo_name)
+    repo_path = repo_entry.get("path") if repo_entry else None
+    if not repo_path:
+        surface("repo-not-configured")
+        continue
+
+    rc, _, _ = tr_run(["rev-parse", "--is-inside-work-tree"], repo_path)
+    if rc != 0:
+        surface("repo-not-on-disk")
+        continue
+
+    # F1: refuse mainline / a non-ticket branch, before trusting the branch
+    # string for anything (including the tab-binding check below, which
+    # depends on the branch already looking like a ticket branch).
+    mainline = repo_entry.get("mainline")
+    if mainline and branch == mainline:
+        surface("branch-is-mainline")
+        continue
+    bm = TICKET_RE.match(branch) if branch else None
+    if not bm:
+        surface("branch-not-a-ticket-branch")
+        continue
+    # F1: the branch's ticket number must EQUAL the dispatch's own linked
+    # issue number, looked up from the fold's authoritative
+    # dispatch_issue_map (never guessed from the branch string alone, and
+    # never re-derived by a second raw-log parse). issue is persisted as
+    # `I-<digits>` (see dispatch_new's `i=` field) -- if it can't be
+    # resolved to that literal form at all, or the numbers don't match,
+    # surface and never record.
+    issue = dispatch_issue_map.get(d)
+    im = ISSUE_RE.match(issue) if issue else None
+    if not im or bm.group(1).lower() != ("i" + im.group(1)).lower():
+        surface("branch-issue-mismatch")
+        continue
+
+    # F5: positive tab-binding -- the tab's label must be present AND share
+    # the branch's own ticket prefix; unlabeled/reused/renamed tabs are an
+    # unconfirmed binding, never recorded.
+    label = snap_entry.get("label")
+    lm = TICKET_RE.match(label) if label else None
+    if not label or not lm or bm.group(1).lower() != lm.group(1).lower():
+        surface("tab-binding-unconfirmed")
+        continue
+
+    reason, result_sha = tr_corroborate_git(
+        repo_path, branch, base_sha, repo_entry.get("mainline_ref"), mainline
+    )
+    if reason:
+        surface(reason)
+        continue
+
+    row["verdict"] = "pass"
+    row["result_sha"] = result_sha
+    results.append(row)
+
+with open(out_path, "w") as f:
+    json.dump({"herdr_ok": herdr_ok, "rows": results}, f)
+PYEOF
+
+PM_TR_INDEX="${_tr_index}" \
+  PM_TR_SNAPSHOT="${_tr_snapshot_file}" \
+  PM_TR_REPOS="${_tr_repos_json}" \
+  PM_TR_HERDR_OK="${_tr_herdr_ok}" \
+  PM_TR_OUT="${_tr_verdict_file}" \
+  bash -c 'printf "%s\n%s\n" "$1" "$2" | python3 -' _ "${_TR_CORROB_PY}" "${_tr_stage1_driver}"
+_tr_stage1_rc=$?
+if [[ ${_tr_stage1_rc} -ne 0 ]]; then
+  echo "track: corroboration step failed" >&2
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# STAGE 2 (critical section): pm_lock -> re-fold (closes the TOCTOU race with
+# a concurrent track/human) -> for each stage-1 PASS, re-check D is STILL
+# ACKED at the SAME attempt `a` against the freshly-folded index, then
+# pm_apply the result. An explicit a="$a" is passed so a race (attempt bumped
+# or dispatch moved on) makes pm_apply itself refuse cleanly (benign, not an
+# error) rather than trusting a stale read. -> pm_unlock.
+# ---------------------------------------------------------------------------
+_tr_final_file="$(_tr_mktemp "${TMPDIR:-/tmp}/pm-track-final.XXXXXX")"
+
+# Auto-close pre-fetch phase (P2-1(b)) -- STILL OUTSIDE the lock, right
+# before acquiring it; see _track_autoclose for the full contract.
+_tr_autoclose_prefetch
+
+if ! pm_lock "${_tr_root}"; then
+  echo "track: failed to acquire repo lock" >&2
+  exit 1
+fi
+# pm_lock installs its own EXIT/INT/TERM traps; re-install ours so temp
+# files are still cleaned up on abnormal exit (same terminate-on-signal
+# shape -- see the C6 note at the trap definitions).
+trap _tr_cleanup EXIT
+trap '_tr_cleanup_sig INT' INT
+trap '_tr_cleanup_sig TERM' TERM
+
+if ! pm_fold "${_tr_root}"; then
+  echo "track: pm_fold failed (see above)" >&2
+  exit 1
+fi
+
+read -r -d '' _tr_stage2_driver <<'PYEOF' || true
+index_path = os.environ["PM_TR_INDEX"]
+verdict_path = os.environ["PM_TR_VERDICT"]
+repos = json.loads(os.environ["PM_TR_REPOS"])
+final_path = os.environ["PM_TR_FINAL"]
+
+with open(index_path) as f:
+    index = json.load(f)
+with open(verdict_path) as f:
+    verdict = json.load(f)
+
+dispatches = index.get("dispatches", {})
+recheck = []
+for row in verdict["rows"]:
+    if row.get("verdict") != "pass":
+        continue
+    disp = dispatches.get(row["d"])
+    if disp is None or disp.get("state") != "ACKED" or disp.get("attempt") != row["a"]:
+        row = dict(row)
+        row["verdict"] = "surface"
+        row["reason"] = "already-recorded"
+        recheck.append(row)
+        continue
+
+    # F2: re-run the FULL git corroboration fresh, under the lock, instead
+    # of trusting stage 1's (pre-lock) read -- any deviation (branch moved,
+    # worktree got dirty, base_sha stopped resolving, ...) between stage 1
+    # and here is a real race and must surface, never record.
+    repo_entry = repos.get(row.get("repo"))
+    repo_path = repo_entry.get("path") if repo_entry else None
+    branch = disp.get("branch")
+    base_sha = (disp.get("attempts") or {}).get(row["a"], {}).get("base_sha")
+    reason = None
+    result_sha = None
+    if not repo_path or not branch or not base_sha:
+        reason = "corroboration-changed-under-lock"
+    else:
+        reason, result_sha = tr_corroborate_git(
+            repo_path, branch, base_sha,
+            repo_entry.get("mainline_ref") if repo_entry else None,
+            repo_entry.get("mainline") if repo_entry else None,
+        )
+
+    if reason:
+        row = dict(row)
+        row["verdict"] = "surface"
+        row["reason"] = "corroboration-changed-under-lock"
+        recheck.append(row)
+        continue
+
+    row = dict(row)
+    row["result_sha"] = result_sha  # lock-time tip, not the stale stage-1 read
+    recheck.append(row)
+
+with open(final_path, "w") as f:
+    json.dump(recheck, f)
+PYEOF
+
+PM_TR_INDEX="${_tr_index}" \
+  PM_TR_VERDICT="${_tr_verdict_file}" \
+  PM_TR_REPOS="${_tr_repos_json}" \
+  PM_TR_FINAL="${_tr_final_file}" \
+  bash -c 'printf "%s\n%s\n" "$1" "$2" | python3 -' _ "${_TR_CORROB_PY}" "${_tr_stage2_driver}"
+
+_tr_now="$(now_iso)"
+_tr_recorded_file="$(_tr_mktemp "${TMPDIR:-/tmp}/pm-track-recorded.XXXXXX")"
+printf '[]' >"${_tr_recorded_file}"
+
+python3 -c '
+import json, sys
+with open(sys.argv[1]) as f:
+    rows = json.load(f)
+for row in rows:
+    print(json.dumps(row))
+' "${_tr_final_file}" | {
+  while IFS= read -r _tr_line; do
+    [[ -z "${_tr_line}" ]] && continue
+    _tr_d="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["d"])' "${_tr_line}")"
+    _tr_verdict="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["verdict"])' "${_tr_line}")"
+    if [[ "${_tr_verdict}" != "pass" ]]; then
+      continue
+    fi
+    _tr_a="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["a"])' "${_tr_line}")"
+    _tr_sha="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["result_sha"])' "${_tr_line}")"
+    # C8: a fixed, predictable `.pm/*.tmp` path here would let anything
+    # with write access to `.pm/` (operator territory, but not a reason to
+    # hand out an arbitrary-file clobber) plant a symlink and have this
+    # stderr redirect truncate-through it. mktemp's unpredictable name
+    # closes that; register it on the manifest so a signal mid-loop still
+    # reaps it.
+    _tr_apply_err_file="$(_tr_mktemp "${TMPDIR:-/tmp}/pm-track-apply-err.XXXXXX")"
+    if pm_apply result d="${_tr_d}" a="${_tr_a}" status=RETURNED result_sha="${_tr_sha}" at="${_tr_now}" >/dev/null 2>"${_tr_apply_err_file}"; then
+      python3 -c '
+import json, sys
+path = sys.argv[1]
+row = json.loads(sys.argv[2])
+with open(path) as f:
+    rows = json.load(f)
+rows.append(row)
+with open(path, "w") as f:
+    json.dump(rows, f)
+' "${_tr_recorded_file}" "${_tr_line}"
+    else
+      _tr_err="$(cat "${_tr_apply_err_file}" 2>/dev/null || true)"
+      python3 -c '
+import json, sys
+path = sys.argv[1]
+row = json.loads(sys.argv[2])
+row["verdict"] = "surface"
+row["reason"] = "raced-refused"
+row["detail"] = sys.argv[3]
+with open(path) as f:
+    rows = json.load(f)
+rows.append(row)
+with open(path, "w") as f:
+    json.dump(rows, f)
+' "${_tr_final_file}" "${_tr_line}" "${_tr_err}"
+    fi
+    rm -f "${_tr_apply_err_file}"
+  done
+}
+
+# STAGE 2.5 (still under the SAME pm_lock hold): B2.1 auto-close pass;
+# see _track_autoclose for the full contract.
+_tr_autoclose_pass
+
+pm_unlock
+trap _tr_cleanup EXIT
+trap '_tr_cleanup_sig INT' INT
+trap '_tr_cleanup_sig TERM' TERM
+
+# SPAWN stage (B3, after STAGE 2.5): automation-lane auto-spawn; the whole
+# stage lives in the sourced component _track_spawn (I25).
+# shellcheck source=./_track_spawn
+# shellcheck disable=SC1091
+source "${_TR_SELF}/_track_spawn"
+
+# ---------------------------------------------------------------------------
+# STAGE 3 (outside lock): render TRACKER.md's `tracker` GENERATED block —
+# pure function of the stage-1/2 results, marker-interior-only writes, never
+# parses Markdown prose for state. Recorded rows come from _tr_recorded_file;
+# every other row in _tr_final_file plus every stage-1 surface-only row is
+# listed with its reason.
+# ---------------------------------------------------------------------------
+# I8: esc_md_inline/esc_md_cell and render_marker come prepended from
+# _lib.sh's _PM_MD_PY (the one shared copy), composed the same way the
+# _TR_CORROB_PY pipelines are.
+read -r -d '' _tr_render_driver <<'PYEOF' || true
+import json
+import os
+
+root = os.environ["PM_TR_ROOT"]
+verdict_path = os.environ["PM_TR_VERDICT"]
+final_path = os.environ["PM_TR_FINAL"]
+recorded_path = os.environ["PM_TR_RECORDED"]
+ac_closed_path = os.environ["PM_TR_AC_CLOSED"]
+ac_surfaced_path = os.environ["PM_TR_AC_SURFACED"]
+tracker_md = os.environ["PM_TR_TRACKER_MD"]
+now = os.environ["PM_TR_NOW"]
+herdr_ok = os.environ["PM_TR_HERDR_OK"] == "1"
+
+with open(verdict_path) as f:
+    stage1 = json.load(f)["rows"]
+with open(final_path) as f:
+    stage2 = json.load(f)
+with open(recorded_path) as f:
+    recorded = json.load(f)
+with open(ac_closed_path) as f:
+    ac_closed = json.load(f)
+with open(ac_surfaced_path) as f:
+    ac_surfaced = json.load(f)
+with open(os.environ["PM_TR_SPAWN_PLAN"]) as f:
+    spawn_plan = json.load(f)
+with open(os.environ["PM_TR_SPAWN_ROWS"]) as f:
+    spawn_exec_rows = json.load(f)
+with open(os.environ["PM_TR_SPAWN_SPAWNED"]) as f:
+    spawn_spawned = json.load(f)
+
+# B3: the spawn stage's full surface set = plan-time rows (guards,
+# recovery anomalies, config) + execution-time rows (herdr failures,
+# benign races); steady-state counts come from the plan.
+spawn_rows = list(spawn_plan.get("rows", [])) + list(spawn_exec_rows)
+spawn_steady = spawn_plan.get("steady", {}) or {}
+
+recorded_ds = {r["d"] for r in recorded}
+
+# Surfaced set: every stage-1 surface-only row, plus every stage-2 row that
+# ended up surfaced (already-recorded / raced-refused), minus anything that
+# actually got recorded.
+surfaced = []
+for row in stage1:
+    if row.get("verdict") == "surface":
+        surfaced.append(row)
+for row in stage2:
+    if row.get("verdict") == "surface" and row["d"] not in recorded_ds:
+        surfaced.append(row)
+
+# Markdown-injection defenses: esc_md_cell/esc_md_inline are provided by
+# the prepended _PM_MD_PY snippet (_lib.sh) -- the single shared copy (I8).
+
+lines = []
+if not herdr_ok:
+    lines.append(
+        "> herdr snapshot unavailable this tick — no dispatches were evaluated "
+        "(degrade-and-surface, not a hard failure)."
+    )
+    lines.append("")
+
+if recorded:
+    lines.append("### Auto-recorded this tick")
+    lines.append("")
+    lines.append("| dispatch | attempt | tab | branch | result_sha |")
+    lines.append("| --- | --- | --- | --- | --- |")
+    for r in sorted(recorded, key=lambda r: r["d"]):
+        lines.append(
+            "| {} | {} | {} | {} | {} |".format(
+                esc_md_cell(r["d"]),
+                esc_md_cell(r["a"]),
+                esc_md_cell(r["tab"]),
+                esc_md_cell(r.get("branch")),
+                esc_md_cell(r.get("result_sha")),
+            )
+        )
+    lines.append("")
+else:
+    lines.append("### Auto-recorded this tick")
+    lines.append("")
+    lines.append("(none)")
+    lines.append("")
+
+if surfaced:
+    lines.append("### Surfaced — done tabs NOT auto-recorded")
+    lines.append("")
+    lines.append("| dispatch | tab | branch | reason |")
+    lines.append("| --- | --- | --- | --- |")
+    for r in sorted(surfaced, key=lambda r: r["d"]):
+        lines.append(
+            "| {} | {} | {} | {} |".format(
+                esc_md_cell(r["d"]),
+                esc_md_cell(r.get("tab")),
+                esc_md_cell(r.get("branch")),
+                esc_md_cell(r.get("reason")),
+            )
+        )
+    lines.append("")
+else:
+    lines.append("### Surfaced — done tabs NOT auto-recorded")
+    lines.append("")
+    lines.append("(none)")
+    lines.append("")
+
+if ac_closed:
+    lines.append("### Auto-closed this tick")
+    lines.append("")
+    lines.append("| issue | action | reason |")
+    lines.append("| --- | --- | --- |")
+    for r in sorted(ac_closed, key=lambda r: r["i"]):
+        lines.append(
+            "| {} | {} | {} |".format(
+                esc_md_cell(r["i"]),
+                esc_md_cell(r.get("action")),
+                esc_md_cell(r.get("reason")),
+            )
+        )
+    lines.append("")
+else:
+    lines.append("### Auto-closed this tick")
+    lines.append("")
+    lines.append("(none)")
+    lines.append("")
+
+# P3-7: signal partition. Steady-state reasons (expected, non-actionable
+# rows that would otherwise drown the real signal) collapse to ONE summary
+# line each with a truncated id list; every other reason is actionable/
+# anomalous and renders individually WITH its detail (P3-3).
+AC_STEADY_STATE_REASONS = (
+    "paused/non-active",
+    "dispatch-not-VERIFIED",
+    "auto-close-disabled",
+    "issue-unregistered",
+)
+
+
+def ac_summarize_ids(ids, limit=10):
+    ids = sorted(ids)
+    shown = ", ".join(ids[:limit])
+    if len(ids) > limit:
+        shown += ", +{} more".format(len(ids) - limit)
+    return shown
+
+
+ac_steady = {}
+ac_actionable = []
+for r in ac_surfaced:
+    if r.get("reason") in AC_STEADY_STATE_REASONS:
+        ac_steady.setdefault(r["reason"], []).append(r["i"])
+    else:
+        ac_actionable.append(r)
+
+lines.append("### Surfaced — issues NOT auto-closed")
+lines.append("")
+if not ac_surfaced:
+    lines.append("(none)")
+    lines.append("")
+else:
+    if ac_actionable:
+        lines.append("| issue | reason | detail |")
+        lines.append("| --- | --- | --- |")
+        for r in sorted(ac_actionable, key=lambda r: r["i"]):
+            lines.append(
+                "| {} | {} | {} |".format(
+                    esc_md_cell(r["i"]),
+                    esc_md_cell(r.get("reason")),
+                    esc_md_cell(r.get("detail") or ""),
+                )
+            )
+        lines.append("")
+    for reason in AC_STEADY_STATE_REASONS:
+        if reason in ac_steady:
+            ids = ac_steady[reason]
+            lines.append(
+                "- {}: {} issue(s) ({})".format(
+                    esc_md_inline(reason),
+                    len(ids),
+                    esc_md_inline(ac_summarize_ids(ids)),
+                )
+            )
+    if ac_steady:
+        lines.append("")
+
+# --- B3: automation lane (auto-spawn) section ---
+lines.append("### Automation lane — auto-spawn")
+lines.append("")
+if not spawn_spawned and not spawn_rows and not spawn_steady:
+    lines.append("(none)")
+    lines.append("")
+else:
+    if spawn_spawned:
+        lines.append("| dispatch | attempt | worker | tab | mode |")
+        lines.append("| --- | --- | --- | --- | --- |")
+        for r in sorted(spawn_spawned, key=lambda r: r["d"]):
+            lines.append(
+                "| {} | {} | {} | {} | {} |".format(
+                    esc_md_cell(r["d"]),
+                    esc_md_cell(r.get("a")),
+                    esc_md_cell(r.get("worker")),
+                    esc_md_cell(r.get("tab")),
+                    esc_md_cell(r.get("mode")),
+                )
+            )
+        lines.append("")
+    if spawn_rows:
+        lines.append("| dispatch | reason | detail |")
+        lines.append("| --- | --- | --- |")
+        for r in sorted(spawn_rows, key=lambda r: r.get("d") or ""):
+            lines.append(
+                "| {} | {} | {} |".format(
+                    esc_md_cell(r.get("d")),
+                    esc_md_cell(r.get("reason")),
+                    esc_md_cell(r.get("detail") or ""),
+                )
+            )
+        lines.append("")
+    for reason in sorted(spawn_steady):
+        ids = spawn_steady[reason]
+        lines.append(
+            "- {}: {} dispatch(es) ({})".format(
+                esc_md_inline(reason),
+                len(ids),
+                esc_md_inline(ac_summarize_ids(ids)),
+            )
+        )
+    if spawn_steady:
+        lines.append("")
+
+lines.append("_last tick: {}_".format(esc_md_cell(now)))
+body = "\n".join(lines)
+
+conflicts = []
+
+render_marker(tracker_md, "tracker", body)
+
+print("=== track ===")
+print(f"recorded: {len(recorded)}")
+print(f"surfaced: {len(surfaced)}")
+print(f"auto-closed: {len(ac_closed)}")
+print(f"auto-close surfaced: {len(ac_surfaced)}")
+if not herdr_ok:
+    print("herdr: unavailable this tick (degraded, not fatal)")
+if conflicts:
+    print("CONFLICTS:")
+    for c in conflicts:
+        print(f"  - {c}")
+else:
+    print("CONFLICTS: none")
+for r in sorted(recorded, key=lambda r: r["d"]):
+    print(f"  RECORDED {r['d']} a={r['a']} tab={r['tab']} result_sha={r.get('result_sha')}")
+for r in sorted(surfaced, key=lambda r: r["d"]):
+    print(f"  SURFACED {r['d']} tab={r.get('tab')} reason={r.get('reason')}")
+for r in sorted(ac_closed, key=lambda r: r["i"]):
+    print(f"  AUTO-CLOSED {r['i']} action={r.get('action')} reason={r.get('reason')}")
+for r in sorted(ac_actionable, key=lambda r: r["i"]):
+    print(f"  AUTO-CLOSE-SURFACED {r['i']} reason={r.get('reason')}")
+for reason in AC_STEADY_STATE_REASONS:
+    if reason in ac_steady:
+        ids = ac_steady[reason]
+        print(f"  AUTO-CLOSE-SURFACED ({reason}) count={len(ids)} ids={ac_summarize_ids(ids)}")
+print(f"auto-spawned: {len([r for r in spawn_spawned if r.get('mode') == 'spawned'])}")
+for r in sorted(spawn_spawned, key=lambda r: r["d"]):
+    print(f"  SPAWNED {r['d']} a={r.get('a')} worker={r.get('worker')} tab={r.get('tab')}")
+for r in sorted(spawn_rows, key=lambda r: r.get("d") or ""):
+    print(f"  SPAWN-SURFACED {r.get('d')} reason={r.get('reason')} detail={r.get('detail') or ''}")
+for reason in sorted(spawn_steady):
+    ids = spawn_steady[reason]
+    print(f"  SPAWN-STEADY ({reason}) count={len(ids)} ids={ac_summarize_ids(ids)}")
+PYEOF
+
+# shellcheck disable=SC2154  # _tr_ac_*/_tr_spawn_* files are assigned by the
+# sourced _track_autoclose/_track_spawn components before the render step runs
+if ! PM_TR_ROOT="${_tr_root}" \
+  PM_TR_VERDICT="${_tr_verdict_file}" \
+  PM_TR_FINAL="${_tr_final_file}" \
+  PM_TR_RECORDED="${_tr_recorded_file}" \
+  PM_TR_AC_CLOSED="${_tr_ac_closed_file}" \
+  PM_TR_AC_SURFACED="${_tr_ac_surfaced_file}" \
+  PM_TR_SPAWN_PLAN="${_tr_spawn_plan_file}" \
+  PM_TR_SPAWN_ROWS="${_tr_spawn_rows_file}" \
+  PM_TR_SPAWN_SPAWNED="${_tr_spawn_spawned_file}" \
+  PM_TR_TRACKER_MD="${_tr_tracker_md}" \
+  PM_TR_NOW="${_tr_now}" \
+  PM_TR_HERDR_OK="${_tr_herdr_ok}" \
+  bash -c 'printf "%s\n%s\n" "$1" "$2" | python3 -' _ "${_PM_MD_PY}" "${_tr_render_driver}"; then
+  echo "track: render step failed" >&2
+  exit 1
+fi
+
+exit 0

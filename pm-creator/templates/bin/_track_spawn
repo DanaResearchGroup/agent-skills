@@ -1,0 +1,696 @@
+# shellcheck shell=bash
+# shellcheck disable=SC2154  # _tr_* globals are assigned by bin/track before this component runs
+# _track_spawn — the B3 automation-lane spawn stage of bin/track, split out
+# as a sourced component (I25). Sourced by bin/track at the original stage
+# position (after STAGE 2.5, before STAGE 3 render), so the whole stage --
+# including its own pm_lock/pm_unlock windows, trap re-installs and the
+# _tr_sp_* helpers -- executes exactly as it did inline. Uses _TR_CORROB_PY
+# and _TR_CLOSE_PY (REASONS registry) defined via _track_autoclose.
+# guard: sourced component of bin/track, never a program of its own
+[[ "${BASH_SOURCE[0]}" != "$0" ]] || { echo "_track_spawn: sourced component of bin/track; run bin/track instead" >&2; exit 2; }
+
+# ---------------------------------------------------------------------------
+# SPAWN stage (B3, after STAGE 2.5): automation-lane auto-spawn via the
+# durable spawn-intent lease. Runs only when automation.auto_spawn is true
+# AND herdr was available this tick (else it skips exactly like STAGE 1);
+# with auto_spawn OFF and a non-empty queue it surfaces the steady-state
+# `auto-spawn-disabled` count instead. An invalid spawn config is a
+# FAIL-CLOSED skip with a surfaced `spawn-config-invalid` row.
+#
+# Two phases, planned OUTSIDE any lock from the fold + the workspace-
+# filtered panes[], then executed with durability-before-effect ordering:
+#
+#   Phase A (crash recovery): a spawn_intent open from a PRIOR tick with no
+#   ACK joins panes[name == ref]. Phase A NEVER ACKs: herdr allows
+#   DUPLICATE pane names and the deterministic worker name is derivable
+#   from events.log, so a name join alone is impostor-forgeable -- an
+#   auto-ACK here would let a single impostor pane permanently silence the
+#   orphan surface. Exactly one live pane -> `spawn-ack-unconfirmed` row
+#   naming the candidate pane (name/tab_id/pane_id) + the exact manual
+#   `bin/record dispatch <D> ACKED --tab <id>` command; >1 ->
+#   `ambiguous-spawn-ack`; none -> the intent ages (advisory
+#   .pm/spawn-intent-age.json -- drives ONLY the `suspected-orphan-intent`
+#   surface, never state; track NEVER auto-abandons). Phase B's same-tick
+#   ACK below is different in kind: track created that tab itself this
+#   tick, so the join is strongly corroborated, not name-guessed.
+#
+#   Phase B (spawn, per free capacity slot, FIFO by dispatch number):
+#   guards (prompt re-resolved from the folded note binding + RE-HASHED
+#   against the recorded prompt_sha; deterministic worker name not already
+#   a live pane), then (i) under pm_lock: re-fold, re-check eligibility,
+#   append the spawn_intent DURABLY, release; (ii) OUTSIDE the lock:
+#   herdr tab create; (iii) OUTSIDE the lock: herdr agent start; (iv)
+#   under pm_lock: DISPATCHED->ACKED with the created tab_id, SAME tick.
+#   Every failure after (i) leaves the durable intent in place (it ages
+#   into Phase A recovery) and surfaces -- fail-closed, never a guess.
+#   pm_lock is NEVER held across the herdr calls.
+# ---------------------------------------------------------------------------
+_tr_spawn_plan_file="$(_tr_mktemp "${TMPDIR:-/tmp}/pm-track-spawn-plan.XXXXXX")"
+printf '{"spawn": [], "rows": [], "steady": {}, "age": {}, "ran": false}' >"${_tr_spawn_plan_file}"
+_tr_spawn_rows_file="$(_tr_mktemp "${TMPDIR:-/tmp}/pm-track-spawn-rows.XXXXXX")"
+printf '[]' >"${_tr_spawn_rows_file}"
+_tr_spawn_spawned_file="$(_tr_mktemp "${TMPDIR:-/tmp}/pm-track-spawn-done.XXXXXX")"
+printf '[]' >"${_tr_spawn_spawned_file}"
+_tr_spawn_age_file="${_tr_root}/.pm/spawn-intent-age.json"
+_tr_spawn_now="$(now_iso)"
+
+read -r -d '' _tr_spawn_plan_driver <<'PYEOF' || true
+import hashlib
+
+# Snapshot-derived herdr ids (tab_id/pane_id) that may be embedded into an
+# operator-pasteable command must match this strict charset; anything else
+# is withheld from the command position (P2 -- paste-injection guard).
+# \A/\Z (not ^/$): see BASE_SHA_RE above -- $ tolerates a trailing "\n".
+_SP_ID_RE = re.compile(r"\A[A-Za-z0-9:_-]+\Z")
+
+_sp_cfg = json.loads(os.environ["PM_TR_SPAWN_CFG"])
+_sp_herdr_ok = os.environ["PM_TR_HERDR_OK"] == "1"
+_sp_root = os.environ["PM_TR_ROOT"]
+_sp_out = os.environ["PM_TR_SPAWN_PLAN"]
+_sp_age_path = os.environ["PM_TR_SPAWN_AGE"]
+
+with open(os.environ["PM_TR_INDEX"]) as f:
+    _sp_index = json.load(f)
+with open(os.environ["PM_TR_PANES"]) as f:
+    _sp_panes = json.load(f)
+
+_sp_plan = {"spawn": [], "rows": [], "steady": {}, "age": {}, "ran": False}
+
+
+def _sp_check_reason(reason):
+    # fix-pass-5b#3 discipline: every reason this stage can surface MUST be
+    # registered in REASONS; an unregistered token is a programming error.
+    if reason not in REASONS:
+        raise RuntimeError(
+            f"spawn stage produced unregistered reason {reason!r} -- REASONS "
+            "registry has drifted; add it to REASONS in track"
+        )
+
+
+def _sp_surface(d, reason, detail=""):
+    _sp_check_reason(reason)
+    row = {"d": d, "reason": reason}
+    if detail:
+        row["detail"] = detail
+    _sp_plan["rows"].append(row)
+
+
+def _sp_steady(reason, ids):
+    _sp_check_reason(reason)
+    _sp_plan["steady"][reason] = sorted(ids)
+
+
+_sp_dispatches = _sp_index.get("dispatches", {})
+_sp_issues = _sp_index.get("issues", {})
+_sp_dim = _sp_index.get("dispatch_issue_map") or {}
+_sp_oq = _sp_index.get("open_questions_by_issue") or {}
+
+
+def _sp_open_intent(disp):
+    # An OPEN lease: the dispatch is still DISPATCHED and its CURRENT
+    # attempt has an accepted spawn_intent (an ACK moves the state on; a
+    # retry mints a new attempt the old intent is not keyed under).
+    # Superseded dispatches are excluded (Red Team F5): they need human
+    # adjudication, matching Phase B's queue rule and under-lock re-check.
+    if disp.get("superseded"):
+        return None, None
+    a = disp.get("attempt")
+    si = disp.get("spawn_intent") or {}
+    if disp.get("state") == "DISPATCHED" and a and a in si:
+        return a, si[a]
+    return None, None
+
+
+def _sp_dnum(d):
+    try:
+        return int(d.split("-", 1)[1])
+    except Exception:
+        return 1 << 30
+
+
+# The queue (computed for BOTH the enabled and disabled paths -- the
+# disabled path needs to know whether anything is waiting): automation-lane
+# dispatches currently DISPATCHED with tab still "?", no open intent, not
+# superseded, whose owning issue is known, not NEEDS-USER/BLOCKED, and has
+# no open question. FIFO by dispatch number.
+_sp_queue = []
+for _sp_d in sorted(_sp_dispatches, key=_sp_dnum):
+    _sp_disp = _sp_dispatches[_sp_d]
+    if _sp_disp.get("state") != "DISPATCHED":
+        continue
+    if _sp_disp.get("lane") != "automation":
+        continue
+    if _sp_disp.get("tab") != "?":
+        continue
+    if _sp_disp.get("superseded"):
+        continue
+    _sp_a, _ = _sp_open_intent(_sp_disp)
+    if _sp_a:
+        continue
+    _sp_issue = _sp_dim.get(_sp_d)
+    if not _sp_issue:
+        continue
+    if (_sp_issues.get(_sp_issue) or {}).get("state") in ("NEEDS-USER", "BLOCKED"):
+        continue
+    if _sp_oq.get(_sp_issue):
+        continue
+    _sp_queue.append(_sp_d)
+
+if not _sp_cfg.get("valid"):
+    # FAIL-CLOSED: invalid automation config -> one loud row, zero spawns.
+    _sp_surface("(automation)", "spawn-config-invalid", _sp_cfg.get("detail") or "")
+elif not _sp_cfg.get("enabled"):
+    if _sp_queue:
+        _sp_steady("auto-spawn-disabled", _sp_queue)
+elif not _sp_herdr_ok:
+    # skip exactly like STAGE 1 -- the global herdr-unavailable banner
+    # already covers the tick.
+    pass
+else:
+    _sp_plan["ran"] = True
+
+    # ---- Phase A: crash-recovery over open PRIOR-tick intents ----
+    # (every folded open intent predates this tick by construction: Phase B
+    # has not run yet, so nothing from THIS tick can be in the fold.)
+    # Age-file failure direction (hunter P2): a corrupt/unreadable file
+    # must FAIL TOWARD SURFACING -- if the counter could be wiped every
+    # tick, a true orphan would never age past the timeout. Whole-file
+    # corruption therefore treats every open intent as ALREADY AGED this
+    # tick (surface sooner, never later); a single malformed ENTRY merely
+    # restarts that entry's count.
+    _sp_age_corrupt = False
+    try:
+        with open(_sp_age_path) as f:
+            _sp_age = json.load(f)
+        if not isinstance(_sp_age, dict):
+            _sp_age = {}
+            _sp_age_corrupt = True
+    except FileNotFoundError:
+        _sp_age = {}
+    except Exception:
+        _sp_age = {}
+        _sp_age_corrupt = True
+
+    def _sp_age_entry(key):
+        # v1 entries were bare ints; v2 entries are {"n": int, "cause": str}
+        # (cause = last known spawn-window failure, advisory text only).
+        raw = _sp_age.get(key)
+        if isinstance(raw, dict):
+            n = raw.get("n")
+            return (n if isinstance(n, int) and n >= 0 else 0), raw.get("cause")
+        if isinstance(raw, int) and raw >= 0:
+            return raw, None
+        return 0, None
+
+    _sp_live_panes = [p for p in _sp_panes.get("panes", []) if p.get("name")]
+    for _sp_d in sorted(_sp_dispatches, key=_sp_dnum):
+        _sp_disp = _sp_dispatches[_sp_d]
+        _sp_a, _sp_intent = _sp_open_intent(_sp_disp)
+        if not _sp_a:
+            continue
+        _sp_ref = _sp_intent.get("ref")
+        _sp_matches = [
+            p for p in _sp_live_panes
+            if _sp_ref and p.get("name") == _sp_ref and p.get("tab_id")
+        ]
+        if len(_sp_matches) == 1:
+            # NEVER auto-ack on a bare name join (impostor-forgeable; see
+            # the stage header). Surface the candidate + the exact manual
+            # confirmation command instead. The ids are SNAPSHOT-derived
+            # (not fold-validated tokens), and the command is built to be
+            # operator-PASTEABLE -- so both ids must pass a strict charset
+            # check before they may ride into it (a hostile tab_id like
+            # `foo; rm -rf ~` must never reach a shell via copy-paste).
+            _sp_pane = _sp_matches[0]
+            _sp_tab_id = str(_sp_pane.get("tab_id") or "")
+            _sp_pane_id = str(_sp_pane.get("pane_id") or "")
+            if _SP_ID_RE.match(_sp_tab_id) and _SP_ID_RE.match(_sp_pane_id):
+                _sp_detail = (
+                    "live pane candidate name={} tab_id={} pane_id={}; if this "
+                    "is the real worker, confirm manually: bin/record dispatch "
+                    "{} ACKED --tab {}".format(
+                        _sp_ref, _sp_tab_id, _sp_pane_id, _sp_d, _sp_tab_id,
+                    )
+                )
+            else:
+                _sp_detail = (
+                    "live pane candidate matched worker name {} but its "
+                    "snapshot ids failed the charset check; ready-to-paste "
+                    "command withheld -- inspect the herdr snapshot "
+                    "manually".format(_sp_ref)
+                )
+            _sp_surface(_sp_d, "spawn-ack-unconfirmed", _sp_detail)
+        elif len(_sp_matches) > 1:
+            _sp_surface(_sp_d, "ambiguous-spawn-ack",
+                        f"{len(_sp_matches)} live panes named {_sp_ref}")
+        else:
+            _sp_key = f"{_sp_d}/{_sp_a}"
+            _sp_prev_n, _sp_cause = _sp_age_entry(_sp_key)
+            if _sp_age_corrupt:
+                _sp_n = max(_sp_cfg["timeout"], 1)
+            else:
+                _sp_n = _sp_prev_n + 1
+            _sp_plan["age"][_sp_key] = {"n": _sp_n, "cause": _sp_cause}
+            if _sp_n >= _sp_cfg["timeout"]:
+                _sp_detail = (
+                    f"no live pane named {_sp_ref} after {_sp_n} herdr-visible "
+                    "tick(s); operator adjudication needed (track never auto-abandons)"
+                )
+                if _sp_age_corrupt:
+                    _sp_detail += "; age counter file was corrupt (failed toward surfacing)"
+                if _sp_cause:
+                    _sp_detail += f"; last known cause: {_sp_cause}"
+                _sp_surface(_sp_d, "suspected-orphan-intent", _sp_detail)
+
+    # ---- Phase B: spawn planning per free capacity slot ----
+    _sp_live = _sp_panes.get("live_agents", 0)
+    _sp_free = _sp_cfg["max_live_workers"] - (_sp_live if isinstance(_sp_live, int) else 0)
+    _sp_pane_names = {p.get("name") for p in _sp_live_panes}
+    if _sp_queue and _sp_free <= 0:
+        _sp_steady("capacity-exceeded", _sp_queue)
+    elif _sp_queue:
+        _sp_over = []
+        for _sp_d in _sp_queue:
+            if _sp_free <= 0:
+                _sp_over.append(_sp_d)
+                continue
+            _sp_disp = _sp_dispatches[_sp_d]
+            _sp_a = _sp_disp.get("attempt")
+            _sp_pref = _sp_disp.get("prompt_ref")
+            _sp_psha = _sp_disp.get("prompt_sha")
+            # D2 guard: the durable prompt copy is re-resolved from the
+            # FOLDED note binding and RE-HASHED against the recorded
+            # prompt_sha before any spawn -- a mismatch/missing binding is
+            # a surface, never a spawn.
+            if not _sp_pref or not _sp_psha:
+                _sp_surface(_sp_d, "prompt-sha-mismatch",
+                            "no folded prompt binding (prompt_ref/prompt_sha missing)")
+                continue
+            if not _sp_pref.startswith("prompts/") or ".." in _sp_pref.split("/"):
+                _sp_surface(_sp_d, "prompt-sha-mismatch",
+                            f"unsafe prompt binding {_sp_pref!r}")
+                continue
+            _sp_m = re.match(r"^I-(\d+)_(.+)_\d{4}-\d{2}-\d{2}\.md$",
+                             _sp_pref.split("/")[-1])
+            if not _sp_m:
+                _sp_surface(_sp_d, "prompt-sha-mismatch",
+                            f"prompt binding {_sp_pref!r} does not match "
+                            "I-###_<slug>_YYYY-MM-DD.md")
+                continue
+            _sp_abs = os.path.join(_sp_root, _sp_pref)
+            try:
+                with open(_sp_abs, "rb") as _sp_f:
+                    _sp_got = hashlib.sha256(_sp_f.read()).hexdigest()[:8]
+            except OSError:
+                _sp_surface(_sp_d, "prompt-sha-mismatch", f"{_sp_pref} unreadable")
+                continue
+            if _sp_got != _sp_psha:
+                _sp_surface(_sp_d, "prompt-sha-mismatch",
+                            f"recorded prompt_sha={_sp_psha}, durable copy hashes {_sp_got}")
+                continue
+            # Deterministic worker identity: label keeps STAGE 1's
+            # ticket-prefix join working; the name is exact for recovery.
+            _sp_label = f"i{_sp_m.group(1)}-{_sp_m.group(2)}"
+            _sp_name = "{}-D{}A{}".format(
+                _sp_label, _sp_d.split("-", 1)[1], (_sp_a or "").split("-", 1)[-1]
+            )
+            if _sp_name in _sp_pane_names:
+                _sp_surface(_sp_d, "name-collision",
+                            f"a live pane named {_sp_name} already exists")
+                continue
+            _sp_free -= 1
+            _sp_plan["spawn"].append({
+                "d": _sp_d, "a": _sp_a, "ref": _sp_name, "label": _sp_label,
+                "prompt": _sp_abs,
+                "argv": [_sp_abs if el == "{prompt}" else el for el in _sp_cfg["argv"]],
+            })
+        if _sp_over:
+            _sp_steady("capacity-exceeded", _sp_over)
+
+with open(_sp_out, "w") as f:
+    json.dump(_sp_plan, f)
+PYEOF
+
+_tr_spawn_err_file="$(_tr_mktemp "${TMPDIR:-/tmp}/pm-track-spawn-err.XXXXXX")"
+if ! PM_TR_INDEX="${_tr_index}" \
+  PM_TR_PANES="${_tr_panes_file}" \
+  PM_TR_SPAWN_CFG="${_tr_spawn_cfg}" \
+  PM_TR_HERDR_OK="${_tr_herdr_ok}" \
+  PM_TR_ROOT="${_tr_root}" \
+  PM_TR_SPAWN_AGE="${_tr_spawn_age_file}" \
+  PM_TR_SPAWN_PLAN="${_tr_spawn_plan_file}" \
+  bash -c 'printf "%s\n%s\n%s\n" "$1" "$2" "$3" | python3 -' _ "${_TR_CORROB_PY}" "${_TR_CLOSE_PY}" "${_tr_spawn_plan_driver}" \
+  2>"${_tr_spawn_err_file}"; then
+  # Loud degrade (mirrors the auto-close driver): a plan-driver crash must
+  # never be a silent no-op -- one unmistakable surfaced row + stderr echo.
+  _tr_spawn_err_tail="$(tail -c 2000 "${_tr_spawn_err_file}" 2>/dev/null || true)"
+  if [[ -n "${_tr_spawn_err_tail}" ]]; then
+    {
+      echo "track: auto-spawn plan driver failed; stderr tail:"
+      printf '%s\n' "${_tr_spawn_err_tail}"
+    } >&2
+  fi
+  printf '{"spawn": [], "rows": [], "steady": {}, "age": {}, "ran": false}' >"${_tr_spawn_plan_file}"
+  DETAIL="${_tr_spawn_err_tail}" python3 -c '
+import json, os, sys
+row = {"d": "(auto-spawn)", "reason": "spawn-driver-error"}
+if os.environ.get("DETAIL"):
+    row["detail"] = os.environ["DETAIL"]
+with open(sys.argv[1]) as f:
+    rows = json.load(f)
+rows.append(row)
+with open(sys.argv[1], "w") as f:
+    json.dump(rows, f)
+' "${_tr_spawn_rows_file}" || true
+fi
+rm -f "${_tr_spawn_err_file}"
+
+# row/spawned append helpers (file-backed, matching the AC loop pattern --
+# a `| { while ...; }` subshell cannot mutate parent variables).
+_tr_sp_add_row() {
+  # _tr_sp_add_row <d> <reason> <detail>
+  python3 -c '
+import json, sys
+path, d, reason, detail = sys.argv[1:5]
+with open(path) as f:
+    rows = json.load(f)
+row = {"d": d, "reason": reason}
+if detail:
+    row["detail"] = detail
+rows.append(row)
+with open(path, "w") as f:
+    json.dump(rows, f)
+' "${_tr_spawn_rows_file}" "$@"
+}
+
+_tr_sp_add_spawned() {
+  # _tr_sp_add_spawned <d> <a> <worker> <tab> <mode>
+  python3 -c '
+import json, sys
+path, d, a, worker, tab, mode = sys.argv[1:7]
+with open(path) as f:
+    rows = json.load(f)
+rows.append({"d": d, "a": a, "worker": worker, "tab": tab, "mode": mode})
+with open(path, "w") as f:
+    json.dump(rows, f)
+' "${_tr_spawn_spawned_file}" "$@"
+}
+
+_tr_spawn_ran="$(python3 -c 'import json, sys; print("1" if json.load(open(sys.argv[1])).get("ran") else "0")' "${_tr_spawn_plan_file}")"
+# max_live_workers for the under-lock DURABLE capacity gate (validated by
+# the verdict above; only read when the stage actually runs).
+_tr_spawn_max_live="$(python3 -c 'import json, sys; print(json.loads(sys.argv[1]).get("max_live_workers", 1))' "${_tr_spawn_cfg}")"
+
+# _tr_sp_write_age <json-string-or-@planfile>: tmp-then-rename write of the
+# advisory age file, refusing to follow a symlinked destination (security
+# P3 -- .pm/ is operator territory, but a planted symlink must not turn an
+# advisory write into an arbitrary-file clobber). Advisory only: failure to
+# write is ignored (fails toward SURFACING sooner, never later, per the
+# corrupt-file rule in the plan driver).
+_tr_sp_write_age_from_plan() {
+  python3 -c '
+import json, os, sys
+plan_path, age_path = sys.argv[1], sys.argv[2]
+with open(plan_path) as f:
+    plan = json.load(f)
+if os.path.islink(age_path):
+    sys.exit(1)
+tmp = age_path + ".tmp"
+# C8: the destination-islink check above guards age_path, not the tmp name
+# actually opened below -- a symlink planted at *that* name would otherwise
+# turn this advisory write into an arbitrary-file clobber. Only remove a
+# pre-existing tmp when it is a plain regular file (never a symlink or
+# anything else); then open with O_EXCL|O_NOFOLLOW so even a symlink
+# planted in the TOCTOU window between the check and the open is refused
+# by the kernel, not raced.
+if os.path.lexists(tmp):
+    if os.path.islink(tmp) or not os.path.isfile(tmp):
+        sys.exit(1)
+    os.unlink(tmp)
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+with os.fdopen(fd, "w") as f:
+    json.dump(plan.get("age", {}), f)
+os.replace(tmp, age_path)
+' "${_tr_spawn_plan_file}" "${_tr_spawn_age_file}" || true
+}
+
+# _tr_sp_note_cause <d> <a> <cause>: record the spawn-window failure cause
+# into the advisory age file entry for (d,a), so the eventual
+# suspected-orphan-intent row can say WHY the worker never appeared
+# (Red Team F2). Advisory only -- never gates state; same tmp-then-rename
+# + no-symlink hygiene as above.
+_tr_sp_note_cause() {
+  python3 -c '
+import json, os, sys
+age_path, d, a, cause = sys.argv[1:5]
+if os.path.islink(age_path):
+    sys.exit(1)
+try:
+    with open(age_path) as f:
+        age = json.load(f)
+    if not isinstance(age, dict):
+        age = {}
+except Exception:
+    age = {}
+key = f"{d}/{a}"
+prev = age.get(key)
+n = 0
+if isinstance(prev, dict) and isinstance(prev.get("n"), int) and prev["n"] >= 0:
+    n = prev["n"]
+elif isinstance(prev, int) and prev >= 0:
+    n = prev
+age[key] = {"n": n, "cause": cause}
+tmp = age_path + ".tmp"
+# C8: same symlink-proof tmp-name handling as _tr_sp_write_age_from_plan
+# above -- see its comment.
+if os.path.lexists(tmp):
+    if os.path.islink(tmp) or not os.path.isfile(tmp):
+        sys.exit(1)
+    os.unlink(tmp)
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+with os.fdopen(fd, "w") as f:
+    json.dump(age, f)
+os.replace(tmp, age_path)
+' "${_tr_spawn_age_file}" "$@" || true
+}
+
+if [[ "${_tr_spawn_ran}" == "1" ]]; then
+  # Persist the advisory intent-age map (drives ONLY the
+  # suspected-orphan-intent surface; a lost file fails toward surfacing).
+  _tr_sp_write_age_from_plan
+
+  # ---- Phase A produces SURFACES ONLY (spawn-ack-unconfirmed /
+  # ambiguous-spawn-ack / suspected-orphan-intent, all planned above);
+  # there is deliberately NO recovery-ACK execution path -- a name join is
+  # impostor-forgeable, so confirming a recovered worker is the operator's
+  # call via `bin/record dispatch <D> ACKED --tab <id>`.
+
+  # ---- Phase B execution: per planned candidate, the durability-before-
+  # effect ordering described in the stage header. The lock is NEVER held
+  # across the herdr calls.
+  python3 -c '
+import json, sys
+with open(sys.argv[1]) as f:
+    plan = json.load(f)
+for r in plan.get("spawn", []):
+    print(json.dumps(r))
+' "${_tr_spawn_plan_file}" | {
+    while IFS= read -r _tr_sp_line; do
+      [[ -z "${_tr_sp_line}" ]] && continue
+      _tr_sp_d="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["d"])' "${_tr_sp_line}")"
+      _tr_sp_a="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["a"])' "${_tr_sp_line}")"
+      _tr_sp_ref="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["ref"])' "${_tr_sp_line}")"
+      _tr_sp_label="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["label"])' "${_tr_sp_line}")"
+
+      # (i) under pm_lock: re-fold, re-check the candidate is STILL
+      # eligible, then append the spawn_intent DURABLY. Any deviation is a
+      # benign race (surface, skip), never an error.
+      # NOTE: no `trap _tr_cleanup` re-install here -- this loop runs in a
+      # pipeline SUBSHELL, and an EXIT trap installed in it would fire at
+      # subshell exit and delete the parent's shared temp files out from
+      # under STAGE 3. pm_lock/pm_unlock stay balanced within each
+      # iteration, which is all the subshell needs.
+      if ! pm_lock "${_tr_root}"; then
+        _tr_sp_add_row "${_tr_sp_d}" raced-refused "could not acquire the repo lock for the spawn intent"
+        continue
+      fi
+      if ! pm_fold "${_tr_root}" >/dev/null 2>&1; then
+        pm_unlock
+        _tr_sp_add_row "${_tr_sp_d}" raced-refused "re-fold failed under lock; spawn skipped this tick"
+        continue
+      fi
+      # Under-lock re-check, three verdicts (exit codes):
+      #   1 -- no longer eligible (benign race)
+      #   2 -- DURABLE capacity gate refused (security P2): the snapshot's
+      #        live-agent count is advisory and lock-free; two concurrent
+      #        track runs can both see live=0 while the log already
+      #        carries commitments. The authoritative count is what the
+      #        LOG supports under this lock: open spawn_intent leases +
+      #        ACKED automation dispatches. Fail direction: under-spawn.
+      #   3 -- prompt re-hash mismatch (security P2): the plan-time hash
+      #        ran outside the lock; re-hash the durable copy here so a
+      #        tamper in the plan->lock window cannot ride into a spawn.
+      _tr_sp_check_out="$(python3 -c '
+import hashlib, json, os, sys
+idx = json.load(open(sys.argv[1]))
+d, a, max_live, root = sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5]
+dispatches = idx.get("dispatches") or {}
+disp = dispatches.get(d) or {}
+issues = idx.get("issues") or {}
+dim = idx.get("dispatch_issue_map") or {}
+oq = idx.get("open_questions_by_issue") or {}
+ok = (
+    disp.get("state") == "DISPATCHED"
+    and disp.get("lane") == "automation"
+    and disp.get("tab") == "?"
+    and disp.get("attempt") == a
+    and not disp.get("superseded")
+    and a not in (disp.get("spawn_intent") or {})
+)
+issue = dim.get(d)
+ok = ok and bool(issue) and (issues.get(issue) or {}).get("state") not in ("NEEDS-USER", "BLOCKED") and not oq.get(issue)
+if not ok:
+    sys.exit(1)
+holders = []
+for od, other in dispatches.items():
+    if other.get("lane") != "automation":
+        continue
+    if other.get("state") == "ACKED":
+        holders.append(od)
+    elif (
+        other.get("state") == "DISPATCHED"
+        and not other.get("superseded")
+        and other.get("attempt")
+        and other.get("attempt") in (other.get("spawn_intent") or {})
+    ):
+        holders.append(od)
+if len(holders) >= max_live:
+    # name the slot holders so the operator can see WHICH dispatches hold
+    # capacity (e.g. a dead-worker ACKED dispatch at max_live_workers=1)
+    print(" ".join(sorted(holders)))
+    sys.exit(2)
+pref, psha = disp.get("prompt_ref"), disp.get("prompt_sha")
+if not pref or not psha:
+    sys.exit(3)
+try:
+    with open(os.path.join(root, pref), "rb") as f:
+        got = hashlib.sha256(f.read()).hexdigest()[:8]
+except OSError:
+    sys.exit(3)
+sys.exit(0 if got == psha else 3)
+' "${_tr_index}" "${_tr_sp_d}" "${_tr_sp_a}" "${_tr_spawn_max_live}" "${_tr_root}")"
+      _tr_sp_rc=$?
+      if [[ ${_tr_sp_rc} -ne 0 ]]; then
+        pm_unlock
+        case "${_tr_sp_rc}" in
+          2) _tr_sp_add_row "${_tr_sp_d}" capacity-exceeded "durable capacity gate: open leases + ACKED automation dispatches >= max_live_workers under lock (snapshot count was stale/optimistic); held by: ${_tr_sp_check_out}" ;;
+          3) _tr_sp_add_row "${_tr_sp_d}" prompt-sha-mismatch "under-lock re-hash of the durable prompt no longer matches the recorded prompt_sha (changed after planning); no intent appended" ;;
+          *) _tr_sp_add_row "${_tr_sp_d}" raced-refused "candidate no longer eligible under lock (benign race)" ;;
+        esac
+        continue
+      fi
+      # C8: unpredictable mktemp name, not a fixed `.pm/*.tmp` path -- see
+      # the STAGE 2 apply-err comment above for why.
+      _tr_sp_intent_err_file="$(_tr_mktemp "${TMPDIR:-/tmp}/pm-track-spawn-err.XXXXXX")"
+      if ! PM_ROOT="${_tr_root}" pm_apply spawn_intent d="${_tr_sp_d}" a="${_tr_sp_a}" ref="${_tr_sp_ref}" at="${_tr_spawn_now}" \
+        >/dev/null 2>"${_tr_sp_intent_err_file}"; then
+        pm_unlock
+        _tr_sp_err="$(tr '\n' ' ' <"${_tr_sp_intent_err_file}" 2>/dev/null || true)"
+        rm -f "${_tr_sp_intent_err_file}"
+        # C4: the engine's spawn-lease-held token means an OPEN intent for
+        # this (d, a) already holds the exclusive lease -- another track
+        # won it (exit 0 no longer exists for duplicates, so "I won" is
+        # only ever true for the process whose append was ACCEPTED).
+        # Surface a distinct row and do NOT spawn; any other refusal stays
+        # the benign raced-refused surface. Either way: skip, never spawn.
+        if [[ "${_tr_sp_err}" == *"spawn-lease-held"* ]]; then
+          _tr_sp_add_row "${_tr_sp_d}" lease-held-elsewhere "spawn_intent refused under lock: an open intent already holds the (d, a) lease (won by another process); not spawning this tick"
+        else
+          _tr_sp_add_row "${_tr_sp_d}" raced-refused "spawn_intent refused under lock (benign race): ${_tr_sp_err}"
+        fi
+        continue
+      fi
+      rm -f "${_tr_sp_intent_err_file}"
+      pm_unlock
+
+      # (ii) OUTSIDE the lock: create the worker tab. On failure the
+      # durable intent stays and ages into Phase A recovery next ticks.
+      _tr_sp_tab_out="$(herdr tab create --workspace "${_tr_herdr_workspace}" \
+        --label "${_tr_sp_label}" --no-focus </dev/null 2>/dev/null)"
+      _tr_sp_rc=$?
+      if [[ ${_tr_sp_rc} -ne 0 ]]; then
+        _tr_sp_code="$(python3 -c '
+import json, sys
+try:
+    print(((json.loads(sys.argv[1]) or {}).get("error") or {}).get("code") or "unknown-error")
+except Exception:
+    print("unknown-error")
+' "${_tr_sp_tab_out}")"
+        _tr_sp_add_row "${_tr_sp_d}" herdr-tab-create-failed "herdr error code: ${_tr_sp_code}; durable intent left for recovery"
+        _tr_sp_note_cause "${_tr_sp_d}" "${_tr_sp_a}" "herdr-tab-create-failed (${_tr_sp_code})"
+        continue
+      fi
+      _tr_sp_tab_id="$(python3 -c '
+import json, sys
+try:
+    print((((json.loads(sys.argv[1]) or {}).get("result") or {}).get("tab") or {}).get("tab_id") or "")
+except Exception:
+    print("")
+' "${_tr_sp_tab_out}")"
+      if [[ -z "${_tr_sp_tab_id}" ]]; then
+        _tr_sp_add_row "${_tr_sp_d}" herdr-tab-create-failed "tab created but no result.tab.tab_id in herdr stdout; durable intent left for recovery"
+        _tr_sp_note_cause "${_tr_sp_d}" "${_tr_sp_a}" "herdr-tab-create-failed (no tab_id in stdout)"
+        continue
+      fi
+
+      # (iii) OUTSIDE the lock: start the worker agent in that tab.
+      mapfile -d '' -t _tr_sp_argv < <(python3 -c '
+import json, sys
+for el in json.loads(sys.argv[1])["argv"]:
+    sys.stdout.write(el + "\0")
+' "${_tr_sp_line}")
+      _tr_sp_start_out="$(herdr agent start "${_tr_sp_ref}" --workspace "${_tr_herdr_workspace}" \
+        --tab "${_tr_sp_tab_id}" --no-focus -- "${_tr_sp_argv[@]}" </dev/null 2>/dev/null)"
+      _tr_sp_rc=$?
+      if [[ ${_tr_sp_rc} -ne 0 ]]; then
+        _tr_sp_code="$(python3 -c '
+import json, sys
+try:
+    print(((json.loads(sys.argv[1]) or {}).get("error") or {}).get("code") or "unknown-error")
+except Exception:
+    print("unknown-error")
+' "${_tr_sp_start_out}")"
+        _tr_sp_add_row "${_tr_sp_d}" herdr-start-failed "herdr error code: ${_tr_sp_code}; durable intent left for recovery"
+        _tr_sp_note_cause "${_tr_sp_d}" "${_tr_sp_a}" "herdr-start-failed (${_tr_sp_code})"
+        # Best-effort cleanup of track-OWNED state (Red Team F3): track
+        # created this tab THIS tick, so closing it is not an auto-act on
+        # operator state. Ignore failure; no surface.
+        herdr tab close "${_tr_sp_tab_id}" </dev/null >/dev/null 2>&1 || true
+        continue
+      fi
+
+      # (iv) under pm_lock (inside pm_apply): re-fold + re-check via the
+      # strict engine, then the SAME-TICK DISPATCHED->ACKED with the
+      # created tab_id. A refusal here is a benign race -- the live agent
+      # is absorbed later by reconcile's unregistered_execution/adopt
+      # path; never killed, never an error.
+      # C8: unpredictable mktemp name, not a fixed `.pm/*.tmp` path -- see
+      # the STAGE 2 apply-err comment above for why.
+      _tr_sp_ack_err_file="$(_tr_mktemp "${TMPDIR:-/tmp}/pm-track-spawn-err.XXXXXX")"
+      if PM_ROOT="${_tr_root}" pm_apply dispatch_state d="${_tr_sp_d}" a="${_tr_sp_a}" from=DISPATCHED to=ACKED \
+        lane=automation tab="${_tr_sp_tab_id}" at="${_tr_spawn_now}" \
+        >/dev/null 2>"${_tr_sp_ack_err_file}"; then
+        _tr_sp_add_spawned "${_tr_sp_d}" "${_tr_sp_a}" "${_tr_sp_ref}" "${_tr_sp_tab_id}" spawned
+      else
+        _tr_sp_err="$(tr '\n' ' ' <"${_tr_sp_ack_err_file}" 2>/dev/null || true)"
+        _tr_sp_add_row "${_tr_sp_d}" raced-refused "same-tick ack refused (benign race; live agent will be absorbed by reconcile): ${_tr_sp_err}"
+      fi
+      rm -f "${_tr_sp_ack_err_file}"
+    done
+  }
+
+  # Leave index.json fresh at end of stage: a benign raced ACK refusal
+  # commits nothing itself, but the RACING event is already durable on the
+  # log -- refold so the index reflects it rather than the pre-race read.
+  pm_fold "${_tr_root}" >/dev/null 2>&1 || true
+fi
