@@ -75,16 +75,34 @@ a glossary. Extract every value the templates need:
     authority. If the user's operating model is "I am involved at defining and reviewing every
     item", then `auto_spawn: true` quietly deletes the *defining* half: a manager that
     proposes and then executes its own proposal has reviewed nothing. Where the user wants a
-    start-gate, set `auto_spawn: false` **and** write the rule into `CONVENTIONS.md` §4 and the
-    top of `RESUME.md` — the flag is the enforcement (a compacted manager cannot skim past it),
-    the prose is the explanation. Note that per-issue `Approval gates:` do NOT cover this:
-    they gate actions taken *during* the work, never the decision to begin it.
+    start-gate, set `auto_spawn: false` **and** fill `START_GATE_NOTE` (below) — the flag is
+    the enforcement (a compacted manager cannot skim past it), the prose is the explanation.
+    Note that per-issue `Approval gates:` do NOT cover this: they gate actions taken *during*
+    the work, never the decision to begin it.
   - **`max_live_workers` counts every live agent in the workspace**, including hand-spawned
     ones, not just auto-spawned. Size it against the actual constraints — API rate limits and
     how many returning results a human can review — rather than CPU, since agent sessions are
     near-idle processes. Set it as a runaway bound comfortably above expected concurrency; a
     cap tight enough to throttle a planned day-one fleet costs real time for no resource
     reason.
+- `START_GATE_NOTE` — the standing pre-flight rule rendered at the TOP of the manager's own
+  reading in `RESUME.md`, or **empty** for a campaign with no start-gate. Put it here rather
+  than only in `CONVENTIONS.md`: `RESUME.md` is what a freshly-compacted manager reads first,
+  and a rule it does not see in the first screen is a rule it will rediscover by breaking it.
+  Keep it short and imperative, and say what the manager may still do without asking (read,
+  probe, reconcile, draft, propose) so the gate reads as a boundary rather than a freeze —
+  e.g.:
+
+  ```markdown
+  ## ⛔ Read this before doing anything else
+
+  **Nothing starts without <user> saying go.** No issue, no dispatch, no worker session — no
+  matter what the queue order or an issue's ACTIVE state implies. Approval is per specific
+  piece of work and is never inferred. You may read, probe, reconcile, draft prompts, and
+  propose; you may not run `bin/dispatch-prep`, create a tab, or start an agent until told to.
+  `automation.auto_spawn` is `false` so `bin/track` cannot spawn even if you forget. Full rule:
+  `CONVENTIONS.md` §4.
+  ```
 - worktree root (default `~/Code`), runs root (only if long-running jobs — see optional slots)
 - herdr workspace — ⚠️ grill for the workspace **id** (`herdr workspace list` → `workspace_id`,
   e.g. `w7`) in preference to its human label. `herdr`'s CLI resolves `--workspace` by id

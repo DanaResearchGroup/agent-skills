@@ -41,6 +41,7 @@ v = {
   "REMOTE_POLICY": "local-only",
   "UPLOAD_POLICY": "none (local-only)",
   "CAPACITY_NOTE": "- **Capacity profile:** see `MACHINE.md` (single dev box).",
+  "START_GATE_NOTE": "",
   "OPTIONAL_SLOT_NOTE": ", `RUNS.md`, `MACHINE.md`",
   "OPTIONAL_SLOT_ROWS": "| `RUNS.md` | Long-running jobs registry (optional slot) |\n| `MACHINE.md` | Resource/capacity profile (optional slot) |",
   "ALWAYS_HUMAN_GATES": "merges to `main`, any push",
