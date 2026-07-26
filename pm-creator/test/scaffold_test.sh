@@ -1369,8 +1369,9 @@ section_optional_slots_inactive_no_dangling_refs() {
 
   values="$WORK/values-slots.json"
   write_full_values "$values" "$demo"
-  # Un-activate BOTH optional slots: every slot placeholder goes empty except
-  # the capacity bullet, which keeps its narrative but names no MACHINE.md.
+  # Un-activate ALL THREE optional slots: every slot placeholder goes empty
+  # except the capacity bullet, which keeps its narrative but names no
+  # MACHINE.md.
   python3 - "$values" <<'PY'
 import json, sys
 v = json.load(open(sys.argv[1]))
@@ -1389,14 +1390,14 @@ PY
   fi
 
   # SKILL step 3: delete the un-activated slot files.
-  rm -f "$out/MACHINE.md" "$out/RUNS.md"
+  rm -f "$out/MACHINE.md" "$out/RUNS.md" "$out/DAYLOG.md"
 
   local dangling
-  dangling="$(find "$out" -maxdepth 1 -name '*.md' -exec grep -l 'MACHINE\.md\|RUNS\.md' {} + 2>/dev/null)"
+  dangling="$(find "$out" -maxdepth 1 -name '*.md' -exec grep -l 'MACHINE\.md\|RUNS\.md\|DAYLOG\.md' {} + 2>/dev/null)"
   if [[ -z "$dangling" ]]; then
-    ok "no dangling MACHINE.md/RUNS.md references in narrative markdown"
+    ok "no dangling MACHINE.md/RUNS.md/DAYLOG.md references in narrative markdown"
   else
-    fail "no dangling MACHINE.md/RUNS.md references in narrative markdown" "found in: $dangling"
+    fail "no dangling MACHINE.md/RUNS.md/DAYLOG.md references in narrative markdown" "found in: $dangling"
   fi
 }
 
