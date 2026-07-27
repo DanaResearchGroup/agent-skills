@@ -123,12 +123,13 @@ a glossary. Extract every value the templates need:
   and are carried into every dispatch prompt (`CONVENTIONS.md` §4/§9)
 - remote policy for THIS PM repo: local-only, or a **private** GitHub repo
 - per-repo upload policy + always-human gates (merges to shared branches, pushes, NEEDS-USER)
-- which optional slots are active: `RUNS.md` (long jobs), `MACHINE.md` (heavy compute).
-  Slot activation is carried by three placeholders (so an un-activated scaffold ships zero
-  dangling references): `OPTIONAL_SLOT_NOTE` (RESUME reading list, e.g.
-  `` , `RUNS.md`, `MACHINE.md` `` or empty), `OPTIONAL_SLOT_ROWS` (README layout-table rows
-  for the active slots, or empty), and `CAPACITY_NOTE` (the whole CONVENTIONS capacity
-  bullet — name `MACHINE.md` in it only when that slot is active)
+- which optional slots are active: `RUNS.md` (long jobs), `MACHINE.md` (heavy compute),
+  `DAYLOG.md` (day-by-day progress log). Each slot is activated only if the user chooses it
+  during this grilling — default is off. Slot activation is carried by three placeholders
+  (so an un-activated scaffold ships zero dangling references): `OPTIONAL_SLOT_NOTE` (RESUME
+  reading list, e.g. `` , `RUNS.md`, `MACHINE.md`, `DAYLOG.md` `` or empty), `OPTIONAL_SLOT_ROWS`
+  (README layout-table rows for the active slots, or empty), and `CAPACITY_NOTE` (the whole
+  CONVENTIONS capacity bullet — name `MACHINE.md` in it only when that slot is active)
 
 **Completion:** every `{{PLACEHOLDER}}` in `templates/` maps to a concrete grilled value,
 and the user has confirmed the repo list + mainlines + remote policy. No placeholder is left
@@ -157,9 +158,9 @@ scaffold.sh --values <values.json> --out <target_dir>
 It interpolates every template, copies `bin/*` executable, writes `.gitignore` + `.pm/`
 config, seeds `.pm/events.log` with its schema header, and FAILS LOUDLY if any placeholder
 lacks a value or any `{{...}}` survives. Then, in the target, IN THIS ORDER: (1) delete the
-optional slot files (`RUNS.md` / `MACHINE.md`) the user did not activate, so they never enter
-history; (2) `git init`, stage, one initial commit; (3) if the remote policy is a private
-GitHub repo, create it **private** and push, otherwise add no remote.
+optional slot files (`RUNS.md` / `MACHINE.md` / `DAYLOG.md`) the user did not activate, so
+they never enter history; (2) `git init`, stage, one initial commit; (3) if the remote policy
+is a private GitHub repo, create it **private** and push, otherwise add no remote.
 
 **Completion:** `scaffold.sh` exited 0, the target is a git repo with an initial commit,
 `bin/` is executable, `.pm/events.log` carries only its header, and `grep -rn '{{' <target>`
