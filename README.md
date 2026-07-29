@@ -93,14 +93,10 @@ Verify with `/plugin` — you should see `superpowers` enabled. Full docs:
 
 | Group | Skills |
 | --- | --- |
-| **Research automation** | `babysit-arc`, `babysit-t3` — run/babysit ARC & T3 campaigns -- Please **NEVER** automate agents on a server without consulting the server owner (your PI) first! |
 | **Notifications** | `slack-ask`, `slack-notify` — reach you over Slack during unattended runs |
 | **Matt Pocock** ([`mattpocock/skills`](https://github.com/mattpocock/skills), MIT — see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)) | `tdd`, `to-spec`, `to-tickets`, `implement`, `code-review`, `triage`, `prototype`, `codebase-design`, `domain-modeling`, `improve-codebase-architecture`, `grilling`, `grill-me`, `grill-with-docs`, `resolving-merge-conflicts`, `setup-matt-pocock-skills`, `writing-great-skills`, `handoff`, `edit-article`, `obsidian-vault`, `wayfinder` |
 | **Workflow** | `writing-git-commits`, `copilot-review` — fold a PR's Copilot/security bot review back into history; `merged` — after a PR lands, sync `main` and rebase the open PRs onto it; `sync-matt-pocock-skills` — pull a newer `mattpocock/skills` release into our vendored copies, keeping local edits |
-| **Orchestration** | `pm-creator` — scaffold a self-resuming `<campaign>-pm` control-plane repo (event-log state, human-gated dispatch lane) for overseeing a multi-repo, multi-agent campaign; `session-sweep` — for an overseer/PM session driving worker sessions: scan every relevant session, triage each `RUN`/`CLOSE`/`MESSAGE`/`ESCALATE` against ground truth, and auto-send any message a worker needs |
 | **Autonomous development** | `autodev` — drive a large feature build end-to-end in one autonomous session, with adversarial Codex review at every milestone and automatic context handoff/compact/resume past 30%; `spar` — run an adversarial "try to break this" Codex sparring round against your current code, plan, or decision, persisted per-project; `herdr` — inspect and control Herdr (a terminal multiplexer for coding agents) panes, tabs, workspaces, and cross-agent communication |
-| **Funding** | `auto-proposals` — for each open funding call in the proposals archive, propose candidate research topics grounded in the group's own track record, then (on approval) write an outline and a full draft; every write goes through a chokepoint that cannot overwrite or delete anything in an un-versioned Dropbox archive |
-| **HQ** (Alon's personal ops vault) | `hq-brief` — write/refresh the weekly focus brief across all hats; `hq-capture` — push a session's decisions, next-actions, and blockers into the owning HQ node; `hq-pr` — triage pull requests and refresh the Developer watch-list with per-PR next-actions; `hq-update` — refresh HQ boards/nodes with live PR/CI/deadline and staleness state |
 
 Plus **gstack** (installed in step 3) and the **Superpowers** plugin (step 4).
 

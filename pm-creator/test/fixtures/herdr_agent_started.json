@@ -1,1 +1,0 @@
-{"id":"cli:agent:start","result":{"agent":{"agent_status":"unknown","name":"__NAME__","pane_id":"zzz-test-ws:p77","tab_id":"__TAB__","workspace_id":"zzz-test-ws"},"argv":["__NAME__"],"type":"agent_started"}}
