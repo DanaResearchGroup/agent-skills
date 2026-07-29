@@ -14,20 +14,17 @@ After edits, run `python3 bin/lint-skills.py` to confirm nothing broke.
 
 | # | Applies if you… | Files | What to change |
 | --- | --- | --- | --- |
-| 1 | …are on any machine (everyone) | `handoff/SKILL.md`, `slack-ask/SKILL.md`, `slack-notify/SKILL.md`, `babysit-arc/SKILL.md`, `SETUP.md`, `~/.claude/settings.json` | Repo docs use `$HOME/...` and usually need no home-dir edits. `handoff` saves to `$HOME/agents/handoffs/`, and the Slack skills call `$HOME/.claude/bin/cc-slack-post.py`. The `~/.claude/settings.json` allow-rule is the exception: write the literal absolute helper path there, because allow-rules do not expand `$HOME`. |
+| 1 | …are on any machine (everyone) | `handoff/SKILL.md`, `slack-ask/SKILL.md`, `slack-notify/SKILL.md`, `SETUP.md`, `~/.claude/settings.json` | Repo docs use `$HOME/...` and usually need no home-dir edits. `handoff` saves to `$HOME/agents/handoffs/`, and the Slack skills call `$HOME/.claude/bin/cc-slack-post.py`. The `~/.claude/settings.json` allow-rule is the exception: write the literal absolute helper path there, because allow-rules do not expand `$HOME`. |
 | 2 | …want Slack notifications | `slack-ask/SKILL.md`, `slack-notify/SKILL.md`, `SETUP.md`, `~/.claude/settings.json` | Create your own Slack bot token (`~/.claude/.slack-bot-token`, never committed), set your channel (default is `#cc-comm` / `CC_SLACK_CHANNEL`), and allowlist the helper path. Full walkthrough in [SETUP.md](SETUP.md). Otherwise mark N/A and ignore these skills. |
-| 3 | …run ARC or T3 campaigns | `babysit-arc/*`, `babysit-t3/*` (incl. `arc_babysitter.sh`, `t3_babysitter.sh`) | Set your own `zeus`/PBS account (e.g. the `alon@zeus.technion.ac.il` SSH gate), workstation paths, conda envs (`t3_env`, `~/.arc/settings.py`), and run-folder locations. These encode the author's ARC/RMG/T3 layout. N/A if you don't run ARC/T3. |
-| 4 | …use an Obsidian vault | `obsidian-vault/SKILL.md`, your private `~/.claude/CLAUDE.md` | Point it at **your** vault path (the author's is under Dropbox). N/A if you don't use Obsidian. |
-| 5 | …want the funding-proposal agent | `auto-proposals/SKILL.md`, `auto-proposals/SAFETY.md` | Point `AUTO_PROPOSALS_ROOT` at **your** proposals folder (the author's is `~/Dropbox/Work/Proposals`); a top-level folder not starting with `_` is treated as an open call and its deadline is parsed from its name, so this only works if your folders are named `YYYY.MM[.DD] <funder> <name>`. Set `AUTO_PROPOSALS_PUBLISH_HOST` to the one machine allowed to write (writes are refused elsewhere, and while Dropbox is mid-sync). Set `CC_SLACK_CHANNEL` if you want the scheduled mode to post. Optional: seed per-call states in `<root>/_auto-proposals/bootstrap-states.json` (or point `AUTO_PROPOSALS_BOOTSTRAP_STATES` at your own path) — a flat JSON object of `"call folder name": "state"`, e.g. `{"2026.10 ExampleFund": "open"}`; it lives outside the repo on purpose because which calls you pursue is private, and absent just means no seed states. The skill also reads an Obsidian vault for ideas — see row 4. N/A if you don't chase funding calls. |
-| 6 | …everyone (global config) | `~/.claude/CLAUDE.md` (private, **not** in this repo) | Build your own global instructions: the gstack section (added in step 3), your Obsidian path, and any personal preferences. Don't copy the author's verbatim. |
+| 3 | …use an Obsidian vault | `obsidian-vault/SKILL.md`, your private `~/.claude/CLAUDE.md` | Point it at **your** vault path (the author's is under Dropbox). N/A if you don't use Obsidian. |
+| 4 | …everyone (global config) | `~/.claude/CLAUDE.md` (private, **not** in this repo) | Build your own global instructions: the gstack section (added in step 3), your Obsidian path, and any personal preferences. Don't copy the author's verbatim. |
 
 ## Checklist
 
 - [ ] 1 — Home-directory paths point at my `$HOME`
 - [ ] 2 — Slack wired up (or N/A)
-- [ ] 3 — ARC/T3 paths + cluster account set (or N/A)
-- [ ] 4 — Obsidian vault path set (or N/A)
-- [ ] 5 — My own `~/.claude/CLAUDE.md` in place
+- [ ] 3 — Obsidian vault path set (or N/A)
+- [ ] 4 — My own `~/.claude/CLAUDE.md` in place
 - [ ] `python3 bin/lint-skills.py` passes after my edits
 
 ## Not in this repo (install separately)
