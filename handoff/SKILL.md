@@ -15,9 +15,14 @@ cron job. If the cron still targets `$HOME/handoffs/`, update it outside this sk
 
 ## Load
 
-If the user asks `/handoff load`, read `$HOME/agents/handoffs/.latest`, then read and present
-that handoff document. If `.latest` is missing or points to a missing file, list the newest
-timestamped handoffs in `$HOME/agents/handoffs/` and ask which one to load.
+If the user asks `/handoff load`, read this session's own pointer,
+`$HOME/agents/handoffs/.latest.<session-uuid>` (the uuid in your scratchpad path), then read
+and present that handoff document.
+
+If that pointer is missing, do NOT silently fall back to `$HOME/agents/handoffs/.latest` or to
+"the newest file in the directory". Both are machine-wide and last-writer-wins: on a box with
+several concurrent sessions they usually name somebody else's mission. Instead, list the newest
+timestamped handoffs and ask the user which one to load.
 
 ## Required sections
 
@@ -62,33 +67,74 @@ After writing the handoff, update the deterministic reload pointer, then file a
 compact-request so the auto-handoff watcher (if installed) finishes the cycle:
 
 ```bash
-tmp="$HOME/agents/handoffs/.latest.tmp"
-printf '%s\n' "<full handoff path>" > "$tmp" && mv "$tmp" "$HOME/agents/handoffs/.latest"
+hf="<full handoff path>"
 
-# Tell the auto-handoff watcher a handoff is ready so it runs /compact + reload on
-# its own — even below the 30% context threshold. Without this a below-threshold
-# /handoff would leave the watcher with no trigger and it would never compact.
-# No-op when autodev is not installed; defers automatically when the watcher is
-# already mid-cycle (it will compact itself); also snapshots .latest per-session.
+# .latest is a SHARED, machine-wide, last-writer-wins pointer. It is for humans
+# ("what handed off most recently on this box"), and it is NOT what your session
+# reloads from — with several sessions running concurrently, whoever writes last
+# wins and everyone else would resume the wrong mission.
+tmp="$HOME/agents/handoffs/.latest.tmp"
+printf '%s\n' "$hf" > "$tmp" && mv "$tmp" "$HOME/agents/handoffs/.latest"
+
+# This is the one that matters. --handoff records the PER-SESSION reload pointer
+# (.latest.<sid>) naming the file you just wrote, which is the only thing the
+# watcher and the SessionStart hook will read back after compaction. Pass it
+# ALWAYS: without it the helper can only copy the shared .latest, which another
+# session may already have clobbered.
+#
+# It also files the compact-request that makes the watcher run /compact + reload
+# even below the 30% threshold. No-op when autodev is not installed; defers on
+# its own when the watcher is already mid-cycle.
 rh="$HOME/.claude/skills/autodev/bin/request-handoff.sh"
-[ -x "$rh" ] && bash "$rh" --compact-only 2>/dev/null || true
+[ -x "$rh" ] && bash "$rh" --compact-only --handoff "$hf" 2>/dev/null || true
 ```
+
+**Then VERIFY the trigger exists — do not assume the script filed one.** `request-handoff.sh`
+legitimately declines to file when the watcher is already mid-cycle, and it is a silent no-op
+when autodev is not installed. Running it is therefore not proof that anything will happen:
+
+```bash
+sid=<session-uuid from your scratchpad path>
+ls -la "$HOME/agents/state/$sid".{compact-request,handoff-request} 2>/dev/null
+ls -la "$HOME/agents/handoffs/.latest.$sid" 2>/dev/null   # the reload pointer
+cat "$HOME/agents/state/$sid.ctx" 2>/dev/null             # authoritative pct — never guess it
+```
+
+Resolve as follows:
+
+- **A marker file exists** → the cycle will run. Emit the block below and end the turn.
+- **No marker, but the script said it was already mid-cycle** → fine, the in-flight cycle will
+  compact. Say so explicitly in your message so the user can see why nothing was filed.
+- **No marker and no mid-cycle** → retry the script; if it still files nothing, tell the user
+  plainly that automation is not attached and ask them to run `/compact`. Never end the turn
+  silently here.
+- **`.latest.$sid` is missing** → the reload after compaction will deliberately fail closed
+  (you will be told to re-orient from your own transcript rather than handed a handoff). Re-run
+  the `--handoff` command above so the pointer exists.
+
+The pct threshold does not fire on its own from an idle session: the Stop-hook watcher evaluates
+once per turn end, and an idle session's pct never rises. `auto-handoff-sweep.sh` (systemd timer,
+every few minutes) is the safety net that re-evaluates parked sessions — but it is a backstop, not
+a substitute for filing and verifying the marker. Do both.
 
 Then emit this explicit instruction block:
 
 ```text
 Handoff written, .latest updated, compact-request filed.
 
-• If this session's status line shows the 🔴 AUTO-HANDOFF badge: do NOTHING — the auto-handoff
-  watcher will run /compact and reload automatically at the next idle Stop (the compact-request
-  filed above makes this fire even below the 30% threshold). It CANNOT act while a background
-  agent or turn is still running (input would be queued), so make sure nothing is left running
-  and end the turn.
+• If this session's status line shows the 🔴 AUTO-HANDOFF badge AND the marker was verified to
+  exist above: end the turn — the auto-handoff watcher will run /compact and reload at the next
+  idle Stop (the verified compact-request is what makes this fire below the 30% threshold; the
+  threshold alone never fires on an idle session). It CANNOT act while a background agent or
+  turn is still running (input would be queued), so make sure nothing is left running.
+  "Do nothing" is correct ONLY because a marker was verified — it is never correct on its own.
 • If there is NO badge (an older session started before the watcher was installed, or not in
   tmux): the automation is not attached here — run /compact yourself now.
 
-Reload contract: after compaction, the next Claude Code turn is handed the handoff to read (via
-the SessionStart hook, or `cat ~/agents/handoffs/.latest`) and re-orients from it before continuing.
+Reload contract: after compaction, the next Claude Code turn is handed THIS session's handoff to
+read, via the SessionStart hook reading ~/agents/handoffs/.latest.<session-uuid>. If that pointer
+is missing the reload fails closed on purpose — it will never hand you the shared ~/agents/handoffs/.latest,
+because that file is machine-wide and would resume another session's mission.
 ```
 
 Claude Code cannot self-trigger `/compact` — only the user or the (badge-confirmed) watcher can.

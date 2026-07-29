@@ -33,16 +33,34 @@ _HERE="$(cd "$(dirname "$0")" && pwd)"
 [ -f "$_HERE/mux-lib.sh" ] && . "$_HERE/mux-lib.sh"
 
 THRESHOLD=30        # act only when used_percentage > THRESHOLD
-SETTLE=2            # settle before the first idle check
-POLL=3             # poll interval while waiting
-PRECHECK=45         # max seconds to wait for an idle window before deferring
-WAIT_IDLE=420       # max seconds to wait for the /handoff turn to finish
-WAIT_COMPACT=300    # max seconds to wait for compaction to complete
+# Wait timings are env-overridable so the tests can drive a whole cycle in
+# seconds. THRESHOLD and COOLDOWN deliberately are NOT — auto-handoff-sweep.sh
+# hard-codes the same values, and a divergence between the two would be silent.
+SETTLE=${AUTODEV_SETTLE:-2}              # settle before the first idle check
+POLL=${AUTODEV_POLL:-3}                  # poll interval while waiting
+PRECHECK=${AUTODEV_PRECHECK:-45}         # max seconds to wait for an idle window before deferring
+WAIT_IDLE=${AUTODEV_WAIT_IDLE:-420}      # max seconds to wait for the /handoff turn to finish
+WAIT_COMPACT=${AUTODEV_WAIT_COMPACT:-300} # max seconds to wait for compaction to complete
 COOLDOWN=900        # suppress re-trigger after a cycle (success OR abort)
 HEARTBEAT_EVERY=600 # emit at most one HEARTBEAT log line per this many seconds
 REQUEST_MAX_AGE=3600 # a .handoff-request / .compact-request older than this is stale -> ignored + removed
 
 log(){ printf '%s [%s] %s\n' "$(date +'%Y.%m.%d %H.%M.%S')" "$sid" "$*" >> "$LOG"; }
+
+# Abandon this cycle. Stamps the cooldown and bumps the consecutive-abort
+# counter that auto-handoff-sweep.sh reads to tell "retry it" from "this session
+# is wedged — stop typing at it and flag it". Cleared on a completed cycle.
+# Only real failures call this; a withdrawn request is not an abort.
+abort_cycle(){ # $1 = what failed
+  local n=0
+  [ -f "$STATE/$sid.abort-count" ] && n=$(cat "$STATE/$sid.abort-count" 2>/dev/null || echo 0)
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  n=$(( n + 1 ))
+  printf '%s\n' "$n" > "$STATE/$sid.abort-count" 2>/dev/null
+  log "ABORT $1 (consecutive aborts: $n)"
+  date +%s > "$cdf"
+  exit 0
+}
 
 # --- global kill switch ---
 if [ -f "$STATE/disable-auto-compact" ]; then exit 0; fi
@@ -244,29 +262,38 @@ else
   send "/handoff"
   if [ "$DRY" = 0 ]; then
     if ! wait_turn_done "$t0" "$WAIT_IDLE"; then
-      log "ABORT /handoff did not complete within ${WAIT_IDLE}s"; date +%s > "$cdf"; exit 0
+      abort_cycle "/handoff did not complete within ${WAIT_IDLE}s"
     fi
     log "/handoff turn completed"
   fi
-  # Snapshot THIS session's freshly-written pointer before another concurrent
-  # session can clobber the shared .latest, so the reload below is per-session.
-  # (compact-only skips this: request-handoff.sh already snapshotted at request
-  # time, and the shared .latest may since have been clobbered.)
-  if [ -s "$AUTODEV_HOME/handoffs/.latest" ]; then
-    ptmp="$AUTODEV_HOME/handoffs/.latest.$sid.tmp"
-    cp -f "$AUTODEV_HOME/handoffs/.latest" "$ptmp" 2>/dev/null &&
-      mv -f "$ptmp" "$AUTODEV_HOME/handoffs/.latest.$sid" 2>/dev/null ||
-      rm -f "$ptmp" 2>/dev/null
-  else
-    # nothing to snapshot — drop any stale per-session pointer so reload falls
-    # back to the shared .latest rather than reading an old snapshot.
-    rm -f "$AUTODEV_HOME/handoffs/.latest.$sid" 2>/dev/null
+  # The handoff skill writes THIS session's own pointer (.latest.<sid>) directly,
+  # so there is normally nothing to do here. Copying the shared .latest — as this
+  # used to do unconditionally — is a race, not a safeguard: between our /handoff
+  # turn ending and the copy, any of the ~25 concurrent sessions on this box can
+  # clobber .latest, and we would then cache THEIR mission as ours, permanently
+  # and invisibly. So only adopt the shared pointer as a bridge for older handoff
+  # skills, and only when the file it names was written during the turn we just
+  # drove (mtime >= t0) — the one moment it is provably ours.
+  per="$AUTODEV_HOME/handoffs/.latest.$sid"
+  if [ ! -s "$per" ] || [ "$(date -r "$per" +%s 2>/dev/null || echo 0)" -lt "$t0" ]; then
+    cand=""; [ -s "$AUTODEV_HOME/handoffs/.latest" ] &&
+      cand=$(cat "$AUTODEV_HOME/handoffs/.latest" 2>/dev/null)
+    if [ -n "$cand" ] && [ -f "$cand" ] &&
+       [ "$(date -r "$cand" +%s 2>/dev/null || echo 0)" -ge "$t0" ]; then
+      ptmp="$per.tmp.$$"
+      printf '%s\n' "$cand" > "$ptmp" 2>/dev/null &&
+        mv -f "$ptmp" "$per" 2>/dev/null || rm -f "$ptmp" 2>/dev/null
+      log "legacy /handoff: adopted .latest by mtime proof (written during our turn)"
+    else
+      rm -f "$per" 2>/dev/null
+      log "WARN /handoff wrote no per-session pointer, and .latest is not provably ours"
+    fi
   fi
 fi
 
 # 2) compact (only when idle)
 if [ "$DRY" = 0 ] && ! wait_pane_idle 60; then
-  log "ABORT pane busy before /compact"; date +%s > "$cdf"; exit 0
+  abort_cycle "pane busy before /compact"
 fi
 t1=$(date +%s)
 send "/compact"
@@ -279,7 +306,7 @@ if [ "$DRY" = 0 ]; then
     fi
     sleep "$POLL"
   done
-  if [ "$ok" != 1 ]; then log "ABORT /compact did not complete within ${WAIT_COMPACT}s"; date +%s > "$cdf"; exit 0; fi
+  if [ "$ok" != 1 ]; then abort_cycle "/compact did not complete within ${WAIT_COMPACT}s"; fi
   log "compaction completed"
 fi
 
@@ -289,19 +316,28 @@ if [ -n "$SESSION_NAME" ]; then
   send "/rename $SESSION_NAME"
   [ "$DRY" = 0 ] && { sleep 2; wait_pane_idle 30; }
 fi
-# Prefer this session's own snapshot (immune to another session clobbering the
-# shared .latest); fall back to the shared pointer.
+# Reload from THIS session's own pointer, and only from it.
+#
+# ~/agents/handoffs/.latest is a single machine-wide, last-writer-wins file. On a
+# box running ~25 concurrent sessions it names whichever session handed off most
+# recently — almost never us. Falling back to it (or to "the newest handoff in
+# the directory") is exactly how a worker comes back from compaction running
+# someone else's mission while its pane still reads perfectly healthy, silently
+# ending whatever it was actually monitoring. A missing pointer must therefore
+# fail closed: no handoff is strictly better than another session's handoff.
 ptr="$AUTODEV_HOME/handoffs/.latest.$sid"
-[ -f "$ptr" ] || ptr="$AUTODEV_HOME/handoffs/.latest"
 hf=""; [ -f "$ptr" ] && hf=$(cat "$ptr" 2>/dev/null)
 if [ -n "$hf" ] && { [ "$DRY" = 1 ] || [ -f "$hf" ]; }; then
   send "Read the handoff at \"$hf\" and continue execution from where it leaves off."
 else
-  send "Resume: read the newest handoff in $AUTODEV_HOME/handoffs and continue execution."
+  log "WARN reloaded with no per-session pointer (.latest.$sid) — sent the fail-closed prompt"
+  send "A compaction just occurred, but no handoff is registered for THIS session. Do not read another session's handoff from $AUTODEV_HOME/handoffs — re-orient from this session's own transcript and continue, or ask the user."
 fi
 
 # 4) stamp cooldown and finish. (An explicit request was already consumed at
-#    TRIGGER, so nothing to clean up here.)
+#    TRIGGER, so nothing to clean up here.) A completed cycle clears the
+#    consecutive-abort counter and any stuck flag the sweeper raised.
 date +%s > "$cdf"
+rm -f "$STATE/$sid.abort-count" "$STATE/$sid.stuck" 2>/dev/null
 log "CYCLE COMPLETE ($reason, dry=$DRY)"
 exit 0
