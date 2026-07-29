@@ -26,6 +26,7 @@ from pathlib import Path
 from lib.paths import (
     PathRefused,
     dropbox_synced,
+    is_draft_pdf,
     owned_artifact_conflicts,
     publish_host_ok,
     resolve_owned,
@@ -133,6 +134,28 @@ def _write_temp_dirfd(dir_fd: int, content: str) -> str:
             f.write(content)
             f.flush()
             os.fsync(f.fileno())
+    except BaseException:
+        _remove_tmp_dirfd(dir_fd, name)
+        raise
+    return name
+
+
+def _write_temp_bytes_dirfd(dir_fd: int, data: bytes) -> str:
+    """Byte-for-byte sibling of _write_temp_dirfd, for artifacts that are not
+    text. Same contract: caller must clean up the returned temp name.
+
+    This exists because _write_temp_dirfd opens the fd in text mode and would
+    apply newline translation to a PDF, corrupting it in a way that is silent
+    until someone opens the file.
+    """
+    name = _make_tmp_name()
+    fd = os.open(name, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644, dir_fd=dir_fd)
+    try:
+        try:
+            _write_all(fd, data)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
     except BaseException:
         _remove_tmp_dirfd(dir_fd, name)
         raise
@@ -288,6 +311,76 @@ def publish_create(root: Path, rel: str, text: str, *, frontmatter: dict) -> Pat
                 os.link(tmp_name, target.name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd, follow_symlinks=False)
             except FileExistsError:
                 raise PathRefused(f"{target} already exists; publish the next -v<N> instead") from None
+            except OSError as exc:
+                if exc.errno == errno.ELOOP:
+                    raise PathRefused(f"{target} is a symlink; refused") from None
+                raise
+
+            os.fsync(dir_fd)
+        finally:
+            _remove_tmp_dirfd(dir_fd, tmp_name)
+    finally:
+        os.close(dir_fd)
+
+    return target
+
+
+def publish_create_binary(root: Path, rel: str, data: bytes) -> Path:
+    """Create a brand-new owned artifact whose content is bytes, not text.
+
+    The only such artifact is the PDF rendering of a markdown draft, and it is
+    held to a stricter rule than any text artifact: **the markdown draft it
+    renders must already exist and be owned by us.** A PDF carries no
+    frontmatter, so it has no way to say who generated it; anchoring it to a
+    sibling .md we can prove we wrote is what keeps `drafts/` from becoming a
+    place arbitrary binaries can be deposited. It also enforces the naming
+    scheme by construction - the PDF cannot drift to a different date or letter
+    than the draft it belongs to.
+
+    Note what is deliberately absent: no frontmatter is prepended and no
+    completeness marker is appended. Both would corrupt the file. Truncation of
+    a PDF is therefore not detectable the way it is for our markdown artifacts,
+    which is the honest reason the write is done as write-temp-then-link like
+    every other create here - the target only ever appears once its bytes are
+    complete and fsynced.
+    """
+    _check_environment()
+
+    if not is_draft_pdf(rel):
+        raise PathRefused(
+            f"{rel!r} is not a draft PDF; binary publishing is limited to "
+            "<call>/drafts/YYYY.MM.DD <letter> <rest>.pdf"
+        )
+
+    md_rel = rel.replace(os.sep, "/")[: -len(".pdf")] + ".md"
+    found = read_owned(Path(root), md_rel)
+    if found is None:
+        raise PathRefused(
+            f"refusing to publish {rel!r}: its markdown draft {md_rel!r} does not "
+            "exist. Publish the draft first; the PDF is a rendering of it, never "
+            "a standalone artifact."
+        )
+    if not is_agent_owned(found[0]):
+        raise PathRefused(
+            f"refusing to publish {rel!r}: the markdown draft {md_rel!r} is not "
+            "owned by auto-proposals, so this PDF would have no provenance and "
+            "would be depositing a binary next to someone else's file."
+        )
+
+    target = resolve_owned(Path(root), rel)
+    _refuse_if_frozen(Path(root), rel)
+    _ensure_parent(Path(root), target)
+
+    dir_fd = _open_parent_dir_fd(target.parent)
+    try:
+        tmp_name = _write_temp_bytes_dirfd(dir_fd, data)
+        try:
+            try:
+                os.link(tmp_name, target.name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd, follow_symlinks=False)
+            except FileExistsError:
+                raise PathRefused(
+                    f"{target} already exists; a new rendering belongs to a new draft letter"
+                ) from None
             except OSError as exc:
                 if exc.errno == errno.ELOOP:
                     raise PathRefused(f"{target} is a symlink; refused") from None
@@ -709,7 +802,7 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="python3 -m lib.publish")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    for name in ("create", "append", "regenerate"):
+    for name in ("create", "append", "regenerate", "create-pdf"):
         p = sub.add_parser(name)
         p.add_argument("--root", required=True)
         p.add_argument("--rel", required=True)
@@ -722,6 +815,22 @@ def main(argv=None) -> int:
         )
 
     args = parser.parse_args(argv)
+
+    # create-pdf is the one command whose payload is bytes. Reading it as text
+    # would mangle it, so it is read and dispatched before the text path.
+    if args.command == "create-pdf":
+        try:
+            data = Path(args.file).read_bytes()
+        except OSError as exc:
+            print(f"refused: could not read --file {args.file!r}: {exc}", file=sys.stderr)
+            return 1
+        try:
+            path = publish_create_binary(args.root, args.rel, data)
+        except PathRefused as exc:
+            print(f"refused: {exc}", file=sys.stderr)
+            return 1
+        print(str(path))
+        return 0
 
     try:
         body = Path(args.file).read_text(encoding="utf-8")

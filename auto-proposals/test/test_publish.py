@@ -21,6 +21,7 @@ from lib.publish import (  # noqa: E402
     parse_frontmatter,
     publish_append,
     publish_create,
+    publish_create_binary,
     publish_regenerate,
     read_owned,
     render_frontmatter,
@@ -631,6 +632,98 @@ class FrontmatterTestCase(unittest.TestCase):
 
         self.assertEqual(bytes(written), b"hello world, this is more than 3 bytes")
         self.assertGreater(len(calls), 1)
+
+
+_PDF_BYTES = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n1 0 obj\n<<>>\nendobj\ntrailer\n%%EOF\n"
+
+_MD_REL = "NSF-2027/drafts/2026.07.28 a T1-slug.md"
+_PDF_REL = "NSF-2027/drafts/2026.07.28 a T1-slug.pdf"
+
+
+class PublishCreateBinaryTests(unittest.TestCase):
+    def setUp(self):
+        self.root = make_test_root()
+        configure_env(self.root)
+        _make_call_dir(self.root)
+
+    def _publish_md(self, rel=_MD_REL):
+        return publish_create(
+            self.root, rel, "# draft\n", frontmatter=owned_frontmatter(artifact="draft")
+        )
+
+    def test_pdf_publishes_alongside_its_markdown(self):
+        self._publish_md()
+        target = publish_create_binary(self.root, _PDF_REL, _PDF_BYTES)
+        self.assertTrue(target.exists())
+        self.assertEqual(target.read_bytes(), _PDF_BYTES)
+
+    def test_bytes_are_stored_verbatim(self):
+        """The whole reason for a separate binary path: text-mode writing would
+        translate newlines and corrupt the PDF silently."""
+        self._publish_md()
+        payload = b"%PDF-1.7\r\n\x00\x01\x02\r\n\x80\xff binary \r\n%%EOF"
+        target = publish_create_binary(self.root, _PDF_REL, payload)
+        self.assertEqual(target.read_bytes(), payload)
+
+    def test_no_frontmatter_or_marker_is_injected(self):
+        self._publish_md()
+        target = publish_create_binary(self.root, _PDF_REL, _PDF_BYTES)
+        raw = target.read_bytes()
+        self.assertTrue(raw.startswith(b"%PDF"))
+        self.assertNotIn(b"generated_by", raw)
+        self.assertNotIn(COMPLETE_MARKER.encode(), raw)
+
+    def test_refuses_when_the_markdown_draft_is_absent(self):
+        """A PDF has no frontmatter, so it cannot vouch for itself. Its sibling
+        .md is the only provenance anchor - without one, drafts/ would accept
+        arbitrary binaries."""
+        with self.assertRaises(PathRefused) as ctx:
+            publish_create_binary(self.root, _PDF_REL, _PDF_BYTES)
+        self.assertIn("markdown draft", str(ctx.exception))
+
+    def test_refuses_when_the_sibling_markdown_is_not_agent_owned(self):
+        drafts = self.root / "NSF-2027" / "drafts"
+        drafts.mkdir(parents=True, exist_ok=True)
+        (drafts / "2026.07.28 a T1-slug.md").write_text(
+            "---\ngenerated_by: a human\n---\nhand written\n", encoding="utf-8"
+        )
+        with self.assertRaises(PathRefused):
+            publish_create_binary(self.root, _PDF_REL, _PDF_BYTES)
+
+    def test_refuses_to_overwrite_an_existing_pdf(self):
+        self._publish_md()
+        publish_create_binary(self.root, _PDF_REL, _PDF_BYTES)
+        with self.assertRaises(PathRefused) as ctx:
+            publish_create_binary(self.root, _PDF_REL, b"%PDF-1.7 different\n")
+        self.assertIn("already exists", str(ctx.exception))
+        self.assertEqual((self.root / _PDF_REL).read_bytes(), _PDF_BYTES)
+
+    def test_refuses_a_non_draft_path(self):
+        for rel in ("NSF-2027/topics.pdf", "OPEN.pdf", "NSF-2027/context/x.pdf"):
+            with self.subTest(rel=rel):
+                with self.assertRaises(PathRefused):
+                    publish_create_binary(self.root, rel, _PDF_BYTES)
+
+    def test_refuses_a_markdown_path(self):
+        """create-pdf must not become a second way to write text artifacts,
+        bypassing frontmatter and the completeness marker."""
+        self._publish_md("NSF-2027/drafts/2026.07.28 b T1-slug.md")
+        with self.assertRaises(PathRefused):
+            publish_create_binary(
+                self.root, "NSF-2027/drafts/2026.07.28 c T1-slug.md", b"plain"
+            )
+
+    def test_leaves_no_temp_file_behind_on_refusal(self):
+        self._publish_md()
+        publish_create_binary(self.root, _PDF_REL, _PDF_BYTES)
+        with self.assertRaises(PathRefused):
+            publish_create_binary(self.root, _PDF_REL, b"%PDF other\n")
+        leftovers = [
+            p.name
+            for p in (self.root / "NSF-2027" / "drafts").iterdir()
+            if p.name.startswith(".auto-proposals.tmp.")
+        ]
+        self.assertEqual(leftovers, [])
 
 
 if __name__ == "__main__":

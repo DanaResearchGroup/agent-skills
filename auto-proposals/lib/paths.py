@@ -52,6 +52,17 @@ class PathRefused(Exception):
 #   <call>/outlines/<Tn>-<slug>.md
 #   <call>/outlines/<Tn>-<slug>-v<N>.md
 #   <call>/drafts/YYYY.MM.DD <letter> <rest>.md
+#   <call>/drafts/YYYY.MM.DD <letter> <rest>.pdf
+#
+# The .pdf is the rendered companion of the .md draft that shares its exact
+# basename, and is only ever publishable alongside one (see
+# publish_create_binary). Nothing else in the archive is ours to write in a
+# binary format.
+#
+# Deliberately NOT in this grammar, and never writable: <call>/context/. That
+# folder is Alon's, for material he drops in to steer a direction after ticking
+# a topic. It is an input to us and an output of nobody, so it stays outside the
+# owned-path grammar and every write to it is refused by construction.
 #
 # <call>   : top-level dir, not starting with "_" or "."
 # <Tn>     : "T" + digits
@@ -79,13 +90,14 @@ _TOPICS_V_RE = re.compile(rf"^({_CALL})/topics-v({_N})\.md$")
 _OUTLINE_RE = re.compile(rf"^({_CALL})/outlines/({_TN})-({_SLUG})\.md$")
 _OUTLINE_V_RE = re.compile(rf"^({_CALL})/outlines/({_TN})-({_SLUG})-v({_N})\.md$")
 _DRAFT_RE = re.compile(rf"^({_CALL})/drafts/({_DRAFT_DATE}) ({_DRAFT_LETTER}) ({_DRAFT_REST})\.md$")
+_DRAFT_PDF_RE = re.compile(rf"^({_CALL})/drafts/({_DRAFT_DATE}) ({_DRAFT_LETTER}) ({_DRAFT_REST})\.pdf$")
 
 # Basename-only version of the draft pattern (no call/drafts/ prefix), used
 # by next_draft_rel() to scan an existing drafts/ directory listing.
 _DRAFT_BASENAME_RE = re.compile(rf"^({_DRAFT_DATE}) ({_DRAFT_LETTER}) ({_DRAFT_REST})\.md$")
 
 _REGENERATE_RE = _ROOT_LEVEL_RE
-_CREATE_PATTERNS = (_TOPICS_RE, _TOPICS_V_RE, _OUTLINE_RE, _OUTLINE_V_RE, _DRAFT_RE)
+_CREATE_PATTERNS = (_TOPICS_RE, _TOPICS_V_RE, _OUTLINE_RE, _OUTLINE_V_RE, _DRAFT_RE, _DRAFT_PDF_RE)
 
 
 def _call_name_from_rel(rel: str) -> str | None:
@@ -265,6 +277,30 @@ def next_draft_rel(root: Path, call: str, base_name: str, today: date) -> str:
         next_letter = chr(ord(highest) + 1)
 
     return f"{call}/drafts/{date_str} {next_letter} {base_name}.md"
+
+
+def is_draft_pdf(rel: str) -> bool:
+    """True if `rel` names the rendered PDF companion of a markdown draft."""
+    return bool(_DRAFT_PDF_RE.match(rel.replace(os.sep, "/")))
+
+
+def draft_pdf_rel_for(md_rel: str) -> str:
+    """Given the call-relative path of a markdown draft, return the path its
+    rendered PDF companion must take.
+
+    The PDF is deliberately NOT free to pick its own name. It shares the
+    markdown draft's date, letter and rest exactly, so the two always sort
+    adjacently and it is never ambiguous which draft a PDF is a rendering of.
+    Deriving it here rather than letting a caller compose the string is the
+    same reasoning as next_draft_rel(): a hand-built path is the one that ends
+    up subtly wrong.
+    """
+    posix_rel = md_rel.replace(os.sep, "/")
+    if not _DRAFT_RE.match(posix_rel):
+        raise PathRefused(
+            f"{md_rel!r} is not a markdown draft path, so it has no PDF companion"
+        )
+    return posix_rel[: -len(".md")] + ".pdf"
 
 
 # ---------------------------------------------------------------------------

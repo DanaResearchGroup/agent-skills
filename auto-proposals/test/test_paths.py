@@ -12,9 +12,11 @@ from test._env import configure_env, make_test_root  # noqa: E402
 
 from lib.paths import (  # noqa: E402
     PathRefused,
+    draft_pdf_rel_for,
     dropbox_synced,
     is_call_dir,
     is_conflicted_copy,
+    is_draft_pdf,
     next_draft_rel,
     owned_artifact_conflicts,
     resolve_owned,
@@ -313,6 +315,74 @@ class PathsTestCase(unittest.TestCase):
 
         with self.assertRaises(PathRefused):
             next_draft_rel(self.root, "NSF-2027", "T1-slug", date(2026, 7, 28))
+
+
+class DraftPdfGrammarTests(unittest.TestCase):
+    def test_draft_pdf_is_a_create_target(self):
+        self.assertEqual(
+            write_mode_for("NSF-2027/drafts/2026.07.28 a T1-slug.pdf"), "create"
+        )
+
+    def test_pdf_must_carry_the_same_date_letter_grammar_as_the_md(self):
+        for rel in (
+            "NSF-2027/drafts/T1-slug.pdf",
+            "NSF-2027/drafts/2026.07.28 T1-slug.pdf",
+            "NSF-2027/drafts/2026.7.28 a T1-slug.pdf",
+            "NSF-2027/drafts/2026.07.28 A T1-slug.pdf",
+        ):
+            with self.subTest(rel=rel):
+                with self.assertRaises(PathRefused):
+                    write_mode_for(rel)
+
+    def test_pdf_is_only_allowed_under_drafts(self):
+        """Outlines and topics have no PDF companion. Allowing one would make
+        `drafts/` special for no reason and widen the binary write surface."""
+        for rel in (
+            "NSF-2027/topics.pdf",
+            "NSF-2027/outlines/T1-slug.pdf",
+            "OPEN.pdf",
+        ):
+            with self.subTest(rel=rel):
+                with self.assertRaises(PathRefused):
+                    write_mode_for(rel)
+
+    def test_is_draft_pdf_discriminates(self):
+        self.assertTrue(is_draft_pdf("NSF-2027/drafts/2026.07.28 a T1-slug.pdf"))
+        self.assertFalse(is_draft_pdf("NSF-2027/drafts/2026.07.28 a T1-slug.md"))
+        self.assertFalse(is_draft_pdf("NSF-2027/context/notes.pdf"))
+
+    def test_pdf_rel_is_derived_from_the_md_not_composed(self):
+        md = next_draft_rel(self.root, "NSF-2027", "T1-slug", date(2026, 7, 28))
+        self.assertEqual(
+            draft_pdf_rel_for(md), "NSF-2027/drafts/2026.07.28 a T1-slug.pdf"
+        )
+
+    def test_pdf_rel_refuses_a_non_draft_source(self):
+        for rel in ("NSF-2027/topics.md", "NSF-2027/outlines/T1-slug.md", "OPEN.md"):
+            with self.subTest(rel=rel):
+                with self.assertRaises(PathRefused):
+                    draft_pdf_rel_for(rel)
+
+    def setUp(self):
+        self.root = make_test_root()
+        configure_env(self.root)
+
+
+class ContextFolderIsNeverWritableTests(unittest.TestCase):
+    """`<call>/context/` is Alon's, for material he drops in to steer a picked
+    direction. It is an input only, so every write to it must be refused by the
+    grammar rather than by anyone remembering not to."""
+
+    def test_context_paths_are_refused(self):
+        for rel in (
+            "NSF-2027/context/notes.md",
+            "NSF-2027/context/paper.pdf",
+            "NSF-2027/context/sub/thing.md",
+            "NSF-2027/context.md",
+        ):
+            with self.subTest(rel=rel):
+                with self.assertRaises(PathRefused):
+                    write_mode_for(rel)
 
 
 if __name__ == "__main__":

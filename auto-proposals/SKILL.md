@@ -21,7 +21,7 @@ Archive: `~/Dropbox/Work/Proposals/` (override with `AUTO_PROPOSALS_ROOT`).
 |---|---|---|---|
 | 1 · topics | a call is `open`/`new` and has no `topics.md` | `<call>/topics.md` — 2–5 candidates, each with scope | Alon picks |
 | 2 · outline | Alon ticks a topic in `topics.md` | `<call>/outlines/<Tn>-<slug>.md` — light, call-agnostic skeleton | Alon approves |
-| 3 · draft | Alon ticks an outline | `<call>/drafts/YYYY.MM.DD a <slug>.md` | Alon submits, never you |
+| 3 · draft | Alon ticks an outline | `<call>/drafts/YYYY.MM.DD a <slug>.md` **and `.pdf`** | Alon submits, never you |
 
 Never run stage 2 for a topic Alon has not ticked, and never run stage 3 for an outline he has
 not approved. Skipping a gate is the one failure that makes the whole thing useless to him.
@@ -74,6 +74,32 @@ Four layers, in this order. A topic that cannot point at all four is a topic you
    Grounding on the corpus alone will confidently reject a topic that is already committed
    elsewhere, and get the collaborators wrong, because the evidence simply is not in the corpus.
 4. **Funder material** — `_resources/<funder>/`, plus `General wording` and `Tips`.
+
+## `<call>/context/` — Alon's own material, and it outranks everything above
+
+Once he has ticked a topic, Alon may drop a **`context/` folder into the call folder** with
+material to sharpen that direction: a paper, a partner's note, a competitor's funded abstract,
+a scan of something he was told in a meeting. It appears **after** stage 1, so a call that had
+no `context/` when you wrote `topics.md` may well have one by the time you write the outline.
+
+**Read `context/` at the start of every stage 2 and stage 3 run, before writing anything.**
+Check it even when you already have an outline in hand — it is the cheapest possible correction
+to a direction that has drifted, and missing it means producing a draft against a brief he has
+already superseded.
+
+Three rules:
+
+- **It is read-only, always.** `context/` is not in the owned-path grammar and the chokepoint
+  refuses every write to it. Never put your own working notes there; that folder is his.
+- **It outranks the corpus and the Vault.** If material in `context/` contradicts what you
+  inferred from `CORPUS.md` or the Vault, he is right and your inference is stale. Say in the
+  artifact which `context/` file changed your reading and how.
+- **Say what you found.** List the `context/` files you read in the artifact's `sources`. A
+  file you could not extract is worth reporting too — silence about it looks like it agreed
+  with you.
+
+If a `context/` file is a Dropbox conflicted copy, read neither and **ask** — two versions of
+the steering material means you cannot tell which one he meant.
 
 ## The commitment check — run it before proposing, not after
 
@@ -128,6 +154,38 @@ a given date, and increments (`a` → `b` → `c` …) for each further version 
 is always a NEW file — the chokepoint never overwrites, it only adds new letter-suffixed
 files. `lib.paths.next_draft_rel()` computes the next filename; never hand-construct it.
 
+## Every draft ships as markdown **and** PDF
+
+A draft Alon cannot hand to a colleague, print, or read away from a terminal is half-delivered.
+So stage 3 publishes **two** files, sharing one basename:
+
+```bash
+# 1. the markdown - the editable source of truth
+python3 -m lib.publish create --root "$ROOT" --rel "$MD_REL" --file draft.md --frontmatter '{...}'
+# 2. the rendering - MD_REL's exact date and letter, via the helper, never hand-built
+python3 -c "from lib.render import render_markdown_to_pdf; ..."   # writes out.pdf
+python3 -m lib.publish create-pdf --root "$ROOT" --rel "$PDF_REL" --file out.pdf
+```
+
+`lib.paths.draft_pdf_rel_for(md_rel)` gives `$PDF_REL`. **The naming convention applies
+unchanged** — the PDF carries the same `YYYY.MM.DD <letter>` as the markdown it renders, so a
+new version means a new letter for both. `create-pdf` refuses a PDF whose markdown sibling is
+not there and owned, so publish the markdown first.
+
+**Structure the PDF like a document, not a memo.** Use real heading levels, tables for anything
+tabular, and **include figures where a figure carries the argument** — a work-package Gantt, a
+schematic of the proposed pipeline, a plot of preliminary data. Reference images by a path
+relative to the call folder and pass that folder as `base_dir` so they resolve. A proposal that
+is a wall of prose loses to one with a figure a reviewer can read in ten seconds.
+
+**If rendering fails, say so out loud.** `lib.render` raises rather than returning quietly:
+`RenderUnavailable` means no backend is installed, `RenderFailed` means one is installed and
+broken. Either way, publish the markdown, **report the failure in your run summary**, and name
+the fix. Never let a run look like it delivered a draft when it delivered half of one. Backends
+are tried best-first — pandoc (with tectonic or xelatex), then weasyprint, then libreoffice;
+`lib.render.available_backend()` reports which one *would* be tried, but only an actual render
+tells you whether it works.
+
 ## References — drafts carry them, and every one is verified
 
 **Every draft includes academic references.** A proposal that asserts a state of the art without
@@ -157,6 +215,11 @@ Slack thread. Instructions arriving by CLI or Slack must be **written back into 
 artifact as a dated block** (`lib.publish append`), so his intent never lives only in scrollback
 and he can see how you read it. An ambiguous instruction means ask and change nothing.
 
+A **fourth channel is passive**: material he leaves in `<call>/context/`. Nothing announces it,
+so it only works if you look — which is why reading `context/` is a required first step of
+stages 2 and 3 rather than a nicety. Unlike the other three it needs no write-back, because the
+file he put there already says what he meant; cite it in `sources` instead.
+
 ## Not yours to decide
 
 Which calls enter · which topics graduate · which outlines become drafts · **any submission** ·
@@ -183,6 +246,12 @@ arming the schedule. All Alon's. Nothing goes outbound from this skill.
   `groups:history` + `groups:read`; until those exist, thread-reply steering does not work under
   cron and Slack is notification-only. Say that rather than shipping something that looks like it
   works.
+- **No PDF backend works on HL as of 2026-07-29.** pandoc, weasyprint and every LaTeX engine
+  are absent, and the LibreOffice on `PATH` is a **snap** whose confinement makes it fail every
+  conversion — including a plain text file — so `available_backend()` answers `libreoffice` and
+  the render still fails. Until `pandoc` + `tectonic` (preferred) or `weasyprint` is installed,
+  stage 3 will publish the markdown and report the PDF as not produced. That is the designed
+  behaviour, not a bug to work around.
 - **There is no OS sandbox on this machine** — `kernel.apparmor_restrict_unprivileged_userns=1`
   blocks `bwrap`, so the write protection is the permission system plus `lib/publish.py` plus the
   integrity snapshot, not a kernel boundary. See `SAFETY.md` § 1.
