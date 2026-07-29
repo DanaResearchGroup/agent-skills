@@ -366,6 +366,12 @@ def is_draft_pdf(rel: str) -> bool:
     return bool(_DRAFT_PDF_RE.match(rel.replace(os.sep, "/")))
 
 
+def is_outline_md(rel: str) -> bool:
+    """True if `rel` names a stage-2 outline markdown (including a -v<N>)."""
+    posix_rel = rel.replace(os.sep, "/")
+    return bool(_OUTLINE_RE.match(posix_rel) or _OUTLINE_V_RE.match(posix_rel))
+
+
 def is_companion(rel: str) -> bool:
     """True if `rel` is a companion: a rendered PDF, or a kept LaTeX source,
     belonging to an outline or a draft.

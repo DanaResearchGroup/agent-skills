@@ -148,7 +148,7 @@ class PublishCreateTestCase(unittest.TestCase):
         path = publish_create(
             self.root,
             "NSF-2027/outlines/T1-slug.md",
-            "outline body\n",
+            "- [ ] approved\n\noutline body\n",
             frontmatter=owned_frontmatter(artifact="outline"),
         )
 
@@ -156,7 +156,7 @@ class PublishCreateTestCase(unittest.TestCase):
         self.assertTrue(path.exists())
         self.assertEqual(
             path.read_text(),
-            _compose_content(owned_frontmatter(artifact="outline"), "outline body\n"),
+            _compose_content(owned_frontmatter(artifact="outline"), "- [ ] approved\n\noutline body\n"),
         )
 
     def test_create_refuses_when_call_folder_frozen_by_conflicted_copy(self):
@@ -809,6 +809,51 @@ class PublishCreateCompanionTests(unittest.TestCase):
             if p.name.startswith(".auto-proposals.tmp.")
         ]
         self.assertEqual(leftovers, [])
+
+
+class OutlineApprovalBoxTests(unittest.TestCase):
+    """An outline with no checkbox is unapprovable, so stage 3 could never run on
+    it. Five such outlines reached the archive before this guard existed."""
+
+    def setUp(self):
+        self.root = make_test_root()
+        configure_env(self.root)
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        _make_call_dir(self.root)
+
+    def test_an_outline_without_a_checkbox_is_refused(self):
+        with self.assertRaises(PathRefused) as ctx:
+            publish_create(
+                self.root,
+                "NSF-2027/outlines/T1-thing.md",
+                "# Title\n\nProse with no box.\n",
+                frontmatter=owned_frontmatter(),
+            )
+        self.assertIn("approval checkbox", str(ctx.exception))
+        self.assertFalse((self.root / "NSF-2027/outlines/T1-thing.md").exists())
+
+    def test_an_outline_with_the_box_is_created(self):
+        rel = "NSF-2027/outlines/T1-thing.md"
+        publish_create(
+            self.root, rel, "- [ ] approved\n\n# Title\n", frontmatter=owned_frontmatter()
+        )
+        self.assertTrue((self.root / rel).exists())
+
+    def test_a_ticked_box_also_satisfies_the_guard(self):
+        """A -v2 may carry an approval forward; the guard checks a box EXISTS."""
+        rel = "NSF-2027/outlines/T1-thing-v2.md"
+        publish_create(
+            self.root, rel, "- [x] approved\n\n# Title\n", frontmatter=owned_frontmatter()
+        )
+        self.assertTrue((self.root / rel).exists())
+
+    def test_non_outline_artifacts_are_unaffected(self):
+        """topics.md and drafts have their own gates; requiring a box here would
+        block every draft the skill writes."""
+        publish_create(
+            self.root, "NSF-2027/topics.md", "# Topics\n", frontmatter=owned_frontmatter()
+        )
+        self.assertTrue((self.root / "NSF-2027/topics.md").exists())
 
 
 if __name__ == "__main__":

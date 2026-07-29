@@ -26,14 +26,18 @@ Archive: `~/Dropbox/Work/Proposals/` (override with `AUTO_PROPOSALS_ROOT`).
 Never run stage 2 for a topic Alon has not ticked, and never run stage 3 for an outline he has
 not approved. Skipping a gate is the one failure that makes the whole thing useless to him.
 
-**Every outline you write ends with an approval checkbox**, because stage 3's gate is a ticked
-box and an outline without one cannot be approved:
+**Every outline you write opens with an unticked approval checkbox**, as the very first line of
+the body — immediately after the frontmatter, before the title and any prose:
 
 ```markdown
-## Approve
-
-- [ ] write the full draft proposal from this outline
+- [ ] approved
 ```
+
+It goes at the **top**, not the bottom, because that is where Alon looks: he opens the outline to
+decide, and the box must be on screen at that moment rather than after several pages of scrolling.
+Stage 3's gate is a ticked box, so an outline shipped without one cannot ever be approved —
+`lib.publish` therefore **refuses to create an outline that has no checkbox**. That refusal is the
+enforcement; this paragraph only explains it.
 
 `lib.scan.approved_outlines(call_dir)` returns the agent-owned outlines carrying a ticked box.
 It accepts a tick **anywhere** in the file — Alon hand-edits these, and a gate that only saw a

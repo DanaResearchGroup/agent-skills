@@ -29,6 +29,7 @@ from lib.paths import (
     companion_md_rel_for,
     is_draft_companion,
     is_figure,
+    is_outline_md,
     owned_artifact_conflicts,
     publish_host_ok,
     resolve_owned,
@@ -38,6 +39,11 @@ from lib.paths import (
 
 
 _TMP_PREFIX = ".auto-proposals.tmp."
+
+# Any markdown checkbox, ticked or not. Deliberately not "unticked only": a -v2
+# outline may legitimately be published carrying a tick forward, and the point of
+# the guard is that a place to tick EXISTS, not what state it is in.
+_APPROVAL_BOX_RE = re.compile(r"^\s*[-*]\s*\[[ xX]\]", re.MULTILINE)
 
 
 # ---------------------------------------------------------------------------
@@ -343,6 +349,17 @@ def publish_create(root: Path, rel: str, text: str, *, frontmatter: dict) -> Pat
             f"{rel!r} is a draft companion and must not be written as text; "
             "frontmatter and the completeness marker would corrupt it. Use "
             "publish_create_companion (CLI: create-companion) instead."
+        )
+
+    # An outline with no approval checkbox is a dead artifact: stage 3's gate is a
+    # ticked box, so Alon has nowhere to tick and the outline can never become a
+    # draft. Five such outlines were published before this guard existed, which is
+    # why the rule lives here rather than only in SKILL.md prose.
+    if is_outline_md(rel) and not _APPROVAL_BOX_RE.search(text):
+        raise PathRefused(
+            f"{rel!r} is an outline with no approval checkbox. Stage 3 is gated on a "
+            "ticked box, so this outline could never be approved. Add a line "
+            "'- [ ] approved' at the top of the outline body."
         )
 
     target = resolve_owned(Path(root), rel)
