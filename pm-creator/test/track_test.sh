@@ -350,7 +350,7 @@ run_track() {
       PATH="/usr/bin:/bin" \
       bash -c '
         # herdr shadow (B3-extended): `api snapshot` returns the fixture;
-        # `tab create` / `agent start` / `tab close` emit the live-probed
+        # `tab create` / `agent start` / `tab close` / `pane close` emit the live-probed
         # herdr JSON shapes from test/fixtures/herdr_*.json (I21: version
         # pin + provenance in test/fixtures/herdr_README.md; sed fills the
         # __N__/__LABEL__/__NAME__/__TAB__ placeholders -- test labels stay
@@ -404,6 +404,10 @@ run_track() {
                 prev="$arg"
               done
               sed -e "s|__NAME__|$name|g" -e "s|__TAB__|$tab|g" "$HERDR_FIXTURES/herdr_agent_started.json"
+              ;;
+            "pane close")
+              if [[ -n "${HERDR_CALL_LOG:-}" ]]; then printf "%s\n" "$*" >>"$HERDR_CALL_LOG"; fi
+              cat "$HERDR_FIXTURES/herdr_pane_closed.json"
               ;;
             *) return 1 ;;
           esac
@@ -4468,7 +4472,7 @@ RECONF
 
   assert_eq "spawn ws-label: exit 0" "0" "$TR_RC"
   assert_eq "spawn ws-label: tab create used the resolved ID, not the label" \
-    "tab create --workspace zzz-test-ws --label i001-widget --no-focus" \
+    "tab create --workspace zzz-test-ws --label i001-widget --cwd $repo --no-focus" \
     "$(sed -n '1p' "$call_log")"
   assert_contains "spawn ws-label: agent start also used the resolved ID" \
     "$(sed -n '2p' "$call_log")" "--workspace zzz-test-ws"
@@ -4563,7 +4567,7 @@ RECONF
 
   assert_eq "nested workspaces: exit 0" "0" "$TR_RC"
   assert_eq "nested workspaces: label resolved to id from result.snapshot.workspaces" \
-    "tab create --workspace zzz-test-ws --label i001-widget --no-focus" \
+    "tab create --workspace zzz-test-ws --label i001-widget --cwd $repo --no-focus" \
     "$(sed -n '1p' "$call_log")"
   if grep -q -- "--workspace zzz-test-label" "$call_log"; then
     fail "nested workspaces: unresolved label never reaches herdr" "$(cat "$call_log")"
@@ -4589,13 +4593,17 @@ section_spawn_happy_path() {
   HERDR_CALL_LOG="$call_log" run_track "$repo" "$(spawn_snapshot_json)"
   assert_eq "spawn happy: exit 0" "0" "$TR_RC"
 
-  assert_eq "spawn happy: herdr tab create argv exact (workspace + ticket label + --no-focus)" \
-    "tab create --workspace zzz-test-ws --label i001-widget --no-focus" \
+  assert_eq "spawn happy: herdr tab create argv exact (workspace + ticket label + cwd + --no-focus)" \
+    "tab create --workspace zzz-test-ws --label i001-widget --cwd $repo --no-focus" \
     "$(sed -n '1p' "$call_log")"
   assert_eq "spawn happy: herdr agent start argv exact (name, tab from tab-create stdout, --no-focus, argv w/ substituted prompt path)" \
     "agent start i001-widget-D001A01 --workspace zzz-test-ws --tab zzz-test-ws:t91 --cwd $repo --no-focus -- zzz-test-runner $repo/prompts/I-001_widget_2026-07-25.md" \
     "$(sed -n '2p' "$call_log")"
-  assert_eq "spawn happy: exactly two herdr side-effect calls" "2" "$(wc -l < "$call_log" | tr -d ' ')"
+  assert_eq "spawn happy: herdr closes the orphaned root pane after a successful start" \
+    "pane close zzz-test-ws:p81" \
+    "$(sed -n '3p' "$call_log")"
+  assert_eq "spawn happy: exactly three herdr side-effect calls (tab create + agent start + root-pane close)" \
+    "3" "$(wc -l < "$call_log" | tr -d ' ')"
 
   assert_eq "spawn happy: exactly ONE durable spawn_intent line" \
     "1" "$(grep -c '^EVENT spawn_intent d=D-001 a=A-01 ' "$repo/.pm/events.log")"
@@ -4607,6 +4615,62 @@ section_spawn_happy_path() {
   assert_contains "spawn happy: stdout reports the spawn" "$TR_OUT" "SPAWNED D-001 a=A-01"
   assert_true "spawn happy: TRACKER.md automation section lists D-001" \
     bash -c "grep -q 'D-001' '$repo/TRACKER.md'"
+
+  rm -f "$call_log"
+  rm -rf "$repo"
+}
+
+# 30e. Regression: `herdr agent start --tab` SPLITS the tab into two panes
+# instead of reusing the tab's root pane, so without this fix every spawned
+# worker tab left an orphaned plain-shell root pane sitting next to the
+# actual agent pane. The fix has two parts, both asserted on EFFECTS (an
+# exit-0 assertion alone would pass either way): (a) `tab create` must also
+# get --cwd, not just `agent start` -- creating the tab cwd-less first is
+# exactly how the orphan landed wherever the daemon defaults to; (b) after a
+# successful `agent start`, the tab's original (pre-split) root pane --
+# result.root_pane.pane_id from the tab-create response -- must be closed.
+section_spawn_root_pane_closed_after_start() {
+  local repo call_log
+  repo="$(new_tmp_repo_spawn true 2 1)"
+  seed_automation_dispatch "$repo" D-021 I-021 widget
+  call_log="$(mktemp "${TMPDIR:-/tmp}/pm-creator-spawn-calls.XXXXXX")"
+
+  HERDR_CALL_LOG="$call_log" run_track "$repo" "$(spawn_snapshot_json)"
+  assert_eq "spawn root-pane-close: exit 0" "0" "$TR_RC"
+  if [[ "$(sed -n '1p' "$call_log")" == *"--cwd $repo"* ]]; then
+    ok "spawn root-pane-close: tab create argv carries --cwd (not just agent start)"
+  else
+    fail "spawn root-pane-close: tab create argv carries --cwd (not just agent start)" \
+      "$(sed -n '1p' "$call_log")"
+  fi
+  assert_eq "spawn root-pane-close: root pane (from tab-create's result.root_pane.pane_id) is closed after a successful start" \
+    "pane close zzz-test-ws:p81" \
+    "$(sed -n '3p' "$call_log")"
+
+  rm -f "$call_log"
+  rm -rf "$repo"
+}
+
+# 30f. The same fix's negative: on an agent-start FAILURE the root pane must
+# NOT be closed -- there is no split-tab orphan to clean up because the
+# split (and thus the second pane) never happened, and best-effort cleanup
+# here must never race the existing `herdr tab close` (leaked-tab) cleanup.
+section_spawn_root_pane_not_closed_on_start_failure() {
+  local repo call_log
+  repo="$(new_tmp_repo_spawn true 2 1)"
+  seed_automation_dispatch "$repo" D-022 I-022 widget
+  call_log="$(mktemp "${TMPDIR:-/tmp}/pm-creator-spawn-calls.XXXXXX")"
+
+  HERDR_CALL_LOG="$call_log" HERDR_AGENT_START_MODE=fail \
+    run_track "$repo" "$(spawn_snapshot_json)"
+  assert_eq "spawn root-pane-not-closed: exit 0" "0" "$TR_RC"
+  if grep -q "^pane close" "$call_log"; then
+    fail "spawn root-pane-not-closed: NO pane close on agent-start failure" "$(cat "$call_log")"
+  else
+    ok "spawn root-pane-not-closed: NO pane close on agent-start failure"
+  fi
+  assert_contains "spawn root-pane-not-closed: leaked tab closed instead (existing cleanup path)" \
+    "$(sed -n '3p' "$call_log")" "tab close"
 
   rm -f "$call_log"
   rm -rf "$repo"
@@ -4968,12 +5032,12 @@ section_spawn_fifo_two_slots() {
 
   HERDR_CALL_LOG="$call_log" run_track "$repo" "$(spawn_snapshot_json)"
   assert_eq "spawn fifo: exit 0" "0" "$TR_RC"
-  assert_eq "spawn fifo: four herdr side-effect calls (2 tabs + 2 starts)" \
-    "4" "$(wc -l < "$call_log" | tr -d ' ')"
+  assert_eq "spawn fifo: six herdr side-effect calls (2 tabs + 2 starts + 2 root-pane closes)" \
+    "6" "$(wc -l < "$call_log" | tr -d ' ')"
   assert_contains "spawn fifo: D-601 tab created FIRST (FIFO by dispatch number)" \
     "$(sed -n '1p' "$call_log")" "--label i601-widget"
   assert_contains "spawn fifo: D-602 tab created second" \
-    "$(sed -n '3p' "$call_log")" "--label i602-gadget"
+    "$(sed -n '4p' "$call_log")" "--label i602-gadget"
   assert_eq "spawn fifo: D-601 ACKED" "ACKED" "$(sp_idx "$repo" "d['dispatches']['D-601']['state']")"
   assert_eq "spawn fifo: D-602 ACKED" "ACKED" "$(sp_idx "$repo" "d['dispatches']['D-602']['state']")"
   assert_eq "spawn fifo: distinct tabs per worker" \
@@ -4995,8 +5059,8 @@ section_spawn_inner_capacity() {
 
   HERDR_CALL_LOG="$call_log" run_track "$repo" "$(spawn_snapshot_json)"
   assert_eq "spawn inner-capacity: exit 0" "0" "$TR_RC"
-  assert_eq "spawn inner-capacity: exactly 4 herdr calls (2 creates + 2 starts)" \
-    "4" "$(wc -l < "$call_log" | tr -d ' ')"
+  assert_eq "spawn inner-capacity: exactly 6 herdr calls (2 creates + 2 starts + 2 root-pane closes)" \
+    "6" "$(wc -l < "$call_log" | tr -d ' ')"
   assert_eq "spawn inner-capacity: D-701 ACKED" "ACKED" "$(sp_idx "$repo" "d['dispatches']['D-701']['state']")"
   assert_eq "spawn inner-capacity: D-702 ACKED" "ACKED" "$(sp_idx "$repo" "d['dispatches']['D-702']['state']")"
   assert_eq "spawn inner-capacity: D-703 NOT spawned" \
@@ -5092,8 +5156,8 @@ section_spawn_prompt_rehash_under_lock() {
     "$TR_OUT" "under-lock re-hash"
   assert_eq "spawn rehash: no intent appended for D-902" \
     "0" "$(grep -c '^EVENT spawn_intent d=D-902 ' "$repo/.pm/events.log")"
-  assert_eq "spawn rehash: only D-901's herdr calls happened" \
-    "2" "$(wc -l < "$call_log" | tr -d ' ')"
+  assert_eq "spawn rehash: only D-901's herdr calls happened (create + start + root-pane close)" \
+    "3" "$(wc -l < "$call_log" | tr -d ' ')"
   assert_eq "spawn rehash: D-902 stays DISPATCHED" \
     "DISPATCHED" "$(sp_idx "$repo" "d['dispatches']['D-902']['state']")"
 
@@ -5173,8 +5237,8 @@ section_spawn_underlock_recheck_refusal() {
   assert_eq "spawn recheck-refusal: D-911 spawned normally" \
     "ACKED" "$(sp_idx "$repo" "d['dispatches']['D-911']['state']")"
   assert_contains "spawn recheck-refusal: D-912 benignly raced-refused" "$TR_OUT" "raced-refused"
-  assert_eq "spawn recheck-refusal: zero herdr calls for D-912 (only D-911's two)" \
-    "2" "$(wc -l < "$call_log" | tr -d ' ')"
+  assert_eq "spawn recheck-refusal: zero herdr calls for D-912 (only D-911's create + start + root-pane close)" \
+    "3" "$(wc -l < "$call_log" | tr -d ' ')"
   assert_eq "spawn recheck-refusal: no intent appended for D-912" \
     "0" "$(grep -c '^EVENT spawn_intent d=D-912 ' "$repo/.pm/events.log")"
   assert_eq "spawn recheck-refusal: D-912 stays DISPATCHED" \
@@ -5465,6 +5529,9 @@ section_spawn_herdr_unavailable() {
 
 echo "== 30. B3: happy-path auto-spawn (intent -> tab -> start -> same-tick ACK) =="
 section_spawn_happy_path
+echo "== 30a. B3 fix: split-tab orphan root pane closed after a successful start =="
+section_spawn_root_pane_closed_after_start
+section_spawn_root_pane_not_closed_on_start_failure
 echo "== 30b. B3 fix: herdr_workspace label resolves to an id before spawn =="
 section_spawn_workspace_label_resolves_to_id
 echo "== 30c. real herdr api snapshot shape (arrays nested under result.snapshot) =="

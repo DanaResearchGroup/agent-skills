@@ -20,6 +20,7 @@ so plain `sed` substitution is safe):
 | `herdr_tab_created_no_id.json` | `herdr tab create` success variant missing `result.tab.tab_id` |
 | `herdr_tab_create_error.json` | `herdr tab create` failure (exit 1) |
 | `herdr_tab_closed.json` | `herdr tab close` success |
+| `herdr_pane_closed.json` | `herdr pane close` success |
 | `herdr_agent_started.json` | `herdr agent start` success |
 | `herdr_agent_start_error.json` | `herdr agent start` failure (exit 1) |
 

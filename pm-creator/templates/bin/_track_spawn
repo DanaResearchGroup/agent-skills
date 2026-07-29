@@ -539,6 +539,12 @@ for r in plan.get("spawn", []):
       _tr_sp_a="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["a"])' "${_tr_sp_line}")"
       _tr_sp_ref="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["ref"])' "${_tr_sp_line}")"
       _tr_sp_label="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["label"])' "${_tr_sp_line}")"
+      # Resolved here (not just before agent start) because `herdr tab
+      # create` also needs it: creating the tab with no --cwd first, then
+      # starting the agent with --cwd, is why workers used to land in a
+      # split tab with an orphaned root pane cwd'd wherever the daemon
+      # defaults to.
+      _tr_sp_cwd="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("cwd") or "")' "${_tr_sp_line}")"
 
       # (i) under pm_lock: re-fold, re-check the candidate is STILL
       # eligible, then append the spawn_intent DURABLY. Any deviation is a
@@ -653,8 +659,13 @@ sys.exit(0 if got == psha else 3)
 
       # (ii) OUTSIDE the lock: create the worker tab. On failure the
       # durable intent stays and ages into Phase A recovery next ticks.
+      # --cwd here matters even though `herdr agent start --tab` also
+      # takes --cwd below: `agent start --tab` SPLITS the tab and starts
+      # the agent in a NEW second pane, it does not reuse the tab's root
+      # pane. Without --cwd here the root pane is left sitting wherever
+      # the daemon defaults to; it gets closed as an orphan in (iii).
       _tr_sp_tab_out="$(herdr tab create --workspace "${_tr_herdr_workspace_id:-${_tr_herdr_workspace}}" \
-        --label "${_tr_sp_label}" --no-focus </dev/null 2>/dev/null)"
+        --label "${_tr_sp_label}" --cwd "${_tr_sp_cwd}" --no-focus </dev/null 2>/dev/null)"
       _tr_sp_rc=$?
       if [[ ${_tr_sp_rc} -ne 0 ]]; then
         _tr_sp_code="$(python3 -c '
@@ -680,6 +691,17 @@ except Exception:
         _tr_sp_note_cause "${_tr_sp_d}" "${_tr_sp_a}" "herdr-tab-create-failed (no tab_id in stdout)"
         continue
       fi
+      # root_pane.pane_id: the tab's original pane, pre-split. `agent start
+      # --tab` below splits the tab and starts the agent in a NEW pane, so
+      # this root pane becomes orphaned once the agent is up; closed in
+      # (iii) after a successful start.
+      _tr_sp_root_pane="$(python3 -c '
+import json, sys
+try:
+    print((((json.loads(sys.argv[1]) or {}).get("result") or {}).get("root_pane") or {}).get("pane_id") or "")
+except Exception:
+    print("")
+' "${_tr_sp_tab_out}")"
 
       # (iii) OUTSIDE the lock: start the worker agent in that tab.
       mapfile -d '' -t _tr_sp_argv < <(python3 -c '
@@ -687,7 +709,6 @@ import json, sys
 for el in json.loads(sys.argv[1])["argv"]:
     sys.stdout.write(el + "\0")
 ' "${_tr_sp_line}")
-      _tr_sp_cwd="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("cwd") or "")' "${_tr_sp_line}")"
       _tr_sp_start_out="$(herdr agent start "${_tr_sp_ref}" --workspace "${_tr_herdr_workspace_id:-${_tr_herdr_workspace}}" \
         --tab "${_tr_sp_tab_id}" --cwd "${_tr_sp_cwd}" --no-focus -- "${_tr_sp_argv[@]}" </dev/null 2>/dev/null)"
       _tr_sp_rc=$?
@@ -706,6 +727,17 @@ except Exception:
         # operator state. Ignore failure; no surface.
         herdr tab close "${_tr_sp_tab_id}" </dev/null >/dev/null 2>&1 || true
         continue
+      fi
+
+      # `agent start --tab` splits the tab rather than reusing its root
+      # pane, so the root pane is now an orphan sitting on the left of the
+      # agent's pane. Close it: track created this tab THIS tick, so
+      # closing its own root pane is not an auto-act on operator state.
+      # Best-effort -- a failure here must not fail the spawn, must not
+      # surface a row, and must not block the DISPATCHED->ACKED record
+      # below (the agent is already up and registered under its name).
+      if [[ -n "${_tr_sp_root_pane}" ]]; then
+        herdr pane close "${_tr_sp_root_pane}" </dev/null >/dev/null 2>&1 || true
       fi
 
       # (iv) under pm_lock (inside pm_apply): re-fold + re-check via the
