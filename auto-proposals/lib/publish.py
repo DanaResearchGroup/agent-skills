@@ -26,7 +26,8 @@ from pathlib import Path
 from lib.paths import (
     PathRefused,
     dropbox_synced,
-    is_draft_pdf,
+    companion_md_rel_for,
+    is_draft_companion,
     owned_artifact_conflicts,
     publish_host_ok,
     resolve_owned,
@@ -262,6 +263,15 @@ def _ensure_parent(root: Path, target: Path) -> None:
         raise PathRefused(
             f"{parent} would be created directly under the archive root; refused"
         )
+    # `tex/` is the one nested directory we may create, and only inside
+    # `drafts/`. Naming it explicitly rather than adding it to
+    # _CREATABLE_SUBDIRS keeps it from becoming creatable at call-folder level
+    # too, where it would mean nothing.
+    if parent.name == "tex" and parent.parent.name == "drafts" and parent.parent.is_dir():
+        parent.mkdir()
+        _fsync_dir(parent.parent)
+        return
+
     if parent.name in _CREATABLE_SUBDIRS and parent.parent.is_dir():
         parent.mkdir()
         _fsync_dir(parent.parent)
@@ -282,12 +292,28 @@ def publish_create(root: Path, rel: str, text: str, *, frontmatter: dict) -> Pat
     already exists - the caller must publish the next -v<N> instead. This is
     what makes Alon's hand-ticked checkboxes unclobberable: this function
     physically cannot overwrite anything.
+
+    Text artifacts only. Companions (.pdf, .tex, .bib) share the "create" mode
+    because resolve_owned() must apply the same containment and symlink checks
+    to them, but they must never come through here - see the guard below.
     """
     _check_environment()
 
     mode = write_mode_for(rel)
     if mode != "create":
         raise PathRefused(f"{rel!r} is not a 'create' artifact (mode={mode!r})")
+
+    # Companions are in the grammar as "create" targets, which would otherwise
+    # let them be written here in text mode with frontmatter prepended and a
+    # completeness marker appended. That corrupts a PDF outright and stops a
+    # .tex compiling - so the grammar alone is not enough, and this is the
+    # guard that makes publish_create_companion the only way in.
+    if is_draft_companion(rel):
+        raise PathRefused(
+            f"{rel!r} is a draft companion and must not be written as text; "
+            "frontmatter and the completeness marker would corrupt it. Use "
+            "publish_create_companion (CLI: create-companion) instead."
+        )
 
     target = resolve_owned(Path(root), rel)
     _refuse_if_frozen(Path(root), rel)
@@ -325,46 +351,83 @@ def publish_create(root: Path, rel: str, text: str, *, frontmatter: dict) -> Pat
     return target
 
 
-def publish_create_binary(root: Path, rel: str, data: bytes) -> Path:
-    """Create a brand-new owned artifact whose content is bytes, not text.
+def _check_companion_payload(rel: str, data: bytes) -> None:
+    """Sanity-check a companion's bytes against what its extension promises.
 
-    The only such artifact is the PDF rendering of a markdown draft, and it is
-    held to a stricter rule than any text artifact: **the markdown draft it
-    renders must already exist and be owned by us.** A PDF carries no
-    frontmatter, so it has no way to say who generated it; anchoring it to a
-    sibling .md we can prove we wrote is what keeps `drafts/` from becoming a
-    place arbitrary binaries can be deposited. It also enforces the naming
-    scheme by construction - the PDF cannot drift to a different date or letter
-    than the draft it belongs to.
+    Companions are written verbatim, so nothing downstream will ever notice
+    that a .pdf holds an error page or that the .tex and .pdf payloads were
+    passed in the wrong order. And because create-only means the file cannot
+    be corrected in place - fixing it costs a whole new draft letter - the
+    cheapest place to catch it is before the write.
+
+    This is a shape check, not validation. It is not trying to prove the PDF
+    renders or the LaTeX compiles, only that the payload is not obviously the
+    wrong kind of thing.
+    """
+    if not data:
+        raise PathRefused(f"refusing to publish {rel!r}: payload is empty")
+
+    if rel.endswith(".pdf"):
+        if not data.startswith(b"%PDF-"):
+            raise PathRefused(
+                f"refusing to publish {rel!r}: payload does not start with the "
+                f"%PDF- header (got {data[:8]!r}), so it is not a PDF"
+            )
+        return
+
+    # .tex and .bib are text and must be readable by a TeX engine. A payload
+    # that is not UTF-8 is either the wrong file entirely or already mangled.
+    try:
+        data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise PathRefused(
+            f"refusing to publish {rel!r}: payload is not valid UTF-8 ({exc})"
+        ) from None
+
+
+def publish_create_companion(root: Path, rel: str, data: bytes) -> Path:
+    """Create a brand-new draft companion - the rendered PDF, or the LaTeX
+    source it was compiled from - writing `data` verbatim.
+
+    Companions are held to a stricter rule than any other artifact: **the
+    markdown draft they belong to must already exist and be owned by us.**
+    Neither a PDF nor a .tex we hand back unchanged can carry our frontmatter,
+    so neither has a way to say who generated it; anchoring both to an .md we
+    can prove we wrote is what keeps `drafts/` from becoming a place arbitrary
+    files can be deposited. It also enforces the naming scheme by construction -
+    a companion cannot drift to a different date or letter than its draft.
 
     Note what is deliberately absent: no frontmatter is prepended and no
-    completeness marker is appended. Both would corrupt the file. Truncation of
-    a PDF is therefore not detectable the way it is for our markdown artifacts,
-    which is the honest reason the write is done as write-temp-then-link like
-    every other create here - the target only ever appears once its bytes are
-    complete and fsynced.
+    completeness marker is appended. Both would corrupt a PDF, and both would
+    stop a .tex compiling. Truncation is therefore not detectable the way it is
+    for our markdown artifacts, which is the honest reason the write is done as
+    write-temp-then-link like every other create here - the target only ever
+    appears once its bytes are complete and fsynced.
     """
     _check_environment()
 
-    if not is_draft_pdf(rel):
+    if not is_draft_companion(rel):
         raise PathRefused(
-            f"{rel!r} is not a draft PDF; binary publishing is limited to "
-            "<call>/drafts/YYYY.MM.DD <letter> <rest>.pdf"
+            f"{rel!r} is not a draft companion; verbatim publishing is limited to "
+            "<call>/drafts/<date> <letter> <rest>.pdf and "
+            "<call>/drafts/tex/<date> <letter> <rest>.{tex,bib}"
         )
 
-    md_rel = rel.replace(os.sep, "/")[: -len(".pdf")] + ".md"
+    _check_companion_payload(rel, data)
+
+    md_rel = companion_md_rel_for(rel)
     found = read_owned(Path(root), md_rel)
     if found is None:
         raise PathRefused(
             f"refusing to publish {rel!r}: its markdown draft {md_rel!r} does not "
-            "exist. Publish the draft first; the PDF is a rendering of it, never "
+            "exist. Publish the draft first; a companion is derived from it, never "
             "a standalone artifact."
         )
     if not is_agent_owned(found[0]):
         raise PathRefused(
             f"refusing to publish {rel!r}: the markdown draft {md_rel!r} is not "
-            "owned by auto-proposals, so this PDF would have no provenance and "
-            "would be depositing a binary next to someone else's file."
+            "owned by auto-proposals, so this companion would have no provenance "
+            "and would be depositing a file next to someone else's."
         )
 
     target = resolve_owned(Path(root), rel)
@@ -802,7 +865,7 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="python3 -m lib.publish")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    for name in ("create", "append", "regenerate", "create-pdf"):
+    for name in ("create", "append", "regenerate", "create-companion"):
         p = sub.add_parser(name)
         p.add_argument("--root", required=True)
         p.add_argument("--rel", required=True)
@@ -816,16 +879,17 @@ def main(argv=None) -> int:
 
     args = parser.parse_args(argv)
 
-    # create-pdf is the one command whose payload is bytes. Reading it as text
-    # would mangle it, so it is read and dispatched before the text path.
-    if args.command == "create-pdf":
+    # create-companion is the one command whose payload is verbatim bytes.
+    # Reading it as text would mangle a PDF, so it is dispatched before the
+    # text path reads --file.
+    if args.command == "create-companion":
         try:
             data = Path(args.file).read_bytes()
         except OSError as exc:
             print(f"refused: could not read --file {args.file!r}: {exc}", file=sys.stderr)
             return 1
         try:
-            path = publish_create_binary(args.root, args.rel, data)
+            path = publish_create_companion(args.root, args.rel, data)
         except PathRefused as exc:
             print(f"refused: {exc}", file=sys.stderr)
             return 1

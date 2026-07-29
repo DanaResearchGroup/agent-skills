@@ -5,10 +5,17 @@ as markdown is one he cannot hand to a colleague. So every draft is published
 twice: the markdown, which stays the editable source of truth, and a PDF
 rendering of it.
 
+**LaTeX is the intended path**, because a proposal is judged partly on looking
+like one and because the .tex it compiles is kept alongside the PDF for Alon to
+edit and recompile. Everything else here is a fallback for a host without a TeX
+engine, and a fallback never produces LaTeX sources.
+
 This module deliberately does NOT pick one PDF toolchain and depend on it. The
 skill runs on several of Alon's machines and inside cron, and the available
-converters differ between them. Instead it tries a chain of backends in quality
-order and reports which one it used, so the caller can say so in its run report.
+converters differ between them - the manuscripts repo compiles with MiKTeX on
+his Windows box, while HL has no TeX at all. So it tries a chain of backends in
+quality order and reports which one it used, so the caller can say so in its
+run report.
 
 The one behaviour this module refuses to have is a silent skip. If no backend
 is available it raises RenderUnavailable naming what to install. A draft that
@@ -24,6 +31,8 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
+
+from lib import latex
 
 
 class RenderUnavailable(Exception):
@@ -67,9 +76,15 @@ figcaption { font-size: 9.5pt; font-style: italic; margin-top: 0.3em; }
 
 def strip_internal_markup(md_text: str) -> str:
     """Remove the frontmatter block and completeness marker from a published
-    artifact, leaving the document a reader should see."""
+    artifact, leaving the document a reader should see.
+
+    Only newlines are trimmed, never spaces. A bare .strip() would also eat
+    leading indentation - turning a document that opens with an indented code
+    block into one that opens with a paragraph - which is the exact class of
+    quiet corruption this renderer exists to avoid.
+    """
     body = _FRONTMATTER_RE.sub("", md_text, count=1)
-    return _MARKER_RE.sub("", body).strip() + "\n"
+    return _MARKER_RE.sub("", body).strip("\n") + "\n"
 
 
 def markdown_to_html(md_text: str, *, title: str) -> str:
@@ -103,6 +118,112 @@ def _run(cmd: list[str], *, cwd: str | None = None, timeout: int = 180) -> subpr
     return subprocess.run(
         cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout, check=False
     )
+
+
+# Unicode engines first. The archive is bilingual and a call may require
+# Hebrew; pdflatex cannot set it at all, so preferring it would produce a PDF
+# of missing glyphs on exactly the documents where that is least noticeable.
+LATEX_ENGINES = ("xelatex", "lualatex", "pdflatex", "tectonic")
+
+
+def latex_engine() -> str | None:
+    """The LaTeX engine that would be used, or None if none is installed."""
+    return next((e for e in LATEX_ENGINES if shutil.which(e)), None)
+
+
+def _has_bidi() -> bool:
+    """Whether polyglossia's `bidi` dependency is installed.
+
+    Probed rather than assumed, because Ubuntu's texlive-xetex does NOT ship
+    bidi.sty - it ships unicode-bidi.sty, which is a different package - so a
+    perfectly reasonable `apt install texlive-xetex` leaves polyglossia's
+    Hebrew support unusable. bidi lives in texlive-lang-arabic. Without this
+    probe every Hebrew draft would fail the compile on a host that looks
+    correctly provisioned.
+    """
+    if not shutil.which("kpsewhich"):
+        return False
+    try:
+        return _run(["kpsewhich", "bidi.sty"], timeout=20).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def _try_latex(
+    md_text: str, out_path: Path, base_dir: Path, title: str, keep_tex: Path | None
+) -> bool:
+    """Preferred backend: emit LaTeX, compile it, and optionally keep the .tex.
+
+    Compiled twice. A single pass leaves cross-references and any table-of-
+    contents unresolved, and the failure is silent - the PDF is produced, just
+    with '??' where the references should be.
+
+    The engine is never allowed to prompt: `-interaction=nonstopmode` plus a
+    timeout, because a LaTeX error dialog waiting on stdin inside cron hangs
+    the run forever rather than failing it.
+    """
+    engine = latex_engine()
+    if engine is None:
+        return False
+
+    hebrew = latex.has_hebrew(md_text) or latex.has_hebrew(title)
+    if hebrew and engine == "pdflatex":
+        raise RenderFailed(
+            "this draft contains Hebrew and the only LaTeX engine available is "
+            "pdflatex, which cannot typeset it. Install xelatex or lualatex."
+        )
+
+    tex_source = latex.build_document(
+        md_text, title=title, hebrew=hebrew, rtl_support=_has_bidi()
+    )
+
+    with tempfile.TemporaryDirectory() as td:
+        stem = "draft"
+        tex_path = Path(td) / f"{stem}.tex"
+        tex_path.write_text(tex_source, encoding="utf-8")
+
+        if engine == "tectonic":
+            cmd = ["tectonic", "--outdir", td, str(tex_path)]
+            passes = 1  # tectonic reruns internally until references settle
+        else:
+            cmd = [
+                engine, "-interaction=nonstopmode", "-halt-on-error",
+                "-output-directory", td, str(tex_path),
+            ]
+            passes = 2
+
+        res = None
+        for _ in range(passes):
+            # cwd=base_dir so \includegraphics finds figures by relative path.
+            res = _run(cmd, cwd=str(base_dir), timeout=240)
+
+        produced = Path(td) / f"{stem}.pdf"
+        if not produced.exists():
+            log = ""
+            log_path = Path(td) / f"{stem}.log"
+            if log_path.exists():
+                log = _latex_error_excerpt(log_path.read_text(errors="replace"))
+            if not log and res is not None:
+                log = (res.stderr or res.stdout or "").strip()[:400]
+            raise RenderFailed(f"{engine} produced no PDF: {log}")
+
+        shutil.copyfile(produced, out_path)
+        if keep_tex is not None:
+            keep_tex.parent.mkdir(parents=True, exist_ok=True)
+            keep_tex.write_text(tex_source, encoding="utf-8")
+    return True
+
+
+def _latex_error_excerpt(log: str) -> str:
+    """Pull the actual LaTeX errors out of a log that is mostly noise.
+
+    A raw .log tail is usually font-map chatter and says nothing about why the
+    compile failed. The lines that matter start with '!'.
+    """
+    errors = [ln for ln in log.splitlines() if ln.startswith("!")]
+    if errors:
+        return " / ".join(errors[:4])[:400]
+    return log.strip()[-400:]
 
 
 def _try_pandoc(md_text: str, out_path: Path, base_dir: Path) -> bool:
@@ -173,7 +294,7 @@ def _try_libreoffice(md_text: str, out_path: Path, base_dir: Path, title: str) -
     return True
 
 
-BACKENDS_IN_PREFERENCE_ORDER = ("pandoc", "weasyprint", "libreoffice")
+BACKENDS_IN_PREFERENCE_ORDER = ("latex", "pandoc", "weasyprint", "libreoffice")
 
 
 def render_markdown_to_pdf(
@@ -182,12 +303,19 @@ def render_markdown_to_pdf(
     *,
     title: str = "draft",
     base_dir: Path | None = None,
+    keep_tex: Path | None = None,
 ) -> str:
     """Render `md_text` to a PDF at `out_path`. Returns the backend name used.
 
     `base_dir` is where relative figure paths resolve from - pass the folder
     holding the draft's images, or the call folder. Frontmatter and the
     completeness marker are stripped first.
+
+    `keep_tex` asks the LaTeX backend to write the .tex it compiled to that
+    path, so the source of the PDF is preserved and Alon can edit and recompile
+    it himself. Only the LaTeX backend honours it; the fallbacks have no LaTeX
+    source to keep, and a caller that got a PDF from one of them will find no
+    file there. Check the returned backend name before assuming otherwise.
 
     Raises RenderUnavailable if no backend exists on this host, and RenderFailed
     if one existed but did not produce a PDF. Neither is caught here on purpose:
@@ -207,6 +335,7 @@ def render_markdown_to_pdf(
     # blocks the file it is handed. Detection by `which` cannot see that, so the
     # only reliable signal is having tried.
     for name, fn in (
+        ("latex", lambda: _try_latex(body, out_path, base_dir, title, keep_tex)),
         ("pandoc", lambda: _try_pandoc(body, out_path, base_dir)),
         ("weasyprint", lambda: _try_weasyprint(body, out_path, base_dir, title)),
         ("libreoffice", lambda: _try_libreoffice(body, out_path, base_dir, title)),
@@ -224,13 +353,15 @@ def render_markdown_to_pdf(
         raise RenderFailed(
             f"every available PDF backend failed ({detail}). If LibreOffice is "
             "installed as a snap, its confinement blocks the conversion - a deb "
-            "or a pandoc/weasyprint install is the fix."
+            "or a TeX install is the fix."
         )
 
     raise RenderUnavailable(
-        "no PDF backend found on this host. Install one of: pandoc (plus "
-        "tectonic/xelatex), weasyprint, or libreoffice. Preferred is pandoc + "
-        "tectonic for typeset output with proper figure placement."
+        "no PDF backend found on this host. Install a LaTeX engine - "
+        "`texlive-xetex` plus `texlive-latex-extra` (xelatex handles the "
+        "archive's Hebrew; pdflatex cannot) - which is also what produces the "
+        "keepable .tex source. Failing that, pandoc, weasyprint or a non-snap "
+        "libreoffice will render, but without LaTeX sources."
     )
 
 
@@ -246,6 +377,8 @@ def available_backend() -> str | None:
     non-None result as "probably", and the return value of an actual render as
     the truth.
     """
+    if latex_engine() is not None:
+        return "latex"
     if shutil.which("pandoc") and any(
         shutil.which(e) for e in ("tectonic", "xelatex", "pdflatex", "weasyprint")
     ):

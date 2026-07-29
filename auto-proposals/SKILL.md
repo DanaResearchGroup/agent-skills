@@ -154,23 +154,41 @@ a given date, and increments (`a` → `b` → `c` …) for each further version 
 is always a NEW file — the chokepoint never overwrites, it only adds new letter-suffixed
 files. `lib.paths.next_draft_rel()` computes the next filename; never hand-construct it.
 
-## Every draft ships as markdown **and** PDF
+## Every draft ships as markdown, PDF, and the LaTeX that made it
 
 A draft Alon cannot hand to a colleague, print, or read away from a terminal is half-delivered.
-So stage 3 publishes **two** files, sharing one basename:
+And a PDF he cannot edit is a dead end. So stage 3 publishes **three** things under one
+basename: the markdown, the PDF, and the `.tex` the PDF was compiled from.
 
 ```bash
+MD_REL=$(...)      # lib.paths.next_draft_rel()
 # 1. the markdown - the editable source of truth
 python3 -m lib.publish create --root "$ROOT" --rel "$MD_REL" --file draft.md --frontmatter '{...}'
-# 2. the rendering - MD_REL's exact date and letter, via the helper, never hand-built
-python3 -c "from lib.render import render_markdown_to_pdf; ..."   # writes out.pdf
-python3 -m lib.publish create-pdf --root "$ROOT" --rel "$PDF_REL" --file out.pdf
+# 2. render via LaTeX, keeping the .tex it compiled
+python3 -c "from lib.render import render_markdown_to_pdf; ..."   # writes out.pdf + out.tex
+# 3. publish both companions
+python3 -m lib.publish create-companion --root "$ROOT" --rel "$PDF_REL" --file out.pdf
+python3 -m lib.publish create-companion --root "$ROOT" --rel "$TEX_REL" --file out.tex
 ```
 
-`lib.paths.draft_pdf_rel_for(md_rel)` gives `$PDF_REL`. **The naming convention applies
-unchanged** — the PDF carries the same `YYYY.MM.DD <letter>` as the markdown it renders, so a
-new version means a new letter for both. `create-pdf` refuses a PDF whose markdown sibling is
-not there and owned, so publish the markdown first.
+`lib.paths.draft_pdf_rel_for(md_rel)` and `draft_tex_rel_for(md_rel)` give the two companion
+paths — **never hand-build them.** The `.tex` lands in `drafts/tex/` so `drafts/` stays a
+readable list of drafts rather than a build directory. **The naming convention applies
+unchanged**: all three carry the same `YYYY.MM.DD <letter>`, so a new version means a new letter
+for all of them. `create-companion` refuses a companion whose markdown sibling is not there and
+owned, so publish the markdown first. Publish `.tex` and `.bib` only — never `.aux`, `.log` or
+any other build artefact.
+
+**LaTeX is the intended renderer, not one option among several.** A proposal is judged partly
+on looking like a proposal, and the `.tex` is what lets Alon take over: edit, recompile, drop it
+into a template, or carry it to Overleaf. `render_markdown_to_pdf(..., keep_tex=...)` returns
+the backend it used — **only `"latex"` produces a `.tex`.** If it returns anything else, there
+is no source to publish, and the run must say so rather than pretend there is.
+
+**Hebrew decides the engine.** `xelatex` and `lualatex` are preferred over `pdflatex` because
+`pdflatex` cannot typeset Hebrew at all — it produces a PDF of silently missing glyphs, which
+is worse than a failed compile. A Hebrew draft with only `pdflatex` available is refused rather
+than rendered wrong.
 
 **Structure the PDF like a document, not a memo.** Use real heading levels, tables for anything
 tabular, and **include figures where a figure carries the argument** — a work-package Gantt, a
@@ -181,10 +199,11 @@ is a wall of prose loses to one with a figure a reviewer can read in ten seconds
 **If rendering fails, say so out loud.** `lib.render` raises rather than returning quietly:
 `RenderUnavailable` means no backend is installed, `RenderFailed` means one is installed and
 broken. Either way, publish the markdown, **report the failure in your run summary**, and name
-the fix. Never let a run look like it delivered a draft when it delivered half of one. Backends
-are tried best-first — pandoc (with tectonic or xelatex), then weasyprint, then libreoffice;
-`lib.render.available_backend()` reports which one *would* be tried, but only an actual render
-tells you whether it works.
+the fix. Never let a run look like it delivered a draft when it delivered a third of one.
+Backends are tried best-first — LaTeX, then pandoc, then weasyprint, then libreoffice — and a
+backend that is installed but broken steps aside for the next rather than ending the chain.
+`lib.render.available_backend()` reports which one *would* be tried; only an actual render tells
+you whether it works.
 
 ## References — drafts carry them, and every one is verified
 
@@ -246,12 +265,18 @@ arming the schedule. All Alon's. Nothing goes outbound from this skill.
   `groups:history` + `groups:read`; until those exist, thread-reply steering does not work under
   cron and Slack is notification-only. Say that rather than shipping something that looks like it
   works.
-- **No PDF backend works on HL as of 2026-07-29.** pandoc, weasyprint and every LaTeX engine
-  are absent, and the LibreOffice on `PATH` is a **snap** whose confinement makes it fail every
-  conversion — including a plain text file — so `available_backend()` answers `libreoffice` and
-  the render still fails. Until `pandoc` + `tectonic` (preferred) or `weasyprint` is installed,
-  stage 3 will publish the markdown and report the PDF as not produced. That is the designed
-  behaviour, not a bug to work around.
+- **LaTeX on HL: working, with one package still missing.** `texlive-xetex` and
+  `texlive-latex-extra` are installed, `xelatex` is the active engine, and English drafts render
+  end to end. **`bidi.sty` is not installed**, and this is the trap: Ubuntu's `texlive-xetex`
+  ships `unicode-bidi.sty`, which is a *different package*, so a host that looks correctly
+  provisioned still cannot load polyglossia's Hebrew support. `lib.render` probes for it with
+  `kpsewhich` and falls back to loading the Hebrew font through `fontspec` alone — correct
+  glyphs, but punctuation at a Hebrew/English boundary may sit on the wrong side. Fine for the
+  short quoted call fragments these drafts contain; **not** fine for a draft written in Hebrew
+  throughout. `sudo apt install texlive-lang-arabic` supplies `bidi` and removes the caveat.
+- **The other backends remain unusable here**, which matters only if TeX is ever removed:
+  pandoc and weasyprint are absent, and the LibreOffice on `PATH` is a **snap** whose
+  confinement fails every conversion, including a plain text file.
 - **There is no OS sandbox on this machine** — `kernel.apparmor_restrict_unprivileged_userns=1`
   blocks `bwrap`, so the write protection is the permission system plus `lib/publish.py` plus the
   integrity snapshot, not a kernel boundary. See `SAFETY.md` § 1.

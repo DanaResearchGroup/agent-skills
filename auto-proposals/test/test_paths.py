@@ -12,10 +12,13 @@ from test._env import configure_env, make_test_root  # noqa: E402
 
 from lib.paths import (  # noqa: E402
     PathRefused,
+    companion_md_rel_for,
     draft_pdf_rel_for,
+    draft_tex_rel_for,
     dropbox_synced,
     is_call_dir,
     is_conflicted_copy,
+    is_draft_companion,
     is_draft_pdf,
     next_draft_rel,
     owned_artifact_conflicts,
@@ -366,6 +369,63 @@ class DraftPdfGrammarTests(unittest.TestCase):
     def setUp(self):
         self.root = make_test_root()
         configure_env(self.root)
+
+
+class DraftTexGrammarTests(unittest.TestCase):
+    def setUp(self):
+        self.root = make_test_root()
+        configure_env(self.root)
+
+    def test_tex_and_bib_under_drafts_tex_are_create_targets(self):
+        for ext in ("tex", "bib"):
+            with self.subTest(ext=ext):
+                self.assertEqual(
+                    write_mode_for(f"NSF-2027/drafts/tex/2026.07.28 a T1-slug.{ext}"),
+                    "create",
+                )
+
+    def test_tex_must_live_in_the_subfolder_not_beside_the_draft(self):
+        """Keeping sources out of drafts/ is the point of the subfolder; if the
+        grammar accepted both, they would end up in both."""
+        with self.assertRaises(PathRefused):
+            write_mode_for("NSF-2027/drafts/2026.07.28 a T1-slug.tex")
+
+    def test_tex_subfolder_does_not_admit_arbitrary_extensions(self):
+        for rel in (
+            "NSF-2027/drafts/tex/2026.07.28 a T1-slug.aux",
+            "NSF-2027/drafts/tex/2026.07.28 a T1-slug.log",
+            "NSF-2027/drafts/tex/2026.07.28 a T1-slug.pdf",
+            "NSF-2027/drafts/tex/notes.tex",
+        ):
+            with self.subTest(rel=rel):
+                with self.assertRaises(PathRefused):
+                    write_mode_for(rel)
+
+    def test_tex_rel_is_derived_from_the_md(self):
+        md = next_draft_rel(self.root, "NSF-2027", "T1-slug", date(2026, 7, 28))
+        self.assertEqual(
+            draft_tex_rel_for(md), "NSF-2027/drafts/tex/2026.07.28 a T1-slug.tex"
+        )
+        self.assertEqual(
+            draft_tex_rel_for(md, "bib"), "NSF-2027/drafts/tex/2026.07.28 a T1-slug.bib"
+        )
+
+    def test_tex_rel_refuses_a_build_artefact_extension(self):
+        md = next_draft_rel(self.root, "NSF-2027", "T1-slug", date(2026, 7, 28))
+        with self.assertRaises(PathRefused):
+            draft_tex_rel_for(md, "aux")
+
+    def test_companion_md_rel_round_trips_for_both_companion_kinds(self):
+        md = "NSF-2027/drafts/2026.07.28 a T1-slug.md"
+        for companion in (draft_pdf_rel_for(md), draft_tex_rel_for(md),
+                          draft_tex_rel_for(md, "bib")):
+            with self.subTest(companion=companion):
+                self.assertTrue(is_draft_companion(companion))
+                self.assertEqual(companion_md_rel_for(companion), md)
+
+    def test_companion_md_rel_refuses_a_non_companion(self):
+        with self.assertRaises(PathRefused):
+            companion_md_rel_for("NSF-2027/topics.md")
 
 
 class ContextFolderIsNeverWritableTests(unittest.TestCase):

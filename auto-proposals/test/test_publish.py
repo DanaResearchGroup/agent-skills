@@ -21,7 +21,7 @@ from lib.publish import (  # noqa: E402
     parse_frontmatter,
     publish_append,
     publish_create,
-    publish_create_binary,
+    publish_create_companion,
     publish_regenerate,
     read_owned,
     render_frontmatter,
@@ -640,7 +640,7 @@ _MD_REL = "NSF-2027/drafts/2026.07.28 a T1-slug.md"
 _PDF_REL = "NSF-2027/drafts/2026.07.28 a T1-slug.pdf"
 
 
-class PublishCreateBinaryTests(unittest.TestCase):
+class PublishCreateCompanionTests(unittest.TestCase):
     def setUp(self):
         self.root = make_test_root()
         configure_env(self.root)
@@ -653,7 +653,7 @@ class PublishCreateBinaryTests(unittest.TestCase):
 
     def test_pdf_publishes_alongside_its_markdown(self):
         self._publish_md()
-        target = publish_create_binary(self.root, _PDF_REL, _PDF_BYTES)
+        target = publish_create_companion(self.root, _PDF_REL, _PDF_BYTES)
         self.assertTrue(target.exists())
         self.assertEqual(target.read_bytes(), _PDF_BYTES)
 
@@ -662,12 +662,12 @@ class PublishCreateBinaryTests(unittest.TestCase):
         translate newlines and corrupt the PDF silently."""
         self._publish_md()
         payload = b"%PDF-1.7\r\n\x00\x01\x02\r\n\x80\xff binary \r\n%%EOF"
-        target = publish_create_binary(self.root, _PDF_REL, payload)
+        target = publish_create_companion(self.root, _PDF_REL, payload)
         self.assertEqual(target.read_bytes(), payload)
 
     def test_no_frontmatter_or_marker_is_injected(self):
         self._publish_md()
-        target = publish_create_binary(self.root, _PDF_REL, _PDF_BYTES)
+        target = publish_create_companion(self.root, _PDF_REL, _PDF_BYTES)
         raw = target.read_bytes()
         self.assertTrue(raw.startswith(b"%PDF"))
         self.assertNotIn(b"generated_by", raw)
@@ -678,7 +678,7 @@ class PublishCreateBinaryTests(unittest.TestCase):
         .md is the only provenance anchor - without one, drafts/ would accept
         arbitrary binaries."""
         with self.assertRaises(PathRefused) as ctx:
-            publish_create_binary(self.root, _PDF_REL, _PDF_BYTES)
+            publish_create_companion(self.root, _PDF_REL, _PDF_BYTES)
         self.assertIn("markdown draft", str(ctx.exception))
 
     def test_refuses_when_the_sibling_markdown_is_not_agent_owned(self):
@@ -688,13 +688,13 @@ class PublishCreateBinaryTests(unittest.TestCase):
             "---\ngenerated_by: a human\n---\nhand written\n", encoding="utf-8"
         )
         with self.assertRaises(PathRefused):
-            publish_create_binary(self.root, _PDF_REL, _PDF_BYTES)
+            publish_create_companion(self.root, _PDF_REL, _PDF_BYTES)
 
     def test_refuses_to_overwrite_an_existing_pdf(self):
         self._publish_md()
-        publish_create_binary(self.root, _PDF_REL, _PDF_BYTES)
+        publish_create_companion(self.root, _PDF_REL, _PDF_BYTES)
         with self.assertRaises(PathRefused) as ctx:
-            publish_create_binary(self.root, _PDF_REL, b"%PDF-1.7 different\n")
+            publish_create_companion(self.root, _PDF_REL, b"%PDF-1.7 different\n")
         self.assertIn("already exists", str(ctx.exception))
         self.assertEqual((self.root / _PDF_REL).read_bytes(), _PDF_BYTES)
 
@@ -702,22 +702,107 @@ class PublishCreateBinaryTests(unittest.TestCase):
         for rel in ("NSF-2027/topics.pdf", "OPEN.pdf", "NSF-2027/context/x.pdf"):
             with self.subTest(rel=rel):
                 with self.assertRaises(PathRefused):
-                    publish_create_binary(self.root, rel, _PDF_BYTES)
+                    publish_create_companion(self.root, rel, _PDF_BYTES)
 
     def test_refuses_a_markdown_path(self):
         """create-pdf must not become a second way to write text artifacts,
         bypassing frontmatter and the completeness marker."""
         self._publish_md("NSF-2027/drafts/2026.07.28 b T1-slug.md")
         with self.assertRaises(PathRefused):
-            publish_create_binary(
+            publish_create_companion(
                 self.root, "NSF-2027/drafts/2026.07.28 c T1-slug.md", b"plain"
             )
 
+    def test_tex_source_publishes_into_the_tex_subfolder(self):
+        self._publish_md()
+        tex_rel = "NSF-2027/drafts/tex/2026.07.28 a T1-slug.tex"
+        target = publish_create_companion(
+            self.root, tex_rel, b"\\documentclass{article}\n\\begin{document}x\\end{document}\n"
+        )
+        self.assertTrue(target.exists())
+        self.assertEqual(target.parent.name, "tex")
+        self.assertTrue(target.read_text().startswith("\\documentclass"))
+
+    def test_tex_source_is_not_wrapped_in_frontmatter(self):
+        """YAML frontmatter on a .tex would stop it compiling, which defeats
+        the entire point of keeping the source."""
+        self._publish_md()
+        tex_rel = "NSF-2027/drafts/tex/2026.07.28 a T1-slug.tex"
+        target = publish_create_companion(self.root, tex_rel, b"\\documentclass{article}\n")
+        self.assertFalse(target.read_text().startswith("---"))
+        self.assertNotIn("generated_by", target.read_text())
+
+    def test_tex_subfolder_is_created_on_demand(self):
+        self._publish_md()
+        tex_dir = self.root / "NSF-2027" / "drafts" / "tex"
+        self.assertFalse(tex_dir.exists())
+        publish_create_companion(
+            self.root, "NSF-2027/drafts/tex/2026.07.28 a T1-slug.tex", b"x\n"
+        )
+        self.assertTrue(tex_dir.is_dir())
+
+    def test_tex_refuses_without_its_markdown_draft(self):
+        with self.assertRaises(PathRefused):
+            publish_create_companion(
+                self.root, "NSF-2027/drafts/tex/2026.07.28 a T1-slug.tex", b"x\n"
+            )
+
+    def test_publish_create_refuses_every_companion_path(self):
+        """Companions are 'create' targets in the grammar so resolve_owned()
+        applies its containment checks to them - but coming through
+        publish_create() would prepend frontmatter and append the completeness
+        marker, corrupting a PDF outright and stopping a .tex compiling."""
+        self._publish_md()
+        for rel in (
+            _PDF_REL,
+            "NSF-2027/drafts/tex/2026.07.28 a T1-slug.tex",
+            "NSF-2027/drafts/tex/2026.07.28 a T1-slug.bib",
+        ):
+            with self.subTest(rel=rel):
+                with self.assertRaises(PathRefused) as ctx:
+                    publish_create(
+                        self.root, rel, "x\n", frontmatter=owned_frontmatter(artifact="draft")
+                    )
+                self.assertIn("companion", str(ctx.exception))
+                self.assertFalse((self.root / rel).exists())
+
+    def test_pdf_payload_must_carry_the_pdf_header(self):
+        """Create-only means a wrong payload cannot be corrected in place -
+        fixing it costs a whole new draft letter - so it is caught before the
+        write, not after."""
+        self._publish_md()
+        with self.assertRaises(PathRefused) as ctx:
+            publish_create_companion(self.root, _PDF_REL, b"\\documentclass{article}\n")
+        self.assertIn("%PDF-", str(ctx.exception))
+        self.assertFalse((self.root / _PDF_REL).exists())
+
+    def test_tex_payload_must_be_utf8(self):
+        self._publish_md()
+        with self.assertRaises(PathRefused):
+            publish_create_companion(
+                self.root, "NSF-2027/drafts/tex/2026.07.28 a T1-slug.tex", b"\xff\xfe\x00bad"
+            )
+
+    def test_tex_payload_may_contain_non_ascii_utf8(self):
+        """Hebrew in a .tex is expected, not an error."""
+        self._publish_md()
+        target = publish_create_companion(
+            self.root,
+            "NSF-2027/drafts/tex/2026.07.28 a T1-slug.tex",
+            "\\documentclass{article}\n% קול קורא\n".encode("utf-8"),
+        )
+        self.assertIn("קול קורא", target.read_text(encoding="utf-8"))
+
+    def test_empty_payload_is_refused(self):
+        self._publish_md()
+        with self.assertRaises(PathRefused):
+            publish_create_companion(self.root, _PDF_REL, b"")
+
     def test_leaves_no_temp_file_behind_on_refusal(self):
         self._publish_md()
-        publish_create_binary(self.root, _PDF_REL, _PDF_BYTES)
+        publish_create_companion(self.root, _PDF_REL, _PDF_BYTES)
         with self.assertRaises(PathRefused):
-            publish_create_binary(self.root, _PDF_REL, b"%PDF other\n")
+            publish_create_companion(self.root, _PDF_REL, b"%PDF other\n")
         leftovers = [
             p.name
             for p in (self.root / "NSF-2027" / "drafts").iterdir()

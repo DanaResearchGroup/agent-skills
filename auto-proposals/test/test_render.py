@@ -35,6 +35,13 @@ class StripInternalMarkupTests(unittest.TestCase):
         self.assertIn("Para two.", out)
         self.assertIn("\n---\n", out)
 
+    def test_leading_indentation_survives(self):
+        """A bare .strip() would eat the four spaces and turn an indented code
+        block into a paragraph - silent corruption of the document."""
+        md = "---\na: b\n---\n    indented code\n\ntext\n"
+        out = render.strip_internal_markup(md)
+        self.assertTrue(out.startswith("    indented code"))
+
     def test_document_without_frontmatter_is_left_alone(self):
         md = "# Title\n\nBody.\n"
         self.assertEqual(render.strip_internal_markup(md).strip(), md.strip())
@@ -89,7 +96,8 @@ class BackendSelectionTests(unittest.TestCase):
             calls.append("weasyprint")
             return True
 
-        with patch.object(render, "_try_pandoc", boom), \
+        with patch.object(render, "_try_latex", lambda *a, **k: False), \
+             patch.object(render, "_try_pandoc", boom), \
              patch.object(render, "_try_weasyprint", ok), \
              patch.object(render, "_try_libreoffice", lambda *a, **k: False):
             backend = render.render_markdown_to_pdf("# t", Path("/tmp/unused.pdf"))
@@ -100,7 +108,8 @@ class BackendSelectionTests(unittest.TestCase):
     def test_all_present_backends_failing_raises_render_failed_not_unavailable(self):
         """The two failure modes must stay distinguishable: 'install something'
         is a different instruction from 'what you installed is broken'."""
-        with patch.object(render, "_try_pandoc", lambda *a, **k: (_ for _ in ()).throw(render.RenderFailed("x"))), \
+        with patch.object(render, "_try_latex", lambda *a, **k: False), \
+             patch.object(render, "_try_pandoc", lambda *a, **k: (_ for _ in ()).throw(render.RenderFailed("x"))), \
              patch.object(render, "_try_weasyprint", lambda *a, **k: False), \
              patch.object(render, "_try_libreoffice", lambda *a, **k: False):
             with self.assertRaises(render.RenderFailed) as ctx:
