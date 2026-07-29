@@ -36,13 +36,19 @@ not approved. Skipping a gate is the one failure that makes the whole thing usel
 
 ## Every run
 
-1. **Scan.** `python3 -m lib.scan` → the open calls, their deadlines, their states, and which are
-   frozen. A top-level folder not starting with `_` is a call; its deadline parses from its name.
-2. **Regenerate `OPEN.md`** — the roster. Its `state` column is **human-owned**: read it back,
-   never override it. `open`/`new` are workable; `submitted`, `ignore` and `blocked` are not.
-3. **Work only `workable()` calls**, nearest deadline first.
-4. **Report what you did not do** — frozen calls, unparseable folder names, calls you skipped and
-   why. Silence about a skipped call reads as coverage you do not have.
+1. **Scan.** `python3 -m lib.scan` → the roster: every call, its deadline, days remaining, state,
+   whether stage 1 is done, whether it is frozen, plus **the workable calls in deadline order and
+   every skipped call with its reason**. A top-level folder not starting with `_` is a call; its
+   deadline parses from its name. Add `--json` for a machine-readable form, `--today YYYY-MM-DD`
+   to pin the date. The scanner is read-only — it never writes to the archive.
+2. **Regenerate `OPEN.md`** — the roster file. `python3 -m lib.scan --open-md` prints the new body
+   on stdout; publishing it is the separate, explicit `lib.publish regenerate` call. Its `state`
+   column is **human-owned**: the scanner reads it back out of the existing file, never overrides
+   it. `open`/`new` are workable; `submitted`, `ignore` and `blocked` are not.
+3. **Work only `workable()` calls**, nearest deadline first — the `*`-marked rows.
+4. **Report what you did not do** — the scan's own "Not worked, and why" section is the source for
+   this; pass it on rather than re-deriving it. Silence about a skipped call reads as coverage you
+   do not have.
 
 State is re-derived by scanning every run. There is no database: a ticked checkbox in an artifact
 *is* the state, which survives hand-edits, renames and Dropbox conflicted copies.

@@ -15,6 +15,7 @@ import calendar
 import json
 import os
 import re
+import sys
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
@@ -25,8 +26,9 @@ from lib.paths import (
     is_call_dir,
     is_conflicted_copy,
     owned_artifact_conflicts,
+    root_artifact_conflicts,
 )
-from lib.publish import is_agent_owned, is_complete
+from lib.publish import is_agent_owned, is_complete, read_owned
 
 
 # ---------------------------------------------------------------------------
@@ -344,14 +346,32 @@ def resolve_states(calls: list[CallInfo], existing_open_md: str | None) -> None:
             call.state = "new"
 
 
+def skip_reasons(call: CallInfo) -> list[str]:
+    """Every reason this call is not workable, most serious first; empty when
+    it is workable.
+
+    workable() is defined in terms of this helper on purpose. SKILL.md
+    requires every run to report what it did NOT do, and a report that
+    computed "why skipped" separately from the filter that actually runs
+    would eventually disagree with it - naming one reason while the filter
+    dropped the call for another, or listing a call as skipped when it was
+    worked. Deriving both from one function makes that drift impossible.
+    """
+    reasons: list[str] = []
+    if call.frozen:
+        names = ", ".join(sorted(p.name for p in call.frozen))
+        reasons.append(f"frozen - Dropbox conflicted copy present: {names}")
+    if call.state not in ("new", "open"):
+        reasons.append(f"state is {call.state!r}, not new/open")
+    if call.has_topics:
+        reasons.append("topics.md already published (stage 1 is done here)")
+    return reasons
+
+
 def workable(calls: list[CallInfo]) -> list[CallInfo]:
     """The calls a run may actually act on: state new/open, not frozen, and
     (stage 1) not already carrying a complete, agent-owned topics.md."""
-    return [
-        c
-        for c in calls
-        if c.state in ("new", "open") and not c.frozen and not c.has_topics
-    ]
+    return [c for c in calls if not skip_reasons(c)]
 
 
 # ---------------------------------------------------------------------------
@@ -454,3 +474,245 @@ def render_open_md(calls: list[CallInfo], *, today: date) -> str:
 
     lines.append("")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+#
+# SKILL.md step 1 tells the agent to run `python3 -m lib.scan` and read the
+# open calls off its output. Without this block that command exits 0 having
+# printed nothing, and a run that trusted it would read "no calls" as
+# "nothing open" - a silent, total loss of coverage that looks like a clean
+# run. The CLI is strictly read-only: it never writes to the archive.
+# ---------------------------------------------------------------------------
+
+def _fmt_deadline_compact(call: CallInfo) -> str:
+    """Terminal-column form of the deadline. _fmt_deadline() spells out
+    "(month-precision)", which is right in OPEN.md but 28 characters wide -
+    enough to overflow its column here and shove every later column out of
+    alignment, which is exactly how a roster becomes unreadable."""
+    if call.deadline is None:
+        return "?"
+    s = call.deadline.isoformat()
+    if call.deadline_precision == "month":
+        s += " (m)"
+    return s
+
+
+def _deadline_sort_key(call: CallInfo) -> tuple[bool, date, str]:
+    """Nearest deadline first, undated calls last. A call with no parseable
+    date is not urgent - it is unknown - so it must not sort to the top and
+    push a real deadline down the list."""
+    return (call.deadline is None, call.deadline or date.max, call.name)
+
+
+def scan_archive(root: Path) -> tuple[list[CallInfo], list[Path]]:
+    """The whole read-only scan: every call with its state resolved from the
+    existing OPEN.md, plus any conflicted copies of OPEN.md itself.
+
+    A conflicted OPEN.md is reported rather than ignored because it blocks
+    the roster regeneration in step 2, and a run that quietly skipped that
+    step would leave a stale roster looking current.
+    """
+    root = Path(root)
+    found = read_owned(root, "OPEN.md")
+    calls = find_calls(root)
+    resolve_states(calls, found[0] if found else None)
+    return calls, root_artifact_conflicts(root, "OPEN")
+
+
+def render_report(
+    calls: list[CallInfo],
+    *,
+    root: Path,
+    today: date,
+    open_md_conflicts: list[Path] | None = None,
+) -> str:
+    """The human/agent-facing roster written to stdout. Every call appears
+    exactly once in the table, and every call that is not workable appears
+    again under its reason - so the two lists always add up."""
+    work = workable(calls)
+    work_names = {c.name for c in work}
+    lines: list[str] = []
+
+    lines.append(f"root:  {root}")
+    lines.append(f"today: {today.isoformat()}")
+    lines.append(f"calls: {len(calls)} total, {len(work)} workable")
+    lines.append("")
+
+    if open_md_conflicts:
+        lines.append(
+            "WARNING: OPEN.md has Dropbox conflicted copies next to it - the "
+            "roster cannot be regenerated until a human reconciles them:"
+        )
+        for p in open_md_conflicts:
+            lines.append(f"  - {p.name}")
+        lines.append("")
+
+    if not calls:
+        lines.append(
+            "No call folders found. Either the archive root is wrong, or "
+            "every top-level folder is `_`-prefixed. This is reported rather "
+            "than returned as an empty success, because 'no calls' and "
+            "'nothing open' are not the same statement."
+        )
+        return "\n".join(lines) + "\n"
+
+    header = (
+        f"{'W':<2} {'state':<9} {'deadline':<14} {'days':>5}  "
+        f"{'topics':<14} {'frz':<3} call"
+    )
+    lines.append(header)
+    lines.append("-" * len(header))
+    for call in sorted(calls, key=_deadline_sort_key):
+        lines.append(
+            "{w:<2} {state:<9} {deadline:<14} {days:>5}  "
+            "{topics:<14} {frz:<3} {name}".format(
+                w="*" if call.name in work_names else "",
+                state=call.state,
+                deadline=_fmt_deadline_compact(call),
+                days=_fmt_days(call, today),
+                topics=_fmt_topics(call),
+                frz="YES" if call.frozen else "-",
+                name=call.name,
+            )
+        )
+
+    lines.append("")
+    lines.append("## Workable, nearest deadline first")
+    lines.append("")
+    if not work:
+        lines.append("None - every call is skipped for a reason listed below.")
+    else:
+        for i, call in enumerate(sorted(work, key=_deadline_sort_key), start=1):
+            lines.append(
+                f"{i}. {call.name}"
+                f"  [deadline {_fmt_deadline(call)}, {_fmt_days(call, today)} days, "
+                f"funder={call.funder or '?'}, {len(call.material)} call file(s)]"
+            )
+
+    lines.append("")
+    lines.append("## Not worked, and why")
+    lines.append("")
+    skipped = [c for c in sorted(calls, key=_deadline_sort_key) if c.name not in work_names]
+    if not skipped:
+        lines.append("Nothing skipped - every call in the archive is workable.")
+    else:
+        for call in skipped:
+            for reason in skip_reasons(call):
+                lines.append(f"- {call.name}: {reason}")
+
+    undated = [c for c in calls if c.deadline is None]
+    if undated:
+        lines.append("")
+        lines.append("## Unparseable folder dates")
+        lines.append("")
+        lines.append(
+            "These names carry no `YYYY.MM`/`YYYY.MM.DD` prefix, so their "
+            "deadline is unknown and they cannot be ordered by urgency:"
+        )
+        for call in undated:
+            lines.append(f"- {call.name}")
+
+    return "\n".join(lines) + "\n"
+
+
+def _call_as_dict(call: CallInfo, today: date) -> dict:
+    # One derivation, emitted twice: "workable" is *defined* as "no skip reasons", so
+    # computing it separately would let the two fields disagree in the JSON.
+    reasons = skip_reasons(call)
+    return {
+        "name": call.name,
+        "path": str(call.path),
+        "deadline": call.deadline.isoformat() if call.deadline else None,
+        "deadline_precision": call.deadline_precision,
+        "days_until": days_until(call, today),
+        "funder": call.funder,
+        "state": call.state,
+        "has_topics": call.has_topics,
+        "topics_versions": call.topics_versions,
+        "material": [str(p) for p in call.material],
+        "frozen": [str(p) for p in call.frozen],
+        "workable": not reasons,
+        "skip_reasons": reasons,
+    }
+
+
+def _main(argv: list[str] | None = None) -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="python3 -m lib.scan",
+        description=(
+            "Read-only roster of the proposal archive: which calls exist, "
+            "their deadlines and states, which are workable, and which are "
+            "not (with the reason). Writes nothing, ever."
+        ),
+    )
+    parser.add_argument(
+        "--root",
+        type=Path,
+        default=None,
+        help="Archive root (default: $AUTO_PROPOSALS_ROOT, else ~/Dropbox/Work/Proposals)",
+    )
+    parser.add_argument(
+        "--today",
+        default=None,
+        metavar="YYYY-MM-DD",
+        help="Treat this as today's date when computing days-to-deadline",
+    )
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--json", action="store_true", help="Emit JSON instead of the report")
+    group.add_argument(
+        "--open-md",
+        action="store_true",
+        help=(
+            "Emit the regenerated OPEN.md BODY on stdout instead of the "
+            "report. This only prints it - publishing it is a separate, "
+            "explicit `lib.publish regenerate` call."
+        ),
+    )
+    args = parser.parse_args(argv)
+
+    root = Path(args.root).expanduser() if args.root else _default_root()
+    try:
+        today = date.fromisoformat(args.today) if args.today else date.today()
+    except ValueError:
+        print(f"error: --today must be YYYY-MM-DD, got {args.today!r}", file=sys.stderr)
+        return 2
+
+    if not root.is_dir():
+        print(f"error: archive root does not exist or is not a directory: {root}", file=sys.stderr)
+        return 2
+
+    try:
+        calls, open_md_conflicts = scan_archive(root)
+    except PathRefused as exc:
+        # A refusal here means a config or artifact the scanner cannot safely
+        # interpret. Reporting it as an error beats degrading to a partial
+        # roster that looks complete.
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "root": str(root),
+                    "today": today.isoformat(),
+                    "open_md_conflicts": [str(p) for p in open_md_conflicts],
+                    "calls": [_call_as_dict(c, today) for c in sorted(calls, key=_deadline_sort_key)],
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+    elif args.open_md:
+        sys.stdout.write(render_open_md(calls, today=today))
+    else:
+        sys.stdout.write(render_report(calls, root=root, today=today, open_md_conflicts=open_md_conflicts))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(_main())
