@@ -20,11 +20,24 @@ Archive: `~/Dropbox/Work/Proposals/` (override with `AUTO_PROPOSALS_ROOT`).
 | stage | starts when | writes | who decides |
 |---|---|---|---|
 | 1 · topics | a call is `open`/`new` and has no `topics.md` | `<call>/topics.md` — 2–5 candidates, each with scope | Alon picks |
-| 2 · outline | Alon ticks a topic in `topics.md` | `<call>/outlines/<Tn>-<slug>.md` — light, call-agnostic skeleton | Alon approves |
-| 3 · draft | Alon ticks an outline | `<call>/drafts/YYYY.MM.DD a <slug>.md` **and `.pdf`** | Alon submits, never you |
+| 2 · outline | Alon ticks a topic in `topics.md` | `<call>/outlines/<Tn>-<slug>.md` **+ `.pdf` + `.tex`** — light skeleton | Alon approves |
+| 3 · draft | Alon ticks an outline | `<call>/YYYY.MM.DD a <slug>.md` **+ `.pdf` + `.tex`**, figures in `<call>/grf/` | Alon submits, never you |
 
 Never run stage 2 for a topic Alon has not ticked, and never run stage 3 for an outline he has
 not approved. Skipping a gate is the one failure that makes the whole thing useless to him.
+
+**Every outline you write ends with an approval checkbox**, because stage 3's gate is a ticked
+box and an outline without one cannot be approved:
+
+```markdown
+## Approve
+
+- [ ] write the full draft proposal from this outline
+```
+
+`lib.scan.approved_outlines(call_dir)` returns the agent-owned outlines carrying a ticked box.
+It accepts a tick **anywhere** in the file — Alon hand-edits these, and a gate that only saw a
+checkbox in the exact spot the generator put it would ignore an approval he typed himself.
 
 ## Two modes
 
@@ -185,6 +198,74 @@ markdown's exact basename, so a `-v2` outline or a new draft letter means new co
 match. `create-companion` refuses a companion whose markdown sibling is not there and owned, so
 publish the markdown first. Publish `.tex` and `.bib` only — never `.aux`, `.log` or any other
 build artefact.
+
+## Stage 3 — the full draft proposal
+
+When an outline is approved, write the **whole proposal**: not an expanded outline, but the
+document as it would be submitted, in the call's own structure, with every section the call
+asks for, at the length the call allows.
+
+**It goes in the call folder itself** — `<call>/YYYY.MM.DD a <slug>.md` and `.pdf` — next to the
+call's own material, because that is where the real document lives for every past proposal in
+this archive. `lib.paths.next_draft_rel(root, call, base_name, today)` computes the name; never
+hand-build it. The `.tex` lands in `<call>/tex/`.
+
+**Mock numbers are expected, and every one is marked in red.** This is a conceptual draft that
+Alon will make real — invent the budget, the timeline, the sample sizes, the performance
+figures, whatever the document needs to be complete and readable. What must never happen is a
+mock number being mistaken for a researched one. So write every invented quantity as:
+
+```markdown
+The pilot will screen [MOCK: 12] APIs at a compute cost of [MOCK: ₪45,000].
+```
+
+`lib.latex.mark_mock_values` renders each marker **bold red** in the PDF. The marker is plain
+text on purpose: Alon reads the markdown in Notepad++ and a terminal, where an HTML colour tag
+is noise and a bare colour is invisible. `[MOCK:` is greppable — he can find every one in a
+second. Do **not** mark a number you actually grounded; the red is only worth something if it
+means "I made this up".
+
+Add a short **"Mock values in this draft"** section near the end listing what was invented and
+what it depends on, so he can work through them as a list rather than hunting the document.
+
+### Figures and tables
+
+**Include figures where a figure carries the argument** — the work-package Gantt, the pipeline
+schematic, a plot of the claimed result. A proposal with no figure reads as a memo.
+
+Figures are **TikZ**, not matplotlib (matplotlib is broken on this host, and a `.tex` figure is
+one Alon can edit — the same argument that makes drafts ship their LaTeX). `lib/figures.py`
+provides the two that nearly every proposal needs:
+
+```python
+from lib import figures
+tex = figures.build_figure_tex(figures.gantt_figure(
+    [("WP1 Test set", 1, 4), ("WP2 Models", 3, 10)], months=24))
+figures.compile_figure(tex, out_pdf)          # cropped vector PDF
+```
+
+`pipeline_figure(stages)` draws a labelled left-to-right flow; `gantt_figure(tasks, months=…)`
+draws the work plan. For anything else, write the TikZ body yourself and pass it through
+`build_figure_tex` so it inherits the shared preamble.
+
+Each figure is **one folder**, `<call>/grf/<slug>/`, holding `<slug>.tex` and `<slug>.pdf` — the
+source and the image share the folder's name so a figure is never separated from what made it.
+Publish with `create-figure` (figures have no markdown sibling, so `create-companion` refuses
+them), and reference them from the markdown with a standard image link whose target is
+`grf/<slug>/<slug>.pdf`, passing the call folder as `base_dir` so they resolve:
+
+```bash
+python3 -m lib.publish create-figure --root "$ROOT" --rel "$CALL/grf/wp-gantt/wp-gantt.tex" --file fig.tex
+python3 -m lib.publish create-figure --root "$ROOT" --rel "$CALL/grf/wp-gantt/wp-gantt.pdf" --file fig.pdf
+```
+
+**Use real tables** for anything tabular — work packages, budget, milestones, the commitment
+check. They render through `tabularx` with `booktabs` rules. Keep them to few enough columns
+that a row fits; a table that needs a 120-character row wants fewer columns.
+
+**A figure that fails to compile is reported, never skipped.** `FigureError` is raised rather
+than swallowed, because a draft that silently drops a figure it references produces a PDF with
+a missing-image box, and the run must say so.
 
 **LaTeX is the intended renderer, not one option among several.** A proposal is judged partly
 on looking like a proposal, and the `.tex` is what lets Alon take over: edit, recompile, drop it

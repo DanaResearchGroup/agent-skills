@@ -39,6 +39,10 @@ CORPUS.md
 <call>/outlines/<Tn>-<slug>.pdf        <call>/outlines/<Tn>-<slug>-v<N>.pdf
 <call>/outlines/tex/<Tn>-<slug>.tex    <call>/outlines/tex/<Tn>-<slug>-v<N>.tex
 <call>/outlines/tex/<Tn>-<slug>.bib    <call>/outlines/tex/<Tn>-<slug>-v<N>.bib
+<call>/YYYY.MM.DD <letter> <rest>.md      <call>/YYYY.MM.DD <letter> <rest>.pdf
+<call>/tex/YYYY.MM.DD <letter> <rest>.tex <call>/tex/YYYY.MM.DD <letter> <rest>.bib
+<call>/grf/<slug>/<slug>.tex              <call>/grf/<slug>/<slug>.pdf
+<call>/grf/<slug>/<slug>.png
 <call>/drafts/YYYY.MM.DD <letter> <rest>.md
 <call>/drafts/YYYY.MM.DD <letter> <rest>.pdf
 <call>/drafts/tex/YYYY.MM.DD <letter> <rest>.tex
@@ -83,6 +87,12 @@ Everything else — `_`-prefixed corpora (`_Granted`, `_Archive`, `_resources`, 
   If the target exists, it **refuses**; the caller must publish the next `-v<N>` instead
   (topics/outlines) or the next date-letter draft filename instead (drafts — see §2).
   This is what makes Alon's hand-ticked checkboxes unclobberable.
+- **`create-figure`** — **only** `<call>/grf/<slug>/<slug>.{tex,pdf,png}`, where the file is
+  named after its own folder. Figures are the one artifact with no markdown sibling to take
+  provenance from — a figure belongs to the call, not to one document, so several drafts can
+  share it. Provenance is therefore **positional**: `grf/` is a directory only auto-proposals
+  creates. That is weaker than frontmatter, which is exactly why it is a separate, narrow mode
+  rather than a widening of `create-companion`.
 - **`create-companion`** — **only** `outlines/*.pdf`, `outlines/tex/*.{tex,bib}`,
   `drafts/*.pdf` and `drafts/tex/*.{tex,bib}`, and only next
   to an owned `.md` of the same basename. Same `O_CREAT|O_EXCL` create-only discipline, but the

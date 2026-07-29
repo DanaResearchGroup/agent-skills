@@ -205,3 +205,41 @@ class HebrewRunMarkingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MockValueTests(unittest.TestCase):
+    """A draft carries invented numbers by design. The one thing that must
+    never happen is a mock number being mistaken for a researched one."""
+
+    def test_a_mock_marker_renders_bold_red(self):
+        out = latex.mark_mock_values("costs [MOCK: 45,000 NIS] per year")
+        self.assertIn("\\textcolor{mockred}{\\textbf{[MOCK: 45,000 NIS]}}", out)
+
+    def test_the_marker_text_survives_into_the_output(self):
+        """The word MOCK stays visible in the PDF, not just the colour - a
+        greyscale print or a colour-blind reader must still see it."""
+        out = latex.mark_mock_values("[MOCK: 12]")
+        self.assertIn("[MOCK: 12]", out)
+
+    def test_several_markers_on_one_line_are_all_caught(self):
+        out = latex.mark_mock_values("[MOCK: 3] of [MOCK: 9] runs")
+        self.assertEqual(out.count("mockred"), 2)
+
+    def test_prose_without_a_marker_is_untouched(self):
+        text = "The budget is 350,000 as stated in the call."
+        self.assertEqual(latex.mark_mock_values(text), text)
+
+    def test_the_colour_is_defined_in_every_document(self):
+        """Otherwise the first mock value in any draft fails the compile."""
+        for md in ("# English only\n", "# עברית\n"):
+            with self.subTest(md=md):
+                self.assertIn("\\definecolor{mockred}", latex.build_document(md, title="t"))
+
+    def test_markers_survive_the_full_inline_pipeline(self):
+        out = latex._inline("screens [MOCK: 12] APIs at **[MOCK: 45,000]** cost")
+        self.assertEqual(out.count("mockred"), 2)
+
+    def test_a_marker_inside_inline_code_is_left_alone(self):
+        """Code is a literal; colouring inside it would change what it says."""
+        out = latex._inline("`[MOCK: x]` is the marker syntax")
+        self.assertNotIn("mockred", out)

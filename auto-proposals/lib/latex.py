@@ -86,6 +86,29 @@ _HEBREW_RUN_RE = re.compile(
 )
 
 
+# Mock values are marked in the MARKDOWN as [MOCK: ...] and rendered red in
+# the PDF. The marker is deliberately plain text rather than an HTML span or a
+# LaTeX command: Alon reads the markdown in Notepad++ and in a terminal, where
+# a colour tag renders as noise and a bare colour renders as nothing at all.
+# `[MOCK:` is greppable, survives copy-paste into any editor, and cannot be
+# mistaken for prose.
+_MOCK_RE = re.compile(r"\[MOCK:\s*([^\]]*)\]")
+
+
+def mark_mock_values(text: str) -> str:
+    """Render every [MOCK: ...] marker in red.
+
+    A draft carries invented numbers by design - it is a conceptual document
+    that Alon will make real. The one thing that must never happen is a mock
+    number being mistaken for a researched one, so the marking is loud and
+    survives into the PDF rather than living only in a covering note.
+    """
+    return _MOCK_RE.sub(
+        lambda m: f"\\textcolor{{mockred}}{{\\textbf{{[MOCK: {m.group(1).strip()}]}}}}",
+        text,
+    )
+
+
 def mark_hebrew_runs(text: str) -> str:
     """Wrap each Hebrew run in `\\foreignlanguage{hebrew}{...}`.
 
@@ -142,6 +165,7 @@ def _inline(text: str) -> str:
     text = re.sub(r"\*\*(.+?)\*\*", r"\\textbf{\1}", text)
     text = re.sub(r"(?<!\*)\*(?!\s)(.+?)(?<!\s)\*(?!\*)", r"\\emph{\1}", text)
 
+    text = mark_mock_values(text)
     text = mark_hebrew_runs(text)
 
     for i, latex in enumerate(placeholders):
@@ -352,6 +376,10 @@ def build_document(
         "\\usepackage{geometry}\n"
         "\\geometry{margin=2.2cm}\n"
         "\\usepackage{graphicx}\n"
+        "\\usepackage{xcolor}\n"
+        # A strong red, not the default: [MOCK: ...] has to survive being
+        # printed on a mediocre office printer and still read as a warning.
+        "\\definecolor{mockred}{RGB}{200,16,46}\n"
         "\\usepackage{booktabs}\n"
         "\\usepackage{tabularx}\n"
         "\\usepackage{array}\n"
