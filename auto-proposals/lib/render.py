@@ -131,24 +131,6 @@ def latex_engine() -> str | None:
     return next((e for e in LATEX_ENGINES if shutil.which(e)), None)
 
 
-def _has_bidi() -> bool:
-    """Whether polyglossia's `bidi` dependency is installed.
-
-    Probed rather than assumed, because Ubuntu's texlive-xetex does NOT ship
-    bidi.sty - it ships unicode-bidi.sty, which is a different package - so a
-    perfectly reasonable `apt install texlive-xetex` leaves polyglossia's
-    Hebrew support unusable. bidi lives in texlive-lang-arabic. Without this
-    probe every Hebrew draft would fail the compile on a host that looks
-    correctly provisioned.
-    """
-    if not shutil.which("kpsewhich"):
-        return False
-    try:
-        return _run(["kpsewhich", "bidi.sty"], timeout=20).returncode == 0
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-
-
 def _try_latex(
     md_text: str, out_path: Path, base_dir: Path, title: str, keep_tex: Path | None
 ) -> bool:
@@ -174,7 +156,7 @@ def _try_latex(
         )
 
     tex_source = latex.build_document(
-        md_text, title=title, hebrew=hebrew, rtl_support=_has_bidi()
+        md_text, title=title, hebrew=hebrew
     )
 
     with tempfile.TemporaryDirectory() as td:

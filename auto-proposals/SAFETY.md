@@ -36,6 +36,9 @@ OPEN.md
 CORPUS.md
 <call>/topics.md                       <call>/topics-v<N>.md
 <call>/outlines/<Tn>-<slug>.md         <call>/outlines/<Tn>-<slug>-v<N>.md
+<call>/outlines/<Tn>-<slug>.pdf        <call>/outlines/<Tn>-<slug>-v<N>.pdf
+<call>/outlines/tex/<Tn>-<slug>.tex    <call>/outlines/tex/<Tn>-<slug>-v<N>.tex
+<call>/outlines/tex/<Tn>-<slug>.bib    <call>/outlines/tex/<Tn>-<slug>-v<N>.bib
 <call>/drafts/YYYY.MM.DD <letter> <rest>.md
 <call>/drafts/YYYY.MM.DD <letter> <rest>.pdf
 <call>/drafts/tex/YYYY.MM.DD <letter> <rest>.tex
@@ -80,7 +83,8 @@ Everything else — `_`-prefixed corpora (`_Granted`, `_Archive`, `_resources`, 
   If the target exists, it **refuses**; the caller must publish the next `-v<N>` instead
   (topics/outlines) or the next date-letter draft filename instead (drafts — see §2).
   This is what makes Alon's hand-ticked checkboxes unclobberable.
-- **`create-companion`** — **only** `drafts/*.pdf` and `drafts/tex/*.{tex,bib}`, and only next
+- **`create-companion`** — **only** `outlines/*.pdf`, `outlines/tex/*.{tex,bib}`,
+  `drafts/*.pdf` and `drafts/tex/*.{tex,bib}`, and only next
   to an owned `.md` of the same basename. Same `O_CREAT|O_EXCL` create-only discipline, but the
   payload is written as raw bytes and **no frontmatter is prepended and no completeness marker
   appended** — both would corrupt a PDF and both would stop a `.tex` compiling. The consequence

@@ -337,14 +337,20 @@ class DraftPdfGrammarTests(unittest.TestCase):
                 with self.assertRaises(PathRefused):
                     write_mode_for(rel)
 
-    def test_pdf_is_only_allowed_under_drafts(self):
-        """Outlines and topics have no PDF companion. Allowing one would make
-        `drafts/` special for no reason and widen the binary write surface."""
+    def test_pdf_is_allowed_for_outlines_and_drafts_only(self):
+        """Outlines and drafts render to PDF because Alon reads them on a
+        tablet and in print. Topics and the roster do not: they are working
+        lists he ticks in a text editor, and a PDF of a checkbox he cannot
+        tick is worse than no PDF."""
         for rel in (
-            "NSF-2027/topics.pdf",
             "NSF-2027/outlines/T1-slug.pdf",
-            "OPEN.pdf",
+            "NSF-2027/outlines/T1-slug-v2.pdf",
+            "NSF-2027/drafts/2026.07.28 a T1-slug.pdf",
         ):
+            with self.subTest(rel=rel):
+                self.assertEqual(write_mode_for(rel), "create")
+
+        for rel in ("NSF-2027/topics.pdf", "OPEN.pdf", "CORPUS.pdf"):
             with self.subTest(rel=rel):
                 with self.assertRaises(PathRefused):
                     write_mode_for(rel)
@@ -360,8 +366,30 @@ class DraftPdfGrammarTests(unittest.TestCase):
             draft_pdf_rel_for(md), "NSF-2027/drafts/2026.07.28 a T1-slug.pdf"
         )
 
-    def test_pdf_rel_refuses_a_non_draft_source(self):
-        for rel in ("NSF-2027/topics.md", "NSF-2027/outlines/T1-slug.md", "OPEN.md"):
+    def test_pdf_rel_is_derived_for_an_outline_too(self):
+        self.assertEqual(
+            draft_pdf_rel_for("NSF-2027/outlines/T1-slug.md"),
+            "NSF-2027/outlines/T1-slug.pdf",
+        )
+        self.assertEqual(
+            draft_tex_rel_for("NSF-2027/outlines/T1-slug.md"),
+            "NSF-2027/outlines/tex/T1-slug.tex",
+        )
+
+    def test_a_versioned_outline_keeps_its_version_in_the_companion(self):
+        """Otherwise -v2's PDF would overwrite -v1's, which the chokepoint
+        would refuse - correctly, but with a baffling error."""
+        self.assertEqual(
+            draft_pdf_rel_for("NSF-2027/outlines/T1-slug-v2.md"),
+            "NSF-2027/outlines/T1-slug-v2.pdf",
+        )
+        self.assertEqual(
+            companion_md_rel_for("NSF-2027/outlines/tex/T1-slug-v2.tex"),
+            "NSF-2027/outlines/T1-slug-v2.md",
+        )
+
+    def test_pdf_rel_refuses_a_source_that_is_neither_outline_nor_draft(self):
+        for rel in ("NSF-2027/topics.md", "OPEN.md", "CORPUS.md"):
             with self.subTest(rel=rel):
                 with self.assertRaises(PathRefused):
                     draft_pdf_rel_for(rel)

@@ -71,6 +71,38 @@ def has_hebrew(text: str) -> bool:
     return bool(_HEBREW_RE.search(text))
 
 
+# A Hebrew "run" is one or more Hebrew letters, plus the neutral characters
+# (spaces, punctuation, digits) that sit BETWEEN two Hebrew letters.
+#
+# The bridge class excludes Latin letters deliberately. Bridging over anything
+# non-Hebrew would swallow English words sitting between two Hebrew fragments -
+# `(ח) says אין מחקר` would come out as one Hebrew run containing the English
+# word "says", typeset in the Hebrew font and reordered right-to-left. Only
+# runs with no letter of either script in between are joined, so the colon in
+# `שפה: אנגלית` is captured while the comma in `מחקר דומה, which means` is
+# left outside, in the English run where it belongs.
+_HEBREW_RUN_RE = re.compile(
+    r"[֐-׿]+(?:[^A-Za-z֐-׿\n]*?[֐-׿]+)*"
+)
+
+
+def mark_hebrew_runs(text: str) -> str:
+    """Wrap each Hebrew run in `\\foreignlanguage{hebrew}{...}`.
+
+    Without this the Hebrew preamble is inert. Declaring a Hebrew font and
+    loading babel does nothing on its own - babel applies the Hebrew font and
+    switches paragraph direction only inside a language switch. Before this
+    existed the preamble declared a Hebrew font that was never selected, so
+    Hebrew was typeset with the Latin font and no bidi algorithm ran.
+
+    Applied to already-escaped text, and before code/link placeholders are
+    restored, so it can never wrap the inside of a `\\texttt` or a URL.
+    """
+    return _HEBREW_RUN_RE.sub(
+        lambda m: f"\\foreignlanguage{{hebrew}}{{{m.group()}}}", text
+    )
+
+
 def _inline(text: str) -> str:
     """Convert inline markdown within a single line, escaping everything else.
 
@@ -109,6 +141,8 @@ def _inline(text: str) -> str:
     text = re.sub(r"\*\*\*(.+?)\*\*\*", r"\\textbf{\\emph{\1}}", text)
     text = re.sub(r"\*\*(.+?)\*\*", r"\\textbf{\1}", text)
     text = re.sub(r"(?<!\*)\*(?!\s)(.+?)(?<!\s)\*(?!\*)", r"\\emph{\1}", text)
+
+    text = mark_hebrew_runs(text)
 
     for i, latex in enumerate(placeholders):
         text = text.replace(f"\x00{i}\x00", latex)
@@ -264,7 +298,6 @@ def build_document(
     *,
     title: str,
     hebrew: bool | None = None,
-    rtl_support: bool = True,
 ) -> str:
     """Wrap a converted body in a complete, compilable LaTeX document.
 
@@ -272,15 +305,23 @@ def build_document(
     The Hebrew path needs a Unicode engine (xelatex/lualatex) - pdflatex will
     fail on it, which is the correct outcome rather than a PDF of blank boxes.
 
-    `rtl_support` says whether polyglossia's `bidi` dependency is installed.
-    When it is not, we fall back to loading the Hebrew font through fontspec
-    alone rather than failing the compile. That fallback is not equivalent:
-    glyphs and within-run ordering are right, but neutral characters
-    (punctuation) at the boundary between Hebrew and English can land on the
-    wrong side, because nothing is running the Unicode bidi algorithm. Good
-    enough for the short quoted call fragments these drafts contain, NOT good
-    enough for a document written in Hebrew throughout - hence the caller
-    probes for bidi rather than assuming.
+    **Two languages are supported, English and Hebrew, and nothing else.**
+
+    RTL is handled by `babel` with `bidi=default`, NOT by polyglossia. This
+    matters and is not a stylistic choice:
+
+    * polyglossia's Hebrew support pulls in `bidi.sty`, which on Debian and
+      Ubuntu ships only inside `texlive-lang-arabic` - an Arabic-language
+      package that has no business being a dependency of Hebrew output.
+    * babel (v3.9+, here v24.1) carries its own Hebrew locale data in
+      `babel-he.ini` and implements the Unicode bidi algorithm itself.
+      `bidi=default` uses XeTeX's TeX--XeT primitives, so it needs no extra
+      package at all - it works on a bare `texlive-xetex` install.
+
+    So there is no degraded fallback path any more, and none is needed: the
+    previous fontspec-only fallback got glyphs right but placed neutral
+    characters (punctuation) at a Hebrew/English boundary on the wrong side,
+    because nothing was running the bidi algorithm. babel runs it.
     """
     if hebrew is None:
         hebrew = has_hebrew(md_text) or has_hebrew(title)
@@ -291,21 +332,15 @@ def build_document(
         # "David CLM" ships in Debian/Ubuntu's `culmus` package; if that is not
         # installed, set AUTO_PROPOSALS_HEBREW_FONT to one that is.
         font = os.environ.get("AUTO_PROPOSALS_HEBREW_FONT", "David CLM")
-        if rtl_support:
-            lang = (
-                "\\usepackage{polyglossia}\n"
-                "\\setmainlanguage{english}\n"
-                "\\setotherlanguage{hebrew}\n"
-                f"\\newfontfamily\\hebrewfont[Script=Hebrew]{{{font}}}\n"
-            )
-        else:
-            lang = (
-                "% bidi.sty is not installed (apt: texlive-lang-arabic), so\n"
-                "% polyglossia's Hebrew support is unavailable. Falling back to\n"
-                "% fontspec alone: correct glyphs, but punctuation at a\n"
-                "% Hebrew/English boundary may sit on the wrong side.\n"
-                f"\\newfontfamily\\hebrewfont[Script=Hebrew]{{{font}}}\n"
-            )
+        latin = os.environ.get("AUTO_PROPOSALS_LATIN_FONT", "Latin Modern Roman")
+        lang = (
+            # bidi=default: XeTeX primitives, no bidi.sty, no Arabic package.
+            "\\usepackage[bidi=default]{babel}\n"
+            "\\babelprovide[import, main]{english}\n"
+            "\\babelprovide[import]{hebrew}\n"
+            f"\\babelfont{{rm}}{{{latin}}}\n"
+            f"\\babelfont[hebrew]{{rm}}{{{font}}}\n"
+        )
         fonts = "\\usepackage{fontspec}\n"
     else:
         lang = ""

@@ -264,10 +264,14 @@ def _ensure_parent(root: Path, target: Path) -> None:
             f"{parent} would be created directly under the archive root; refused"
         )
     # `tex/` is the one nested directory we may create, and only inside
-    # `drafts/`. Naming it explicitly rather than adding it to
-    # _CREATABLE_SUBDIRS keeps it from becoming creatable at call-folder level
-    # too, where it would mean nothing.
-    if parent.name == "tex" and parent.parent.name == "drafts" and parent.parent.is_dir():
+    # `drafts/` or `outlines/`. Naming those explicitly rather than adding
+    # `tex` to _CREATABLE_SUBDIRS keeps it from becoming creatable at
+    # call-folder level too, where it would mean nothing.
+    if (
+        parent.name == "tex"
+        and parent.parent.name in ("drafts", "outlines")
+        and parent.parent.is_dir()
+    ):
         parent.mkdir()
         _fsync_dir(parent.parent)
         return

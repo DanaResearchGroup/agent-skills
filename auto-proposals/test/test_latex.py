@@ -1,3 +1,4 @@
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -114,13 +115,13 @@ class DocumentTests(unittest.TestCase):
         self.assertTrue(latex.has_hebrew("קול קורא"))
         self.assertFalse(latex.has_hebrew("call for proposals"))
         doc = latex.build_document("# קול קורא\n", title="t")
-        self.assertIn("polyglossia", doc)
+        self.assertIn("\\usepackage[bidi=default]{babel}", doc)
         self.assertIn("fontspec", doc)
         self.assertNotIn("inputenc", doc)
 
     def test_english_document_does_not_pull_in_the_hebrew_preamble(self):
         doc = latex.build_document("# Call\n", title="t")
-        self.assertNotIn("polyglossia", doc)
+        self.assertNotIn("babel", doc)
         self.assertIn("inputenc", doc)
 
     def test_hebrew_font_is_overridable(self):
@@ -136,25 +137,70 @@ class DocumentTests(unittest.TestCase):
         self.assertIn("{Noto Sans Hebrew}", doc)
         self.assertNotIn("{David CLM}", doc)
 
-    def test_hebrew_falls_back_to_fontspec_when_bidi_is_missing(self):
-        """Ubuntu's texlive-xetex ships unicode-bidi.sty, NOT bidi.sty, so
-        polyglossia's Hebrew support is unavailable on a host that looks
-        correctly provisioned. Falling back beats failing every Hebrew draft."""
-        doc = latex.build_document("שלום\n", title="t", rtl_support=False)
-        self.assertNotIn("\\usepackage{polyglossia}", doc)
-        self.assertIn("\\usepackage{fontspec}", doc)
-        self.assertIn("\\newfontfamily\\hebrewfont", doc)
-        self.assertIn("texlive-lang-arabic", doc)
+    def test_hebrew_needs_no_package_beyond_a_bare_xetex_install(self):
+        """The whole reason for babel over polyglossia. polyglossia's Hebrew
+        pulls in bidi.sty, which Debian/Ubuntu ship ONLY inside
+        texlive-lang-arabic - an Arabic package that has no business being a
+        dependency of Hebrew output. babel carries babel-he.ini itself and
+        implements bidi with XeTeX primitives, so `texlive-xetex` alone is
+        enough. This test is the guard against that dependency creeping back."""
+        doc = latex.build_document("שלום\n", title="t")
+        self.assertNotIn("polyglossia", doc)
+        self.assertNotIn("bidi.sty", doc)
+        self.assertNotIn("texlive-lang-arabic", doc)
+        self.assertIn("\\usepackage[bidi=default]{babel}", doc)
+        self.assertIn("\\babelprovide[import]{hebrew}", doc)
 
-    def test_rtl_support_is_irrelevant_to_an_english_document(self):
-        for rtl in (True, False):
-            with self.subTest(rtl=rtl):
-                doc = latex.build_document("# Call\n", title="t", rtl_support=rtl)
-                self.assertNotIn("hebrewfont", doc)
+    def test_only_english_and_hebrew_are_declared(self):
+        """Two languages, deliberately. Every other language would need its own
+        font and locale data, and none of them appear in this archive."""
+        doc = latex.build_document("שלום\n", title="t")
+        provided = re.findall(r"\\babelprovide\[[^\]]*\]\{(\w+)\}", doc)
+        self.assertEqual(sorted(provided), ["english", "hebrew"])
 
     def test_hebrew_can_be_forced_off(self):
         doc = latex.build_document("שלום\n", title="t", hebrew=False)
-        self.assertNotIn("polyglossia", doc)
+        self.assertNotIn("babel", doc)
+
+
+class HebrewRunMarkingTests(unittest.TestCase):
+    """Without \\foreignlanguage the Hebrew preamble is inert: babel applies
+    the Hebrew font and switches direction only inside a language switch."""
+
+    def test_a_hebrew_run_is_wrapped(self):
+        out = latex.mark_hebrew_runs("a term מחקר דומה, which means similar.")
+        self.assertIn("\\foreignlanguage{hebrew}{מחקר דומה}", out)
+        self.assertNotIn("similar", out.split("}")[0])
+
+    def test_neutrals_between_hebrew_words_stay_inside_the_run(self):
+        """The colon belongs to the Hebrew phrase. Left outside, the bidi
+        algorithm places it at the wrong end of the run."""
+        out = latex.mark_hebrew_runs("requires: שפה: אנגלית בלבד.")
+        self.assertIn("\\foreignlanguage{hebrew}{שפה: אנגלית בלבד}", out)
+
+    def test_english_between_two_hebrew_fragments_is_not_swallowed(self):
+        """The bug this regex was rewritten for: bridging over any non-Hebrew
+        character pulled the English word into the Hebrew run, where it would
+        be typeset in the Hebrew font and reordered right-to-left."""
+        out = latex.mark_hebrew_runs("Clause (ח) says אין מחקר outright.")
+        self.assertIn("\\foreignlanguage{hebrew}{ח}", out)
+        self.assertIn("\\foreignlanguage{hebrew}{אין מחקר}", out)
+        # The real property: no English word ends up inside a Hebrew group.
+        wrapped = re.findall(r"\\foreignlanguage\{hebrew\}\{([^}]*)\}", out)
+        self.assertEqual(wrapped, ["ח", "אין מחקר"])
+        for group in wrapped:
+            self.assertNotRegex(group, r"[A-Za-z]")
+
+    def test_an_english_only_document_is_untouched(self):
+        text = "No Hebrew here at all: 100% English."
+        self.assertEqual(latex.mark_hebrew_runs(text), text)
+
+    def test_inline_code_is_never_wrapped(self):
+        """mark_hebrew_runs runs while code is still stashed as a placeholder,
+        so a path or identifier can never be reordered."""
+        out = latex._inline("see `AUTO_PROPOSALS_ROOT` and שלום")
+        self.assertIn("\\texttt{AUTO\\_PROPOSALS\\_ROOT}", out)
+        self.assertIn("\\foreignlanguage{hebrew}{שלום}", out)
 
 
 if __name__ == "__main__":

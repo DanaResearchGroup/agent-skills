@@ -154,16 +154,22 @@ a given date, and increments (`a` → `b` → `c` …) for each further version 
 is always a NEW file — the chokepoint never overwrites, it only adds new letter-suffixed
 files. `lib.paths.next_draft_rel()` computes the next filename; never hand-construct it.
 
-## Every draft ships as markdown, PDF, and the LaTeX that made it
+## Every outline and draft ships as markdown, PDF, and the LaTeX that made it
 
-A draft Alon cannot hand to a colleague, print, or read away from a terminal is half-delivered.
-And a PDF he cannot edit is a dead end. So stage 3 publishes **three** things under one
-basename: the markdown, the PDF, and the `.tex` the PDF was compiled from.
+An artifact Alon cannot hand to a colleague, print, or read away from a terminal is
+half-delivered. And a PDF he cannot edit is a dead end. So **stages 2 and 3 both** publish
+**three** things under one basename: the markdown, the PDF, and the `.tex` the PDF was compiled
+from.
+
+This applies to outlines as well as drafts — he reads outlines on a tablet and on paper, and a
+markdown-only outline is one he cannot read where he actually reads it. **Topics files and the
+roster get no PDF**: they are working lists he ticks in a text editor, and a PDF of a checkbox
+he cannot tick is worse than none.
 
 ```bash
-MD_REL=$(...)      # lib.paths.next_draft_rel()
+MD_REL=$(...)      # lib.paths.next_draft_rel(), or the outline path
 # 1. the markdown - the editable source of truth
-python3 -m lib.publish create --root "$ROOT" --rel "$MD_REL" --file draft.md --frontmatter '{...}'
+python3 -m lib.publish create --root "$ROOT" --rel "$MD_REL" --file body.md --frontmatter '{...}'
 # 2. render via LaTeX, keeping the .tex it compiled
 python3 -c "from lib.render import render_markdown_to_pdf; ..."   # writes out.pdf + out.tex
 # 3. publish both companions
@@ -171,13 +177,14 @@ python3 -m lib.publish create-companion --root "$ROOT" --rel "$PDF_REL" --file o
 python3 -m lib.publish create-companion --root "$ROOT" --rel "$TEX_REL" --file out.tex
 ```
 
-`lib.paths.draft_pdf_rel_for(md_rel)` and `draft_tex_rel_for(md_rel)` give the two companion
-paths — **never hand-build them.** The `.tex` lands in `drafts/tex/` so `drafts/` stays a
-readable list of drafts rather than a build directory. **The naming convention applies
-unchanged**: all three carry the same `YYYY.MM.DD <letter>`, so a new version means a new letter
-for all of them. `create-companion` refuses a companion whose markdown sibling is not there and
-owned, so publish the markdown first. Publish `.tex` and `.bib` only — never `.aux`, `.log` or
-any other build artefact.
+`lib.paths.pdf_rel_for(md_rel)` and `tex_rel_for(md_rel)` give the two companion paths —
+**never hand-build them.** (`draft_pdf_rel_for`/`draft_tex_rel_for` remain as aliases.) The
+`.tex` lands in `<outlines|drafts>/tex/` so those folders stay readable lists rather than build
+directories. **The naming convention applies unchanged**: every companion carries its
+markdown's exact basename, so a `-v2` outline or a new draft letter means new companions to
+match. `create-companion` refuses a companion whose markdown sibling is not there and owned, so
+publish the markdown first. Publish `.tex` and `.bib` only — never `.aux`, `.log` or any other
+build artefact.
 
 **LaTeX is the intended renderer, not one option among several.** A proposal is judged partly
 on looking like a proposal, and the `.tex` is what lets Alon take over: edit, recompile, drop it
@@ -265,15 +272,20 @@ arming the schedule. All Alon's. Nothing goes outbound from this skill.
   `groups:history` + `groups:read`; until those exist, thread-reply steering does not work under
   cron and Slack is notification-only. Say that rather than shipping something that looks like it
   works.
-- **LaTeX on HL: working, with one package still missing.** `texlive-xetex` and
-  `texlive-latex-extra` are installed, `xelatex` is the active engine, and English drafts render
-  end to end. **`bidi.sty` is not installed**, and this is the trap: Ubuntu's `texlive-xetex`
-  ships `unicode-bidi.sty`, which is a *different package*, so a host that looks correctly
-  provisioned still cannot load polyglossia's Hebrew support. `lib.render` probes for it with
-  `kpsewhich` and falls back to loading the Hebrew font through `fontspec` alone — correct
-  glyphs, but punctuation at a Hebrew/English boundary may sit on the wrong side. Fine for the
-  short quoted call fragments these drafts contain; **not** fine for a draft written in Hebrew
-  throughout. `sudo apt install texlive-lang-arabic` supplies `bidi` and removes the caveat.
+- **LaTeX on HL: working, English and Hebrew, no further packages needed.** `texlive-xetex` and
+  `texlive-latex-extra` are installed and `xelatex` is the active engine. **Two languages are
+  supported — English and Hebrew — and nothing else.**
+  RTL comes from **`babel` with `bidi=default`, not polyglossia**, and that choice is
+  load-bearing: polyglossia's Hebrew pulls in `bidi.sty`, which Debian and Ubuntu ship only
+  inside **`texlive-lang-arabic`** — an Arabic-language package with no business being a
+  dependency of Hebrew output. babel carries its own `babel-he.ini` and implements the bidi
+  algorithm on XeTeX primitives, so a bare `texlive-xetex` is enough. There is no degraded
+  fallback any more and none is needed.
+  The Hebrew font is `David CLM` (Ubuntu's `culmus`), overridable via
+  `AUTO_PROPOSALS_HEBREW_FONT`; the Latin font via `AUTO_PROPOSALS_LATIN_FONT`.
+  Hebrew runs are wrapped in `\foreignlanguage{hebrew}{…}` automatically by
+  `lib.latex.mark_hebrew_runs` — **without that the preamble is inert**, because babel applies
+  the Hebrew font and switches direction only inside a language switch.
 - **The other backends remain unusable here**, which matters only if TeX is ever removed:
   pandoc and weasyprint are absent, and the LibreOffice on `PATH` is a **snap** whose
   confinement fails every conversion, including a plain text file.
