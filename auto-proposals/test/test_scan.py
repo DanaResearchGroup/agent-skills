@@ -1,6 +1,7 @@
 import json
 import os
 import shutil
+import subprocess
 import sys
 import unittest
 from datetime import date
@@ -21,6 +22,7 @@ from lib.scan import (  # noqa: E402
     read_states,
     render_open_md,
     resolve_states,
+    skip_reasons,
     workable,
 )
 
@@ -469,6 +471,209 @@ class BootstrapStatesFileTestCase(_EnvMixin):
         self.assertEqual(load_bootstrap_states(), {"2026.10 ExampleFund": "open"})
         self._write_bootstrap({"2026.10 ExampleFund": "blocked"})
         self.assertEqual(load_bootstrap_states(), {"2026.10 ExampleFund": "blocked"})
+
+
+class SkipReasonsTestCase(_EnvMixin):
+    """skip_reasons() and workable() must never disagree - the roster's
+    stated reason for skipping a call has to be the reason the filter
+    actually applied."""
+
+    def test_workable_call_has_no_reasons(self):
+        self._mkcall("2026.10 Fresh")
+        calls = find_calls(self.root)
+        resolve_states(calls, None)
+        self.assertEqual(skip_reasons(calls[0]), [])
+        self.assertEqual([c.name for c in workable(calls)], ["2026.10 Fresh"])
+
+    def test_every_skipped_call_carries_at_least_one_reason(self):
+        """The property that makes the 'what I did not do' report honest: a
+        call is skipped if and only if it has a reason to show for it."""
+        self._mkcall("2026.10 Fresh")
+        done = self._mkcall("2026.11 Done")
+        _write_agent_owned_topics(done, call_name="2026.11 Done")
+        self._mkcall("2026.12 Submitted")
+        frozen = self._mkcall("2026.09 Frozen")
+        _write_agent_owned_topics(frozen, call_name="2026.09 Frozen")
+        (frozen / "topics (Alon's conflicted copy 2026-07-01).md").write_text("x", encoding="utf-8")
+
+        calls = find_calls(self.root)
+        resolve_states(calls, None)
+        for c in calls:
+            if c.name == "2026.12 Submitted":
+                c.state = "submitted"
+
+        work_names = {c.name for c in workable(calls)}
+        for c in calls:
+            reasons = skip_reasons(c)
+            if c.name in work_names:
+                self.assertEqual(reasons, [], f"{c.name} was worked but claims a skip reason")
+            else:
+                self.assertTrue(reasons, f"{c.name} was skipped with no reason to report")
+
+    def test_a_call_blocked_two_ways_reports_both(self):
+        """Reporting only the first reason would let a human 'fix' the state
+        column and expect the call to be picked up, when a conflicted copy is
+        still freezing it."""
+        d = self._mkcall("2026.09 Frozen")
+        (d / "topics (Alon's conflicted copy 2026-07-01).md").write_text("x", encoding="utf-8")
+        calls = find_calls(self.root)
+        resolve_states(calls, None)
+        calls[0].state = "submitted"
+        reasons = skip_reasons(calls[0])
+        self.assertEqual(len(reasons), 2)
+        self.assertIn("frozen", reasons[0])
+        self.assertIn("submitted", reasons[1])
+
+
+class ScanCliTestCase(_EnvMixin):
+    """The CLI is what SKILL.md step 1 actually invokes. These cases run it
+    as a real subprocess rather than calling _main() directly: the defect
+    being guarded against was a module with no `__main__` block at all, which
+    an in-process call would not have caught - `python3 -m lib.scan` exited 0
+    printing nothing, and a run that trusted it would have read "no calls" as
+    "nothing open"."""
+
+    SKILL_DIR = Path(__file__).resolve().parent.parent
+
+    def _run(self, *args, root: Path | None = None, expect_ok: bool = True):
+        env = dict(os.environ)
+        env["AUTO_PROPOSALS_ROOT"] = str(root if root is not None else self.root)
+        env["AUTO_PROPOSALS_BOOTSTRAP_STATES"] = str(self.bootstrap_path)
+        proc = subprocess.run(
+            [sys.executable, "-m", "lib.scan", *args],
+            cwd=self.SKILL_DIR,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        if expect_ok:
+            self.assertEqual(
+                proc.returncode, 0, f"exit {proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+            )
+        return proc
+
+    def _snapshot(self, root: Path) -> dict[str, bytes]:
+        out = {}
+        for p in sorted(root.rglob("*")):
+            if p.is_file():
+                out[str(p.relative_to(root))] = p.read_bytes()
+        return out
+
+    # -- the regression this CLI exists to close ----------------------------
+
+    def test_bare_invocation_prints_the_calls_it_found(self):
+        self._mkcall("2026.10 Kamin")
+        self._mkcall("2026.08.10 VATAT POC")
+        proc = self._run("--today", "2026-07-27")
+        self.assertIn("2026.10 Kamin", proc.stdout)
+        self.assertIn("2026.08.10 VATAT POC", proc.stdout)
+        self.assertIn("2 total", proc.stdout)
+
+    def test_an_empty_archive_says_so_instead_of_printing_nothing(self):
+        """Silence is the failure mode: an empty stdout reads as 'nothing
+        open' when it may mean 'the root is wrong'."""
+        proc = self._run("--today", "2026-07-27")
+        self.assertTrue(proc.stdout.strip(), "an empty archive must still produce output")
+        self.assertIn("No call folders found", proc.stdout)
+
+    def test_nearest_deadline_sorts_first_and_undated_calls_sort_last(self):
+        self._mkcall("2026.12 Later")
+        self._mkcall("Some Undated Folder")
+        self._mkcall("2026.08 Sooner")
+        proc = self._run("--today", "2026-07-27")
+        body = proc.stdout
+        self.assertLess(body.index("2026.08 Sooner"), body.index("2026.12 Later"))
+        self.assertLess(body.index("2026.12 Later"), body.index("Some Undated Folder"))
+
+    # -- what it does NOT do ------------------------------------------------
+
+    def test_the_cli_writes_nothing_to_the_archive(self):
+        """The scanner is read-only by contract (SAFETY.md #3). Anything it
+        creates in the archive is a breach, including a stray temp file."""
+        d = self._mkcall("2026.10 Kamin")
+        (d / "call.txt").write_text("call text", encoding="utf-8")
+        before = self._snapshot(self.root)
+        self._run("--today", "2026-07-27")
+        self._run("--today", "2026-07-27", "--json")
+        self._run("--today", "2026-07-27", "--open-md")
+        self.assertEqual(self._snapshot(self.root), before)
+
+    def test_skipped_calls_and_their_reasons_are_reported(self):
+        done = self._mkcall("2026.11 Done")
+        _write_agent_owned_topics(done, call_name="2026.11 Done")
+        proc = self._run("--today", "2026-07-27")
+        self.assertIn("Not worked, and why", proc.stdout)
+        self.assertIn("topics.md already published", proc.stdout)
+
+    def test_states_are_read_back_out_of_an_existing_open_md(self):
+        """resolve_states() is what keeps the human-owned state column
+        authoritative. If the CLI skipped that read, a call Alon marked
+        `ignore` would be worked on anyway."""
+        self._mkcall("2026.10 Kamin")
+        (self.root / "OPEN.md").write_text(
+            _compose_content(
+                {
+                    "artifact": "open",
+                    "generated_by": "auto-proposals",
+                    "generated_at": "27/07/2026 10:00",
+                    "version": 1,
+                },
+                "| call | deadline | days | state | topics | note |\n"
+                "|---|---|---|---|---|---|\n"
+                "| 2026.10 Kamin | 2026-10-31 | 96 | ignore | no |  |\n",
+            ),
+            encoding="utf-8",
+        )
+        proc = self._run("--today", "2026-07-27")
+        self.assertIn("0 workable", proc.stdout)
+        self.assertIn("state is 'ignore'", proc.stdout)
+
+    # -- machine-readable modes ---------------------------------------------
+
+    def test_json_mode_carries_the_skip_reasons(self):
+        self._mkcall("2026.10 Fresh")
+        done = self._mkcall("2026.11 Done")
+        _write_agent_owned_topics(done, call_name="2026.11 Done")
+        payload = json.loads(self._run("--today", "2026-07-27", "--json").stdout)
+        by_name = {c["name"]: c for c in payload["calls"]}
+        self.assertTrue(by_name["2026.10 Fresh"]["workable"])
+        self.assertEqual(by_name["2026.10 Fresh"]["skip_reasons"], [])
+        self.assertFalse(by_name["2026.11 Done"]["workable"])
+        self.assertTrue(by_name["2026.11 Done"]["skip_reasons"])
+        self.assertEqual(by_name["2026.10 Fresh"]["days_until"], 96)
+
+    def test_open_md_mode_emits_exactly_the_renderer_output(self):
+        self._mkcall("2026.10 Kamin")
+        proc = self._run("--today", "2026-07-27", "--open-md")
+        calls = find_calls(self.root)
+        resolve_states(calls, None)
+        self.assertEqual(proc.stdout, render_open_md(calls, today=date(2026, 7, 27)))
+
+    def test_json_and_open_md_are_mutually_exclusive(self):
+        proc = self._run("--json", "--open-md", expect_ok=False)
+        self.assertEqual(proc.returncode, 2)
+
+    # -- error paths --------------------------------------------------------
+
+    def test_a_bad_today_is_refused_not_silently_defaulted(self):
+        proc = self._run("--today", "not-a-date", expect_ok=False)
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("YYYY-MM-DD", proc.stderr)
+
+    def test_a_missing_root_is_an_error_not_an_empty_roster(self):
+        """The single most dangerous confusion this CLI can produce: a wrong
+        root that reports zero calls looks identical to a clean run."""
+        missing = self.root / "no-such-archive"
+        proc = self._run(root=missing, expect_ok=False)
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("does not exist", proc.stderr)
+
+    def test_a_corrupt_bootstrap_file_fails_loudly(self):
+        self._mkcall("2026.10 Kamin")
+        self._write_bootstrap("{not json")
+        proc = self._run("--today", "2026-07-27", expect_ok=False)
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("not valid JSON", proc.stderr)
 
 
 class CallInfoDefaultsTestCase(unittest.TestCase):
