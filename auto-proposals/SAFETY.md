@@ -36,7 +36,17 @@ OPEN.md
 CORPUS.md
 <call>/topics.md                       <call>/topics-v<N>.md
 <call>/outlines/<Tn>-<slug>.md         <call>/outlines/<Tn>-<slug>-v<N>.md
+<call>/outlines/<Tn>-<slug>.pdf        <call>/outlines/<Tn>-<slug>-v<N>.pdf
+<call>/outlines/tex/<Tn>-<slug>.tex    <call>/outlines/tex/<Tn>-<slug>-v<N>.tex
+<call>/outlines/tex/<Tn>-<slug>.bib    <call>/outlines/tex/<Tn>-<slug>-v<N>.bib
+<call>/YYYY.MM.DD <letter> <rest>.md      <call>/YYYY.MM.DD <letter> <rest>.pdf
+<call>/tex/YYYY.MM.DD <letter> <rest>.tex <call>/tex/YYYY.MM.DD <letter> <rest>.bib
+<call>/grf/<slug>/<slug>.tex              <call>/grf/<slug>/<slug>.pdf
+<call>/grf/<slug>/<slug>.png
 <call>/drafts/YYYY.MM.DD <letter> <rest>.md
+<call>/drafts/YYYY.MM.DD <letter> <rest>.pdf
+<call>/drafts/tex/YYYY.MM.DD <letter> <rest>.tex
+<call>/drafts/tex/YYYY.MM.DD <letter> <rest>.bib
 ```
 
 where `<call>` is a top-level directory **not** starting with `_` and not starting with `.`,
@@ -45,6 +55,22 @@ a dot-separated four-digit year / two-digit month / two-digit day, `<letter>` is
 lowercase ascii letter (`a` for the first draft produced on a given date, incrementing for
 each further version of the same `<rest>` produced that same date, resetting to `a` on a new
 date), and `<rest>` is non-empty and may contain spaces and non-ascii characters.
+
+The `.pdf` and the LaTeX sources are **companions** of the `.md` draft whose basename they share
+exactly. Each is publishable **only** when that `.md` already exists and carries
+`generated_by: auto-proposals`, and never differs from it in date or letter. A companion is
+written verbatim and so cannot carry frontmatter; this sibling rule is the whole of its
+provenance — without it `drafts/` would be a place any file could be deposited.
+
+The sources sit in a `tex/` subfolder rather than beside the draft, so `drafts/` stays a
+readable list of drafts instead of a build directory. **`tex/` is the only nested directory the
+agent may create, and only inside `drafts/`.** Only `.tex` and `.bib` are accepted there —
+build artefacts (`.aux`, `.log`, `.out`) are never published.
+
+**`<call>/context/` is deliberately absent from this grammar and must stay absent.** It is
+where Alon drops material to steer a direction he has already picked. It is an input to the
+agent and an output of nobody, so every write to it is refused by the grammar rather than by
+anyone remembering the rule.
 
 Validation is **`realpath`-based, not string-based**: the resolved parent must still be inside
 the resolved `$PROPOSALS`, and no path component may be a symlink. A `drafts/` symlinked at
@@ -55,12 +81,26 @@ Everything else — `_`-prefixed corpora (`_Granted`, `_Archive`, `_resources`, 
 
 ## 3. Write modes
 
-`publish.py` supports exactly three, and **never deletes anything**:
+`publish.py` supports exactly four, and **never deletes anything**:
 
 - **`create`** — `topics*.md`, `outlines/*`, `drafts/*`. Opens `O_CREAT|O_EXCL|O_NOFOLLOW`.
   If the target exists, it **refuses**; the caller must publish the next `-v<N>` instead
   (topics/outlines) or the next date-letter draft filename instead (drafts — see §2).
   This is what makes Alon's hand-ticked checkboxes unclobberable.
+- **`create-figure`** — **only** `<call>/grf/<slug>/<slug>.{tex,pdf,png}`, where the file is
+  named after its own folder. Figures are the one artifact with no markdown sibling to take
+  provenance from — a figure belongs to the call, not to one document, so several drafts can
+  share it. Provenance is therefore **positional**: `grf/` is a directory only auto-proposals
+  creates. That is weaker than frontmatter, which is exactly why it is a separate, narrow mode
+  rather than a widening of `create-companion`.
+- **`create-companion`** — **only** `outlines/*.pdf`, `outlines/tex/*.{tex,bib}`,
+  `drafts/*.pdf` and `drafts/tex/*.{tex,bib}`, and only next
+  to an owned `.md` of the same basename. Same `O_CREAT|O_EXCL` create-only discipline, but the
+  payload is written as raw bytes and **no frontmatter is prepended and no completeness marker
+  appended** — both would corrupt a PDF and both would stop a `.tex` compiling. The consequence
+  is stated plainly rather than hidden: a truncated companion is not detectable the way a
+  truncated markdown artifact is, so the write-temp-then-link order is what guarantees the
+  target only ever appears complete.
 - **`append`** — appends a fenced, dated steering block to an artifact the agent owns and that
   already exists. Never rewrites existing bytes.
 - **`regenerate`** — **only** `OPEN.md` and `CORPUS.md`. Read-modify-write guarded by

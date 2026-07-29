@@ -21,6 +21,7 @@ from lib.publish import (  # noqa: E402
     parse_frontmatter,
     publish_append,
     publish_create,
+    publish_create_companion,
     publish_regenerate,
     read_owned,
     render_frontmatter,
@@ -147,7 +148,7 @@ class PublishCreateTestCase(unittest.TestCase):
         path = publish_create(
             self.root,
             "NSF-2027/outlines/T1-slug.md",
-            "outline body\n",
+            "- [ ] approved\n\noutline body\n",
             frontmatter=owned_frontmatter(artifact="outline"),
         )
 
@@ -155,7 +156,7 @@ class PublishCreateTestCase(unittest.TestCase):
         self.assertTrue(path.exists())
         self.assertEqual(
             path.read_text(),
-            _compose_content(owned_frontmatter(artifact="outline"), "outline body\n"),
+            _compose_content(owned_frontmatter(artifact="outline"), "- [ ] approved\n\noutline body\n"),
         )
 
     def test_create_refuses_when_call_folder_frozen_by_conflicted_copy(self):
@@ -631,6 +632,228 @@ class FrontmatterTestCase(unittest.TestCase):
 
         self.assertEqual(bytes(written), b"hello world, this is more than 3 bytes")
         self.assertGreater(len(calls), 1)
+
+
+_PDF_BYTES = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n1 0 obj\n<<>>\nendobj\ntrailer\n%%EOF\n"
+
+_MD_REL = "NSF-2027/drafts/2026.07.28 a T1-slug.md"
+_PDF_REL = "NSF-2027/drafts/2026.07.28 a T1-slug.pdf"
+
+
+class PublishCreateCompanionTests(unittest.TestCase):
+    def setUp(self):
+        self.root = make_test_root()
+        configure_env(self.root)
+        _make_call_dir(self.root)
+
+    def _publish_md(self, rel=_MD_REL):
+        return publish_create(
+            self.root, rel, "# draft\n", frontmatter=owned_frontmatter(artifact="draft")
+        )
+
+    def test_pdf_publishes_alongside_its_markdown(self):
+        self._publish_md()
+        target = publish_create_companion(self.root, _PDF_REL, _PDF_BYTES)
+        self.assertTrue(target.exists())
+        self.assertEqual(target.read_bytes(), _PDF_BYTES)
+
+    def test_bytes_are_stored_verbatim(self):
+        """The whole reason for a separate binary path: text-mode writing would
+        translate newlines and corrupt the PDF silently."""
+        self._publish_md()
+        payload = b"%PDF-1.7\r\n\x00\x01\x02\r\n\x80\xff binary \r\n%%EOF"
+        target = publish_create_companion(self.root, _PDF_REL, payload)
+        self.assertEqual(target.read_bytes(), payload)
+
+    def test_no_frontmatter_or_marker_is_injected(self):
+        self._publish_md()
+        target = publish_create_companion(self.root, _PDF_REL, _PDF_BYTES)
+        raw = target.read_bytes()
+        self.assertTrue(raw.startswith(b"%PDF"))
+        self.assertNotIn(b"generated_by", raw)
+        self.assertNotIn(COMPLETE_MARKER.encode(), raw)
+
+    def test_refuses_when_the_markdown_draft_is_absent(self):
+        """A PDF has no frontmatter, so it cannot vouch for itself. Its sibling
+        .md is the only provenance anchor - without one, drafts/ would accept
+        arbitrary binaries."""
+        with self.assertRaises(PathRefused) as ctx:
+            publish_create_companion(self.root, _PDF_REL, _PDF_BYTES)
+        self.assertIn("markdown draft", str(ctx.exception))
+
+    def test_refuses_when_the_sibling_markdown_is_not_agent_owned(self):
+        drafts = self.root / "NSF-2027" / "drafts"
+        drafts.mkdir(parents=True, exist_ok=True)
+        (drafts / "2026.07.28 a T1-slug.md").write_text(
+            "---\ngenerated_by: a human\n---\nhand written\n", encoding="utf-8"
+        )
+        with self.assertRaises(PathRefused):
+            publish_create_companion(self.root, _PDF_REL, _PDF_BYTES)
+
+    def test_refuses_to_overwrite_an_existing_pdf(self):
+        self._publish_md()
+        publish_create_companion(self.root, _PDF_REL, _PDF_BYTES)
+        with self.assertRaises(PathRefused) as ctx:
+            publish_create_companion(self.root, _PDF_REL, b"%PDF-1.7 different\n")
+        self.assertIn("already exists", str(ctx.exception))
+        self.assertEqual((self.root / _PDF_REL).read_bytes(), _PDF_BYTES)
+
+    def test_refuses_a_non_draft_path(self):
+        for rel in ("NSF-2027/topics.pdf", "OPEN.pdf", "NSF-2027/context/x.pdf"):
+            with self.subTest(rel=rel):
+                with self.assertRaises(PathRefused):
+                    publish_create_companion(self.root, rel, _PDF_BYTES)
+
+    def test_refuses_a_markdown_path(self):
+        """create-pdf must not become a second way to write text artifacts,
+        bypassing frontmatter and the completeness marker."""
+        self._publish_md("NSF-2027/drafts/2026.07.28 b T1-slug.md")
+        with self.assertRaises(PathRefused):
+            publish_create_companion(
+                self.root, "NSF-2027/drafts/2026.07.28 c T1-slug.md", b"plain"
+            )
+
+    def test_tex_source_publishes_into_the_tex_subfolder(self):
+        self._publish_md()
+        tex_rel = "NSF-2027/drafts/tex/2026.07.28 a T1-slug.tex"
+        target = publish_create_companion(
+            self.root, tex_rel, b"\\documentclass{article}\n\\begin{document}x\\end{document}\n"
+        )
+        self.assertTrue(target.exists())
+        self.assertEqual(target.parent.name, "tex")
+        self.assertTrue(target.read_text().startswith("\\documentclass"))
+
+    def test_tex_source_is_not_wrapped_in_frontmatter(self):
+        """YAML frontmatter on a .tex would stop it compiling, which defeats
+        the entire point of keeping the source."""
+        self._publish_md()
+        tex_rel = "NSF-2027/drafts/tex/2026.07.28 a T1-slug.tex"
+        target = publish_create_companion(self.root, tex_rel, b"\\documentclass{article}\n")
+        self.assertFalse(target.read_text().startswith("---"))
+        self.assertNotIn("generated_by", target.read_text())
+
+    def test_tex_subfolder_is_created_on_demand(self):
+        self._publish_md()
+        tex_dir = self.root / "NSF-2027" / "drafts" / "tex"
+        self.assertFalse(tex_dir.exists())
+        publish_create_companion(
+            self.root, "NSF-2027/drafts/tex/2026.07.28 a T1-slug.tex", b"x\n"
+        )
+        self.assertTrue(tex_dir.is_dir())
+
+    def test_tex_refuses_without_its_markdown_draft(self):
+        with self.assertRaises(PathRefused):
+            publish_create_companion(
+                self.root, "NSF-2027/drafts/tex/2026.07.28 a T1-slug.tex", b"x\n"
+            )
+
+    def test_publish_create_refuses_every_companion_path(self):
+        """Companions are 'create' targets in the grammar so resolve_owned()
+        applies its containment checks to them - but coming through
+        publish_create() would prepend frontmatter and append the completeness
+        marker, corrupting a PDF outright and stopping a .tex compiling."""
+        self._publish_md()
+        for rel in (
+            _PDF_REL,
+            "NSF-2027/drafts/tex/2026.07.28 a T1-slug.tex",
+            "NSF-2027/drafts/tex/2026.07.28 a T1-slug.bib",
+        ):
+            with self.subTest(rel=rel):
+                with self.assertRaises(PathRefused) as ctx:
+                    publish_create(
+                        self.root, rel, "x\n", frontmatter=owned_frontmatter(artifact="draft")
+                    )
+                self.assertIn("companion", str(ctx.exception))
+                self.assertFalse((self.root / rel).exists())
+
+    def test_pdf_payload_must_carry_the_pdf_header(self):
+        """Create-only means a wrong payload cannot be corrected in place -
+        fixing it costs a whole new draft letter - so it is caught before the
+        write, not after."""
+        self._publish_md()
+        with self.assertRaises(PathRefused) as ctx:
+            publish_create_companion(self.root, _PDF_REL, b"\\documentclass{article}\n")
+        self.assertIn("%PDF-", str(ctx.exception))
+        self.assertFalse((self.root / _PDF_REL).exists())
+
+    def test_tex_payload_must_be_utf8(self):
+        self._publish_md()
+        with self.assertRaises(PathRefused):
+            publish_create_companion(
+                self.root, "NSF-2027/drafts/tex/2026.07.28 a T1-slug.tex", b"\xff\xfe\x00bad"
+            )
+
+    def test_tex_payload_may_contain_non_ascii_utf8(self):
+        """Hebrew in a .tex is expected, not an error."""
+        self._publish_md()
+        target = publish_create_companion(
+            self.root,
+            "NSF-2027/drafts/tex/2026.07.28 a T1-slug.tex",
+            "\\documentclass{article}\n% קול קורא\n".encode("utf-8"),
+        )
+        self.assertIn("קול קורא", target.read_text(encoding="utf-8"))
+
+    def test_empty_payload_is_refused(self):
+        self._publish_md()
+        with self.assertRaises(PathRefused):
+            publish_create_companion(self.root, _PDF_REL, b"")
+
+    def test_leaves_no_temp_file_behind_on_refusal(self):
+        self._publish_md()
+        publish_create_companion(self.root, _PDF_REL, _PDF_BYTES)
+        with self.assertRaises(PathRefused):
+            publish_create_companion(self.root, _PDF_REL, b"%PDF other\n")
+        leftovers = [
+            p.name
+            for p in (self.root / "NSF-2027" / "drafts").iterdir()
+            if p.name.startswith(".auto-proposals.tmp.")
+        ]
+        self.assertEqual(leftovers, [])
+
+
+class OutlineApprovalBoxTests(unittest.TestCase):
+    """An outline with no checkbox is unapprovable, so stage 3 could never run on
+    it. Five such outlines reached the archive before this guard existed."""
+
+    def setUp(self):
+        self.root = make_test_root()
+        configure_env(self.root)
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        _make_call_dir(self.root)
+
+    def test_an_outline_without_a_checkbox_is_refused(self):
+        with self.assertRaises(PathRefused) as ctx:
+            publish_create(
+                self.root,
+                "NSF-2027/outlines/T1-thing.md",
+                "# Title\n\nProse with no box.\n",
+                frontmatter=owned_frontmatter(),
+            )
+        self.assertIn("approval checkbox", str(ctx.exception))
+        self.assertFalse((self.root / "NSF-2027/outlines/T1-thing.md").exists())
+
+    def test_an_outline_with_the_box_is_created(self):
+        rel = "NSF-2027/outlines/T1-thing.md"
+        publish_create(
+            self.root, rel, "- [ ] approved\n\n# Title\n", frontmatter=owned_frontmatter()
+        )
+        self.assertTrue((self.root / rel).exists())
+
+    def test_a_ticked_box_also_satisfies_the_guard(self):
+        """A -v2 may carry an approval forward; the guard checks a box EXISTS."""
+        rel = "NSF-2027/outlines/T1-thing-v2.md"
+        publish_create(
+            self.root, rel, "- [x] approved\n\n# Title\n", frontmatter=owned_frontmatter()
+        )
+        self.assertTrue((self.root / rel).exists())
+
+    def test_non_outline_artifacts_are_unaffected(self):
+        """topics.md and drafts have their own gates; requiring a box here would
+        block every draft the skill writes."""
+        publish_create(
+            self.root, "NSF-2027/topics.md", "# Topics\n", frontmatter=owned_frontmatter()
+        )
+        self.assertTrue((self.root / "NSF-2027/topics.md").exists())
 
 
 if __name__ == "__main__":

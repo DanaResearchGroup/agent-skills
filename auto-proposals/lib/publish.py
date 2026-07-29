@@ -26,6 +26,10 @@ from pathlib import Path
 from lib.paths import (
     PathRefused,
     dropbox_synced,
+    companion_md_rel_for,
+    is_draft_companion,
+    is_figure,
+    is_outline_md,
     owned_artifact_conflicts,
     publish_host_ok,
     resolve_owned,
@@ -35,6 +39,11 @@ from lib.paths import (
 
 
 _TMP_PREFIX = ".auto-proposals.tmp."
+
+# Any markdown checkbox, ticked or not. Deliberately not "unticked only": a -v2
+# outline may legitimately be published carrying a tick forward, and the point of
+# the guard is that a place to tick EXISTS, not what state it is in.
+_APPROVAL_BOX_RE = re.compile(r"^\s*[-*]\s*\[[ xX]\]", re.MULTILINE)
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +148,28 @@ def _write_temp_dirfd(dir_fd: int, content: str) -> str:
     return name
 
 
+def _write_temp_bytes_dirfd(dir_fd: int, data: bytes) -> str:
+    """Byte-for-byte sibling of _write_temp_dirfd, for artifacts that are not
+    text. Same contract: caller must clean up the returned temp name.
+
+    This exists because _write_temp_dirfd opens the fd in text mode and would
+    apply newline translation to a PDF, corrupting it in a way that is silent
+    until someone opens the file.
+    """
+    name = _make_tmp_name()
+    fd = os.open(name, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644, dir_fd=dir_fd)
+    try:
+        try:
+            _write_all(fd, data)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except BaseException:
+        _remove_tmp_dirfd(dir_fd, name)
+        raise
+    return name
+
+
 def _hash_dirfd_or_none(dir_fd: int, name: str) -> str | None:
     """Read the file `name` (inside `dir_fd`) and return its sha256 hex
     digest the same way read_owned() computes it, or None if it doesn't
@@ -215,39 +246,77 @@ def _refuse_if_frozen(root: Path, rel: str) -> None:
         )
 
 
-_CREATABLE_SUBDIRS = ("outlines", "drafts")
+_CREATABLE_SUBDIRS = ("outlines", "drafts", "tex", "grf")
 
 
 def _ensure_parent(root: Path, target: Path) -> None:
-    """Make sure `target`'s directory exists, creating at most the two
-    subdirectories we are allowed to introduce.
+    """Make sure `target`'s directory exists, creating only the specific
+    subdirectory shapes the grammar allows, inside a call folder that already
+    exists.
 
     We deliberately refuse to `mkdir -p` our way to a target. A call folder is
     supplied by a human dropping a call's material into the archive; if the
     model hallucinates or misspells a call name, `mkdir(parents=True)` would
     quietly grow a new top-level folder in someone's proposal archive and the
-    mistake would then sync to five machines. The only directories we may
-    create are `outlines/` and `drafts/` inside a call folder that already
-    exists.
+    mistake would then sync to five machines.
+
+    The allowed shapes, relative to a call folder, are exhaustive on purpose -
+    an allow-list of literal shapes rather than a rule about depth, so a new
+    grammar entry cannot silently widen what may be created:
+
+        outlines/            drafts/            tex/            grf/
+        outlines/tex/        drafts/tex/                        grf/<slug>/
     """
     parent = target.parent
     if parent.is_dir():
         return
 
     root = Path(root)
-    if parent.parent == root and parent.name in _CREATABLE_SUBDIRS:
-        raise PathRefused(
-            f"{parent} would be created directly under the archive root; refused"
-        )
-    if parent.name in _CREATABLE_SUBDIRS and parent.parent.is_dir():
-        parent.mkdir()
-        _fsync_dir(parent.parent)
-        return
+    try:
+        rel_parts = parent.relative_to(root).parts
+    except ValueError:
+        raise PathRefused(f"{parent} is outside the archive root; refused") from None
 
-    raise PathRefused(
-        f"{parent} does not exist. auto-proposals never creates call folders - "
-        "a call folder only ever comes from a human putting the call's material in the archive."
+    # rel_parts[0] is the call folder, which must already exist. Anything
+    # shallower than that is an attempt to create a call folder or a top-level
+    # directory, both of which are refused outright.
+    if len(rel_parts) < 2:
+        raise PathRefused(
+            f"{parent} does not exist. auto-proposals never creates call folders - "
+            "a call folder only ever comes from a human putting the call's "
+            "material in the archive."
+        )
+
+    call_dir = root / rel_parts[0]
+    if not call_dir.is_dir():
+        raise PathRefused(
+            f"{call_dir} does not exist. auto-proposals never creates call folders."
+        )
+
+    sub = rel_parts[1:]
+    allowed = (
+        len(sub) == 1 and sub[0] in _CREATABLE_SUBDIRS
+    ) or (
+        len(sub) == 2 and sub[0] in ("drafts", "outlines") and sub[1] == "tex"
+    ) or (
+        # One folder per figure, named by the figure's own slug.
+        len(sub) == 2 and sub[0] == "grf" and bool(re.fullmatch(r"[a-z0-9-]+", sub[1]))
     )
+    if not allowed:
+        raise PathRefused(
+            f"{parent} is not a directory auto-proposals may create "
+            f"(allowed: outlines/, drafts/, tex/, grf/, outlines/tex/, "
+            f"drafts/tex/, grf/<slug>/)"
+        )
+
+    # Create the missing levels one at a time, fsyncing each parent, so an
+    # interrupted run leaves a consistent tree rather than a half-made path.
+    current = call_dir
+    for part in sub:
+        current = current / part
+        if not current.is_dir():
+            current.mkdir()
+            _fsync_dir(current.parent)
 
 
 # ---------------------------------------------------------------------------
@@ -259,12 +328,39 @@ def publish_create(root: Path, rel: str, text: str, *, frontmatter: dict) -> Pat
     already exists - the caller must publish the next -v<N> instead. This is
     what makes Alon's hand-ticked checkboxes unclobberable: this function
     physically cannot overwrite anything.
+
+    Text artifacts only. Companions (.pdf, .tex, .bib) share the "create" mode
+    because resolve_owned() must apply the same containment and symlink checks
+    to them, but they must never come through here - see the guard below.
     """
     _check_environment()
 
     mode = write_mode_for(rel)
     if mode != "create":
         raise PathRefused(f"{rel!r} is not a 'create' artifact (mode={mode!r})")
+
+    # Companions are in the grammar as "create" targets, which would otherwise
+    # let them be written here in text mode with frontmatter prepended and a
+    # completeness marker appended. That corrupts a PDF outright and stops a
+    # .tex compiling - so the grammar alone is not enough, and this is the
+    # guard that makes publish_create_companion the only way in.
+    if is_draft_companion(rel):
+        raise PathRefused(
+            f"{rel!r} is a draft companion and must not be written as text; "
+            "frontmatter and the completeness marker would corrupt it. Use "
+            "publish_create_companion (CLI: create-companion) instead."
+        )
+
+    # An outline with no approval checkbox is a dead artifact: stage 3's gate is a
+    # ticked box, so Alon has nowhere to tick and the outline can never become a
+    # draft. Five such outlines were published before this guard existed, which is
+    # why the rule lives here rather than only in SKILL.md prose.
+    if is_outline_md(rel) and not _APPROVAL_BOX_RE.search(text):
+        raise PathRefused(
+            f"{rel!r} is an outline with no approval checkbox. Stage 3 is gated on a "
+            "ticked box, so this outline could never be approved. Add a line "
+            "'- [ ] approved' at the top of the outline body."
+        )
 
     target = resolve_owned(Path(root), rel)
     _refuse_if_frozen(Path(root), rel)
@@ -288,6 +384,185 @@ def publish_create(root: Path, rel: str, text: str, *, frontmatter: dict) -> Pat
                 os.link(tmp_name, target.name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd, follow_symlinks=False)
             except FileExistsError:
                 raise PathRefused(f"{target} already exists; publish the next -v<N> instead") from None
+            except OSError as exc:
+                if exc.errno == errno.ELOOP:
+                    raise PathRefused(f"{target} is a symlink; refused") from None
+                raise
+
+            os.fsync(dir_fd)
+        finally:
+            _remove_tmp_dirfd(dir_fd, tmp_name)
+    finally:
+        os.close(dir_fd)
+
+    return target
+
+
+def _check_companion_payload(rel: str, data: bytes) -> None:
+    """Sanity-check a companion's bytes against what its extension promises.
+
+    Companions are written verbatim, so nothing downstream will ever notice
+    that a .pdf holds an error page or that the .tex and .pdf payloads were
+    passed in the wrong order. And because create-only means the file cannot
+    be corrected in place - fixing it costs a whole new draft letter - the
+    cheapest place to catch it is before the write.
+
+    This is a shape check, not validation. It is not trying to prove the PDF
+    renders or the LaTeX compiles, only that the payload is not obviously the
+    wrong kind of thing.
+    """
+    if not data:
+        raise PathRefused(f"refusing to publish {rel!r}: payload is empty")
+
+    if rel.endswith(".pdf"):
+        if not data.startswith(b"%PDF-"):
+            raise PathRefused(
+                f"refusing to publish {rel!r}: payload does not start with the "
+                f"%PDF- header (got {data[:8]!r}), so it is not a PDF"
+            )
+        return
+    if rel.endswith(".png"):
+        if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+            raise PathRefused(
+                f"refusing to publish {rel!r}: payload does not start with the "
+                f"PNG signature (got {data[:8]!r}), so it is not a PNG"
+            )
+        return
+
+    # .tex and .bib are text and must be readable by a TeX engine. A payload
+    # that is not UTF-8 is either the wrong file entirely or already mangled.
+    try:
+        data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise PathRefused(
+            f"refusing to publish {rel!r}: payload is not valid UTF-8 ({exc})"
+        ) from None
+
+
+def publish_create_companion(root: Path, rel: str, data: bytes) -> Path:
+    """Create a brand-new draft companion - the rendered PDF, or the LaTeX
+    source it was compiled from - writing `data` verbatim.
+
+    Companions are held to a stricter rule than any other artifact: **the
+    markdown draft they belong to must already exist and be owned by us.**
+    Neither a PDF nor a .tex we hand back unchanged can carry our frontmatter,
+    so neither has a way to say who generated it; anchoring both to an .md we
+    can prove we wrote is what keeps `drafts/` from becoming a place arbitrary
+    files can be deposited. It also enforces the naming scheme by construction -
+    a companion cannot drift to a different date or letter than its draft.
+
+    Note what is deliberately absent: no frontmatter is prepended and no
+    completeness marker is appended. Both would corrupt a PDF, and both would
+    stop a .tex compiling. Truncation is therefore not detectable the way it is
+    for our markdown artifacts, which is the honest reason the write is done as
+    write-temp-then-link like every other create here - the target only ever
+    appears once its bytes are complete and fsynced.
+    """
+    _check_environment()
+
+    if is_figure(rel):
+        raise PathRefused(
+            f"{rel!r} is a figure, which has no markdown sibling to take its "
+            "provenance from. Use publish_create_figure (CLI: create-figure)."
+        )
+
+    if not is_draft_companion(rel):
+        raise PathRefused(
+            f"{rel!r} is not a companion; verbatim publishing is limited to the "
+            "PDF and LaTeX sources of a proposal, outline or draft, and to "
+            "figures under <call>/grf/<slug>/"
+        )
+
+    _check_companion_payload(rel, data)
+
+    md_rel = companion_md_rel_for(rel)
+    found = read_owned(Path(root), md_rel)
+    if found is None:
+        raise PathRefused(
+            f"refusing to publish {rel!r}: its markdown draft {md_rel!r} does not "
+            "exist. Publish the draft first; a companion is derived from it, never "
+            "a standalone artifact."
+        )
+    if not is_agent_owned(found[0]):
+        raise PathRefused(
+            f"refusing to publish {rel!r}: the markdown draft {md_rel!r} is not "
+            "owned by auto-proposals, so this companion would have no provenance "
+            "and would be depositing a file next to someone else's."
+        )
+
+    target = resolve_owned(Path(root), rel)
+    _refuse_if_frozen(Path(root), rel)
+    _ensure_parent(Path(root), target)
+
+    dir_fd = _open_parent_dir_fd(target.parent)
+    try:
+        tmp_name = _write_temp_bytes_dirfd(dir_fd, data)
+        try:
+            try:
+                os.link(tmp_name, target.name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd, follow_symlinks=False)
+            except FileExistsError:
+                raise PathRefused(
+                    f"{target} already exists; a new rendering belongs to a new draft letter"
+                ) from None
+            except OSError as exc:
+                if exc.errno == errno.ELOOP:
+                    raise PathRefused(f"{target} is a symlink; refused") from None
+                raise
+
+            os.fsync(dir_fd)
+        finally:
+            _remove_tmp_dirfd(dir_fd, tmp_name)
+    finally:
+        os.close(dir_fd)
+
+    return target
+
+
+def publish_create_figure(root: Path, rel: str, data: bytes) -> Path:
+    """Publish one figure file - a TikZ source or a compiled image - under
+    `<call>/grf/<slug>/`, writing `data` verbatim.
+
+    Figures need their own mode because they break the companion rule: a
+    companion borrows provenance from the .md of identical basename, and a
+    figure has no such sibling. A figure belongs to the CALL, not to one
+    document, and deliberately so - several drafts and versions of a draft
+    should include the same figure rather than each carrying a private copy
+    that drifts.
+
+    Provenance is therefore positional: `grf/` is a directory only
+    auto-proposals ever creates, and every path inside it must match the
+    figure grammar (`<slug>/<slug>.{tex,pdf,png}`, slug lowercase). That is
+    weaker than frontmatter, and it is why the mode is separate and narrow
+    rather than folded into create-companion, where it would have widened the
+    companion rule for every artifact type at once.
+
+    Create-only, like everything else here: a changed figure is a new figure
+    name, never an overwrite of the one a published PDF already embeds.
+    """
+    _check_environment()
+
+    if not is_figure(rel):
+        raise PathRefused(
+            f"{rel!r} is not a figure path; figures are "
+            "<call>/grf/<slug>/<slug>.{tex,pdf,png} with a lowercase slug"
+        )
+    _check_companion_payload(rel, data)
+
+    target = resolve_owned(Path(root), rel)
+    _ensure_parent(Path(root), target)
+
+    tmp_name = None
+    dir_fd = _open_parent_dir_fd(target.parent)
+    try:
+        tmp_name = _write_temp_bytes_dirfd(dir_fd, data)
+        try:
+            try:
+                os.link(tmp_name, target.name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd, follow_symlinks=False)
+            except FileExistsError:
+                raise PathRefused(
+                    f"{target} already exists; a changed figure belongs to a new "
+                    "figure name, because a published PDF already embeds this one"
+                ) from None
             except OSError as exc:
                 if exc.errno == errno.ELOOP:
                     raise PathRefused(f"{target} is a symlink; refused") from None
@@ -709,7 +984,7 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="python3 -m lib.publish")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    for name in ("create", "append", "regenerate"):
+    for name in ("create", "append", "regenerate", "create-companion", "create-figure"):
         p = sub.add_parser(name)
         p.add_argument("--root", required=True)
         p.add_argument("--rel", required=True)
@@ -722,6 +997,28 @@ def main(argv=None) -> int:
         )
 
     args = parser.parse_args(argv)
+
+    # create-companion is the one command whose payload is verbatim bytes.
+    # Reading it as text would mangle a PDF, so it is dispatched before the
+    # text path reads --file.
+    if args.command in ("create-companion", "create-figure"):
+        try:
+            data = Path(args.file).read_bytes()
+        except OSError as exc:
+            print(f"refused: could not read --file {args.file!r}: {exc}", file=sys.stderr)
+            return 1
+        writer = (
+            publish_create_companion
+            if args.command == "create-companion"
+            else publish_create_figure
+        )
+        try:
+            path = writer(args.root, args.rel, data)
+        except PathRefused as exc:
+            print(f"refused: {exc}", file=sys.stderr)
+            return 1
+        print(str(path))
+        return 0
 
     try:
         body = Path(args.file).read_text(encoding="utf-8")

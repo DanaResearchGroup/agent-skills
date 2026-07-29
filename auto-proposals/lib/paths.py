@@ -51,7 +51,39 @@ class PathRefused(Exception):
 #   <call>/topics-v<N>.md
 #   <call>/outlines/<Tn>-<slug>.md
 #   <call>/outlines/<Tn>-<slug>-v<N>.md
-#   <call>/drafts/YYYY.MM.DD <letter> <rest>.md
+#   <call>/outlines/<Tn>-<slug>.pdf
+#   <call>/outlines/<Tn>-<slug>-v<N>.pdf
+#   <call>/outlines/tex/<Tn>-<slug>.tex
+#   <call>/outlines/tex/<Tn>-<slug>.bib
+#   <call>/YYYY.MM.DD <letter> <rest>.md          <- full draft proposal
+#   <call>/YYYY.MM.DD <letter> <rest>.pdf
+#   <call>/tex/YYYY.MM.DD <letter> <rest>.tex
+#   <call>/tex/YYYY.MM.DD <letter> <rest>.bib
+#   <call>/grf/<slug>/<slug>.tex                  <- one figure, TikZ source
+#   <call>/grf/<slug>/<slug>.pdf                  <- the compiled figure
+#   <call>/drafts/YYYY.MM.DD <letter> <rest>.md   <- legacy draft location
+#   <call>/drafts/YYYY.MM.DD <letter> <rest>.pdf
+#   <call>/drafts/tex/YYYY.MM.DD <letter> <rest>.tex
+#   <call>/drafts/tex/YYYY.MM.DD <letter> <rest>.bib
+#
+# A finished draft proposal sits in the CALL FOLDER ITSELF, next to the call's
+# own material, because that is where Alon keeps the real document for every
+# past proposal in this archive and it is what he asked for. `drafts/` is kept
+# in the grammar because drafts already published there exist and must stay
+# recognised - but stage 3 writes to the call root now.
+#
+# The .pdf and the LaTeX sources are companions of the .md that shares their
+# exact basename, and are only ever publishable alongside one (see
+# publish_create_companion). Outlines carry them for the same reason drafts do:
+# Alon reads these on a tablet and in print, and a markdown-only outline is one
+# he cannot read where he actually reads it. The sources live in a tex/
+# subfolder so outlines/ and drafts/ stay readable lists rather than build
+# directories - three files per version would bury them once there are several.
+#
+# Deliberately NOT in this grammar, and never writable: <call>/context/. That
+# folder is Alon's, for material he drops in to steer a direction after ticking
+# a topic. It is an input to us and an output of nobody, so it stays outside the
+# owned-path grammar and every write to it is refused by construction.
 #
 # <call>   : top-level dir, not starting with "_" or "."
 # <Tn>     : "T" + digits
@@ -79,13 +111,59 @@ _TOPICS_V_RE = re.compile(rf"^({_CALL})/topics-v({_N})\.md$")
 _OUTLINE_RE = re.compile(rf"^({_CALL})/outlines/({_TN})-({_SLUG})\.md$")
 _OUTLINE_V_RE = re.compile(rf"^({_CALL})/outlines/({_TN})-({_SLUG})-v({_N})\.md$")
 _DRAFT_RE = re.compile(rf"^({_CALL})/drafts/({_DRAFT_DATE}) ({_DRAFT_LETTER}) ({_DRAFT_REST})\.md$")
+# The full draft proposal, in the call folder itself.
+_PROPOSAL_RE = re.compile(rf"^({_CALL})/({_DRAFT_DATE}) ({_DRAFT_LETTER}) ({_DRAFT_REST})\.md$")
+_PROPOSAL_PDF_RE = re.compile(rf"^({_CALL})/({_DRAFT_DATE}) ({_DRAFT_LETTER}) ({_DRAFT_REST})\.pdf$")
+_PROPOSAL_TEX_RE = re.compile(
+    rf"^({_CALL})/tex/({_DRAFT_DATE}) ({_DRAFT_LETTER}) ({_DRAFT_REST})\.(tex|bib)$"
+)
+# One figure per folder: the TikZ source and the compiled figure share the
+# folder's own name, so a figure is a single self-describing unit that Alon can
+# open, edit and recompile without hunting for which source made which image.
+_FIGURE_RE = re.compile(rf"^({_CALL})/grf/({_SLUG})/(\2)\.(tex|pdf|png)$")
+_DRAFT_PDF_RE = re.compile(rf"^({_CALL})/drafts/({_DRAFT_DATE}) ({_DRAFT_LETTER}) ({_DRAFT_REST})\.pdf$")
+_DRAFT_TEX_RE = re.compile(
+    rf"^({_CALL})/drafts/tex/({_DRAFT_DATE}) ({_DRAFT_LETTER}) ({_DRAFT_REST})\.(tex|bib)$"
+)
+# Outlines carry the same companions as drafts. Alon reads these on a tablet
+# and in print, so a markdown-only outline is one he cannot actually read where
+# he reads it - which is the whole point of rendering. Same rule as drafts: the
+# companion never picks its own name, it inherits the .md basename exactly, so
+# the two always sort adjacently and it is never ambiguous which outline a PDF
+# renders.
+_OUTLINE_PDF_RE = re.compile(
+    rf"^({_CALL})/outlines/({_TN})-({_SLUG})(?:-v({_N}))?\.pdf$"
+)
+_OUTLINE_TEX_RE = re.compile(
+    rf"^({_CALL})/outlines/tex/({_TN})-({_SLUG})(?:-v({_N}))?\.(tex|bib)$"
+)
 
 # Basename-only version of the draft pattern (no call/drafts/ prefix), used
 # by next_draft_rel() to scan an existing drafts/ directory listing.
 _DRAFT_BASENAME_RE = re.compile(rf"^({_DRAFT_DATE}) ({_DRAFT_LETTER}) ({_DRAFT_REST})\.md$")
 
 _REGENERATE_RE = _ROOT_LEVEL_RE
-_CREATE_PATTERNS = (_TOPICS_RE, _TOPICS_V_RE, _OUTLINE_RE, _OUTLINE_V_RE, _DRAFT_RE)
+_CREATE_PATTERNS = (
+    _TOPICS_RE, _TOPICS_V_RE, _OUTLINE_RE, _OUTLINE_V_RE,
+    _OUTLINE_PDF_RE, _OUTLINE_TEX_RE,
+    _PROPOSAL_RE, _PROPOSAL_PDF_RE, _PROPOSAL_TEX_RE, _FIGURE_RE,
+    _DRAFT_RE, _DRAFT_PDF_RE, _DRAFT_TEX_RE,
+)
+
+# Every companion pattern, paired with the markdown pattern it renders. Kept
+# as one table so a new companion kind cannot be added to the grammar without
+# also declaring what it is a companion OF - the omission that let a .pdf be
+# written through the text path once already.
+#
+# Figures are companions too, in the sense that matters here: they are written
+# verbatim and carry no frontmatter. They are NOT tied to one markdown file
+# though - a figure belongs to the call, and several drafts may include the
+# same one - so they get their own provenance rule (see publish_create_figure).
+_COMPANION_PATTERNS = (
+    _OUTLINE_PDF_RE, _OUTLINE_TEX_RE,
+    _PROPOSAL_PDF_RE, _PROPOSAL_TEX_RE,
+    _DRAFT_PDF_RE, _DRAFT_TEX_RE,
+)
 
 
 def _call_name_from_rel(rel: str) -> str | None:
@@ -216,12 +294,24 @@ def resolve_owned(root: Path, rel: str) -> Path:
     return target
 
 
-def next_draft_rel(root: Path, call: str, base_name: str, today: date) -> str:
+def next_draft_rel(
+    root: Path, call: str, base_name: str, today: date, *, in_call_root: bool = True
+) -> str:
     """Pick the call-relative path for the next DRAFT version of `base_name`.
 
-    Filenames follow `<call>/drafts/YYYY.MM.DD <letter> <base_name>.md`. The
-    chokepoint that calls this never overwrites an existing draft - each new
-    version is a brand-new, letter-suffixed file.
+    Filenames follow `<call>/YYYY.MM.DD <letter> <base_name>.md` - the full
+    draft proposal lives in the call folder itself, where Alon keeps the real
+    document for every past proposal in this archive. Pass
+    `in_call_root=False` for the legacy `<call>/drafts/` location.
+
+    The letter is chosen by looking at BOTH locations regardless of which one
+    is being written. A draft written to the call root while a same-day draft
+    of the same base name sits in `drafts/` must not reuse its letter: the two
+    would then be different documents claiming the same version, which is the
+    one thing the letter exists to prevent.
+
+    The chokepoint that calls this never overwrites an existing draft - each
+    new version is a brand-new, letter-suffixed file.
 
     Design choice (non-obvious, stated explicitly): the letter sequence is
     scoped per (date, base_name) pair, not per call or per day across the
@@ -237,34 +327,171 @@ def next_draft_rel(root: Path, call: str, base_name: str, today: date) -> str:
     or silently overwrite.
     """
     date_str = today.strftime("%Y.%m.%d")
-    drafts_dir = Path(root) / call / "drafts"
-    try:
-        entries = os.listdir(drafts_dir)
-    except OSError:
-        entries = []
+    call_dir = Path(root) / call
+    search_dirs = (call_dir, call_dir / "drafts")
 
     highest: str | None = None
-    for name in entries:
-        m = _DRAFT_BASENAME_RE.match(name)
-        if not m:
+    for d in search_dirs:
+        try:
+            entries = os.listdir(d)
+        except OSError:
             continue
-        file_date, letter, rest = m.group(1), m.group(2), m.group(3)
-        if file_date != date_str or rest != base_name:
-            continue
-        if highest is None or letter > highest:
-            highest = letter
+        for name in entries:
+            m = _DRAFT_BASENAME_RE.match(name)
+            if not m:
+                continue
+            file_date, letter, rest = m.group(1), m.group(2), m.group(3)
+            if file_date != date_str or rest != base_name:
+                continue
+            if highest is None or letter > highest:
+                highest = letter
 
     if highest is None:
         next_letter = "a"
     elif highest == "z":
         raise PathRefused(
             f"26 draft versions of {base_name!r} already exist for {date_str} "
-            f"under {drafts_dir} (a..z); refusing to roll over - something is wrong"
+            f"in {call_dir} (a..z); refusing to roll over - something is wrong"
         )
     else:
         next_letter = chr(ord(highest) + 1)
 
+    if in_call_root:
+        return f"{call}/{date_str} {next_letter} {base_name}.md"
     return f"{call}/drafts/{date_str} {next_letter} {base_name}.md"
+
+
+def is_draft_pdf(rel: str) -> bool:
+    """True if `rel` names the rendered PDF companion of a markdown draft."""
+    return bool(_DRAFT_PDF_RE.match(rel.replace(os.sep, "/")))
+
+
+def is_outline_md(rel: str) -> bool:
+    """True if `rel` names a stage-2 outline markdown (including a -v<N>)."""
+    posix_rel = rel.replace(os.sep, "/")
+    return bool(_OUTLINE_RE.match(posix_rel) or _OUTLINE_V_RE.match(posix_rel))
+
+
+def is_companion(rel: str) -> bool:
+    """True if `rel` is a companion: a rendered PDF, or a kept LaTeX source,
+    belonging to an outline or a draft.
+
+    Companions are written verbatim and carry no frontmatter, so they are all
+    subject to the same rule - publishable only beside the .md they belong to.
+    """
+    posix_rel = rel.replace(os.sep, "/")
+    return any(p.match(posix_rel) for p in _COMPANION_PATTERNS)
+
+
+# Retained name: the guard in publish_create and several tests refer to it, and
+# the meaning is unchanged - it is just no longer drafts-only.
+is_draft_companion = is_companion
+
+
+def pdf_rel_for(md_rel: str) -> str:
+    """Given the call-relative path of a markdown outline or draft, return the
+    path its rendered PDF companion must take.
+
+    The PDF is deliberately NOT free to pick its own name. It shares the
+    markdown file's basename exactly, so the two always sort adjacently and it
+    is never ambiguous which artifact a PDF is a rendering of. Deriving it here
+    rather than letting a caller compose the string is the same reasoning as
+    next_draft_rel(): a hand-built path is the one that ends up subtly wrong.
+    """
+    return _companion_rel_for(md_rel, "pdf")
+
+
+def tex_rel_for(md_rel: str, ext: str = "tex") -> str:
+    """Path for a kept LaTeX source belonging to `md_rel`.
+
+    `ext` is "tex" or "bib". Same basename as the markdown, one folder deeper
+    in a `tex/` subdirectory, so the sources never clutter the folder Alon
+    actually reads.
+    """
+    if ext not in ("tex", "bib"):
+        raise PathRefused(f"{ext!r} is not a LaTeX source extension (tex, bib)")
+    return _companion_rel_for(md_rel, ext)
+
+
+# Previous drafts-only names, kept so existing callers and tests keep working.
+draft_pdf_rel_for = pdf_rel_for
+draft_tex_rel_for = tex_rel_for
+
+
+def _companion_rel_for(md_rel: str, ext: str) -> str:
+    posix_rel = md_rel.replace(os.sep, "/")
+
+    # A proposal sits at the call root, so its tex/ folder is at the call root
+    # too - there is no intermediate folder to strip.
+    m = _PROPOSAL_RE.match(posix_rel)
+    if m:
+        stem = posix_rel[: -len(".md")]
+        if ext == "pdf":
+            return f"{stem}.pdf"
+        call, _, basename = stem.rpartition("/")
+        return f"{call}/tex/{basename}.{ext}"
+
+    for kind, pattern in (("drafts", _DRAFT_RE), ("outlines", _OUTLINE_RE), ("outlines", _OUTLINE_V_RE)):
+        if pattern.match(posix_rel):
+            stem = posix_rel[: -len(".md")]
+            if ext == "pdf":
+                return f"{stem}.pdf"
+            call, _, basename = stem.rpartition(f"/{kind}/")
+            return f"{call}/{kind}/tex/{basename}.{ext}"
+    raise PathRefused(
+        f"{md_rel!r} is not a markdown proposal, outline or draft path, "
+        f"so it has no {ext} companion"
+    )
+
+
+def figure_rel_for(call: str, slug: str, ext: str = "pdf") -> str:
+    """Path for one figure of `call`. Source and image share the folder name.
+
+    `slug` is the figure's name and must match the owned-path slug grammar -
+    lowercase, digits and hyphens - so a figure folder can never be a
+    hallucinated name with a space or a path separator in it.
+    """
+    if ext not in ("tex", "pdf", "png"):
+        raise PathRefused(f"{ext!r} is not a figure extension (tex, pdf, png)")
+    if not re.fullmatch(_SLUG, slug):
+        raise PathRefused(
+            f"{slug!r} is not a valid figure name (lowercase letters, digits, hyphens)"
+        )
+    return f"{call}/grf/{slug}/{slug}.{ext}"
+
+
+def is_figure(rel: str) -> bool:
+    """True if `rel` names a figure source or image under `<call>/grf/`."""
+    return bool(_FIGURE_RE.match(rel.replace(os.sep, "/")))
+
+
+def companion_md_rel_for(rel: str) -> str:
+    """The markdown outline or draft a companion belongs to.
+
+    A companion carries no frontmatter and so cannot vouch for itself; this is
+    how the chokepoint finds the artifact whose provenance it borrows.
+    """
+    posix_rel = rel.replace(os.sep, "/")
+    if (
+        _DRAFT_PDF_RE.match(posix_rel)
+        or _OUTLINE_PDF_RE.match(posix_rel)
+        or _PROPOSAL_PDF_RE.match(posix_rel)
+    ):
+        return posix_rel[: -len(".pdf")] + ".md"
+    m = _PROPOSAL_TEX_RE.match(posix_rel)
+    if m:
+        call, date, letter, rest = m.group(1), m.group(2), m.group(3), m.group(4)
+        return f"{call}/{date} {letter} {rest}.md"
+    m = _DRAFT_TEX_RE.match(posix_rel)
+    if m:
+        call, date, letter, rest = m.group(1), m.group(2), m.group(3), m.group(4)
+        return f"{call}/drafts/{date} {letter} {rest}.md"
+    m = _OUTLINE_TEX_RE.match(posix_rel)
+    if m:
+        call, tn, slug, ver = m.group(1), m.group(2), m.group(3), m.group(4)
+        suffix = f"-v{ver}" if ver else ""
+        return f"{call}/outlines/{tn}-{slug}{suffix}.md"
+    raise PathRefused(f"{rel!r} is not a companion")
 
 
 # ---------------------------------------------------------------------------
@@ -301,7 +528,13 @@ def owned_artifact_conflicts(call_dir: Path) -> list[Path]:
     """
     call_dir = Path(call_dir)
     found: list[Path] = []
-    for sub in (call_dir, call_dir / "outlines", call_dir / "drafts"):
+    for sub in (
+        call_dir,
+        call_dir / "outlines",
+        call_dir / "outlines" / "tex",
+        call_dir / "drafts",
+        call_dir / "drafts" / "tex",
+    ):
         try:
             entries = list(os.scandir(sub))
         except OSError:

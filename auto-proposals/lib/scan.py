@@ -108,8 +108,20 @@ _TOPICS_V_RE = re.compile(r"^topics-v(\d+)\.md$")
 
 
 def _scan_material(call_dir: Path) -> list[Path]:
-    """Top-level call-material files: everything except topics*.md (an owned
-    artifact, not material), dotfiles, and Dropbox conflicted copies."""
+    """Top-level call-material files: everything except owned artifacts,
+    dotfiles, and Dropbox conflicted copies.
+
+    Since full draft proposals are written into the call folder itself, this
+    has to exclude them too. If it did not, a run would read its own previous
+    draft back as though it were part of the call's own material, quote it as
+    if the funder had written it, and get more confident with every version -
+    a feedback loop, and the kind that looks like better grounding.
+
+    Ownership here is decided by frontmatter, never by the filename, because
+    Alon's own files use exactly the same `YYYY.MM.DD <letter> <name>`
+    convention; a name-only rule would silently hide his documents from the
+    grounding step.
+    """
     material: list[Path] = []
     try:
         entries = sorted(os.scandir(call_dir), key=lambda e: e.name)
@@ -128,8 +140,32 @@ def _scan_material(call_dir: Path) -> list[Path]:
             continue
         if _TOPICS_NAME_RE.match(name):
             continue
+        if _is_owned_artifact_file(Path(entry.path)):
+            continue
         material.append(Path(entry.path))
     return material
+
+
+def _is_owned_artifact_file(path: Path) -> bool:
+    """True for a file auto-proposals wrote: a markdown artifact whose
+    frontmatter claims it, or the PDF companion of one.
+
+    A companion carries no frontmatter, so it is identified by its markdown
+    sibling exactly as the chokepoint does it.
+    """
+    if path.suffix == ".pdf":
+        sibling = path.with_suffix(".md")
+        if not sibling.is_file():
+            return False
+        path = sibling
+    elif path.suffix != ".md":
+        return False
+    try:
+        return is_agent_owned(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError):
+        # Unreadable means "not provably ours", which keeps it visible as
+        # material rather than silently dropping a file from the grounding.
+        return False
 
 
 def _scan_topics(call_dir: Path) -> tuple[bool, list[int]]:
@@ -366,6 +402,49 @@ def skip_reasons(call: CallInfo) -> list[str]:
     if call.has_topics:
         reasons.append("topics.md already published (stage 1 is done here)")
     return reasons
+
+
+# A ticked checkbox anywhere in an agent-owned outline means "write the
+# draft". Deliberately ANY ticked box rather than one at a fixed line: Alon
+# hand-edits these files (he added two whole topics to an RSCC topics.md by
+# hand), and a gate that only recognises a checkbox in the exact position the
+# generator put it would silently ignore an approval he typed himself. The
+# cost of being permissive is bounded - the worst case is drafting something
+# he marked for another reason, and a draft is never submitted by this skill.
+_TICKED_RE = re.compile(r"^\s*[-*]\s*\[[xX]\]", re.MULTILINE)
+
+
+def is_approved(text: str) -> bool:
+    """True if an artifact carries at least one ticked checkbox."""
+    return bool(_TICKED_RE.search(text))
+
+
+def approved_outlines(call_dir: Path) -> list[Path]:
+    """Every agent-owned outline in `call_dir` that Alon has ticked.
+
+    Ownership is checked before approval: a human's own notes file dropped
+    into outlines/ with a ticked box is not an instruction to this skill.
+    Conflicted copies are skipped - a frozen call does no stage work at all,
+    and this keeps the two checks from disagreeing.
+    """
+    out: list[Path] = []
+    outlines_dir = Path(call_dir) / "outlines"
+    try:
+        entries = sorted(os.scandir(outlines_dir), key=lambda e: e.name)
+    except OSError:
+        return out
+    for entry in entries:
+        if not entry.name.endswith(".md") or is_conflicted_copy(entry.name):
+            continue
+        try:
+            if not entry.is_file(follow_symlinks=False):
+                continue
+            text = Path(entry.path).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        if is_agent_owned(text) and is_approved(text):
+            out.append(Path(entry.path))
+    return out
 
 
 def workable(calls: list[CallInfo]) -> list[CallInfo]:

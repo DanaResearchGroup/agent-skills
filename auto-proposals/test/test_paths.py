@@ -12,9 +12,16 @@ from test._env import configure_env, make_test_root  # noqa: E402
 
 from lib.paths import (  # noqa: E402
     PathRefused,
+    companion_md_rel_for,
+    draft_pdf_rel_for,
+    draft_tex_rel_for,
     dropbox_synced,
     is_call_dir,
     is_conflicted_copy,
+    is_draft_companion,
+    is_draft_pdf,
+    is_figure,
+    figure_rel_for,
     next_draft_rel,
     owned_artifact_conflicts,
     resolve_owned,
@@ -258,13 +265,13 @@ class PathsTestCase(unittest.TestCase):
     def test_next_draft_rel_returns_a_when_drafts_dir_absent(self):
         (self.root / "NSF-2027").mkdir(parents=True)
         rel = next_draft_rel(self.root, "NSF-2027", "T1-slug", date(2026, 7, 28))
-        self.assertEqual(rel, "NSF-2027/drafts/2026.07.28 a T1-slug.md")
+        self.assertEqual(rel, "NSF-2027/2026.07.28 a T1-slug.md")
 
     def test_next_draft_rel_returns_a_when_drafts_dir_empty(self):
         call_dir = self.root / "NSF-2027"
         (call_dir / "drafts").mkdir(parents=True)
         rel = next_draft_rel(self.root, "NSF-2027", "T1-slug", date(2026, 7, 28))
-        self.assertEqual(rel, "NSF-2027/drafts/2026.07.28 a T1-slug.md")
+        self.assertEqual(rel, "NSF-2027/2026.07.28 a T1-slug.md")
 
     def test_next_draft_rel_increments_letter_for_same_date_and_base_name(self):
         call_dir = self.root / "NSF-2027"
@@ -273,7 +280,7 @@ class PathsTestCase(unittest.TestCase):
         (drafts_dir / "2026.07.28 a T1-slug.md").write_text("---\n---\n")
 
         rel = next_draft_rel(self.root, "NSF-2027", "T1-slug", date(2026, 7, 28))
-        self.assertEqual(rel, "NSF-2027/drafts/2026.07.28 b T1-slug.md")
+        self.assertEqual(rel, "NSF-2027/2026.07.28 b T1-slug.md")
 
     def test_next_draft_rel_resets_to_a_on_different_date(self):
         call_dir = self.root / "NSF-2027"
@@ -282,7 +289,7 @@ class PathsTestCase(unittest.TestCase):
         (drafts_dir / "2026.07.27 c T1-slug.md").write_text("---\n---\n")
 
         rel = next_draft_rel(self.root, "NSF-2027", "T1-slug", date(2026, 7, 28))
-        self.assertEqual(rel, "NSF-2027/drafts/2026.07.28 a T1-slug.md")
+        self.assertEqual(rel, "NSF-2027/2026.07.28 a T1-slug.md")
 
     def test_next_draft_rel_scoped_per_base_name(self):
         # A different topic drafted the same day starts its own lettering.
@@ -292,7 +299,7 @@ class PathsTestCase(unittest.TestCase):
         (drafts_dir / "2026.07.28 a T1-slug.md").write_text("---\n---\n")
 
         rel = next_draft_rel(self.root, "NSF-2027", "T2-other-slug", date(2026, 7, 28))
-        self.assertEqual(rel, "NSF-2027/drafts/2026.07.28 a T2-other-slug.md")
+        self.assertEqual(rel, "NSF-2027/2026.07.28 a T2-other-slug.md")
 
     def test_next_draft_rel_skips_unrelated_and_malformed_files(self):
         call_dir = self.root / "NSF-2027"
@@ -303,7 +310,7 @@ class PathsTestCase(unittest.TestCase):
         (drafts_dir / "2026.07.28 a T1-slug (Alon's conflicted copy 2026-07-29).md").write_text("dup")
 
         rel = next_draft_rel(self.root, "NSF-2027", "T1-slug", date(2026, 7, 28))
-        self.assertEqual(rel, "NSF-2027/drafts/2026.07.28 a T1-slug.md")
+        self.assertEqual(rel, "NSF-2027/2026.07.28 a T1-slug.md")
 
     def test_next_draft_rel_refuses_after_z(self):
         call_dir = self.root / "NSF-2027"
@@ -315,5 +322,266 @@ class PathsTestCase(unittest.TestCase):
             next_draft_rel(self.root, "NSF-2027", "T1-slug", date(2026, 7, 28))
 
 
+class DraftPdfGrammarTests(unittest.TestCase):
+    def test_draft_pdf_is_a_create_target(self):
+        self.assertEqual(
+            write_mode_for("NSF-2027/drafts/2026.07.28 a T1-slug.pdf"), "create"
+        )
+
+    def test_pdf_must_carry_the_same_date_letter_grammar_as_the_md(self):
+        for rel in (
+            "NSF-2027/drafts/T1-slug.pdf",
+            "NSF-2027/drafts/2026.07.28 T1-slug.pdf",
+            "NSF-2027/drafts/2026.7.28 a T1-slug.pdf",
+            "NSF-2027/drafts/2026.07.28 A T1-slug.pdf",
+        ):
+            with self.subTest(rel=rel):
+                with self.assertRaises(PathRefused):
+                    write_mode_for(rel)
+
+    def test_pdf_is_allowed_for_outlines_and_drafts_only(self):
+        """Outlines and drafts render to PDF because Alon reads them on a
+        tablet and in print. Topics and the roster do not: they are working
+        lists he ticks in a text editor, and a PDF of a checkbox he cannot
+        tick is worse than no PDF."""
+        for rel in (
+            "NSF-2027/outlines/T1-slug.pdf",
+            "NSF-2027/outlines/T1-slug-v2.pdf",
+            "NSF-2027/drafts/2026.07.28 a T1-slug.pdf",
+        ):
+            with self.subTest(rel=rel):
+                self.assertEqual(write_mode_for(rel), "create")
+
+        for rel in ("NSF-2027/topics.pdf", "OPEN.pdf", "CORPUS.pdf"):
+            with self.subTest(rel=rel):
+                with self.assertRaises(PathRefused):
+                    write_mode_for(rel)
+
+    def test_is_draft_pdf_discriminates(self):
+        self.assertTrue(is_draft_pdf("NSF-2027/drafts/2026.07.28 a T1-slug.pdf"))
+        self.assertFalse(is_draft_pdf("NSF-2027/drafts/2026.07.28 a T1-slug.md"))
+        self.assertFalse(is_draft_pdf("NSF-2027/context/notes.pdf"))
+
+    def test_pdf_rel_is_derived_from_the_md_not_composed(self):
+        md = next_draft_rel(self.root, "NSF-2027", "T1-slug", date(2026, 7, 28))
+        self.assertEqual(
+            draft_pdf_rel_for(md), "NSF-2027/2026.07.28 a T1-slug.pdf"
+        )
+
+    def test_pdf_rel_is_derived_for_an_outline_too(self):
+        self.assertEqual(
+            draft_pdf_rel_for("NSF-2027/outlines/T1-slug.md"),
+            "NSF-2027/outlines/T1-slug.pdf",
+        )
+        self.assertEqual(
+            draft_tex_rel_for("NSF-2027/outlines/T1-slug.md"),
+            "NSF-2027/outlines/tex/T1-slug.tex",
+        )
+
+    def test_a_versioned_outline_keeps_its_version_in_the_companion(self):
+        """Otherwise -v2's PDF would overwrite -v1's, which the chokepoint
+        would refuse - correctly, but with a baffling error."""
+        self.assertEqual(
+            draft_pdf_rel_for("NSF-2027/outlines/T1-slug-v2.md"),
+            "NSF-2027/outlines/T1-slug-v2.pdf",
+        )
+        self.assertEqual(
+            companion_md_rel_for("NSF-2027/outlines/tex/T1-slug-v2.tex"),
+            "NSF-2027/outlines/T1-slug-v2.md",
+        )
+
+    def test_pdf_rel_refuses_a_source_that_is_neither_outline_nor_draft(self):
+        for rel in ("NSF-2027/topics.md", "OPEN.md", "CORPUS.md"):
+            with self.subTest(rel=rel):
+                with self.assertRaises(PathRefused):
+                    draft_pdf_rel_for(rel)
+
+    def setUp(self):
+        self.root = make_test_root()
+        configure_env(self.root)
+
+
+class DraftTexGrammarTests(unittest.TestCase):
+    def setUp(self):
+        self.root = make_test_root()
+        configure_env(self.root)
+
+    def test_tex_and_bib_under_drafts_tex_are_create_targets(self):
+        for ext in ("tex", "bib"):
+            with self.subTest(ext=ext):
+                self.assertEqual(
+                    write_mode_for(f"NSF-2027/drafts/tex/2026.07.28 a T1-slug.{ext}"),
+                    "create",
+                )
+
+    def test_tex_must_live_in_the_subfolder_not_beside_the_draft(self):
+        """Keeping sources out of drafts/ is the point of the subfolder; if the
+        grammar accepted both, they would end up in both."""
+        with self.assertRaises(PathRefused):
+            write_mode_for("NSF-2027/drafts/2026.07.28 a T1-slug.tex")
+
+    def test_tex_subfolder_does_not_admit_arbitrary_extensions(self):
+        for rel in (
+            "NSF-2027/drafts/tex/2026.07.28 a T1-slug.aux",
+            "NSF-2027/drafts/tex/2026.07.28 a T1-slug.log",
+            "NSF-2027/drafts/tex/2026.07.28 a T1-slug.pdf",
+            "NSF-2027/drafts/tex/notes.tex",
+        ):
+            with self.subTest(rel=rel):
+                with self.assertRaises(PathRefused):
+                    write_mode_for(rel)
+
+    def test_tex_rel_is_derived_from_the_md(self):
+        md = next_draft_rel(self.root, "NSF-2027", "T1-slug", date(2026, 7, 28))
+        self.assertEqual(
+            draft_tex_rel_for(md), "NSF-2027/tex/2026.07.28 a T1-slug.tex"
+        )
+        self.assertEqual(
+            draft_tex_rel_for(md, "bib"), "NSF-2027/tex/2026.07.28 a T1-slug.bib"
+        )
+
+    def test_legacy_drafts_location_still_derives_its_own_companions(self):
+        """Drafts already published under drafts/ must keep working - they
+        exist in the archive and cannot be moved."""
+        md = next_draft_rel(
+            self.root, "NSF-2027", "T1-slug", date(2026, 7, 28), in_call_root=False
+        )
+        self.assertEqual(md, "NSF-2027/drafts/2026.07.28 a T1-slug.md")
+        self.assertEqual(
+            draft_tex_rel_for(md), "NSF-2027/drafts/tex/2026.07.28 a T1-slug.tex"
+        )
+
+    def test_the_letter_does_not_collide_across_the_two_locations(self):
+        """A draft in the call root and one in drafts/ are different documents;
+        letting them share a letter would make the version ambiguous."""
+        call = self.root / "NSF-2027"
+        (call / "drafts").mkdir(parents=True)
+        (call / "drafts" / "2026.07.28 a T1-slug.md").write_text("x", encoding="utf-8")
+        rel = next_draft_rel(self.root, "NSF-2027", "T1-slug", date(2026, 7, 28))
+        self.assertEqual(rel, "NSF-2027/2026.07.28 b T1-slug.md")
+
+    def test_tex_rel_refuses_a_build_artefact_extension(self):
+        md = next_draft_rel(self.root, "NSF-2027", "T1-slug", date(2026, 7, 28))
+        with self.assertRaises(PathRefused):
+            draft_tex_rel_for(md, "aux")
+
+    def test_companion_md_rel_round_trips_for_both_companion_kinds(self):
+        md = "NSF-2027/drafts/2026.07.28 a T1-slug.md"
+        for companion in (draft_pdf_rel_for(md), draft_tex_rel_for(md),
+                          draft_tex_rel_for(md, "bib")):
+            with self.subTest(companion=companion):
+                self.assertTrue(is_draft_companion(companion))
+                self.assertEqual(companion_md_rel_for(companion), md)
+
+    def test_companion_md_rel_refuses_a_non_companion(self):
+        with self.assertRaises(PathRefused):
+            companion_md_rel_for("NSF-2027/topics.md")
+
+
+class ContextFolderIsNeverWritableTests(unittest.TestCase):
+    """`<call>/context/` is Alon's, for material he drops in to steer a picked
+    direction. It is an input only, so every write to it must be refused by the
+    grammar rather than by anyone remembering not to."""
+
+    def test_context_paths_are_refused(self):
+        for rel in (
+            "NSF-2027/context/notes.md",
+            "NSF-2027/context/paper.pdf",
+            "NSF-2027/context/sub/thing.md",
+            "NSF-2027/context.md",
+        ):
+            with self.subTest(rel=rel):
+                with self.assertRaises(PathRefused):
+                    write_mode_for(rel)
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProposalGrammarTests(unittest.TestCase):
+    """The full draft proposal lives in the call folder itself."""
+
+    def setUp(self):
+        self.root = make_test_root()
+        configure_env(self.root)
+
+    def test_proposal_md_pdf_and_tex_are_creatable(self):
+        for rel in (
+            "NSF-2027/2026.07.28 a T1-slug.md",
+            "NSF-2027/2026.07.28 a T1-slug.pdf",
+            "NSF-2027/tex/2026.07.28 a T1-slug.tex",
+            "NSF-2027/tex/2026.07.28 a T1-slug.bib",
+        ):
+            with self.subTest(rel=rel):
+                self.assertEqual(write_mode_for(rel), "create")
+
+    def test_a_proposal_pdf_finds_its_markdown(self):
+        self.assertEqual(
+            companion_md_rel_for("NSF-2027/2026.07.28 a T1-slug.pdf"),
+            "NSF-2027/2026.07.28 a T1-slug.md",
+        )
+        self.assertEqual(
+            companion_md_rel_for("NSF-2027/tex/2026.07.28 a T1-slug.tex"),
+            "NSF-2027/2026.07.28 a T1-slug.md",
+        )
+
+    def test_a_bare_name_at_the_call_root_is_still_refused(self):
+        """Only the date-letter convention is ours. Anything else at the call
+        root is Alon's material and must never be a write target."""
+        for rel in (
+            "NSF-2027/proposal.md",
+            "NSF-2027/2026.07.28 T1-slug.md",   # no letter
+            "NSF-2027/notes.pdf",
+        ):
+            with self.subTest(rel=rel):
+                with self.assertRaises(PathRefused):
+                    write_mode_for(rel)
+
+
+class FigureGrammarTests(unittest.TestCase):
+    def setUp(self):
+        self.root = make_test_root()
+        configure_env(self.root)
+
+    def test_figure_source_and_image_are_creatable(self):
+        for ext in ("tex", "pdf", "png"):
+            with self.subTest(ext=ext):
+                self.assertEqual(
+                    write_mode_for(f"NSF-2027/grf/wp-gantt/wp-gantt.{ext}"), "create"
+                )
+
+    def test_the_file_must_be_named_after_its_folder(self):
+        """One figure per folder, self-describing. A folder holding several
+        differently-named images is how a figure gets separated from the
+        source that made it."""
+        with self.assertRaises(PathRefused):
+            write_mode_for("NSF-2027/grf/wp-gantt/something-else.pdf")
+
+    def test_figure_rel_for_builds_the_path(self):
+        self.assertEqual(
+            figure_rel_for("NSF-2027", "wp-gantt"), "NSF-2027/grf/wp-gantt/wp-gantt.pdf"
+        )
+        self.assertEqual(
+            figure_rel_for("NSF-2027", "wp-gantt", "tex"),
+            "NSF-2027/grf/wp-gantt/wp-gantt.tex",
+        )
+
+    def test_a_bad_figure_name_is_refused_before_it_becomes_a_folder(self):
+        for slug in ("WP Gantt", "wp/gantt", "../escape", "wp_gantt", ""):
+            with self.subTest(slug=slug):
+                with self.assertRaises(PathRefused):
+                    figure_rel_for("NSF-2027", slug)
+
+    def test_a_figure_is_not_a_companion(self):
+        """Companions borrow provenance from a markdown sibling; a figure has
+        none, so it must not reach the companion writer."""
+        rel = "NSF-2027/grf/wp-gantt/wp-gantt.pdf"
+        self.assertTrue(is_figure(rel))
+        self.assertFalse(is_draft_companion(rel))
+
+    def test_no_build_artefacts_are_publishable(self):
+        for ext in ("aux", "log", "out", "synctex.gz"):
+            with self.subTest(ext=ext):
+                with self.assertRaises(PathRefused):
+                    write_mode_for(f"NSF-2027/grf/wp-gantt/wp-gantt.{ext}")
