@@ -25,10 +25,10 @@ setup_install() {
   : > "$SB/calls.log"
 }
 
-run_install() { # extra env assignments passed through
+run_install() { # any args are extra VAR=value assignments, applied after ours
   env PATH="$FAKEBIN:$PATH" HOME="$SB/home" \
       CLAUDE_SETTINGS="$SB/settings.json" AUTODEV_HOME="$SB/home/agents" \
-      bash "$BIN/install.sh" >"$SB/install.out" 2>&1
+      "$@" bash "$BIN/install.sh" >"$SB/install.out" 2>&1
 }
 
 UNIT_DIR_REL=".config/systemd/user"
@@ -44,13 +44,31 @@ assert_file "install writes the sweeper service unit" "$svc"
 assert_file "install writes the sweeper timer unit" "$tmr"
 
 # THE regression guard. Without this line the sweeper is installed but inert.
-assert_contains "service sets KillMode=process so spawned watchers survive" "$(cat "$svc")" "KillMode=process"
-assert_contains "service runs the sweeper" "$(cat "$svc")" "auto-handoff-sweep.sh"
-assert_contains "service pins AUTODEV_HOME" "$(cat "$svc")" "AUTODEV_HOME=$SB/home/agents"
-assert_contains "timer repeats on an interval" "$(cat "$tmr")" "OnUnitActiveSec="
-assert_contains "timer is wanted by timers.target" "$(cat "$tmr")" "WantedBy=timers.target"
+# Line-anchored deliberately: the unit carries comments that mention
+# KillMode=process, so a substring match passes even with the directive deleted.
+assert_line "service sets KillMode=process so spawned watchers survive" "$(cat "$svc")" "KillMode=process"
+assert_line "service is a oneshot" "$(cat "$svc")" "Type=oneshot"
+assert_line "service runs the sweeper" "$(cat "$svc")" "ExecStart=$BIN/auto-handoff-sweep.sh"
+assert_line "service pins AUTODEV_HOME" "$(cat "$svc")" "Environment=AUTODEV_HOME=$SB/home/agents"
+assert_line_start "timer repeats on an interval" "$(cat "$tmr")" "OnUnitActiveSec="
+assert_line "default sweep interval is 3min" "$(cat "$tmr")" "OnUnitActiveSec=3min"
+assert_line "timer is wanted by timers.target" "$(cat "$tmr")" "WantedBy=timers.target"
 assert_contains "install enables the timer" "$(cat "$SB/calls.log")" "enable --now auto-handoff-sweep.timer"
 assert_contains "install reports how the sweeper was wired" "$(cat "$SB/install.out")" "sweeper"
+sandbox_rm
+
+echo "== the sweep interval is configurable =="
+
+# The assertions above pin the DEFAULT interval. This one pins the plumbing:
+# AUTODEV_SWEEP_EVERY has to survive install.sh and land in the generated unit.
+# Without it the variable could quietly stop being honoured — the unit would
+# still carry a valid OnUnitActiveSec, so every other assertion here would pass
+# while the operator's chosen cadence was silently ignored.
+setup_install
+run_install AUTODEV_SWEEP_EVERY=45s
+tmr="$SB/home/$UNIT_DIR_REL/auto-handoff-sweep.timer"
+assert_line "AUTODEV_SWEEP_EVERY reaches the generated timer" "$(cat "$tmr")" "OnUnitActiveSec=45s"
+assert_contains "install reports the configured interval" "$(cat "$SB/install.out")" "45s"
 sandbox_rm
 
 echo "== hooks are still registered, without duplicates =="

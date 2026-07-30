@@ -75,6 +75,13 @@ _fail() {
 assert_eq()           { [ "$2" = "$3" ] && _pass "$1" || _fail "$1" "expected [$3], got [$2]"; }
 assert_contains()     { case "$2" in *"$3"*) _pass "$1";; *) _fail "$1" "expected to contain [$3], got [$2]";; esac; }
 assert_not_contains() { case "$2" in *"$3"*) _fail "$1" "must NOT contain [$3], got [$2]";; *) _pass "$1";; esac; }
+# For config files, assert on a WHOLE LINE, never a substring. The generated
+# systemd unit carries comments explaining its own directives, so a substring
+# match for "KillMode=process" also matches the prose describing it and passes
+# with the directive deleted — a guard that guards nothing.
+assert_line()       { printf '%s\n' "$2" | grep -qxF -- "$3" && _pass "$1" || _fail "$1" "no line exactly [$3]"; }
+assert_line_start() { printf '%s\n' "$2" | grep -qF -- "$3" && printf '%s\n' "$2" | grep -q "^$(printf '%s' "$3" | sed 's/[][\.*^$\/]/\\&/g')" && _pass "$1" || _fail "$1" "no line starting [$3]"; }
+
 assert_file()         { [ -f "$2" ] && _pass "$1" || _fail "$1" "missing file: $2"; }
 assert_no_file()      { [ -f "$2" ] && _fail "$1" "file should not exist: $2" || _pass "$1"; }
 
