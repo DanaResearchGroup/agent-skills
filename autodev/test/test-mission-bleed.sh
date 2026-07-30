@@ -63,6 +63,24 @@ assert_contains "hook: own pointer => names our own handoff" "$ctx" "$H2"
 assert_not_contains "hook: own pointer => never names the foreign one" "$ctx" "$H1"
 sandbox_rm
 
+# Hold a live cycle lock for a session, the way the watcher does mid-cycle.
+#
+# request-handoff.sh tests the lock with `kill -0`, so a pid that exits first
+# makes the lock look STALE and the deferral is never exercised. That must not be
+# allowed to pass quietly: the non-deferred path writes the pointer too, so the
+# pointer assertion below — the actual regression guard — would go green against
+# the very ordering it exists to catch. Hence both the generous margin (the pid is
+# killed immediately after, so it costs no runtime) and the explicit liveness
+# check, which turns a dead pid into a loud harness failure instead.
+hold_cycle_lock() { # $1 = sid; sets $lockpid
+  sleep 300 & lockpid=$!
+  mkdir -p "$STATE/$1.cycle.lock"
+  printf '%s\n' "$lockpid" > "$STATE/$1.cycle.lock/pid"
+  kill -0 "$lockpid" 2>/dev/null ||
+    _fail "harness: cycle-lock pid died before the test ran" "the deferral was never exercised"
+}
+release_cycle_lock() { kill "$lockpid" 2>/dev/null; wait "$lockpid" 2>/dev/null; }
+
 echo "== request-handoff.sh =="
 
 # The pointer must be derived from the path the session actually wrote, not
@@ -72,6 +90,37 @@ printf '%s\n' "$H1" > "$AUTODEV_HOME/handoffs/.latest"   # clobbered by S1 alrea
 bash "$BIN/request-handoff.sh" "$S2" --compact-only --handoff "$H2" >/dev/null 2>&1
 got=$(cat "$AUTODEV_HOME/handoffs/.latest.$S2" 2>/dev/null)
 assert_eq "request-handoff: --handoff wins over a clobbered .latest" "$got" "$H2"
+sandbox_rm
+
+# THE regression guard for the ordering bug. When the watcher itself drove the
+# /handoff, its cycle lock is live while the handoff skill runs — so "deferred,
+# no marker filed" is the NORMAL threshold-path outcome, not an edge case. With
+# the pointer write behind that deferral it never happened on that route, and the
+# reload silently degraded to the mtime-proof bridge, which a concurrent session
+# writing the shared .latest can defeat. Recording our own handoff is idempotent
+# and races nothing, so it must happen before any early return.
+setup
+hold_cycle_lock "$S2"
+printf '%s\n' "$H1" > "$AUTODEV_HOME/handoffs/.latest"
+out=$(bash "$BIN/request-handoff.sh" "$S2" --compact-only --handoff "$H2" 2>&1)
+release_cycle_lock
+got=$(cat "$AUTODEV_HOME/handoffs/.latest.$S2" 2>/dev/null)
+assert_eq "request-handoff: mid-cycle still records the pointer" "$got" "$H2"
+assert_no_file "request-handoff: mid-cycle files no compact-request" "$STATE/$S2.compact-request"
+assert_contains "request-handoff: mid-cycle says why nothing was filed" "$out" "already mid-cycle"
+sandbox_rm
+
+# Deferring with no --handoff cannot record anything authoritative. The racy
+# shared-.latest copy must NOT be promoted up here: a fresh pointer makes the
+# watcher skip its bridge, so a mid-cycle copy would replace the bridge's mtime
+# proof with something weaker. Warn the caller instead.
+setup
+hold_cycle_lock "$S2"
+printf '%s\n' "$H1" > "$AUTODEV_HOME/handoffs/.latest"
+out=$(bash "$BIN/request-handoff.sh" "$S2" --compact-only 2>&1)
+release_cycle_lock
+assert_no_file "request-handoff: mid-cycle never copies the shared .latest" "$AUTODEV_HOME/handoffs/.latest.$S2"
+assert_contains "request-handoff: mid-cycle without --handoff warns" "$out" "no reload pointer"
 sandbox_rm
 
 echo "== auto-handoff-watch.sh reload =="

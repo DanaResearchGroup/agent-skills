@@ -124,7 +124,14 @@ is what makes a below-threshold handoff actually compact instead of silently sta
 never double-fires a compact.
 
 `--compact-only --handoff <path>` records the **per-session** reload pointer
-`~/agents/handoffs/.latest.<sid>`, naming the file the session just wrote.
+`~/agents/handoffs/.latest.<sid>`, naming the file the session just wrote. It does so **before**
+the deferral above, and therefore records it even when no marker is filed. That ordering is
+load-bearing rather than tidy: on the threshold path the watcher sends the `/handoff` itself, so
+its cycle lock is *always* live while the handoff skill runs, and the deferral is the common case,
+not an edge case. A pointer written after the check would never be written on the harness's main
+route — the reload would fall back to the mtime bridge below, which a concurrent writer can
+defeat. Recording which handoff *we* wrote is bookkeeping about ourselves: idempotent, racing
+nothing, and correct whether or not a cycle gets filed.
 
 This is the only pointer that is ever read back. `~/agents/handoffs/.latest` is shared,
 machine-wide and last-writer-wins: on a box running many concurrent sessions it names whoever
