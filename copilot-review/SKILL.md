@@ -1,6 +1,6 @@
 ---
 name: copilot-review
-description: Fix a PR's Copilot / GitHub Advanced Security bot review — triage each finding, fix the real ones, and fold the fixes back into history.
+description: Fix a PR's Copilot / GitHub Advanced Security bot review — triage each finding, fix the real ones, then squash each fix into the commit it fixes and force-push with lease.
 disable-model-invocation: true
 ---
 
@@ -87,6 +87,13 @@ rule, history rewrites and force-pushes need approval.
 
 Make the code changes for each **address** item. Run the repo's tests/linters if the change is
 non-trivial and they're quick; report honestly if anything fails.
+
+**Writing the fixes is NOT the end state.** Whoever makes the changes carries them all the way
+through step 5 in the same session: squash each fix into the commit it fixes, then
+`git push --force-with-lease`. Do not stop here and hand back a dirty worktree or a branch of
+loose "address review" commits for someone else to fold in — the approval you obtained in step 3
+was approval to rewrite history and force-push, so finish the job. If a fix turns out to be
+blocked, squash and push the ones that aren't and say plainly which you left and why.
 
 **Done when:** every **address**-classified item from step 3 has a corresponding code change (or is
 explicitly re-classified as skip with a one-line reason), and any tests/linters you ran are reported.
