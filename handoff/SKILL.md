@@ -104,7 +104,10 @@ Resolve as follows:
 
 - **A marker file exists** → the cycle will run. Emit the block below and end the turn.
 - **No marker, but the script said it was already mid-cycle** → fine, the in-flight cycle will
-  compact. Say so explicitly in your message so the user can see why nothing was filed.
+  compact. This is the *normal* outcome when the watcher itself sent the `/handoff` you are
+  answering: its cycle lock is live for the whole turn. Say so explicitly in your message so the
+  user can see why nothing was filed, and check `.latest.$sid` below — the pointer is recorded even
+  on this path, so if it is missing something else is wrong.
 - **No marker and no mid-cycle** → retry the script; if it still files nothing, tell the user
   plainly that automation is not attached and ask them to run `/compact`. Never end the turn
   silently here.
