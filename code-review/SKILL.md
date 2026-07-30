@@ -79,6 +79,21 @@ Present the two reports under `## Standards` and `## Spec` headings, verbatim or
 
 End with a one-line summary: total findings per axis, and the worst issue _within each axis_ (if any). Don't pick a single winner across axes — that's the reranking the separation exists to prevent.
 
+### 6. Offer the artifact
+
+Both reports exist only in this conversation, and the reader who has to act on them is usually the session that wrote the code. Close by offering to persist them:
+
+> Run `/drop-review` to write this review to a file the authoring session can act on.
+
+Offer it once, and offer it even when both axes came back clean — `drop-review` records negative results as their own section, which is the evidence that something was checked and found sound rather than never looked at.
+
+Then **stop**. `drop-review` sets `disable-model-invocation`, so running it is the user's call; suggest it and end your turn rather than trying to invoke it.
+
+Carry forward the two things `drop-review` cannot re-derive once this context is gone:
+
+- **Bookends** — repo, branch, `git rev-parse HEAD`, and the *resolved SHA* of the step-1 fixed point, not the ref you were handed. A branch moves, so a review pinned to `main` is pinned to nothing. If HEAD moved mid-review, say so and name which findings predate the move.
+- **Provenance** — the sub-agents established their findings by reading lines and reasoning, not by running anything, so they cap at **8** on `drop-review`'s scale (10 means you executed the failure and can paste the output). Say so when you hand off, or the artifact will present read-and-reasoned findings with more confidence than they earned.
+
 ## Why two axes
 
 A change can pass one axis and fail the other:
