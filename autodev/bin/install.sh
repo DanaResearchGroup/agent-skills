@@ -67,6 +67,15 @@ Description=Claude Code auto-handoff sweeper (level trigger for parked sessions)
 
 [Service]
 Type=oneshot
+# KillMode=process is REQUIRED, not a tuning knob. The sweeper's whole job is to
+# launch detached watchers and exit immediately. Under the default
+# KillMode=control-group, systemd tears down the service cgroup the moment
+# ExecStart returns — killing every watcher it just spawned, setsid or not. The
+# sweeper then looks perfectly healthy in the log ("SWEEP re-arming watcher...")
+# while nothing ever happens: the watcher survives just long enough to write its
+# heartbeat and dies before any gate that logs. Verified both ways: with the
+# default the child is reaped, with KillMode=process it survives.
+KillMode=process
 Environment=AUTODEV_HOME=$AUTODEV_HOME
 ExecStart=$SWEEP
 EOF
