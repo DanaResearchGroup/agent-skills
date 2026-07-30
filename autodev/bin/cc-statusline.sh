@@ -40,6 +40,11 @@ if [ -n "$sid" ] && [ -f "$lw" ]; then
   badge="\033[1;5;97;45m ⏳ AUTO-RESUME @ ${lw_h:-reset} \033[0m"  # bold + blink, white on magenta
 elif [ -f "$STATE/disable-auto-compact" ]; then
   badge="\033[1;97;100m ⛔ AUTO-HANDOFF: OFF \033[0m"        # bold white on grey
+elif [ -n "$sid" ] && [ -f "$STATE/$sid.stuck" ]; then
+  # auto-handoff-sweep.sh gave up after repeated aborted cycles. Without this the
+  # pane keeps showing a healthy ARMED badge while nothing will ever hand off
+  # again — the exact "looks fine, is dead" state this harness exists to prevent.
+  badge="\033[1;5;97;101m ⚠ AUTO-HANDOFF STUCK — /compact yourself \033[0m"  # bold + blink, white on bright red
 elif [ -f "$STATE/auto-handoff.armed" ]; then
   badge="\033[1;5;97;41m 🔴 AUTO-HANDOFF: ARMED \033[0m"     # bold + blink, white on red
 else

@@ -42,26 +42,34 @@ _HERE="$(cd "$(dirname "$0")" && pwd)"
 # without it we fall back to $CLAUDE_CODE_SESSION_ID.
 [ -f "$_HERE/mux-lib.sh" ] && . "$_HERE/mux-lib.sh"
 
-usage(){ echo "usage: $(basename "$0") [sid] [--cancel] [--compact-only]" >&2; exit 2; }
+usage(){ echo "usage: $(basename "$0") [sid] [--cancel] [--compact-only] [--handoff <path>]" >&2; exit 2; }
 
 # --- parse args (a lone non-flag token is an explicit sid) ---
 # --compact-only raises a *compact-request* instead of a handoff-request: the
 # session has ALREADY written its handoff and only needs the watcher to finish
-# (skip /handoff, go straight to /compact -> reload). It also snapshots the
-# global .latest pointer into a per-session .latest.<sid> so the reload is immune
-# to another concurrent session clobbering .latest.
+# (skip /handoff, go straight to /compact -> reload). It also records the
+# per-session reload pointer .latest.<sid>.
+# --handoff <path> names the handoff this session just wrote. ALWAYS pass it:
+# without it we can only copy the shared, machine-wide .latest, which any of the
+# concurrent sessions on this box may already have clobbered.
 CANCEL=0
 COMPACT_ONLY=0
 SID_ARG=""
+HANDOFF=""
+want_handoff=0
 for a in "$@"; do
+  if [ "$want_handoff" = 1 ]; then HANDOFF="$a"; want_handoff=0; continue; fi
   case "$a" in
     --cancel) CANCEL=1 ;;
     --compact-only) COMPACT_ONLY=1 ;;
+    --handoff) want_handoff=1 ;;
+    --handoff=*) HANDOFF="${a#--handoff=}" ;;
     -h|--help) usage ;;
     -*) echo "unknown option: $a" >&2; usage ;;
     *) [ -n "$SID_ARG" ] && { echo "too many arguments" >&2; usage; }; SID_ARG="$a" ;;
   esac
 done
+[ "$want_handoff" = 1 ] && { echo "--handoff requires a path" >&2; usage; }
 
 # --- resolve this session's sid ---
 # Priority: explicit arg > $CLAUDE_CODE_SESSION_ID > reverse pane-owner file.
@@ -170,17 +178,35 @@ tmp="$req.tmp.$$"
 : > "$tmp" 2>/dev/null && mv -f "$tmp" "$req" 2>/dev/null || {
   rm -f "$tmp" 2>/dev/null; echo "failed to write $req" >&2; exit 2; }
 
-# For compact-only, snapshot the global .latest pointer into a per-session copy
-# NOW, while it still names THIS session's just-written handoff. The reload step
-# (watcher / SessionStart hook) prefers .latest.<sid>, so a later clobber of the
-# shared .latest by another concurrent session cannot redirect our reload.
+# Record the per-session reload pointer. The watcher and the SessionStart hook
+# read ONLY .latest.<sid>, so this is what makes the post-compaction reload land
+# on our own mission instead of whichever session happened to hand off last.
+#
+# --handoff is authoritative: the caller names the file it just wrote, so no
+# shared state is consulted and there is nothing to race. Copying the shared
+# .latest is the legacy path and is inherently racy — another session can clobber
+# it between the handoff being written and this copy, which would cache THEIR
+# mission as ours permanently and invisibly. We keep it only so an older handoff
+# skill still works, and we say plainly in the log that it was used.
 if [ "$COMPACT_ONLY" = 1 ]; then
-  gl="$AUTODEV_HOME/handoffs/.latest"
   per="$AUTODEV_HOME/handoffs/.latest.$sid"
-  if [ -s "$gl" ]; then
+  if [ -n "$HANDOFF" ]; then
+    case "$HANDOFF" in
+      /*) ;;
+      *) echo "--handoff must be an absolute path: '$HANDOFF'" >&2; exit 2 ;;
+    esac
+    [ -f "$HANDOFF" ] || { echo "--handoff names a missing file: '$HANDOFF'" >&2; exit 2; }
     ptmp="$per.tmp.$$"
-    cp -f "$gl" "$ptmp" 2>/dev/null && mv -f "$ptmp" "$per" 2>/dev/null || rm -f "$ptmp" 2>/dev/null
-    log "snapshot .latest -> .latest.$sid"
+    printf '%s\n' "$HANDOFF" > "$ptmp" 2>/dev/null && mv -f "$ptmp" "$per" 2>/dev/null ||
+      { rm -f "$ptmp" 2>/dev/null; echo "failed to write $per" >&2; exit 2; }
+    log "pointer .latest.$sid -> $HANDOFF (explicit)"
+  else
+    gl="$AUTODEV_HOME/handoffs/.latest"
+    if [ -s "$gl" ]; then
+      ptmp="$per.tmp.$$"
+      cp -f "$gl" "$ptmp" 2>/dev/null && mv -f "$ptmp" "$per" 2>/dev/null || rm -f "$ptmp" 2>/dev/null
+      log "WARN legacy copy .latest -> .latest.$sid (racy; caller should pass --handoff)"
+    fi
   fi
 fi
 

@@ -27,9 +27,21 @@ autodev/
     cc-stop-hook.sh            # Stop hook: marks idle, launches both watchers (via $HERE)
     cc-sessionstart-compact.sh # SessionStart(compact) hook: reload-after-compaction backup
     auto-handoff-watch.sh      # engine: context-threshold (or handoff-request marker) → handoff/compact/reload
+    auto-handoff-sweep.sh      # LEVEL trigger: timer-driven; re-arms the engine for parked sessions
     request-handoff.sh         # helper: raise/cancel a voluntary below-threshold handoff-request for this session
     session-resume-watch.sh    # Phoenix engine: usage/session-limit → credits / wait → continue
+  tests/                       # bash tests: run tests/run-all.sh (uses a sandbox, never your real ~/agents)
 ```
+
+**Edge vs. level.** `cc-stop-hook.sh` launches the watcher at a *turn end* — an edge. The
+condition the watcher guards ("this session is parked with a full context") is a *level*. A
+parked session emits no more edges and its context % never rises, so every declined evaluation
+(busy pane, cooldown, aborted cycle) used to be final and the session waited forever.
+`auto-handoff-sweep.sh` runs from a systemd user timer (cron fallback) every few minutes and
+re-invokes the watcher for any session that still looks like it needs a cycle. It decides
+nothing itself — the watcher re-applies every gate. After `MAX_ABORTS` consecutive aborted
+cycles it stops retrying and raises `<sid>.stuck`, which the status line shows as
+**⚠ AUTO-HANDOFF STUCK**, so a wedged session cannot keep looking healthy.
 
 **Code vs. data.** The scripts live in the skill (version-controlled). Runtime *data* —
 state, logs, handoffs, sparring records, autodev progress — lives under **`AUTODEV_HOME`**
@@ -105,12 +117,23 @@ is what makes a below-threshold handoff actually compact instead of silently sta
 **defers** (no marker) when the watcher is already mid-cycle, so a watcher-driven `/handoff`
 never double-fires a compact.
 
-`--compact-only` also snapshots the shared `.latest` pointer into a per-session
-`~/agents/handoffs/.latest.<sid>` at request time. The watcher and the post-compaction
-SessionStart hook both **prefer** `.latest.<sid>` over the shared `.latest`, so a reload always
-resumes *this* session's handoff even if another concurrent session clobbered the shared pointer
-in between (it is last-writer-wins). In the threshold path the watcher takes the same snapshot
-right after its own `/handoff`.
+`--compact-only --handoff <path>` records the **per-session** reload pointer
+`~/agents/handoffs/.latest.<sid>`, naming the file the session just wrote.
+
+This is the only pointer that is ever read back. `~/agents/handoffs/.latest` is shared,
+machine-wide and last-writer-wins: on a box running many concurrent sessions it names whoever
+handed off most recently. The watcher and the post-compaction SessionStart hook therefore read
+**only** `.latest.<sid>` and **never fall back** to the shared file (nor to "the newest handoff
+in the directory"). A missing pointer **fails closed** — the session is told to re-orient from
+its own transcript. Resuming nothing is recoverable; silently resuming another session's mission
+while the pane still reads healthy is not.
+
+Always pass `--handoff`. Without it the helper can only *copy* the shared `.latest`, which is a
+race, not a safeguard: another session can clobber it between the handoff being written and the
+copy, permanently caching their mission as ours. That legacy path is kept only for older handoff
+skills and logs a `WARN`. In the threshold path the watcher accepts the shared `.latest` solely
+when the file it names was written during the `/handoff` turn the watcher itself just drove
+(mtime proof) — the one moment it is provably ours.
 
 Resolution of "this session" is `explicit arg` → `$CLAUDE_CODE_SESSION_ID` → the reverse
 pane-owner file, and it **hard-fails if the env id and the pane owner disagree** rather than

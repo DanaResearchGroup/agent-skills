@@ -22,7 +22,7 @@ SETTINGS="${CLAUDE_SETTINGS:-$HOME/.claude/settings.json}"
 : "${AUTODEV_HOME:=$HOME/agents}"
 
 command -v jq >/dev/null 2>&1 || { echo "error: jq is required" >&2; exit 1; }
-for f in cc-statusline.sh cc-stop-hook.sh cc-sessionstart-compact.sh auto-handoff-watch.sh session-resume-watch.sh request-handoff.sh; do
+for f in cc-statusline.sh cc-stop-hook.sh cc-sessionstart-compact.sh auto-handoff-watch.sh auto-handoff-sweep.sh session-resume-watch.sh request-handoff.sh; do
   [ -f "$HERE/$f" ] || { echo "error: missing $HERE/$f" >&2; exit 1; }
   chmod +x "$HERE/$f"
 done
@@ -50,10 +50,55 @@ jq \
 ' "$SETTINGS" > "$SETTINGS.tmp"
 mv "$SETTINGS.tmp" "$SETTINGS"
 
+# --- level trigger: auto-handoff-sweep.sh on a timer ------------------------
+# The Stop hook only fires the watcher at a turn end, so a session that parks
+# (busy pane, aborted cycle, cooldown) is never re-evaluated and waits forever.
+# The sweeper supplies the missing level trigger. Installed as a systemd user
+# timer where available, cron otherwise. Idempotent either way.
+SWEEP="$HERE/auto-handoff-sweep.sh"
+SWEEP_EVERY="${AUTODEV_SWEEP_EVERY:-3min}"
+sweep_installed=""
+if command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
+  UNIT_DIR="$HOME/.config/systemd/user"
+  mkdir -p "$UNIT_DIR"
+  cat > "$UNIT_DIR/auto-handoff-sweep.service" <<EOF
+[Unit]
+Description=Claude Code auto-handoff sweeper (level trigger for parked sessions)
+
+[Service]
+Type=oneshot
+Environment=AUTODEV_HOME=$AUTODEV_HOME
+ExecStart=$SWEEP
+EOF
+  cat > "$UNIT_DIR/auto-handoff-sweep.timer" <<EOF
+[Unit]
+Description=Run the Claude Code auto-handoff sweeper every $SWEEP_EVERY
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=$SWEEP_EVERY
+
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl --user daemon-reload >/dev/null 2>&1 || true
+  if systemctl --user enable --now auto-handoff-sweep.timer >/dev/null 2>&1; then
+    sweep_installed="systemd user timer (every $SWEEP_EVERY)"
+  fi
+fi
+if [ -z "$sweep_installed" ] && command -v crontab >/dev/null 2>&1; then
+  line="*/5 * * * * AUTODEV_HOME=$AUTODEV_HOME $SWEEP  # autodev-sweep"
+  if (crontab -l 2>/dev/null | grep -v '# autodev-sweep$'; echo "$line") | crontab - 2>/dev/null; then
+    sweep_installed="cron (every 5 min)"
+  fi
+fi
+[ -z "$sweep_installed" ] && sweep_installed="NOT INSTALLED — run $SWEEP from a timer yourself"
+
 echo "installed into: $SETTINGS"
 echo "  statusLine        -> $SL"
 echo "  Stop hook         -> $STOP"
 echo "  SessionStart(compact) -> $SC"
+echo "  sweeper (level trigger) -> $sweep_installed"
 echo "  runtime home (AUTODEV_HOME) -> $AUTODEV_HOME"
 echo
 echo "Takes effect for NEW Claude Code sessions (hooks load at session start)."
