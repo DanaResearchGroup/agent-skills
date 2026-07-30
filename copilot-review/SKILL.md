@@ -1,18 +1,22 @@
 ---
 name: copilot-review
-description: Fix a PR's Copilot / GitHub Advanced Security bot review — triage each finding, fix the real ones, and fold the fixes back into history.
+description: Fix a PR's Copilot / GitHub Advanced Security bot review — triage each finding, fix the real ones, then squash each fix into the commit it fixes, rebase onto the base if it has moved, and force-push with lease.
 disable-model-invocation: true
 ---
 
 # copilot-review
 
 Turn a PR's automated bot review into fixes folded cleanly back into history: **target** the PR →
-**fetch** the bot comments → **triage** them → fix → **fixup** into the right commits and force-push
-with lease.
+**fetch** the bot comments → **triage** them → fix → **fixup** into the right commits, **rebase**
+onto the base if it has moved, and force-push with lease.
 
 ## 1. Target the PR
 
 Resolve to exactly one PR before fetching anything. Its state must be OPEN.
+
+`<remote>` below is the canonical remote — whatever `git remote -v` shows, often `official`, **not**
+`origin`. Resolve it once and substitute it in every command; many repos have no `origin` at all, so
+a copy-pasted `origin/...` fails outright. `BASE` is the PR's `baseRefName` (usually `main`).
 
 - If this session just created or discussed a specific PR, that's the target — confirm its
   number, don't re-derive it.
@@ -88,39 +92,90 @@ rule, history rewrites and force-pushes need approval.
 Make the code changes for each **address** item. Run the repo's tests/linters if the change is
 non-trivial and they're quick; report honestly if anything fails.
 
+**Writing the fixes is NOT the end state.** Whoever makes the changes carries them all the way
+through step 5 in the same session: squash each fix into the commit it fixes, then
+`git push --force-with-lease`. Do not stop here and hand back a dirty worktree or a branch of
+loose "address review" commits for someone else to fold in — the approval you obtained in step 3
+was approval to rewrite history and force-push, so finish the job. If a fix turns out to be
+blocked, squash and push the ones that aren't and say plainly which you left and why.
+
 **Done when:** every **address**-classified item from step 3 has a corresponding code change (or is
 explicitly re-classified as skip with a one-line reason), and any tests/linters you ran are reported.
 
-## 5. Fixup into history and force-push
+## 5. Fixup into history, rebase if behind, force-push
 
 Fold each fix into the commit that introduced the reviewed line rather than stacking "address
-review" commits — one logical change per commit in the final history.
+review" commits — one logical change per commit in the final history. If the base branch has moved
+while the PR sat in review, rebase onto it in the same pass, so the whole rewrite costs one
+force-push rather than two.
 
 ### 5a — Fixup & autosquash
 
 Create one `--fixup` commit per target commit, then autosquash them in.
 
 ```bash
-git log --oneline $(git merge-base HEAD origin/BASE)..HEAD   # find the target commit per fix
-git blame -L START,END -- path/to/file                       # confirm which commit owns the line
-git add path/to/file && git commit --fixup=TARGET_SHA        # one fixup per target commit
+git log --oneline $(git merge-base HEAD <remote>/BASE)..HEAD   # find the target commit per fix
+git blame -L START,END -- path/to/file                         # confirm which commit owns the line
+git add path/to/file && git commit --fixup=TARGET_SHA          # one fixup per target commit
 # ...repeat for each fix, then autosquash them in. A no-op sequence editor makes the interactive
 # rebase run non-interactively — plain `git rebase --autosquash` (without -i) does NOT squash:
-GIT_SEQUENCE_EDITOR=true git rebase -i --autosquash --autostash $(git merge-base HEAD origin/BASE)
+GIT_SEQUENCE_EDITOR=true git rebase -i --autosquash --autostash $(git merge-base HEAD <remote>/BASE)
 ```
 
 A fix with no natural home (addresses freshly added code with no clear owning commit) can stay a
 normal commit — squash only where a target commit clearly owns the line.
 
-### 5b — Verify, then push
+### 5b — Rebase onto the base branch if it has moved
+
+Only if the PR is behind its base. Check first and skip this whole sub-step when it is zero —
+rebasing a branch that is already current rewrites history for nothing:
+
+```bash
+git fetch <remote> --prune
+git rev-list --count HEAD..<remote>/BASE      # 0 => already current, skip to 5c
+```
+
+Do this **after** 5a, never before: autosquashing first means any conflict is resolved once,
+against the final content, instead of once per loose fixup commit.
+
+Clear the same three tripwires the global git rule names before rewriting:
+
+- **No downstream branch** builds on this tip — `git branch --contains HEAD` names only this
+  branch. Rebasing a shared base strands every branch below it on dead SHAs.
+- **The worktree is clean**, and it is **this branch's own** worktree — never rebase a branch that
+  is checked out dirty somewhere else; that is a live session, not debris.
+- If the branch is **shared with collaborators**, do not rebase it. Merge `<remote>/BASE` in
+  instead, or leave it and say why — a force-push can clobber commits they have already based work on.
+
+```bash
+git rebase <remote>/BASE
+```
+
+**On conflict:** resolve it, don't paper over it. Use the `resolving-merge-conflicts` skill — the
+short version is to read both sides and keep the intent of each, rather than taking whichever side
+makes the conflict markers disappear:
+
+```bash
+git status --short                 # UU = both modified; resolve each
+# ...edit each conflicted file, keeping BOTH sides' intent...
+git add <resolved-file>
+git rebase --continue              # repeat until the rebase completes
+git rebase --abort                 # bail out cleanly; leaves the branch exactly as it was
+```
+
+A conflict that you cannot resolve confidently is a stop-and-report, not a guess: `git rebase
+--abort` and tell the user which files collided and why. Re-run the repo's tests after a
+non-trivial conflict resolution — a clean rebase is not proof the merged logic is right.
+
+### 5c — Verify, then push
 
 Verify the squash landed **before** pushing, then push:
 
 ```bash
-git log --oneline $(git merge-base HEAD origin/BASE)..HEAD   # verify: zero `fixup!` subjects remain
+git log --oneline $(git merge-base HEAD <remote>/BASE)..HEAD   # verify: zero `fixup!` subjects remain
 ```
 
-**Done when / blocking:** `git log --oneline $(git merge-base HEAD origin/BASE)..HEAD` shows ZERO
+**Done when / blocking:** `git log --oneline $(git merge-base HEAD <remote>/BASE)..HEAD` shows ZERO
 `fixup!` entries and the expected commit count; only THEN run `git push --force-with-lease`. A stray
 `fixup!` commit reaching the remote is the exact failure this skill exists to prevent, so treat this
 zero-`fixup!` check as a hard gate, not a formality.
@@ -132,6 +187,7 @@ git push --force-with-lease
 Use `--force-with-lease` (never bare `--force`) so a concurrent push on the branch aborts you instead
 of getting clobbered. If the lease is stale, re-fetch and reconcile — don't override with `--force`.
 
-**Done when:** each fix is squashed into its target commit, the branch is force-pushed with lease,
-and the PR head reflects the new history. Optionally reply to or resolve the addressed threads and
-tell the user which comments were skipped and why.
+**Done when:** each fix is squashed into its target commit, the branch sits on top of the current
+base (or is explicitly left behind it with a reason), it is force-pushed with lease, and the PR head
+reflects the new history. Optionally reply to or resolve the addressed threads and tell the user
+which comments were skipped and why.
