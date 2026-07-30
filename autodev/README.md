@@ -30,7 +30,13 @@ autodev/
     auto-handoff-sweep.sh      # LEVEL trigger: timer-driven; re-arms the engine for parked sessions
     request-handoff.sh         # helper: raise/cancel a voluntary below-threshold handoff-request for this session
     session-resume-watch.sh    # Phoenix engine: usage/session-limit → credits / wait → continue
-  tests/                       # bash tests: run tests/run-all.sh (uses a sandbox, never your real ~/agents)
+  test/                        # bash tests: sandboxed, never touch your real ~/agents
+    ci.sh                      # the repo's CI entrypoint (fixed name); runs every suite below
+    lib.sh                     # harness: throwaway AUTODEV_HOME, copied bin/, stubbed multiplexer
+    test-mission-bleed.sh      # a session may only ever be pointed at its OWN handoff
+    test-parked-session.sh     # the sweeper re-arms a session the Stop hook can no longer reach
+    test-abort-recovery.sh     # aborts are counted, retried, then surfaced as STUCK
+    test-install-sweeper.sh    # the generated systemd unit (incl. the KillMode=process guard)
 ```
 
 **Edge vs. level.** `cc-stop-hook.sh` launches the watcher at a *turn end* — an edge. The
