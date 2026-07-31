@@ -32,7 +32,7 @@ mkdir -p "$STATE" "$LOGDIR" 2>/dev/null
 _HERE="$(cd "$(dirname "$0")" && pwd)"
 [ -f "$_HERE/mux-lib.sh" ] && . "$_HERE/mux-lib.sh"
 
-THRESHOLD=30        # act only when used_percentage > THRESHOLD
+THRESHOLD=35        # act only when used_percentage > THRESHOLD
 # Wait timings are env-overridable so the tests can drive a whole cycle in
 # seconds. THRESHOLD and COOLDOWN deliberately are NOT — auto-handoff-sweep.sh
 # hard-codes the same values, and a divergence between the two would be silent.

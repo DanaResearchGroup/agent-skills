@@ -40,7 +40,7 @@ command -v mux_init >/dev/null 2>&1 || exit 0
 
 # These MUST match auto-handoff-watch.sh. The sweeper only prefilters; every one
 # of these is re-checked authoritatively by the watcher itself.
-THRESHOLD=30
+THRESHOLD=35
 COOLDOWN=900
 REQUEST_MAX_AGE=3600
 # After this many consecutive aborted cycles, stop retrying and mark the session

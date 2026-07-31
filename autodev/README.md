@@ -79,7 +79,7 @@ Logs: `$AUTODEV_HOME/logs/{auto-handoff,auto-resume}.log`.
 
 ## Tunables (top of the engine scripts)
 
-- `auto-handoff-watch.sh`: `THRESHOLD=30`, `COOLDOWN=900`, `WAIT_IDLE/WAIT_COMPACT`, `SETTLE`.
+- `auto-handoff-watch.sh`: `THRESHOLD=35`, `COOLDOWN=900`, `WAIT_IDLE/WAIT_COMPACT`, `SETTLE`.
 - `session-resume-watch.sh`: `BUFFER_MIN=4` (minutes past reset), `CREDITS_WAIT`, `WAKE`, `MAX_WAIT`.
 - `auto-handoff-watch.sh`: `REQUEST_MAX_AGE=3600` — TTL for a `handoff-request` / `compact-request` marker.
 
@@ -108,7 +108,7 @@ forgotten request can't fire arbitrarily later.
 
 `--compact-only` is a **third trigger path** for the case where a handoff is *already written*
 (you ran `/handoff` yourself, or the `handoff` skill did) and all that's left is the compact +
-reload. The reactive `THRESHOLD` gate never fires below 30%, and a plain `handoff-request` would
+reload. The reactive `THRESHOLD` gate never fires below 35%, and a plain `handoff-request` would
 make the watcher write a *second, redundant* handoff — so neither fits.
 
 ```bash

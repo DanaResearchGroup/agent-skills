@@ -7,7 +7,7 @@
 # Under systemd it does not. With the default KillMode=control-group, systemd
 # tears the service cgroup down as soon as a Type=oneshot ExecStart returns and
 # kills every watcher the sweep just launched. The failure is silent and reads as
-# success: the log fills with "SWEEP re-arming watcher (pct=... > 30)" every few
+# success: the log fills with "SWEEP re-arming watcher (pct=... > 35)" every few
 # minutes while no cycle ever runs, because the watcher lives just long enough to
 # write its heartbeat. That shipped once; these tests exist so it cannot again.
 #

@@ -83,7 +83,7 @@ printf '%s\n' "$hf" > "$tmp" && mv "$tmp" "$HOME/agents/handoffs/.latest"
 # session may already have clobbered.
 #
 # It also files the compact-request that makes the watcher run /compact + reload
-# even below the 30% threshold. No-op when autodev is not installed; defers on
+# even below the 35% threshold. No-op when autodev is not installed; defers on
 # its own when the watcher is already mid-cycle.
 rh="$HOME/.claude/skills/autodev/bin/request-handoff.sh"
 [ -x "$rh" ] && bash "$rh" --compact-only --handoff "$hf" 2>/dev/null || true
@@ -127,7 +127,7 @@ Handoff written, .latest updated, compact-request filed.
 
 • If this session's status line shows the 🔴 AUTO-HANDOFF badge AND the marker was verified to
   exist above: end the turn — the auto-handoff watcher will run /compact and reload at the next
-  idle Stop (the verified compact-request is what makes this fire below the 30% threshold; the
+  idle Stop (the verified compact-request is what makes this fire below the 35% threshold; the
   threshold alone never fires on an idle session). It CANNOT act while a background agent or
   turn is still running (input would be queued), so make sure nothing is left running.
   "Do nothing" is correct ONLY because a marker was verified — it is never correct on its own.

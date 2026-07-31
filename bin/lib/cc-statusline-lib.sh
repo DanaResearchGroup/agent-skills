@@ -9,12 +9,12 @@
 # when git is absent or the directory is not a work tree).
 
 # cc_ctx_color <pct> -> prints the ANSI colour escape for a context-usage %.
-#   green    <30    comfortable
-#   yellow   30..<40 watch it (the ~30% handoff nudge lives in this band)
+#   green    <35    comfortable
+#   yellow   35..<40 watch it (the ~35% handoff nudge lives in this band)
 #   bold red >=40   handoff territory
 cc_ctx_color() {
   awk -v p="${1:-0}" 'BEGIN{
-    if (p < 30)      printf "\033[32m";
+    if (p < 35)      printf "\033[32m";
     else if (p < 40) printf "\033[33m";
     else             printf "\033[1;31m";
   }'
