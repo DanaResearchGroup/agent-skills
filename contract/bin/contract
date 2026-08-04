@@ -1,0 +1,252 @@
+#!/usr/bin/env bash
+# contract — start gate and durable work note, keyed on the git worktree.
+# State layout:
+#   <worktree>/docs/superpowers/contracts/<slug>.md   the note
+#   <worktree>/docs/superpowers/contracts/ACTIVE      slug of the active note
+#   <git-common-dir>/contract-enabled                 per-repo opt-in marker
+#   <git-common-dir>/contract-skips.log               permanent skip record
+#   <git-common-dir>/contract-skips/<session_id>      session-scoped skip
+#   <git-common-dir>/contract-abandons.log            permanent abandon record
+set -uo pipefail
+
+# Resolve state paths from $1 (a file or dir; defaults to $PWD).
+# Returns 1 when not inside a git worktree. Never exits non-zero itself.
+resolve_paths() {
+  local from="${1:-$PWD}"
+  [ -d "$from" ] || from=$(dirname "$from")
+  [ -d "$from" ] || return 1
+  WT=$(git -C "$from" rev-parse --show-toplevel 2>/dev/null) || return 1
+  [ -n "$WT" ] || return 1
+  local common
+  common=$(git -C "$from" rev-parse --git-common-dir 2>/dev/null) || return 1
+  case "$common" in
+    /*) COMMON="$common" ;;
+    *)  COMMON=$(cd "$from" && cd "$common" 2>/dev/null && pwd) || return 1 ;;
+  esac
+  CDIR="$WT/docs/superpowers/contracts"
+  ACTIVE_FILE="$CDIR/ACTIVE"
+  ENABLED="$COMMON/contract-enabled"
+  SKIPLOG="$COMMON/contract-skips.log"
+  SKIPDIR="$COMMON/contract-skips"
+  ABANDONLOG="$COMMON/contract-abandons.log"
+  return 0
+}
+
+cmd_status() {
+  if ! resolve_paths "${1:-$PWD}"; then
+    printf 'wt=none\ncommon=none\nenabled=no\nactive=none\n'
+    return 0
+  fi
+  printf 'wt=%s\n' "$WT"
+  printf 'common=%s\n' "$COMMON"
+  if [ -f "$ENABLED" ]; then printf 'enabled=yes\n'; else printf 'enabled=no\n'; fi
+  local slug; slug=$(active_slug)
+  if [ -n "$slug" ]; then
+    printf 'active=%s\n' "$slug"
+  else
+    printf 'active=none\n'
+  fi
+}
+
+die() { printf 'contract: %s\n' "$1" >&2; exit 2; }
+
+# Checks for leaked bare identifiers and a missing Verifier section.
+# Necessary, never sufficient — the same caveat pm-creator's lint-prompt carries.
+cmd_lint() {
+  local f="${1:-}"
+  [ -n "$f" ] || die "usage: contract lint <file>"
+  [ -f "$f" ] || die "no such file: $f"
+  local found=0
+
+  # Bare dispatch/ticket identifiers that mean nothing to a fresh worker.
+  while IFS=: read -r ln text; do
+    [ -n "$ln" ] || continue
+    printf '%s:%s: leaked identifier (%s) — a fresh worker cannot resolve it\n' \
+      "$f" "$ln" "$(printf '%s' "$text" | grep -oE '\b[IDQRA]-[0-9]{2,3}\b' | head -1)" >&2
+    found=1
+  done < <(grep -nE '\b[IDQRA]-[0-9]{2,3}\b' "$f" 2>/dev/null)
+
+  if ! grep -qiE '^#+[[:space:]]*Verifier|^Verifier:' "$f"; then
+    printf '%s: no Verifier section — the worker has no definition of done\n' "$f" >&2
+    found=1
+  fi
+
+  return "$found"
+}
+
+require_repo() {
+  resolve_paths "$PWD" || die "not inside a git worktree"
+}
+
+cmd_enable() {
+  require_repo
+  : > "$ENABLED"
+  printf 'contract: gate enabled for %s (covers every worktree of this repo)\n' "$COMMON"
+}
+
+cmd_disable() {
+  require_repo
+  rm -f "$ENABLED"
+  printf 'contract: gate disabled for %s\n' "$COMMON"
+}
+
+# The slug in ACTIVE counts only while its note still exists on disk: a
+# hand-deleted note must fail SAFE (no active contract, gate re-armed), not
+# leave a phantom slug that disables the gate and breaks close.
+active_slug() {
+  local slug
+  { [ -f "$ACTIVE_FILE" ] && [ -s "$ACTIVE_FILE" ]; } || return 0
+  slug=$(cat "$ACTIVE_FILE")
+  [ -f "$CDIR/$slug.md" ] || return 0
+  printf '%s\n' "$slug"
+}
+
+cmd_new() {
+  local slug="${1:-}"
+  [ -n "$slug" ] || die "usage: contract new <slug>"
+  case "$slug" in *[!a-zA-Z0-9._-]*) die "slug must be [a-zA-Z0-9._-]" ;; esac
+  require_repo
+  local cur; cur=$(active_slug)
+  if [ -n "$cur" ]; then
+    printf 'contract: %s is already active in this worktree; close it first\n' "$cur" >&2
+    exit 3
+  fi
+  mkdir -p "$CDIR/closed" || die "cannot create $CDIR"
+  # The contracts dir must ignore itself: rollout repos do not globally
+  # ignore docs/superpowers/, and a tracked note would become git-tracked
+  # runtime state. Idempotent: an existing .gitignore is left alone.
+  if [ ! -f "$CDIR/.gitignore" ]; then
+    printf '*\n' > "$CDIR/.gitignore" || die "cannot write $CDIR/.gitignore"
+  fi
+  local base sha
+  base=$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)
+  sha=$(git -C "$WT" rev-parse --short HEAD 2>/dev/null || echo unknown)
+  if ! cat > "$CDIR/$slug.md" <<EOF
+# Contract — $slug
+
+Opened: $(date -u +%Y-%m-%dT%H:%M:%SZ) · Worktree: $WT · Base: $base@$sha
+
+## Intent
+
+<One paragraph, in the agent's own words, on what changes and for whom.
+ Echoed, never transcribed — restating is what makes a misread visible.>
+
+## Verifier
+
+<A command plus its expected outcome, or an artifact plus what makes it correct.
+ "Tests pass" is not a verifier. A command that exits 0 is.>
+
+## Non-goals
+
+<Answer every category in reference/landmines.md, or mark it N/A.>
+
+## Gates
+
+<Actions requiring explicit user approval before execution.>
+
+## Evidence
+
+EOF
+  then
+    die "cannot write $CDIR/$slug.md"
+  fi
+  if ! printf '%s\n' "$slug" > "$ACTIVE_FILE"; then
+    # Leave no orphan: a note on disk with no ACTIVE claims success while
+    # the gate still denies.
+    rm -f "$CDIR/$slug.md"
+    die "cannot write $ACTIVE_FILE — note removed, no contract is active"
+  fi
+  printf 'contract: opened %s\n' "$CDIR/$slug.md"
+}
+
+cmd_show() {
+  resolve_paths "$PWD" || return 0
+  local slug; slug=$(active_slug)
+  [ -n "$slug" ] || return 0
+  cat "$CDIR/$slug.md"
+}
+
+cmd_close() {
+  require_repo
+  local slug; slug=$(active_slug)
+  [ -n "$slug" ] || die "no active contract in this worktree"
+  local note="$CDIR/$slug.md"
+  # Everything after the Evidence heading must contain a non-blank line.
+  local evidence
+  evidence=$(sed -n '/^## Evidence/,$p' "$note" | tail -n +2 | tr -d '[:space:]')
+  if [ -z "$evidence" ]; then
+    printf 'contract: Evidence is empty in %s — run the verifier and paste its real output first\n' "$note" >&2
+    exit 4
+  fi
+  mkdir -p "$CDIR/closed"
+  mv "$note" "$CDIR/closed/$slug.md"
+  rm -f "$ACTIVE_FILE"
+  printf 'contract: closed %s\n' "$slug"
+}
+
+# Walk away from a contract without evidence: archive the note (marked
+# ABANDONED), clear ACTIVE, log it. Reads ACTIVE raw — not via active_slug —
+# so a contract whose note was hand-deleted can still be cleaned up.
+cmd_abandon() {
+  require_repo
+  local slug=""
+  [ -f "$ACTIVE_FILE" ] && [ -s "$ACTIVE_FILE" ] && slug=$(cat "$ACTIVE_FILE")
+  [ -n "$slug" ] || die "no active contract in this worktree"
+  local reason="${*:-no reason given}"
+  local note="$CDIR/$slug.md"
+  if [ -f "$note" ]; then
+    mkdir -p "$CDIR/closed" || die "cannot create $CDIR/closed"
+    printf '\n## ABANDONED\n\n%s — %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$reason" >> "$note" \
+      || die "cannot mark $note abandoned"
+    mv "$note" "$CDIR/closed/$slug.md" || die "cannot archive $note"
+  fi
+  rm -f "$ACTIVE_FILE"
+  local sanitized
+  sanitized=$(printf '%s' "$reason" | tr '\n\r\t' ' ')
+  printf '%s\t%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$slug" "$WT" "$sanitized" >> "$ABANDONLOG"
+  printf 'contract: abandoned %s — the gate is re-armed\n' "$slug"
+}
+
+cmd_skip() {
+  local sid="${1:-}"; shift 2>/dev/null || true
+  local reason="$*"
+  [ -n "$sid" ] || die "usage: contract skip <session_id> <reason>"
+  case "$sid" in
+    *[!A-Za-z0-9._-]*) die "session id must match [A-Za-z0-9._-]+ — got '$sid' (do not paste the <session_id> placeholder verbatim)" ;;
+  esac
+  [ -n "$reason" ] || die "a reason is required — the escape hatch is logged, not silent"
+  require_repo
+  mkdir -p "$SKIPDIR"
+  printf '%s\n' "$reason" > "$SKIPDIR/$sid"
+  # Sanitize reason for log: collapse newlines, carriage returns, and tabs to single spaces
+  local sanitized_reason
+  sanitized_reason=$(printf '%s' "$reason" | tr '\n\r\t' ' ')
+  printf '%s\t%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$sid" "$WT" "$sanitized_reason" >> "$SKIPLOG"
+  printf 'contract: gate skipped for this session — logged to %s\n' "$SKIPLOG"
+}
+
+cmd_skipped() {
+  local sid="${1:-}"
+  [ -n "$sid" ] || return 1
+  resolve_paths "$PWD" || return 1
+  [ -f "$SKIPDIR/$sid" ]
+}
+
+main() {
+  local sub="${1:-status}"; shift 2>/dev/null || true
+  case "$sub" in
+    status)  cmd_status "$@" ;;
+    enable)  cmd_enable ;;
+    disable) cmd_disable ;;
+    new)     cmd_new "$@" ;;
+    show)    cmd_show ;;
+    close)   cmd_close ;;
+    abandon) cmd_abandon "$@" ;;
+    skip)    cmd_skip "$@" ;;
+    skipped) cmd_skipped "$@" ;;
+    lint)    cmd_lint "$@" ;;
+    *) printf 'contract: unknown subcommand %s\n' "$sub" >&2; return 2 ;;
+  esac
+}
+
+main "$@"
