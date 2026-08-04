@@ -17,7 +17,7 @@ After edits, run `python3 bin/lint-skills.py` to confirm nothing broke.
 | 1 | …are on any machine (everyone) | `handoff/SKILL.md`, `slack-ask/SKILL.md`, `slack-notify/SKILL.md`, `SETUP.md`, `~/.claude/settings.json` | Repo docs use `$HOME/...` and usually need no home-dir edits. `handoff` saves to `$HOME/agents/handoffs/`, and the Slack skills call `$HOME/.claude/bin/cc-slack-post.py`. The `~/.claude/settings.json` allow-rule is the exception: write the literal absolute helper path there, because allow-rules do not expand `$HOME`. |
 | 2 | …want Slack notifications | `slack-ask/SKILL.md`, `slack-notify/SKILL.md`, `SETUP.md`, `~/.claude/settings.json` | Create your own Slack bot token (`~/.claude/.slack-bot-token`, never committed), set your channel (default is `#cc-comm` / `CC_SLACK_CHANNEL`), and allowlist the helper path. Full walkthrough in [SETUP.md](SETUP.md). Otherwise mark N/A and ignore these skills. |
 | 3 | …use an Obsidian vault | `obsidian-vault/SKILL.md`, your private `~/.claude/CLAUDE.md` | Point it at **your** vault path (the author's is under Dropbox). N/A if you don't use Obsidian. |
-| 4 | …everyone (global config) | `~/.claude/CLAUDE.md` (private, **not** in this repo) | Build your own global instructions: the gstack section (added in step 3), your Obsidian path, and any personal preferences. Don't copy the author's verbatim. |
+| 4 | …everyone (global config) | `~/.claude/CLAUDE.md` (private, **not** in this repo) | Build your own global instructions: your Obsidian path and any personal preferences. Don't copy the author's verbatim. |
 
 ## Checklist
 
@@ -29,5 +29,4 @@ After edits, run `python3 bin/lint-skills.py` to confirm nothing broke.
 
 ## Not in this repo (install separately)
 
-- **gstack** — README step 3.
-- **Superpowers** plugin — README step 4.
+- **Superpowers** plugin — README step 3.

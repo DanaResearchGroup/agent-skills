@@ -7,7 +7,7 @@
 # Writes $AUTODEV_HOME/state/codex-spar.<slug>.ctx:  pct=<n> used=<n> win=<n> ts=<epoch>
 # The file is keyed by project slug so the badge reflects THIS repo's spar
 # session, not whichever project sparred last. If the caller omits <slug> it is
-# derived from the current directory (gstack-slug, falling back to the git
+# derived from the current directory (skill-slug, falling back to the git
 # toplevel basename) so the status line resolves the same key.
 # Also echoes `pct=<n>` to stdout so callers can read this specific session's
 # fresh fill % directly.
@@ -22,7 +22,7 @@ state="$AUTODEV_HOME/state"
 mkdir -p "$state" 2>/dev/null || exit 0
 
 if [ -z "$slug" ]; then
-  GS="$HOME/.claude/skills/gstack/bin/gstack-slug"
+  GS="$HOME/.claude/skills/bin/skill-slug"
   [ -x "$GS" ] && slug=$( (eval "$("$GS" 2>/dev/null)" 2>/dev/null; printf '%s' "${SLUG:-}") )
   [ -z "$slug" ] && slug=$(basename "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" | tr -cd 'a-zA-Z0-9._-')
 fi

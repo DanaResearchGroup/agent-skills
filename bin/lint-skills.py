@@ -8,7 +8,7 @@ Checks, per top-level `<skill>/SKILL.md`:
   4. Every relative markdown link target (`](foo.md)`, `](scripts/x.sh)`) exists.
 
 Deliberately NOT checked: cross-skill `/other-skill` references — many legitimately
-point at gstack / superpowers skills that don't live in this repo, so checking them
+point at superpowers skills that don't live in this repo, so checking them
 here would only produce false positives.
 
 Run locally with `python3 bin/lint-skills.py`; exits non-zero if anything fails.
@@ -23,7 +23,7 @@ from pathlib import Path
 
 # Vendored / non-skill directories that may exist locally but aren't ours to lint
 # (used only by the glob fallback when not inside a git work tree).
-EXCLUDE_DIRS = {"gstack", "node_modules", "bin", ".git", ".github"}
+EXCLUDE_DIRS = {"node_modules", "bin", ".git", ".github"}
 
 LINK_RE = re.compile(r"\]\(([^)]+)\)")
 
@@ -32,7 +32,7 @@ def find_skills(root: Path) -> list[Path]:
     """Top-level `<skill>/SKILL.md` files that belong to this repo.
 
     Prefer git-tracked files so local runs match CI exactly (CI checks out only
-    tracked content — untracked, locally-synced gstack skills are not ours).
+    tracked content — untracked skills synced here by other tooling are not ours).
     """
     try:
         out = subprocess.run(
@@ -78,9 +78,27 @@ def parse_frontmatter(text: str) -> tuple[dict[str, str] | None, str]:
     return None, text
 
 
+def strip_fenced_code(body: str) -> str:
+    """Blank out ``` fenced blocks, keeping line count stable.
+
+    A skill that documents markdown syntax writes example links inside a fence —
+    make-pdf shows `![chart](data.png){width=full}` to teach its image options.
+    Those are illustrations, not links, and resolving them against the filesystem
+    reports four broken links in a skill that has none.
+    """
+    out, in_fence = [], False
+    for line in body.splitlines():
+        if line.lstrip().startswith("```"):
+            in_fence = not in_fence
+            out.append("")
+            continue
+        out.append("" if in_fence else line)
+    return "\n".join(out)
+
+
 def link_targets(body: str) -> list[str]:
     out = []
-    for raw in LINK_RE.findall(body):
+    for raw in LINK_RE.findall(strip_fenced_code(body)):
         target = raw.strip().split()[0] if raw.strip() else ""  # drop ` "title"`
         target = target.split("#", 1)[0]  # drop #anchor
         if not target:

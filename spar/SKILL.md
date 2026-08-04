@@ -28,7 +28,7 @@ before asking the new question. See **Codex Context Auto-Handoff** below.
 Run setup before any new round:
 
 ```bash
-eval "$(~/.claude/skills/gstack/bin/gstack-slug 2>/dev/null)" 2>/dev/null || true
+eval "$(~/.claude/skills/bin/skill-slug 2>/dev/null)" 2>/dev/null || true
 [ -z "${SLUG:-}" ] && SLUG=$(basename "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" | tr -cd 'a-zA-Z0-9._-')
 SLUG="${SLUG:-unknown}"
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
@@ -41,8 +41,12 @@ chmod 700 "$HOME/agents" "$HOME/agents/adversarial" "$STORE" 2>/dev/null || true
 Run the Codex auth probe:
 
 ```bash
-~/.claude/skills/gstack/bin/gstack-codex-probe
+source ~/.claude/skills/bin/skill-codex-probe && _skill_codex_auth_probe
 ```
+
+The probe file only *defines* functions — it must be sourced and the function
+called. Executing it as a command defines the functions in a subshell that then
+exits, printing nothing and returning 0, so the check below never fires.
 
 If it prints `AUTH_FAILED` or exits non-zero, stop and tell the user:
 `No Codex authentication found. Run codex login or set $CODEX_API_KEY / $OPENAI_API_KEY, then re-run /spar.`

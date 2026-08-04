@@ -30,7 +30,7 @@ watcher. Reserve the mother turn for orchestration and decisions, not bulk work.
 ## Step 0 — Preflight (run once)
 
 ```bash
-eval "$(~/.claude/skills/gstack/bin/gstack-slug 2>/dev/null)" 2>/dev/null || true
+eval "$(~/.claude/skills/bin/skill-slug 2>/dev/null)" 2>/dev/null || true
 [ -z "${SLUG:-}" ] && SLUG=$(basename "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" | tr -cd 'a-zA-Z0-9._-')
 SLUG="${SLUG:-unknown}"
 DEV="$HOME/agents/autodev/$SLUG"; mkdir -p "$DEV"

@@ -1,0 +1,87 @@
+#!/usr/bin/env python3
+"""Read back this project's learnings, latest entry winning per key+type.
+
+Usage:
+    skill-learnings-search [--type TYPE] [--query TEXT] [--limit N]
+
+The store is append-only, so a key logged twice appears twice; the newest entry
+is the current one. Output is plain text for an agent to read, newest first.
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+
+def project_slug() -> str:
+    slug_bin = Path(__file__).resolve().parent / "skill-slug"
+    try:
+        out = subprocess.run(
+            [str(slug_bin)], capture_output=True, text=True, timeout=10, check=False
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        out = ""
+    for line in out.splitlines():
+        if line.startswith("SLUG="):
+            return line[5:].strip()
+    return Path.cwd().name
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("--type", dest="type_")
+    ap.add_argument("--query")
+    ap.add_argument("--limit", type=int, default=10)
+    args = ap.parse_args()
+
+    home = Path(os.environ.get("SKILLS_HOME", Path.home() / ".skills"))
+    path = home / "projects" / project_slug() / "learnings.jsonl"
+    if not path.exists():
+        return 0
+
+    # Later lines overwrite earlier ones for the same key+type, so a plain
+    # front-to-back pass leaves `current` holding the newest of each.
+    current: dict[tuple[str, str], dict] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(rec, dict) and rec.get("key"):
+            current[(rec.get("key", ""), rec.get("type", ""))] = rec
+
+    records = list(current.values())
+
+    if args.type_:
+        records = [r for r in records if r.get("type") == args.type_]
+    if args.query:
+        q = args.query.lower()
+        records = [
+            r
+            for r in records
+            if q in json.dumps(r, ensure_ascii=False).lower()
+        ]
+
+    records.sort(key=lambda r: str(r.get("ts", "")), reverse=True)
+
+    for rec in records[: args.limit]:
+        trust = "user-stated" if rec.get("trusted") else rec.get("source", "unknown")
+        print(
+            f"[{rec.get('type', '?')}/{rec.get('key', '?')}] "
+            f"(confidence {rec.get('confidence', '?')}, {trust})"
+        )
+        print(f"  {rec.get('insight', '')}")
+        files = rec.get("files")
+        if files:
+            print(f"  files: {', '.join(str(f) for f in files)}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
