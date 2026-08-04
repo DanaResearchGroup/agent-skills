@@ -31,4 +31,17 @@ assert_eq 2 "$rc" "skip without a reason is refused"
 (cd "$WT" && "$CONTRACT" skipped sess-C); rc=$?
 assert_eq 1 "$rc" "a refused skip does not unblock"
 
+# Log integrity: embedded newline and tab must not corrupt the one-record-per-line invariant.
+lines_before=$(wc -l < "$COMMON/contract-skips.log")
+(cd "$WT" && "$CONTRACT" skip sess-D "reason with
+embedded	tabs" >/dev/null); rc=$?
+assert_eq 0 "$rc" "skip with embedded newline and tab succeeds"
+lines_after=$(wc -l < "$COMMON/contract-skips.log")
+lines_added=$((lines_after - lines_before))
+assert_eq 1 "$lines_added" "exactly one physical line added to log"
+log=$(cat "$COMMON/contract-skips.log")
+assert_contains "$log" "sess-D" "session id is in sanitized log line"
+# Verify the whitespace is collapsed to spaces (newline and tab both become spaces)
+assert_contains "$log" "reason with embedded tabs" "newline and tab collapsed to spaces"
+
 finish
