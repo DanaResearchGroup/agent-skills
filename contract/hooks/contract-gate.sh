@@ -50,7 +50,16 @@ sid=$(field session_id)
 path=$(field file_path)
 [ -n "$path" ] || allow
 
+# Walk up to the nearest EXISTING ancestor: a Write that creates a new file
+# in a not-yet-existing directory (a fresh module) must still be gated by the
+# worktree that directory will land in. Fail open only if no existing
+# ancestor is inside a git worktree at all (resolved via `contract status`).
 dir=$(dirname "$path")
+while [ ! -d "$dir" ]; do
+  parent=$(dirname "$dir")
+  [ "$parent" != "$dir" ] || break
+  dir="$parent"
+done
 [ -d "$dir" ] || allow
 
 status=$(cd "$dir" 2>/dev/null && "$CONTRACT" status 2>/dev/null) || allow

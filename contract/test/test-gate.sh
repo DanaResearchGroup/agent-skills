@@ -69,6 +69,14 @@ print(json.dumps({"session_id": "s4", "tool_name": "Edit", "tool_input": {"file_
 out=$(printf '%s' "$quoted_payload" | bash "$GATE")
 assert_contains "$out" '"deny"' "a file_path with a quote in a directory segment resolves to the real worktree, not truncated to fail open"
 
+# A NEW file in a not-yet-existing directory is the highest-value gated case
+# (a fresh module). The gate must walk up to the nearest EXISTING ancestor and
+# resolve git state from there, not fail open because dirname() does not exist.
+out=$(hook Write "$WT/src/newmod/foo.py" sC3)
+assert_contains "$out" '"deny"' "a new file in a not-yet-existing directory is still gated"
+# Fail open is preserved when no existing ancestor is inside a git worktree.
+assert_eq "" "$(hook Write "$SANDBOX/nodir/deep/foo.py" sC3)" "a new path outside any git repo still fails open"
+
 # A skip unblocks that session only.
 (cd "$WT" && "$CONTRACT" skip s1 "one-line typo" >/dev/null)
 assert_eq "" "$(hook Edit "$target" s1)" "the skipping session may edit"
