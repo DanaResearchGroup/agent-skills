@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/DanaResearchGroup/agent-skills/actions/workflows/ci.yml/badge.svg)](https://github.com/DanaResearchGroup/agent-skills/actions/workflows/ci.yml)
 [![Claude Code](https://img.shields.io/badge/Claude%20Code-skills-8A2BE2)](https://docs.anthropic.com/en/docs/claude-code)
-[![skills](https://img.shields.io/badge/skills-38-blue)](#whats-in-here)
+[![skills](https://img.shields.io/badge/skills-32-blue)](#whats-in-here)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Personal [Claude Code](https://docs.anthropic.com/en/docs/claude-code) skills for our
@@ -13,7 +13,7 @@ notifications, and more.
 This repo **is** your skills directory: you symlink the whole thing into
 `~/.claude/skills`, so every skill here becomes available in Claude Code everywhere.
 
-> **New group member?** Do the four steps below in order. Budget ~15 minutes.
+> **New group member?** Do the three steps below in order. Budget ~15 minutes.
 
 ## Prerequisites
 
@@ -52,18 +52,7 @@ an exact, file-and-line checklist of what I must change — and mark the rest N/
 Work through the list it produces. Re-run `python3 bin/lint-skills.py` after edits to make
 sure you didn't break a skill.
 
-### 3. Install gstack
-
-[gstack](https://github.com/garrytan/gstack) is a separate suite of ~23 skills (review, QA,
-ship, design, browse, …). Easiest path — paste this to a Claude Code session and let it run:
-
-> Install gstack: run `git clone --single-branch --depth 1 https://github.com/garrytan/gstack.git ~/.claude/skills/gstack && cd ~/.claude/skills/gstack && ./setup`, then add a "gstack" section to my CLAUDE.md listing the available gstack skills and telling you to use `/browse` for all web browsing.
-
-Because `~/.claude/skills` is this repo, gstack lands in `agent-skills/gstack/` and its skills
-sync into top-level folders. Those are **git-ignored** (see [.gitignore](.gitignore)) — don't
-commit them; update gstack with `/gstack-upgrade`.
-
-### 4. Install the Superpowers plugin
+### 3. Install the Superpowers plugin
 
 [Superpowers](https://github.com/obra/superpowers) is a Claude Code **plugin** (not a skill in
 this repo) that adds disciplines like brainstorming, systematic-debugging, and TDD. Install it
@@ -98,7 +87,7 @@ Verify with `/plugin` — you should see `superpowers` enabled. Full docs:
 | **Workflow** | `writing-git-commits`, `copilot-review` — fold a PR's Copilot/security bot review back into history; `drop-review` — drop the review you just ran as a markdown artifact in the OS temp directory, written for the session that wrote the code; `merged` — after a PR lands, sync `main` and rebase the open PRs onto it; `sync-matt-pocock-skills` — pull a newer `mattpocock/skills` release into our vendored copies, keeping local edits |
 | **Autonomous development** | `autodev` — drive a large feature build end-to-end in one autonomous session, with adversarial Codex review at every milestone and automatic context handoff/compact/resume past 35%; `spar` — run an adversarial "try to break this" Codex sparring round against your current code, plan, or decision, persisted per-project; `herdr` — inspect and control Herdr (a terminal multiplexer for coding agents) panes, tabs, workspaces, and cross-agent communication |
 
-Plus **gstack** (installed in step 3) and the **Superpowers** plugin (step 4).
+Plus the **Superpowers** plugin (step 3).
 
 ## Recommended workflow
 
@@ -133,8 +122,7 @@ So on Codex, do step 1 as `ln -s ~/Code/agent-skills ~/.codex/skills` instead. C
 
 - The **Slack** and **babysit** skills hard-code `~/.claude/...` paths — adapt them to your
   agent's home (e.g. `~/.codex`) per [ADAPTATION.md](ADAPTATION.md).
-- **gstack** (step 3) is Claude-Code-specific — skip it on other agents.
-- **Superpowers** (step 4) ships its own Codex/Copilot/Gemini install — see
+- **Superpowers** (step 3) ships its own Codex/Copilot/Gemini install — see
   [its docs](https://github.com/obra/superpowers).
 - Skills that dispatch sub-agents need Codex's multi-agent tools enabled in `~/.codex/config.toml`.
 

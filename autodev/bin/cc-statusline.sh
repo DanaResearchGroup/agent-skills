@@ -80,7 +80,7 @@ spar_badge=""
 _sp_dir=$(printf '%s' "$input" | jq -r '.workspace.current_dir // .cwd // empty')
 _sp_slug=""
 if [ -n "$_sp_dir" ]; then
-  _GS="$HOME/.claude/skills/gstack/bin/gstack-slug"
+  _GS="$HOME/.claude/skills/bin/skill-slug"
   [ -x "$_GS" ] && _sp_slug=$( (cd "$_sp_dir" 2>/dev/null && eval "$("$_GS" 2>/dev/null)" 2>/dev/null; printf '%s' "${SLUG:-}") )
   [ -z "$_sp_slug" ] && _sp_slug=$(cd "$_sp_dir" 2>/dev/null && basename "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" | tr -cd 'a-zA-Z0-9._-')
 fi

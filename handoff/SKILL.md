@@ -61,7 +61,6 @@ When composing **Standing items**, cross-reference by path:
 
 - latest sparring artifacts under `~/agents/adversarial/{slug}/`, including `.session-id`,
   `sparring-log.md`, and the latest round Q/A if present;
-- latest gstack checkpoint if present.
 
 After writing the handoff, update the deterministic reload pointer, then file a
 compact-request so the auto-handoff watcher (if installed) finishes the cycle:

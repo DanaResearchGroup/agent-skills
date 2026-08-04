@@ -7,7 +7,7 @@
 # portable to any machine): copy the autodev skill, run this, done.
 #
 # Idempotent: re-running replaces our own entries, never duplicates them, and preserves
-# any other hooks you already have (gstack, superpowers, etc.).
+# any other hooks you already have (superpowers, etc.).
 #
 # Usage:
 #   bash install.sh                 # installs into ~/.claude/settings.json
