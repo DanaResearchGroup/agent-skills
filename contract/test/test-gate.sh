@@ -23,6 +23,13 @@ assert_contains "$out" '"permissionDecision":"deny"' "enabled with no contract d
 assert_contains "$out" 'contract new'  "the denial names how to open a contract"
 assert_contains "$out" 'contract skip' "the denial names the escape hatch"
 
+# The denial must hand the agent commands that actually run: the real session
+# id (not a literal "<session_id>" placeholder that cmd_skip would reject) and
+# the absolute CLI path (bare `contract` is not on PATH).
+assert_contains "$out" 'skip s1' "the denial interpolates the real session id"
+assert_not_contains "$out" '<session_id>' "the denial carries no session id placeholder"
+assert_contains "$out" "$CONTRACT" "the denial names the absolute contract path"
+
 assert_contains "$(hook Write "$target" s1)"        '"deny"' "Write is gated"
 assert_contains "$(hook NotebookEdit "$target" s1)" '"deny"' "NotebookEdit is gated"
 

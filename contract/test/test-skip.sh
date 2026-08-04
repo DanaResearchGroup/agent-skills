@@ -31,6 +31,16 @@ assert_eq 2 "$rc" "skip without a reason is refused"
 (cd "$WT" && "$CONTRACT" skipped sess-C); rc=$?
 assert_eq 1 "$rc" "a refused skip does not unblock"
 
+# A session id with invalid characters (e.g. the literal "<session_id>"
+# placeholder copied verbatim from a denial message) must be refused loudly,
+# not become a marker file named "<session_id>" plus a bogus log entry.
+out=$(cd "$WT" && "$CONTRACT" skip '<session_id>' "copied verbatim" 2>&1); rc=$?
+assert_eq 2 "$rc" "skip refuses a session id with invalid characters"
+assert_contains "$out" "session id" "the refusal explains what is wrong"
+assert_no_file "$COMMON/contract-skips/<session_id>" "no marker file created for an invalid session id"
+(cd "$WT" && "$CONTRACT" skipped '<session_id>'); rc=$?
+assert_eq 1 "$rc" "a refused invalid session id does not unblock"
+
 # Log integrity: embedded newline and tab must not corrupt the one-record-per-line invariant.
 lines_before=$(wc -l < "$COMMON/contract-skips.log")
 (cd "$WT" && "$CONTRACT" skip sess-D "reason with

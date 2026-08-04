@@ -164,6 +164,9 @@ cmd_skip() {
   local sid="${1:-}"; shift 2>/dev/null || true
   local reason="$*"
   [ -n "$sid" ] || die "usage: contract skip <session_id> <reason>"
+  case "$sid" in
+    *[!A-Za-z0-9._-]*) die "session id must match [A-Za-z0-9._-]+ — got '$sid' (do not paste the <session_id> placeholder verbatim)" ;;
+  esac
   [ -n "$reason" ] || die "a reason is required — the escape hatch is logged, not silent"
   require_repo
   mkdir -p "$SKIPDIR"

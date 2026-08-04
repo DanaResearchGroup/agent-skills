@@ -7,7 +7,7 @@ set -uo pipefail
 allow() { exit 0; }
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-CONTRACT="$HERE/../bin/contract"
+CONTRACT="$(cd "$HERE/.." && pwd)/bin/contract"
 [ -x "$CONTRACT" ] || allow
 
 payload=$(cat) || allow
@@ -66,9 +66,10 @@ if [ -n "$sid" ] && (cd "$dir" 2>/dev/null && "$CONTRACT" skipped "$sid" 2>/dev/
   allow
 fi
 
-reason='This worktree has contract enabled and no active contract for this change.
-Before editing, open one: `contract new <slug>` — states Intent / Verifier / Non-goals / Gates.
-For a one-line or trivial change instead: `contract skip <session_id> "<reason>"` — the skip is logged, not silent.'
+sid_arg=${sid:-'<session_id>'}
+reason="This worktree has contract enabled and no active contract for this change.
+Before editing, open one: \`$CONTRACT new <slug>\` — states Intent / Verifier / Non-goals / Gates.
+For a one-line or trivial change instead: \`$CONTRACT skip $sid_arg \"<reason>\"\` — the skip is logged, not silent."
 
 esc=$(printf '%s' "$reason" | sed 's/\\/\\\\/g; s/"/\\"/g' | awk 'BEGIN{ORS="\\n"}1')
 esc=${esc%\\n}

@@ -37,7 +37,17 @@ cd ~/Code/ARC && ~/.claude/skills/contract/bin/contract enable
 Enabling is keyed on the shared git dir, so this covers every worktree of the
 repo at once (`ARC`, `ARC-adaptive`, `ARC-conformers`, `ARC-wt2` …).
 
-## 3. Roll out on evidence
+## 3. Put `contract` on your PATH
+
+The hooks call the CLI by absolute path and the gate's denial message names
+that absolute path, so nothing breaks without this step. But for typing
+`contract new <slug>` by hand, link it somewhere on your PATH:
+
+```bash
+ln -s ~/.claude/skills/contract/bin/contract ~/.local/bin/contract
+```
+
+## 4. Roll out on evidence
 
 Start with two or three repos. The skip log is the instrument:
 
