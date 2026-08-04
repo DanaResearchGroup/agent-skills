@@ -1,6 +1,6 @@
 ---
 name: contract
-description: Use before changing code for anything bigger than a typo, when a contract gate denies an edit, when writing a subagent dispatch brief, or when closing out work — agrees Intent, Verifier, Non-goals and Gates with the user and records them in a durable note.
+description: Use before changing code for anything bigger than a typo, when a contract gate denies an edit, when writing a subagent dispatch brief, or when closing work out against its Verifier.
 ---
 
 # Contract
@@ -14,8 +14,8 @@ Announce: "Using contract to define the work before implementing."
 ## When the gate denies an edit
 
 This worktree has no active contract. Resolve the denial itself — open a contract below, or
-take the logged skip for genuinely trivial work. Writing the file through `Bash` gets you
-past the only check standing between you and the failure above.
+take [the escape hatch](#the-escape-hatch). Writing the file through `Bash` gets you past the
+only check standing between you and the failure above.
 
 ## Procedure
 
@@ -94,10 +94,10 @@ Verifier passes?**
 - Yes → build it, or ask with concrete options and your recommendation.
 
 Adding a helper, a migration, a compatibility shim, or a second mechanism "while we're here"
-is **yak shaving** with extra steps. Offer the cut instead: propose the smallest thing that
-passes the Verifier and name what you are leaving out. **Offer the deletion before you build
-the migration** — ripping a thing out is usually cheaper, and usually what was wanted. Unsure
-whether something is in scope? It is not; ask, smaller option first.
+is **yak shaving** with extra steps. **Offer the cut instead** — the smallest thing that passes
+the Verifier, with what you are leaving out named. Deletion is a cut too, and usually cheaper
+than the migration you were about to write. Unsure whether something is in scope? It is not;
+offer the cut and ask.
 
 This skill's own construction is the worked example. Its dispatch-brief linter grew an
 English-phrase check no Verifier needed, which then cried wolf on `"the ticket price"` — and
