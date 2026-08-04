@@ -47,6 +47,7 @@ cmd_status() {
 
 die() { printf 'contract: %s\n' "$1" >&2; exit 2; }
 
+# Checks for leaked bare identifiers and a missing Verifier section.
 # Necessary, never sufficient — the same caveat pm-creator's lint-prompt carries.
 cmd_lint() {
   local f="${1:-}"
@@ -61,15 +62,6 @@ cmd_lint() {
       "$f" "$ln" "$(printf '%s' "$text" | grep -oE '\b[IDQRA]-[0-9]{2,3}\b' | head -1)" >&2
     found=1
   done < <(grep -nE '\b[IDQRA]-[0-9]{2,3}\b' "$f" 2>/dev/null)
-
-  # Deixis that only resolves inside the parent conversation.
-  local phrases='as discussed|the above|same as before|as mentioned|the ticket|the ledger|the user'"'"'s earlier|per our discussion'
-  while IFS=: read -r ln text; do
-    [ -n "$ln" ] || continue
-    printf '%s:%s: conversation-only reference (%s) — resolve it from text or filesystem\n' \
-      "$f" "$ln" "$(printf '%s' "$text" | grep -oiE "$phrases" | head -1)" >&2
-    found=1
-  done < <(grep -niE "$phrases" "$f" 2>/dev/null)
 
   if ! grep -qiE '^#+[[:space:]]*Verifier|^Verifier:' "$f"; then
     printf '%s: no Verifier section — the worker has no definition of done\n' "$f" >&2

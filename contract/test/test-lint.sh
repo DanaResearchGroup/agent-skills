@@ -20,12 +20,6 @@ out=$("$CONTRACT" lint "$bad_id" 2>&1); rc=$?
 assert_eq 1 "$rc" "a bare ticket id fails"
 assert_contains "$out" "I-005" "the finding names the leaked identifier"
 
-bad_deixis="$SANDBOX/bad-deixis.md"
-printf 'Apply the fix as discussed above.\n\n## Verifier\npytest x  # exits 0\n' > "$bad_deixis"
-out=$("$CONTRACT" lint "$bad_deixis" 2>&1); rc=$?
-assert_eq 1 "$rc" "conversation-only deixis fails"
-assert_contains "$out" "as discussed" "the finding names the offending phrase"
-
 no_verifier="$SANDBOX/no-verifier.md"
 printf 'Refactor /abs/path/repo/src/parser.py for clarity.\n' > "$no_verifier"
 out=$("$CONTRACT" lint "$no_verifier" 2>&1); rc=$?
