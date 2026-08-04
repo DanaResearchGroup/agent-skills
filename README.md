@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/DanaResearchGroup/agent-skills/actions/workflows/ci.yml/badge.svg)](https://github.com/DanaResearchGroup/agent-skills/actions/workflows/ci.yml)
 [![Claude Code](https://img.shields.io/badge/Claude%20Code-skills-8A2BE2)](https://docs.anthropic.com/en/docs/claude-code)
-[![skills](https://img.shields.io/badge/skills-32-blue)](#whats-in-here)
+[![skills](https://img.shields.io/badge/skills-33-blue)](#whats-in-here)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Personal [Claude Code](https://docs.anthropic.com/en/docs/claude-code) skills for our
@@ -84,7 +84,9 @@ Verify with `/plugin` — you should see `superpowers` enabled. Full docs:
 | --- | --- |
 | **Notifications** | `slack-ask`, `slack-notify` — reach you over Slack during unattended runs |
 | **Matt Pocock** ([`mattpocock/skills`](https://github.com/mattpocock/skills), MIT — see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)) | `tdd`, `to-spec`, `to-tickets`, `implement`, `code-review`, `triage`, `prototype`, `codebase-design`, `domain-modeling`, `improve-codebase-architecture`, `grilling`, `grill-me`, `grill-with-docs`, `resolving-merge-conflicts`, `setup-matt-pocock-skills`, `writing-great-skills`, `handoff`, `edit-article`, `obsidian-vault`, `wayfinder` |
-| **Workflow** | `writing-git-commits`, `copilot-review` — fold a PR's Copilot/security bot review back into history; `drop-review` — drop the review you just ran as a markdown artifact in the OS temp directory, written for the session that wrote the code; `merged` — after a PR lands, sync `main` and rebase the open PRs onto it; `sync-matt-pocock-skills` — pull a newer `mattpocock/skills` release into our vendored copies, keeping local edits |
+| **Review** | `review` — pre-landing review of a PR or diff, sizing the agent fleet to the change's breadth and routing each pass to a model that fits its job; `copilot-review` — fold a PR's Copilot/security bot review back into history; `drop-review` — drop the review you just ran as a markdown artifact in the OS temp directory, written for the session that wrote the code |
+| **Workflow** | `writing-git-commits`; `contract` — settle what a change must do, and how you'll know it did it, before writing it; `merged` — after a PR lands, sync `main` and rebase the open PRs onto it; `sync-matt-pocock-skills` — pull a newer `mattpocock/skills` release into our vendored copies, keeping local edits |
+| **Research writing** | `paper-outline` — plan a scientific paper with you by filling out the group's Outline document, one decision at a time |
 | **Autonomous development** | `autodev` — drive a large feature build end-to-end in one autonomous session, with adversarial Codex review at every milestone and automatic context handoff/compact/resume past 35%; `spar` — run an adversarial "try to break this" Codex sparring round against your current code, plan, or decision, persisted per-project; `herdr` — inspect and control Herdr (a terminal multiplexer for coding agents) panes, tabs, workspaces, and cross-agent communication |
 
 Plus the **Superpowers** plugin (step 3).
