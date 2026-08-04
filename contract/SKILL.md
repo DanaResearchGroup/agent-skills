@@ -81,6 +81,10 @@ contract close
 intake, not truth — corroborate anything load-bearing yourself (`git log`,
 re-running the verifier) rather than trusting it verbatim.
 
+If the work is walked away from instead of finished, run
+`contract abandon "<reason>"` — it archives the note (marked ABANDONED) and
+re-arms the gate, so a stale contract never leaves the worktree ungated.
+
 ## The escape hatch
 
 Genuinely trivial work takes the logged escape hatch:

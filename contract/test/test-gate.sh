@@ -86,6 +86,11 @@ assert_contains "$(hook Edit "$target" s2)" '"deny"' "a different session is sti
 (cd "$WT" && "$CONTRACT" new real-work >/dev/null)
 assert_eq "" "$(hook Edit "$target" s2)" "an active contract unblocks the gate"
 
+# A hand-deleted note must re-arm the gate, not leave a phantom active slug
+# that disables it forever.
+rm "$WT/docs/superpowers/contracts/real-work.md"
+assert_contains "$(hook Edit "$target" s2)" '"deny"' "a deleted note re-arms the gate"
+
 # Fail open: paths outside any git repo, and malformed input, must allow.
 assert_eq "" "$(hook Edit "$SANDBOX/loose.txt" s3)" "a path outside a git repo is not gated"
 assert_eq "" "$(printf 'not json' | bash "$GATE")" "malformed hook input fails open"

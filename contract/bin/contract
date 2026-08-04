@@ -6,6 +6,7 @@
 #   <git-common-dir>/contract-enabled                 per-repo opt-in marker
 #   <git-common-dir>/contract-skips.log               permanent skip record
 #   <git-common-dir>/contract-skips/<session_id>      session-scoped skip
+#   <git-common-dir>/contract-abandons.log            permanent abandon record
 set -uo pipefail
 
 # Resolve state paths from $1 (a file or dir; defaults to $PWD).
@@ -27,6 +28,7 @@ resolve_paths() {
   ENABLED="$COMMON/contract-enabled"
   SKIPLOG="$COMMON/contract-skips.log"
   SKIPDIR="$COMMON/contract-skips"
+  ABANDONLOG="$COMMON/contract-abandons.log"
   return 0
 }
 
@@ -38,8 +40,9 @@ cmd_status() {
   printf 'wt=%s\n' "$WT"
   printf 'common=%s\n' "$COMMON"
   if [ -f "$ENABLED" ]; then printf 'enabled=yes\n'; else printf 'enabled=no\n'; fi
-  if [ -f "$ACTIVE_FILE" ] && [ -s "$ACTIVE_FILE" ]; then
-    printf 'active=%s\n' "$(cat "$ACTIVE_FILE")"
+  local slug; slug=$(active_slug)
+  if [ -n "$slug" ]; then
+    printf 'active=%s\n' "$slug"
   else
     printf 'active=none\n'
   fi
@@ -87,8 +90,15 @@ cmd_disable() {
   printf 'contract: gate disabled for %s\n' "$COMMON"
 }
 
+# The slug in ACTIVE counts only while its note still exists on disk: a
+# hand-deleted note must fail SAFE (no active contract, gate re-armed), not
+# leave a phantom slug that disables the gate and breaks close.
 active_slug() {
-  [ -f "$ACTIVE_FILE" ] && [ -s "$ACTIVE_FILE" ] && cat "$ACTIVE_FILE"
+  local slug
+  { [ -f "$ACTIVE_FILE" ] && [ -s "$ACTIVE_FILE" ]; } || return 0
+  slug=$(cat "$ACTIVE_FILE")
+  [ -f "$CDIR/$slug.md" ] || return 0
+  printf '%s\n' "$slug"
 }
 
 cmd_new() {
@@ -174,6 +184,29 @@ cmd_close() {
   printf 'contract: closed %s\n' "$slug"
 }
 
+# Walk away from a contract without evidence: archive the note (marked
+# ABANDONED), clear ACTIVE, log it. Reads ACTIVE raw — not via active_slug —
+# so a contract whose note was hand-deleted can still be cleaned up.
+cmd_abandon() {
+  require_repo
+  local slug=""
+  [ -f "$ACTIVE_FILE" ] && [ -s "$ACTIVE_FILE" ] && slug=$(cat "$ACTIVE_FILE")
+  [ -n "$slug" ] || die "no active contract in this worktree"
+  local reason="${*:-no reason given}"
+  local note="$CDIR/$slug.md"
+  if [ -f "$note" ]; then
+    mkdir -p "$CDIR/closed" || die "cannot create $CDIR/closed"
+    printf '\n## ABANDONED\n\n%s — %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$reason" >> "$note" \
+      || die "cannot mark $note abandoned"
+    mv "$note" "$CDIR/closed/$slug.md" || die "cannot archive $note"
+  fi
+  rm -f "$ACTIVE_FILE"
+  local sanitized
+  sanitized=$(printf '%s' "$reason" | tr '\n\r\t' ' ')
+  printf '%s\t%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$slug" "$WT" "$sanitized" >> "$ABANDONLOG"
+  printf 'contract: abandoned %s — the gate is re-armed\n' "$slug"
+}
+
 cmd_skip() {
   local sid="${1:-}"; shift 2>/dev/null || true
   local reason="$*"
@@ -208,6 +241,7 @@ main() {
     new)     cmd_new "$@" ;;
     show)    cmd_show ;;
     close)   cmd_close ;;
+    abandon) cmd_abandon "$@" ;;
     skip)    cmd_skip "$@" ;;
     skipped) cmd_skipped "$@" ;;
     lint)    cmd_lint "$@" ;;

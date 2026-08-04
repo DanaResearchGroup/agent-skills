@@ -56,6 +56,34 @@ assert_eq 3 "$rc" "an existing contracts/.gitignore is left alone (new still ref
 printf 'evidence\n' >> "$WT/docs/superpowers/contracts/second.md"
 (cd "$WT" && "$CONTRACT" close >/dev/null)
 
+# A contract can be walked away from: abandon archives the note with an
+# ABANDONED marker, clears ACTIVE, and re-arms the gate — a never-closed
+# contract must not leave the worktree ungated forever.
+(cd "$WT" && "$CONTRACT" new dead-end >/dev/null)
+(cd "$WT" && "$CONTRACT" abandon "wrong direction" >/dev/null); rc=$?
+assert_eq 0 "$rc" "abandon succeeds on an active contract"
+assert_contains "$(cd "$WT" && "$CONTRACT" status)" "active=none" "abandon clears the active slug"
+assert_file "$WT/docs/superpowers/contracts/closed/dead-end.md" "abandoned note is archived"
+assert_contains "$(cat "$WT/docs/superpowers/contracts/closed/dead-end.md")" "ABANDONED" \
+  "the archived note carries the ABANDONED marker"
+assert_contains "$(cat "$COMMON/contract-abandons.log" 2>/dev/null)" "dead-end" "the abandon is logged"
+out=$(cd "$WT" && "$CONTRACT" abandon 2>&1); rc=$?
+assert_eq 2 "$rc" "abandon refuses when nothing is active"
+
+# A hand-deleted note must read as NO active contract (fail safe, gate
+# re-armed), not as a phantom slug that disables the gate and breaks close.
+(cd "$WT" && "$CONTRACT" new vanishing >/dev/null)
+rm "$WT/docs/superpowers/contracts/vanishing.md"
+assert_contains "$(cd "$WT" && "$CONTRACT" status)" "active=none" "a deleted note reads as no active contract"
+(cd "$WT" && "$CONTRACT" show); rc=$?
+assert_eq 0 "$rc" "show does not error on a deleted note"
+(cd "$WT" && "$CONTRACT" new recovered >/dev/null); rc=$?
+assert_eq 0 "$rc" "new recovers after a deleted note"
+rm "$WT/docs/superpowers/contracts/recovered.md"
+(cd "$WT" && "$CONTRACT" abandon "note deleted by hand" >/dev/null); rc=$?
+assert_eq 0 "$rc" "abandon clears state even when the note is already gone"
+assert_contains "$(cd "$WT" && "$CONTRACT" status)" "active=none" "state is clean after abandoning a gone note"
+
 # new must fail loudly when it cannot write, and leave no partial state — a
 # quiet rc=0 with nothing created means status says active=none, the gate
 # keeps denying, and re-running new never trips the already-active guard.
