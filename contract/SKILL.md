@@ -1,6 +1,6 @@
 ---
 name: contract
-description: Use before changing code for anything bigger than a typo, when a contract gate denies an edit, when writing a subagent dispatch brief, or when closing work out against its Verifier.
+description: Use before changing code for anything bigger than a typo, when writing a subagent dispatch brief, or when closing work out against its Verifier.
 ---
 
 # Contract
@@ -10,12 +10,6 @@ request, discovered only after the tokens are spent. A contract spends a little 
 front to save the rework.
 
 Announce: "Using contract to define the work before implementing."
-
-## When the gate denies an edit
-
-This worktree has no active contract. Resolve the denial itself — open a contract below, or
-take [the escape hatch](#the-escape-hatch). Writing the file through `Bash` gets you past the
-only check standing between you and the failure above.
 
 ## Procedure
 
@@ -81,6 +75,10 @@ contract skip <session_id> "<reason>"
 Unblocks one session and leaves a permanent log entry. Spend it freely on real typos.
 "Impatient, context is thin" is the moment **correct code, wrong thing** is most likely, and
 the log is what makes that pattern visible later.
+
+It is also the only bypass that leaves a record, which is what makes it the only one to take: a
+file written via `Bash` lands the same edit and leaves nothing behind, and a gate nobody can see
+being skipped has already stopped working.
 
 ## The Verifier is the ceiling
 
