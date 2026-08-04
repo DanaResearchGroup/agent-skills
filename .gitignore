@@ -32,27 +32,18 @@ _gstack-command/
 autoplan/
 benchmark/
 benchmark-models/
-browse/
 canary/
-careful/
-codex/
 connect-chrome/
-context-restore/
-context-save/
 cso/
 design-consultation/
 design-html/
 design-review/
 design-shotgun/
 devex-review/
-diagram/
 document-generate/
 document-release/
-freeze/
 gstack-upgrade/
-guard/
 health/
-investigate/
 ios-clean/
 ios-design-review/
 ios-fix/
@@ -60,8 +51,6 @@ ios-qa/
 ios-sync/
 land-and-deploy/
 landing-report/
-learn/
-make-pdf/
 office-hours/
 open-gstack-browser/
 pair-agent/
@@ -73,12 +62,18 @@ plan-tune/
 qa/
 qa-only/
 retro/
-scrape/
 setup-browser-cookies/
 setup-deploy/
 setup-gbrain/
-ship/
 skillify/
-spec/
 sync-gbrain/
-unfreeze/
+
+# ── build output of the vendored TS skills ──────────────────────────────
+# browse/ and make-pdf/ ship compiled binaries. The binaries are kept on disk
+# so the skills keep working, but they are build output and 275M of it, so
+# they stay untracked. Their build tooling lived in gstack; see the note in
+# browse/SKILL.md before changing their source.
+browse/dist/
+browse/test/fixtures/
+make-pdf/dist/
+*/node_modules/

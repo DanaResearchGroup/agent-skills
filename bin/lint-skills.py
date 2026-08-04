@@ -78,9 +78,27 @@ def parse_frontmatter(text: str) -> tuple[dict[str, str] | None, str]:
     return None, text
 
 
+def strip_fenced_code(body: str) -> str:
+    """Blank out ``` fenced blocks, keeping line count stable.
+
+    A skill that documents markdown syntax writes example links inside a fence —
+    make-pdf shows `![chart](data.png){width=full}` to teach its image options.
+    Those are illustrations, not links, and resolving them against the filesystem
+    reports four broken links in a skill that has none.
+    """
+    out, in_fence = [], False
+    for line in body.splitlines():
+        if line.lstrip().startswith("```"):
+            in_fence = not in_fence
+            out.append("")
+            continue
+        out.append("" if in_fence else line)
+    return "\n".join(out)
+
+
 def link_targets(body: str) -> list[str]:
     out = []
-    for raw in LINK_RE.findall(body):
+    for raw in LINK_RE.findall(strip_fenced_code(body)):
         target = raw.strip().split()[0] if raw.strip() else ""  # drop ` "title"`
         target = target.split("#", 1)[0]  # drop #anchor
         if not target:
