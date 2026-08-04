@@ -101,11 +101,17 @@ cmd_new() {
     printf 'contract: %s is already active in this worktree; close it first\n' "$cur" >&2
     exit 3
   fi
-  mkdir -p "$CDIR/closed"
+  mkdir -p "$CDIR/closed" || die "cannot create $CDIR"
+  # The contracts dir must ignore itself: rollout repos do not globally
+  # ignore docs/superpowers/, and a tracked note would become git-tracked
+  # runtime state. Idempotent: an existing .gitignore is left alone.
+  if [ ! -f "$CDIR/.gitignore" ]; then
+    printf '*\n' > "$CDIR/.gitignore" || die "cannot write $CDIR/.gitignore"
+  fi
   local base sha
   base=$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)
   sha=$(git -C "$WT" rev-parse --short HEAD 2>/dev/null || echo unknown)
-  cat > "$CDIR/$slug.md" <<EOF
+  if ! cat > "$CDIR/$slug.md" <<EOF
 # Contract — $slug
 
 Opened: $(date -u +%Y-%m-%dT%H:%M:%SZ) · Worktree: $WT · Base: $base@$sha
@@ -131,7 +137,15 @@ Opened: $(date -u +%Y-%m-%dT%H:%M:%SZ) · Worktree: $WT · Base: $base@$sha
 ## Evidence
 
 EOF
-  printf '%s\n' "$slug" > "$ACTIVE_FILE"
+  then
+    die "cannot write $CDIR/$slug.md"
+  fi
+  if ! printf '%s\n' "$slug" > "$ACTIVE_FILE"; then
+    # Leave no orphan: a note on disk with no ACTIVE claims success while
+    # the gate still denies.
+    rm -f "$CDIR/$slug.md"
+    die "cannot write $ACTIVE_FILE — note removed, no contract is active"
+  fi
   printf 'contract: opened %s\n' "$CDIR/$slug.md"
 }
 
