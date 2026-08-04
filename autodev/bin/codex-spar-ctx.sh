@@ -22,7 +22,7 @@ state="$AUTODEV_HOME/state"
 mkdir -p "$state" 2>/dev/null || exit 0
 
 if [ -z "$slug" ]; then
-  GS="$HOME/.claude/skills/gstack/bin/gstack-slug"
+  GS="$HOME/.claude/skills/bin/skill-slug"
   [ -x "$GS" ] && slug=$( (eval "$("$GS" 2>/dev/null)" 2>/dev/null; printf '%s' "${SLUG:-}") )
   [ -z "$slug" ] && slug=$(basename "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" | tr -cd 'a-zA-Z0-9._-')
 fi

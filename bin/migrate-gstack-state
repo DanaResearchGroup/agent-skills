@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# migrate-gstack-state — copy accumulated project memory out of ~/.gstack
+# into this repo's own state directory (~/.skills), so gstack can be removed
+# without taking the memory with it.
+#
+# What moves: projects/<slug>/*.jsonl (learnings, *-reviews, timeline,
+# decisions) and slug-cache/ (so slugs stay stable for directories whose git
+# remote has since changed).
+#
+# What does NOT move: analytics/, sessions/, chromium-profile/, .migrations/,
+# config.json, and the various dotfile prompt markers. Those are gstack's own
+# ceremony — telemetry, activation flags, upgrade throttles — and nothing
+# outside gstack reads them.
+#
+# Safety contract:
+#   - NEVER deletes or modifies anything under ~/.gstack. The source is left
+#     intact so this can be re-run, and so removing gstack stays a separate,
+#     deliberate step.
+#   - NEVER overwrites an existing destination file. A file already present in
+#     the destination is reported as SKIP, not merged and not clobbered —
+#     these are append-only JSONL logs, and a blind copy in either direction
+#     would silently drop entries.
+#
+# Usage: migrate-gstack-state [--dry-run]
+set -euo pipefail
+
+GSTACK_HOME="${GSTACK_HOME:-$HOME/.gstack}"
+SKILLS_HOME="${SKILLS_HOME:-$HOME/.skills}"
+
+DRY_RUN=false
+[ "${1:-}" = "--dry-run" ] && DRY_RUN=true
+
+if [ ! -d "$GSTACK_HOME" ]; then
+  echo "migrate-gstack-state: no $GSTACK_HOME — nothing to migrate."
+  exit 0
+fi
+
+copied=0
+skipped=0
+conflicts=()
+
+copy_tree() {
+  # $1 = subdirectory under both homes (e.g. "projects")
+  local sub="$1"
+  local src="$GSTACK_HOME/$sub"
+  [ -d "$src" ] || return 0
+
+  local f rel dest
+  while IFS= read -r f; do
+    rel="${f#"$src/"}"
+    dest="$SKILLS_HOME/$sub/$rel"
+    if [ -e "$dest" ]; then
+      skipped=$((skipped + 1))
+      conflicts+=("$sub/$rel")
+      continue
+    fi
+    if [ "$DRY_RUN" = true ]; then
+      echo "  would copy  $sub/$rel"
+    else
+      mkdir -p "$(dirname "$dest")"
+      cp -p "$f" "$dest"
+      echo "  copied      $sub/$rel"
+    fi
+    copied=$((copied + 1))
+  done < <(find "$src" -type f)
+
+  # Recreate empty directories too. They carry no data, but leaving them out
+  # makes `diff -r ~/.gstack/projects $SKILLS_HOME/projects` report a difference,
+  # and the whole point of this script is that the verification comes back clean.
+  if [ "$DRY_RUN" = false ]; then
+    while IFS= read -r d; do
+      mkdir -p "$SKILLS_HOME/$sub/${d#"$src/"}"
+    done < <(find "$src" -type d -empty)
+  fi
+}
+
+echo "migrate-gstack-state: $GSTACK_HOME -> $SKILLS_HOME"
+[ "$DRY_RUN" = true ] && echo "(dry run — nothing will be written)"
+echo
+
+copy_tree projects
+copy_tree slug-cache
+
+echo
+echo "copied: $copied   skipped (already present): $skipped"
+
+if [ ${#conflicts[@]} -gt 0 ]; then
+  echo
+  echo "The following already existed in $SKILLS_HOME and were left untouched."
+  echo "If the gstack copy has entries the destination lacks, reconcile by hand —"
+  echo "these are append-only logs and neither side is authoritative:"
+  for c in "${conflicts[@]}"; do
+    echo "  $c"
+  done
+fi
+
+echo
+echo "$GSTACK_HOME is unchanged. Remove it only after verifying the copy."

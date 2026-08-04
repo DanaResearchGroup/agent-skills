@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# skill-codex-probe: shared helper for skills that shell out to the Codex CLI.
+# Sourced from skill bash blocks; never execute directly.
+#
+# Vendored from gstack-codex-probe (gstack v1.60.1.0), minus the two pieces that
+# only made sense inside gstack: telemetry emission to ~/.gstack/analytics/, and
+# the hang handler that wrote an "operational learning" through gstack's own
+# learnings store. Both were fire-and-forget side effects, not signals anyone
+# read; dropping them removes the last reason this file needs gstack on disk.
+#
+# Functions (all prefixed with _skill_codex_ for namespace hygiene):
+#   _skill_codex_auth_probe      — multi-signal auth check (env + file)
+#   _skill_codex_version_check   — warn on known-bad Codex CLI versions
+#   _skill_codex_timeout_wrapper — gtimeout -> timeout -> unwrapped fallback
+#
+# Hygiene rules — this file is SOURCED into a caller's shell, so it must not
+# disturb it: never set -e / set -u / trap / IFS= / PATH= here, and execute
+# nothing at source time (function definitions only).
+
+# --- Auth probe -------------------------------------------------------------
+
+_skill_codex_auth_probe() {
+  # Multi-signal: env vars OR auth file. Avoids false negatives for env-auth
+  # users (CI, platform engineers) that a file-only check would reject.
+  local _codex_home="${CODEX_HOME:-$HOME/.codex}"
+  # Bash's [ -n ] alone accepts a whitespace-only value; strip whitespace first
+  # so a key of " " reads as absent rather than present.
+  local _k1 _k2
+  _k1=$(printf '%s' "${CODEX_API_KEY:-}" | tr -d '[:space:]')
+  _k2=$(printf '%s' "${OPENAI_API_KEY:-}" | tr -d '[:space:]')
+  if [ -n "$_k1" ] || [ -n "$_k2" ] || [ -f "$_codex_home/auth.json" ]; then
+    echo "AUTH_OK"
+    return 0
+  fi
+  echo "AUTH_FAILED"
+  return 1
+}
+
+# --- Version check ----------------------------------------------------------
+
+_skill_codex_version_check() {
+  # Warn on known-bad Codex CLI versions. Anchored regex prevents false
+  # positives like 0.120.10 or 0.120.20 from matching. 0.120.2-beta still
+  # matches the bad release and gets warned (it IS buggy).
+  # Update this list when a new Codex CLI version regresses.
+  local _ver
+  _ver=$(codex --version 2>/dev/null | head -1)
+  [ -z "$_ver" ] && return 0
+  if echo "$_ver" | grep -Eq '(^|[^0-9.])0\.120\.(0|1|2)([^0-9.]|$)'; then
+    echo "WARN: Codex CLI $_ver has known stdin deadlock bugs. Run: npm install -g @openai/codex@latest"
+  fi
+}
+
+# --- Timeout wrapper --------------------------------------------------------
+
+_skill_codex_timeout_wrapper() {
+  # Resolve wrapper binary: prefer gtimeout (Homebrew coreutils on macOS),
+  # fall back to timeout (Linux), else run unwrapped. Arguments: $1 is the
+  # duration in seconds; rest is the command to run.
+  local _duration="$1"
+  shift
+  local _to
+  _to=$(command -v gtimeout 2>/dev/null || command -v timeout 2>/dev/null || echo "")
+  if [ -n "$_to" ]; then
+    "$_to" "$_duration" "$@"
+  else
+    "$@"
+  fi
+}
