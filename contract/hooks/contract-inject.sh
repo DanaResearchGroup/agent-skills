@@ -24,10 +24,18 @@ print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "addit
 
 if [ -z "$payload" ]; then
   if ! command -v python3 >/dev/null 2>&1; then
-    esc=$(printf '%s' "$note" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\t/\\t/g' | awk 'BEGIN{ORS="\\n"}1')
+    # JSON strings forbid raw control characters. Strip every C0 control
+    # byte except tab and newline (both escaped explicitly below) before
+    # doing the backslash/quote/tab/newline escaping — otherwise a raw
+    # \r (or other control byte) in the note produces invalid JSON.
+    esc=$(printf '%s' "$note" \
+      | tr -d '\000-\010\013-\037' \
+      | sed 's/\\/\\\\/g; s/"/\\"/g; s/\t/\\t/g' \
+      | awk 'BEGIN{ORS="\\n"}1')
     esc=${esc%\\n}
-    [ -n "$esc" ] || exit 0
-    payload=$(printf '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"Active contract (re-injected after compaction):\\n\\n%s"}}' "$esc")
+    if [ -n "$esc" ]; then
+      payload=$(printf '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"Active contract (re-injected after compaction):\\n\\n%s"}}' "$esc")
+    fi
   fi
 fi
 
