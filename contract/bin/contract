@@ -136,6 +136,25 @@ cmd_close() {
   printf 'contract: closed %s\n' "$slug"
 }
 
+cmd_skip() {
+  local sid="${1:-}"; shift 2>/dev/null || true
+  local reason="$*"
+  [ -n "$sid" ] || die "usage: contract skip <session_id> <reason>"
+  [ -n "$reason" ] || die "a reason is required — the escape hatch is logged, not silent"
+  require_repo
+  mkdir -p "$SKIPDIR"
+  printf '%s\n' "$reason" > "$SKIPDIR/$sid"
+  printf '%s\t%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$sid" "$WT" "$reason" >> "$SKIPLOG"
+  printf 'contract: gate skipped for this session — logged to %s\n' "$SKIPLOG"
+}
+
+cmd_skipped() {
+  local sid="${1:-}"
+  [ -n "$sid" ] || return 1
+  resolve_paths "$PWD" || return 1
+  [ -f "$SKIPDIR/$sid" ]
+}
+
 main() {
   local sub="${1:-status}"; shift 2>/dev/null || true
   case "$sub" in
@@ -145,6 +164,8 @@ main() {
     new)     cmd_new "$@" ;;
     show)    cmd_show ;;
     close)   cmd_close ;;
+    skip)    cmd_skip "$@" ;;
+    skipped) cmd_skipped "$@" ;;
     *) printf 'contract: unknown subcommand %s\n' "$sub" >&2; return 2 ;;
   esac
 }
