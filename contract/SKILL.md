@@ -116,6 +116,25 @@ while the gate — the thing that actually catches "correct code, wrong
 thing" — was already finished and green. The right move was to cut the noisy
 check, not to tune it.
 
+## Don't over-build
+
+The Verifier is the scope ceiling, not just the finish line. Of every
+component you are about to build, ask: **is this required for the Verifier
+to pass?** No → it is not in this contract; say so and record it under
+Non-goals. Yes → build it, and build only it.
+
+When you catch yourself adding a helper, a migration, a compatibility shim,
+or a second mechanism "while we're here" — stop and offer the cut instead.
+Propose the smallest thing that passes the Verifier and name what you are
+leaving out. Deleting a thing outright is usually cheaper than migrating it:
+offer the deletion before you build the migration. If you are unsure whether
+something is in scope, it is not — ask, with the smaller option first.
+
+Worked examples from this skill's own construction: the dispatch-brief
+linter grew an English-phrase check no Verifier needed — false positives,
+cut. A sibling project proposed migrating state the user simply wanted
+deleted.
+
 ## Scale
 
 | Shape | Use |
