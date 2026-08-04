@@ -77,3 +77,15 @@ browse/dist/
 browse/test/fixtures/
 make-pdf/dist/
 */node_modules/
+# browse/ and make-pdf/ are compiled tools: the skills invoke only dist/, and
+# their build tooling lived in gstack, so tracking source we cannot compile buys
+# nothing. Source stays on disk and is recoverable from github.com/garrytan/gstack
+# if we ever port the build and take real ownership.
+browse/src/
+browse/test/
+make-pdf/src/
+make-pdf/test/
+# ship/sections/*.md is generated from these upstream templates; we keep the
+# output, not gstack's generator.
+ship/sections/*.md.tmpl
+browse/PLAN-snapshot-dropdown-interactive.md
