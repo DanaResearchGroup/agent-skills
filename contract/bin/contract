@@ -45,10 +45,106 @@ cmd_status() {
   fi
 }
 
+die() { printf 'contract: %s\n' "$1" >&2; exit 2; }
+
+require_repo() {
+  resolve_paths "$PWD" || die "not inside a git worktree"
+}
+
+cmd_enable() {
+  require_repo
+  : > "$ENABLED"
+  printf 'contract: gate enabled for %s (covers every worktree of this repo)\n' "$COMMON"
+}
+
+cmd_disable() {
+  require_repo
+  rm -f "$ENABLED"
+  printf 'contract: gate disabled for %s\n' "$COMMON"
+}
+
+active_slug() {
+  [ -f "$ACTIVE_FILE" ] && [ -s "$ACTIVE_FILE" ] && cat "$ACTIVE_FILE"
+}
+
+cmd_new() {
+  local slug="${1:-}"
+  [ -n "$slug" ] || die "usage: contract new <slug>"
+  case "$slug" in *[!a-zA-Z0-9._-]*) die "slug must be [a-zA-Z0-9._-]" ;; esac
+  require_repo
+  local cur; cur=$(active_slug)
+  if [ -n "$cur" ]; then
+    printf 'contract: %s is already active in this worktree; close it first\n' "$cur" >&2
+    exit 3
+  fi
+  mkdir -p "$CDIR/closed"
+  local base sha
+  base=$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)
+  sha=$(git -C "$WT" rev-parse --short HEAD 2>/dev/null || echo unknown)
+  cat > "$CDIR/$slug.md" <<EOF
+# Contract — $slug
+
+Opened: $(date -u +%Y-%m-%dT%H:%M:%SZ) · Worktree: $WT · Base: $base@$sha
+
+## Intent
+
+<One paragraph, in the agent's own words, on what changes and for whom.
+ Echoed, never transcribed — restating is what makes a misread visible.>
+
+## Verifier
+
+<A command plus its expected outcome, or an artifact plus what makes it correct.
+ "Tests pass" is not a verifier. A command that exits 0 is.>
+
+## Non-goals
+
+<Answer every category in reference/landmines.md, or mark it N/A.>
+
+## Gates
+
+<Actions requiring explicit user approval before execution.>
+
+## Evidence
+
+EOF
+  printf '%s\n' "$slug" > "$ACTIVE_FILE"
+  printf 'contract: opened %s\n' "$CDIR/$slug.md"
+}
+
+cmd_show() {
+  resolve_paths "$PWD" || return 0
+  local slug; slug=$(active_slug)
+  [ -n "$slug" ] || return 0
+  cat "$CDIR/$slug.md"
+}
+
+cmd_close() {
+  require_repo
+  local slug; slug=$(active_slug)
+  [ -n "$slug" ] || die "no active contract in this worktree"
+  local note="$CDIR/$slug.md"
+  # Everything after the Evidence heading must contain a non-blank line.
+  local evidence
+  evidence=$(sed -n '/^## Evidence/,$p' "$note" | tail -n +2 | tr -d '[:space:]')
+  if [ -z "$evidence" ]; then
+    printf 'contract: Evidence is empty in %s — run the verifier and paste its real output first\n' "$note" >&2
+    exit 4
+  fi
+  mkdir -p "$CDIR/closed"
+  mv "$note" "$CDIR/closed/$slug.md"
+  rm -f "$ACTIVE_FILE"
+  printf 'contract: closed %s\n' "$slug"
+}
+
 main() {
   local sub="${1:-status}"; shift 2>/dev/null || true
   case "$sub" in
-    status) cmd_status "$@" ;;
+    status)  cmd_status "$@" ;;
+    enable)  cmd_enable ;;
+    disable) cmd_disable ;;
+    new)     cmd_new "$@" ;;
+    show)    cmd_show ;;
+    close)   cmd_close ;;
     *) printf 'contract: unknown subcommand %s\n' "$sub" >&2; return 2 ;;
   esac
 }
