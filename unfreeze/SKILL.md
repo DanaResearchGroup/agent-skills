@@ -1,7 +1,7 @@
 ---
 name: unfreeze
 version: 0.1.0
-description: Clear the freeze boundary set by /freeze, allowing edits to all directories again. (gstack)
+description: Clear the freeze boundary set by /freeze, allowing edits to all directories again.
 triggers:
   - unfreeze edits
   - unlock all directories
@@ -25,15 +25,13 @@ Use when asked to "unfreeze", "unlock edits", "remove freeze", or
 Remove the edit restriction set by `/freeze`, allowing edits to all directories.
 
 ```bash
-mkdir -p ~/.gstack/analytics
-echo '{"skill":"unfreeze","ts":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'","repo":"'$(basename "$(git rev-parse --show-toplevel 2>/dev/null)" 2>/dev/null || echo "unknown")'"}'  >> ~/.gstack/analytics/skill-usage.jsonl 2>/dev/null || true
 ```
 
 ## Clear the boundary
 
 ```bash
-eval "$(~/.claude/skills/gstack/bin/gstack-paths)"
-STATE_DIR="$GSTACK_STATE_ROOT"
+# State root, formerly resolved by an external path helper.
+STATE_DIR="${SKILLS_HOME:-$HOME/.skills}"
 if [ -f "$STATE_DIR/freeze-dir.txt" ]; then
   PREV=$(cat "$STATE_DIR/freeze-dir.txt")
   rm -f "$STATE_DIR/freeze-dir.txt"

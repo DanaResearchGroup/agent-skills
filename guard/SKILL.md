@@ -1,7 +1,7 @@
 ---
 name: guard
 version: 0.1.0
-description: "Full safety mode: destructive command warnings + directory-scoped edits. (gstack)"
+description: "Full safety mode: destructive command warnings + directory-scoped edits."
 triggers:
   - full safety mode
   - guard against mistakes
@@ -15,17 +15,17 @@ hooks:
     - matcher: "Bash"
       hooks:
         - type: command
-          command: "bash $HOME/.claude/skills/gstack/careful/bin/check-careful.sh"
+          command: "bash $HOME/.claude/skills/careful/bin/check-careful.sh"
           statusMessage: "Checking for destructive commands..."
     - matcher: "Edit"
       hooks:
         - type: command
-          command: "bash $HOME/.claude/skills/gstack/freeze/bin/check-freeze.sh"
+          command: "bash $HOME/.claude/skills/freeze/bin/check-freeze.sh"
           statusMessage: "Checking freeze boundary..."
     - matcher: "Write"
       hooks:
         - type: command
-          command: "bash $HOME/.claude/skills/gstack/freeze/bin/check-freeze.sh"
+          command: "bash $HOME/.claude/skills/freeze/bin/check-freeze.sh"
           statusMessage: "Checking freeze boundary..."
 ---
 <!-- AUTO-GENERATED from SKILL.md.tmpl — do not edit directly -->
@@ -46,11 +46,9 @@ This is the combination of `/careful` + `/freeze` in a single command.
 
 **Dependency note:** This skill references hook scripts from the sibling `/careful`
 and `/freeze` skill directories. Both must be installed (they are installed together
-by the gstack setup script).
+by the setup script).
 
 ```bash
-mkdir -p ~/.gstack/analytics
-echo '{"skill":"guard","ts":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'","repo":"'$(basename "$(git rev-parse --show-toplevel 2>/dev/null)" 2>/dev/null || echo "unknown")'"}'  >> ~/.gstack/analytics/skill-usage.jsonl 2>/dev/null || true
 ```
 
 ## Setup
@@ -71,8 +69,8 @@ echo "$FREEZE_DIR"
 2. Ensure trailing slash and save to the freeze state file:
 ```bash
 FREEZE_DIR="${FREEZE_DIR%/}/"
-eval "$(~/.claude/skills/gstack/bin/gstack-paths)"
-STATE_DIR="$GSTACK_STATE_ROOT"
+# State root, formerly resolved by an external path helper.
+STATE_DIR="${SKILLS_HOME:-$HOME/.skills}"
 mkdir -p "$STATE_DIR"
 echo "$FREEZE_DIR" > "$STATE_DIR/freeze-dir.txt"
 echo "Freeze boundary set: $FREEZE_DIR"
