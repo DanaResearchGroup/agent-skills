@@ -1,46 +1,42 @@
 ---
 name: contract
-description: Use before changing code for any work bigger than a typo - agrees Intent, Verifier, Non-goals and Gates with the user and records them in a durable note, so "correct code, wrong thing" is caught before implementation rather than after. Also use when a contract gate denies an edit, when writing a subagent dispatch brief, or when closing out work.
+description: Use before changing code for anything bigger than a typo, when a contract gate denies an edit, when writing a subagent dispatch brief, or when closing out work — agrees Intent, Verifier, Non-goals and Gates with the user and records them in a durable note.
 ---
 
 # Contract
 
-The expensive failure mode is **correct code, wrong thing**: an implementation
-that matches a misread request, discovered only after the tokens are spent.
-This skill spends a little up front on definition to save a lot of rework.
+The expensive failure is **correct code, wrong thing**: a clean implementation of a misread
+request, discovered only after the tokens are spent. A contract spends a little definition up
+front to save the rework.
 
 Announce: "Using contract to define the work before implementing."
 
-## Any work bigger than a typo
+## When the gate denies an edit
 
-If the gate is enabled and there is no active contract, an `Edit` or `Write`
-is denied with a reason. Do not route around it through `Bash`.
+This worktree has no active contract. Resolve the denial itself — open a contract below, or
+take the logged skip for genuinely trivial work. Writing the file through `Bash` gets you
+past the only check standing between you and the failure above.
 
 ## Procedure
 
-**1. Explore first.** Exploration informs the Intent; it is never gated. An
-Intent written before reading the code is a misread waiting to happen.
+**1. Explore first.** `Read`, `Grep` and `Bash` are never gated: the gate stops you writing
+before you have read, nothing more. An Intent written without reading the code is the misread
+it exists to catch.
 
 **2. Negotiate four fields with the user.**
 
-- **Intent** — one paragraph, *in your own words*. Never paste the request
-  back verbatim; restating is what makes a misread visible. If the user
-  corrects your restatement, that correction is the whole point of the skill.
-- **Verifier** — a command plus its expected outcome, or an artifact plus
-  what makes it correct. "Tests pass" is not a verifier; a command that exits
-  0 is. If no such command exists yet, say so (write one, or name the doc/
-  artifact review that will make correctness visible) rather than inventing
-  one to fill the field.
-- **Non-goals** — answer every category in [landmines](reference/landmines.md),
-  or mark it N/A. Free-text non-goals decay into boilerplate; the checklist
-  names the real landmines.
-- **Gates** — actions needing explicit approval before execution: pushes,
-  merges, deletions, schema changes, spend, work on a shared branch.
-
-There is no minimum-effort escape from the Verifier field: it must be a
-runnable command. If you notice yourself *inventing* one just to fill the
-field, say so out loud — that invention is exactly the failure this skill
-exists to catch.
+- **Intent** — one paragraph *in your own words*. Restate the request; a paraphrase makes a
+  misread visible where a verbatim echo hides it. When the user corrects your restatement, the
+  skill has just paid for itself.
+- **Verifier** — a command plus its expected outcome, or an artifact plus what makes it
+  correct. "Tests pass" is not a verifier; a command that exits 0 is. Where none exists yet,
+  write one or name the artifact review that makes correctness visible — and if you catch
+  yourself inventing a verifier to fill the field, say so out loud. That invention is the
+  failure this skill exists to catch.
+- **Non-goals** — answer every category in [landmines](reference/landmines.md), or mark it
+  N/A. Free text decays into boilerplate; the checklist names the real landmines.
+- **Gates** — what needs explicit approval before execution: pushes, merges, deletions, schema
+  changes, spend, work on a shared branch.
 
 **3. Open the note.**
 
@@ -48,92 +44,66 @@ exists to catch.
 contract new <slug>
 ```
 
-Fill in the note the command opens. The gate stops blocking as soon as it
-exists.
+Fill it in. The gate opens as soon as the note exists.
 
-**4. Implement.** When dispatching a subagent, paste the contract above the
-task detail, then lint the brief:
+**4. Implement.** Dispatching a subagent? Paste the contract above the task detail, then:
 
 ```bash
 contract lint <brief-file>
 ```
 
-Lint mechanically checks two things: leaked bare identifiers (`I-005`,
-`D-012`) that mean nothing to a fresh worker, and a missing Verifier section.
-It does not check for conversation-only phrasing ("as discussed above", "the
-ticket") — that check produced real false positives (`"the ticket price"`,
-`"the above-mentioned constraint"`) and was cut. The underlying rule still
-stands by hand, it is simply no longer machine-checked for phrasing: below
-the paste marker, every noun must resolve from the brief's own text or the
-filesystem — absolute paths and SHAs, never a label that exists only in this
-conversation. A worker sees ONLY the brief. Workers report in three sections
-— **Completed / Verification / Remaining work** — where Verification is the
-verifier command actually run, plus its actual output.
+Lint catches leaked bare identifiers (`I-005`, `D-012`) and a missing Verifier section. It
+cannot check phrasing, so hold that rule by hand: **a worker sees only the brief.** Below the
+paste marker every noun resolves from the brief's own text or the filesystem — absolute paths
+and SHAs, never a label that lives only in this conversation.
 
-**5. Close.** Run the verifier, paste its real output under `## Evidence`,
-then:
+Workers report in three sections — **Completed / Verification / Remaining work** — where
+Verification is the verifier command actually run, plus its actual output.
+
+**5. Close.** Run the verifier, paste its real output under `## Evidence`, then:
 
 ```bash
 contract close
 ```
 
-`close` refuses if Evidence is empty. Treat the worker's self-report as
-intake, not truth — corroborate anything load-bearing yourself (`git log`,
-re-running the verifier) rather than trusting it verbatim.
+`close` refuses while Evidence is empty. Treat a worker's self-report as intake, not truth:
+corroborate anything load-bearing yourself with `git log` or by re-running the verifier.
 
-If the work is walked away from instead of finished, run
-`contract abandon "<reason>"` — it archives the note (marked ABANDONED) and
-re-arms the gate, so a stale contract never leaves the worktree ungated.
+Walking away instead of finishing? `contract abandon "<reason>"` archives the note and re-arms
+the gate, so a stale contract never leaves the worktree ungated.
 
 ## The escape hatch
-
-Genuinely trivial work takes the logged escape hatch:
 
 ```bash
 contract skip <session_id> "<reason>"
 ```
 
-This unblocks one session and leaves a permanent log entry. Use it freely for
-real typos, but not as "I'm just impatient" when context is thin — the skip
-log exists precisely so that pattern becomes visible later.
+Unblocks one session and leaves a permanent log entry. Spend it freely on real typos.
+"Impatient, context is thin" is the moment **correct code, wrong thing** is most likely, and
+the log is what makes that pattern visible later.
 
-## Staying on target
+## The Verifier is the ceiling
 
-The Intent is the target. Before escalating any decision to the user, ask:
-**does this change whether the Verifier passes?**
+The Verifier bounds the work, it does not merely end it. Of every component you are about to
+build and every decision you are about to escalate, ask: **does this change whether the
+Verifier passes?**
 
-- No → decide it yourself, note the decision, move on. Do not spend the
+- No → **YAGNI**. Say so, record it under Non-goals, and leave it unbuilt. If it was a
+  decision rather than a component, make it yourself and note it, rather than spending the
   user's attention.
-- Yes → ask, with concrete options and your recommendation.
+- Yes → build it, or ask with concrete options and your recommendation.
 
-Drift looks like polishing a component no Intent depends on, or asking the
-user to adjudicate a detail that does not move the Verifier. When you notice
-it, cut scope back to the Intent instead of perfecting the detour.
+Adding a helper, a migration, a compatibility shim, or a second mechanism "while we're here"
+is **yak shaving** with extra steps. Offer the cut instead: propose the smallest thing that
+passes the Verifier and name what you are leaving out. **Offer the deletion before you build
+the migration** — ripping a thing out is usually cheaper, and usually what was wanted. Unsure
+whether something is in scope? It is not; ask, smaller option first.
 
-This skill's own construction is the worked example: the dispatch-brief
-linter's regex false-positives were escalated to the user for adjudication
-while the gate — the thing that actually catches "correct code, wrong
-thing" — was already finished and green. The right move was to cut the noisy
-check, not to tune it.
-
-## Don't over-build
-
-The Verifier is the scope ceiling, not just the finish line. Of every
-component you are about to build, ask: **is this required for the Verifier
-to pass?** No → it is not in this contract; say so and record it under
-Non-goals. Yes → build it, and build only it.
-
-When you catch yourself adding a helper, a migration, a compatibility shim,
-or a second mechanism "while we're here" — stop and offer the cut instead.
-Propose the smallest thing that passes the Verifier and name what you are
-leaving out. Deleting a thing outright is usually cheaper than migrating it:
-offer the deletion before you build the migration. If you are unsure whether
-something is in scope, it is not — ask, with the smaller option first.
-
-Worked examples from this skill's own construction: the dispatch-brief
-linter grew an English-phrase check no Verifier needed — false positives,
-cut. A sibling project proposed migrating state the user simply wanted
-deleted.
+This skill's own construction is the worked example. Its dispatch-brief linter grew an
+English-phrase check no Verifier needed, which then cried wolf on `"the ticket price"` — and
+the question of how to tune it went to the user while the gate, the part that actually catches
+**correct code, wrong thing**, was already finished and green. Cutting the check was the move,
+twice over.
 
 ## Scale
 
@@ -144,10 +114,10 @@ deleted.
 | feature, unknown shape | `superpowers:brainstorming` + `superpowers:writing-plans` |
 | multi-repo, multi-agent campaign | `pm-creator` |
 
-Field names match `pm-creator`'s ledger exactly, so a ticket that outgrows
-this tier moves into the PM repo with no translation.
+Field names match `pm-creator`'s ledger exactly, so a ticket that outgrows this tier moves into
+the PM repo with no translation.
 
 ## Installing
 
-See [install](reference/install.md). The gate is opt-in per repo, keyed on
-the shared git dir — enabling in one repo covers all of its worktrees.
+See [install](reference/install.md). The gate is opt-in per repo, keyed on the shared git dir —
+enabling one repo covers all of its worktrees.
