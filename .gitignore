@@ -73,19 +73,26 @@ sync-gbrain/
 # so the skills keep working, but they are build output and 275M of it, so
 # they stay untracked. Their build tooling lived in gstack; see the note in
 # browse/SKILL.md before changing their source.
-browse/dist/
-browse/test/fixtures/
 make-pdf/dist/
 */node_modules/
 # browse/ and make-pdf/ are compiled tools: the skills invoke only dist/, and
 # their build tooling lived in gstack, so tracking source we cannot compile buys
 # nothing. Source stays on disk and is recoverable from github.com/garrytan/gstack
 # if we ever port the build and take real ownership.
-browse/src/
-browse/test/
 make-pdf/src/
 make-pdf/test/
 # ship/sections/*.md is generated from these upstream templates; we keep the
 # output, not gstack's generator.
-ship/sections/*.md.tmpl
-browse/PLAN-snapshot-dropdown-interactive.md
+
+# Skills we evaluated and chose not to own (see PR #46). gstack's copies may
+# still sit here on disk; they are not ours and are not tracked.
+browse/
+codex/
+context-restore/
+context-save/
+diagram/
+investigate/
+learn/
+scrape/
+ship/
+spec/
