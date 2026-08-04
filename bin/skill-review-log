@@ -1,0 +1,66 @@
+#!/usr/bin/env python3
+"""Append a review record to this project's per-branch review log.
+
+Usage:
+    skill-review-log '{"tier":"T1","breadth":2,"agents":3,"findings":33,
+                       "critical":13,"head":"8d68360"}'
+
+Written to $SKILLS_HOME/projects/<slug>/<branch>-reviews.jsonl so a re-review of
+the same branch can see what the last pass covered and at what tier.
+
+Replaces gstack-review-log, minus the enqueue to gstack's cloud sync.
+"""
+
+import json
+import os
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+def slug_and_branch() -> tuple[str, str]:
+    slug_bin = Path(__file__).resolve().parent / "skill-slug"
+    slug = branch = ""
+    try:
+        out = subprocess.run(
+            [str(slug_bin)], capture_output=True, text=True, timeout=10, check=False
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        out = ""
+    for line in out.splitlines():
+        if line.startswith("SLUG="):
+            slug = line[5:].strip()
+        elif line.startswith("BRANCH="):
+            branch = line[7:].strip()
+    return slug or Path.cwd().name, branch or "unknown"
+
+
+def main() -> int:
+    if len(sys.argv) < 2:
+        print("skill-review-log: expected one JSON argument", file=sys.stderr)
+        return 1
+
+    try:
+        rec = json.loads(sys.argv[1])
+    except json.JSONDecodeError as exc:
+        print(f"skill-review-log: invalid JSON ({exc})", file=sys.stderr)
+        return 1
+
+    if not isinstance(rec, dict):
+        print("skill-review-log: expected a JSON object", file=sys.stderr)
+        return 1
+
+    rec.setdefault("ts", datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+
+    slug, branch = slug_and_branch()
+    home = Path(os.environ.get("SKILLS_HOME", Path.home() / ".skills"))
+    dest = home / "projects" / slug
+    dest.mkdir(parents=True, exist_ok=True)
+    with (dest / f"{branch}-reviews.jsonl").open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(rec) + "\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -78,16 +78,33 @@ the substrate before the thing that uses it.
 ### Phase 1 — rebuild the skills we actually run
 
 One at a time, each discussed before it is written and put through
-`/writing-great-skills`. Order is by demonstrated pain, `/review` first: it has
-both a proven defect and a proven cost. Each rebuild keeps gstack's checklist
-prose — that content is data, it is good, and copying it carries no dependency —
-and drops the preamble entirely.
+`/writing-great-skills`. Order is by demonstrated pain. Each rebuild keeps
+gstack's checklist prose — that content is data, it is good, and copying it
+carries no dependency — and drops the preamble entirely.
 
-`/review` specifically must gain what upstream cannot give it: agent count scaled
-to the diff's **breadth** (distinct non-test source files) rather than its line
-count, a hard cap per tier, per-specialist model routing onto the four role
-agents, and a dispatch plan printed *before* anything launches so it can be vetoed
-in one keystroke.
+**`/review` — done.** Ours now: `review/` is tracked, removed from the gstack
+block in `.gitignore`, and the symlink into `gstack/review/` is gone. It is
+user-invoked (`disable-model-invocation: true`), so it costs no context in any
+turn of any session.
+
+What it gained that upstream could not give it:
+
+- **Breadth, not length.** Agent count scales on distinct non-test source files,
+  with a hard cap per tier. Validated against the PR that motivated this: 2 files,
+  T1, cap 3 — against the 7 Opus agents that actually ran.
+- **Legwork vs judgment.** A pass that earns its value by *running* things routes
+  to sonnet or haiku; a pass that earns it by *reasoning* adversarially gets opus.
+  The highest-value pass in that review was mutation testing — pure legwork.
+- **A dispatch plan printed before any agent launches**, so the spend is a
+  one-keystroke veto rather than a mid-run interruption.
+- **Executed or it is not P0.** A CRITICAL finding must quote output from
+  something that was run. Two confident P0 candidates in that review evaporated on
+  execution.
+- **Mutation testing**, which gstack's testing checklist does not mention at all,
+  with the instruction that matters: mutate *order*, not just presence.
+
+After a few real PRs, decide what else earns a fork. Everything not forked keeps
+running off gstack until Phase 2.
 
 ### Phase 2 — delete
 

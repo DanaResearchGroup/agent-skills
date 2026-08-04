@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+"""Append a learning to this project's learnings file.
+
+Usage:
+    skill-learnings-log '{"type":"pitfall","key":"n-plus-one","insight":"...",
+                          "confidence":8,"source":"observed"}'
+
+Storage is append-only. Duplicate key+type pairs are resolved at read time by
+skill-learnings-search, which keeps the latest.
+
+Replaces gstack-learnings-log. Two things changed: validation moved from Bun to
+Python (already a CI dependency here, whereas Bun was one more runtime to
+install), and the fire-and-forget enqueue to gstack's cloud sync is gone.
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+TYPES = {
+    "pattern",
+    "pitfall",
+    "preference",
+    "architecture",
+    "tool",
+    "operational",
+    "investigation",
+}
+SOURCES = {"observed", "user-stated", "inferred", "cross-model"}
+
+# A learning is written by an agent and read back into a later agent's context.
+# That round trip is an injection surface: text that reads as an instruction on
+# the way out will be obeyed on the way back in. Reject it at write time, where
+# there is still a human nearby to notice.
+INJECTION = re.compile(
+    r"(ignore\s+(all\s+)?previous|disregard\s+(the\s+)?above|"
+    r"new\s+instructions?\s*:|system\s*prompt|</?(system|assistant|user)>|"
+    r"you\s+are\s+now\s+a)",
+    re.IGNORECASE,
+)
+
+
+def die(msg: str) -> None:
+    print(f"skill-learnings-log: {msg}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def project_slug() -> str:
+    """Resolve the slug the same way skill-slug does, by calling it."""
+    slug_bin = Path(__file__).resolve().parent / "skill-slug"
+    try:
+        out = subprocess.run(
+            [str(slug_bin)], capture_output=True, text=True, timeout=10, check=False
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        out = ""
+    for line in out.splitlines():
+        if line.startswith("SLUG="):
+            return line[5:].strip()
+    return Path.cwd().name
+
+
+def main() -> int:
+    if len(sys.argv) < 2:
+        die("expected one JSON argument")
+
+    try:
+        rec = json.loads(sys.argv[1])
+    except json.JSONDecodeError as exc:
+        die(f"invalid JSON ({exc})")
+
+    if not isinstance(rec, dict):
+        die("expected a JSON object")
+
+    if rec.get("type") not in TYPES:
+        die(f"type must be one of: {', '.join(sorted(TYPES))}")
+
+    key = rec.get("key", "")
+    if not isinstance(key, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", key):
+        die("key must be alphanumeric with hyphens or underscores only")
+
+    try:
+        conf = int(rec["confidence"])
+    except (KeyError, TypeError, ValueError):
+        die("confidence must be an integer 1-10")
+    if not 1 <= conf <= 10:
+        die("confidence must be an integer 1-10")
+    rec["confidence"] = conf
+
+    source = rec.get("source")
+    if source is not None and source not in SOURCES:
+        die(f"source must be one of: {', '.join(sorted(SOURCES))}")
+
+    insight = rec.get("insight", "")
+    if insight and INJECTION.search(insight):
+        die("insight contains instruction-like content, rejected")
+
+    rec.setdefault("ts", datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+    # user-stated means the human said it. Everything else is the agent's own
+    # inference, and a later reader should weigh it accordingly.
+    rec["trusted"] = source == "user-stated"
+
+    home = Path(os.environ.get("SKILLS_HOME", Path.home() / ".skills"))
+    dest = home / "projects" / project_slug()
+    dest.mkdir(parents=True, exist_ok=True)
+    with (dest / "learnings.jsonl").open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(rec) + "\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

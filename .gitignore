@@ -23,6 +23,10 @@ ui-ux-pro-max-skill/
 # gstack is installed separately (README step 3) into this dir; its skills
 # sync into the top-level folders below. None of it belongs in this repo.
 # If gstack adds new skills, append them here (or regenerate this block).
+#
+# This block shrinks as we take skills over — see docs/degstack.md. A skill
+# removed from here is ours now, tracked, and gstack's copy of it is dead.
+# `review/` was the first to go.
 gstack/
 _gstack-command/
 autoplan/
@@ -69,7 +73,6 @@ plan-tune/
 qa/
 qa-only/
 retro/
-review/
 scrape/
 setup-browser-cookies/
 setup-deploy/
