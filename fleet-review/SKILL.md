@@ -1,5 +1,5 @@
 ---
-name: review
+name: fleet-review
 description: Pre-landing review of a PR or diff. Scopes the agent fleet to the change's breadth and routes each pass to a model that fits its job.
 disable-model-invocation: true
 argument-hint: "[PR url | branch | base ref — defaults to the merge-base with the repo's default branch]"
