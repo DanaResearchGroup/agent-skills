@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # contract — start gate and durable work note, keyed on the git worktree.
 # State layout:
-#   <worktree>/docs/superpowers/contracts/<slug>.md   the note
-#   <worktree>/docs/superpowers/contracts/ACTIVE      slug of the active note
+#   <worktree>/docs/contracts/<slug>.md             the note
+#   <worktree>/docs/contracts/ACTIVE                 slug of the active note
 #   <git-common-dir>/contract-enabled                 per-repo opt-in marker
 #   <git-common-dir>/contract-skips.log               permanent skip record
 #   <git-common-dir>/contract-skips/<session_id>      session-scoped skip
@@ -23,7 +23,14 @@ resolve_paths() {
     /*) COMMON="$common" ;;
     *)  COMMON=$(cd "$from" && cd "$common" 2>/dev/null && pwd) || return 1 ;;
   esac
-  CDIR="$WT/docs/superpowers/contracts"
+  # docs/contracts/ is the current home. docs/superpowers/contracts/ is the legacy one
+  # and is still honoured wherever it already exists, so a repo that is mid-contract
+  # does not silently lose its ACTIVE marker -- and therefore its gate -- the moment
+  # this tool is updated. A repo with neither directory gets the current location.
+  CDIR="$WT/docs/contracts"
+  if [ ! -d "$CDIR" ] && [ -d "$WT/docs/superpowers/contracts" ]; then
+    CDIR="$WT/docs/superpowers/contracts"
+  fi
   ACTIVE_FILE="$CDIR/ACTIVE"
   ENABLED="$COMMON/contract-enabled"
   SKIPLOG="$COMMON/contract-skips.log"

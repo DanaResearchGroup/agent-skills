@@ -88,7 +88,7 @@ assert_eq "" "$(hook Edit "$target" s2)" "an active contract unblocks the gate"
 
 # A hand-deleted note must re-arm the gate, not leave a phantom active slug
 # that disables it forever.
-rm "$WT/docs/superpowers/contracts/real-work.md"
+rm "$WT/docs/contracts/real-work.md"
 assert_contains "$(hook Edit "$target" s2)" '"deny"' "a deleted note re-arms the gate"
 
 # Fail open: paths outside any git repo, and malformed input, must allow.
