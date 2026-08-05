@@ -1,5 +1,5 @@
 ---
-name: review
+name: fleet-review
 description: Pre-landing review of a PR or diff. Scopes the agent fleet to the change's breadth and routes each pass to a model that fits its job.
 disable-model-invocation: true
 argument-hint: "[PR url | branch | base ref — defaults to the merge-base with the repo's default branch]"
@@ -171,15 +171,24 @@ Lead with the bookends table (repo, PR, head, base, scope, worktree, date), then
 
 ## Step 7 — Persist
 
+The Step 6 report lives only in this conversation, and the reader who has to act on it is
+usually the session that wrote the code. Drop it as a standalone artifact — run `drop-review`.
+It reuses what this review already pinned: the bookends from Step 1 and the per-finding
+provenance from Step 5, which land straight on its own scale. It synthesizes what is here; it
+runs no new passes.
+
+Then log the metric line, so the next review of this repo sizes itself against this one:
+
 ```bash
 bin/skill-review-log '{"tier":"T1","breadth":2,"agents":3,"findings":33,"critical":13,"head":"<sha>"}'
 ```
 
-Then store every finding that would change how the *next* review of this repo behaves — a gate
+And store every finding that would change how the *next* review of this repo behaves — a gate
 that lies, a suite that passes for the wrong reason, a constant no test pins:
 
 ```bash
 bin/skill-learnings-log '{"type":"pitfall","key":"<slug>","insight":"...","confidence":8,"source":"observed"}'
 ```
 
-**Done when:** the review record is written, and every finding meeting that bar is stored.
+**Done when:** the artifact is dropped, the review record is written, and every finding meeting
+that bar is stored.

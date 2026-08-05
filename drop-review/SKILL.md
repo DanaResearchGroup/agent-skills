@@ -1,7 +1,6 @@
 ---
 name: drop-review
-description: Drop the review you just ran as a markdown artifact in the OS temp directory, written for the session that wrote the code.
-disable-model-invocation: true
+description: Drop the review already in this conversation as a markdown artifact in the OS temp directory, written for the session that wrote the code. Use when a review pass has just finished and its findings need to outlive the conversation, when the user asks to save, persist, or write up a review, or when another skill closes out a review and needs the artifact.
 argument-hint: "[output path — defaults to <tmpdir>/<repo>-<sha>-review-<date>.md]"
 ---
 
