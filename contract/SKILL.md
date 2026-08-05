@@ -40,16 +40,20 @@ contract new <slug>
 
 Fill it in. The gate opens as soon as the note exists.
 
-**4. Implement.** Dispatching a subagent? Paste the contract above the task detail, then:
+**4. Implement.** Dispatching a subagent? Paste the contract, then a `paste below this line`
+marker, then the task detail the worker sees, then:
 
 ```bash
 contract lint <brief-file>
 ```
 
-Lint catches leaked bare identifiers (`I-005`, `D-012`) and a missing Verifier section. It
-cannot check phrasing, so hold that rule by hand: **a worker sees only the brief.** Below the
-paste marker every noun resolves from the brief's own text or the filesystem — absolute paths
-and SHAs, never a label that lives only in this conversation.
+Lint scans only what the worker sees — the region below the `paste below this line` marker (the
+same marker `pm-creator`'s briefs carry; with no marker the whole file is worker-facing). It
+flags leaked bare identifiers (`I-005`, `D-012`) there and a missing Verifier anywhere in the
+brief — a `## Verifier` heading and a `**Verifier.**` prose label both count. It cannot check
+phrasing, so hold that rule by hand: **a worker sees only the brief.** Below the marker every
+noun resolves from the brief's own text or the filesystem — absolute paths and SHAs, never a
+label that lives only in this conversation.
 
 Workers report in three sections — **Completed / Verification / Remaining work** — where
 Verification is the verifier command actually run, plus its actual output.

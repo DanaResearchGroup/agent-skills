@@ -65,15 +65,33 @@ cmd_lint() {
   [ -f "$f" ] || die "no such file: $f"
   local found=0
 
+  # A dispatched worker sees only the text below a "paste below this line"
+  # marker; everything above it is the dispatcher's own bookkeeping — the
+  # contract, its ticket refs — and never reaches the worker. So the
+  # leaked-identifier scan is marker-aware: it flags identifiers only in the
+  # below-marker region, exactly as pm-creator's lint-prompt does, or it cries
+  # wolf on every ticket ref in the contract header. With no marker the whole
+  # file is worker-facing and every line is in scope.
+  local marker_ln
+  marker_ln=$(grep -niE 'paste below this line' "$f" 2>/dev/null | head -1 | cut -d: -f1)
+  [ -n "$marker_ln" ] || marker_ln=0
+
   # Bare dispatch/ticket identifiers that mean nothing to a fresh worker.
   while IFS=: read -r ln text; do
     [ -n "$ln" ] || continue
+    [ "$ln" -gt "$marker_ln" ] || continue
     printf '%s:%s: leaked identifier (%s) — a fresh worker cannot resolve it\n' \
       "$f" "$ln" "$(printf '%s' "$text" | grep -oE '\b[IDQRA]-[0-9]{2,3}\b' | head -1)" >&2
     found=1
   done < <(grep -nE '\b[IDQRA]-[0-9]{2,3}\b' "$f" 2>/dev/null)
 
-  if ! grep -qiE '^#+[[:space:]]*Verifier|^Verifier:' "$f"; then
+  # A Verifier is a definition of done, not a heading style. Accept it as a
+  # markdown heading (## Verifier), a bare line-start label (Verifier: /
+  # Verifier.), or a bolded prose label (**Verifier.** / **Verifier:** /
+  # **Verifier**) — the last is what a brief carries when the four fields are
+  # written inline rather than as sections. Reshaping a real Verifier into a
+  # ## heading only to satisfy the check is the move this skill forbids.
+  if ! grep -qiE '^#+[[:space:]]*Verifier|^[[:space:]]*Verifier[.:]|\*\*[[:space:]]*Verifier[.:*]' "$f"; then
     printf '%s: no Verifier section — the worker has no definition of done\n' "$f" >&2
     found=1
   fi
