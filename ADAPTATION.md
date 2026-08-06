@@ -19,6 +19,17 @@ After edits, run `python3 bin/lint-skills.py` to confirm nothing broke.
 | 3 | …use an Obsidian vault | `obsidian-vault/SKILL.md`, your private `~/.claude/CLAUDE.md` | Point it at **your** vault path (the author's is under Dropbox). N/A if you don't use Obsidian. |
 | 4 | …everyone (global config) | `~/.claude/CLAUDE.md` (private, **not** in this repo) | Build your own global instructions: your Obsidian path and any personal preferences. Don't copy the author's verbatim. |
 
+## Deliberate drift from upstream (vendored Matt Pocock skills)
+
+These are intentional local edits to vendored skills. `/sync-matt-pocock-skills` must
+re-apply each one onto the new upstream base at every sync (current base: v1.2.2):
+
+| File | Local edit |
+| --- | --- |
+| `grilling/SKILL.md` | Present each round's questions through the `AskUserQuestion` tool with 2-4 concrete options; the recommended answer is the first option, marked "(Recommended)"; upstream's prose format is kept as the fallback for questions that can't be framed as options. (Originally applied to `grill-me` before upstream moved the family's content into `grilling`.) |
+| `wait-what/SKILL.md` | Upstream reads the shared vocabulary from `CONTEXT.md`; our repos don't standardize that file, so the reference is generalized to "the project's shared-vocabulary doc (`CONTEXT.md`, or this repo's domain model / `CLAUDE.md`)". |
+| `grill-with-docs/SKILL.md` | Typo fix in the description: "ADR's" → "ADRs". |
+
 ## Checklist
 
 - [ ] 1 — Home-directory paths point at my `$HOME`
