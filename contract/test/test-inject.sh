@@ -12,7 +12,7 @@ assert_eq "" "$(cd "$WT" && bash "$INJECT" </dev/null)" "no contract means no in
 # Put a distinctive verifier in the note, with a real embedded tab so the
 # no-raw-tab assertion below actually exercises tab-escaping.
 sed -i $'s|^<A command plus.*|pytest tests/test_parser.py -k schema\t# exits 0|' \
-  "$WT/docs/superpowers/contracts/parser-fix.md"
+  "$WT/docs/contracts/parser-fix.md"
 
 out=$(cd "$WT" && bash "$INJECT" </dev/null)
 assert_contains "$out" '"hookEventName":"SessionStart"' "emits a SessionStart hook object"
@@ -28,7 +28,7 @@ assert_eq "" "$(cd "$SANDBOX" && bash "$INJECT" </dev/null)" "silent outside a g
 # raw tab, double quote, backslash, and a non-ASCII em-dash must still
 # produce output that is either empty or strictly valid JSON — never
 # malformed JSON handed to the harness.
-printf 'She said "hi"\tworld\\path\r\nem\xe2\x80\x94dash\n' >> "$WT/docs/superpowers/contracts/parser-fix.md"
+printf 'She said "hi"\tworld\\path\r\nem\xe2\x80\x94dash\n' >> "$WT/docs/contracts/parser-fix.md"
 
 NOPY_DIR=$(mktemp -d "${TMPDIR:-/tmp}/contract-nopy-XXXXXX")
 # `contract show` (invoked by the hook) needs its own external tools —
