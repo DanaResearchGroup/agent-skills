@@ -19,7 +19,8 @@ substantially). Each remains under the upstream MIT license reproduced below:
 - `codebase-design/`
 - `code-review/`
 - `domain-modeling/`
-- `edit-article/`
+- `edit-article/` — upstream folded this skill into `obsidian-vault` in v1.2; we
+  deliberately retain the standalone copy (frozen at its pre-v1.2 content)
 - `grilling/`
 - `grill-me/`
 - `grill-with-docs/`
@@ -31,11 +32,18 @@ substantially). Each remains under the upstream MIT license reproduced below:
 - `resolving-merge-conflicts/`
 - `setup-matt-pocock-skills/`
 - `tdd/`
+- `to-questionnaire/`
 - `to-spec/`
 - `to-tickets/`
 - `triage/`
+- `wait-what/`
 - `wayfinder/`
-- `writing-great-skills/`
+- `writing-for-agents/`
+
+`writing-great-skills/` was vendored from upstream through v1.1.0; as of the
+v1.2.2 sync it is this repository's own thin wrapper over `writing-for-agents`
+(upstream retired the skill in favor of `writing-for-agents`) and is no longer
+third-party material.
 
 ```
 MIT License
