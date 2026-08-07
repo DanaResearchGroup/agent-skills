@@ -94,6 +94,30 @@ if [ -n "$_sp_slug" ] && [ -f "$_scf" ]; then
   fi
 fi
 
+# ---- prompt-cache TTL badge (hot / <30s countdown / cold) ----
+# Claude's ephemeral prompt cache has a sliding TTL (default 5 min) refreshed on
+# every API call. The newest transcript entry's timestamp is when we last hit the
+# API, so elapsed-since-then vs the TTL tells us the cache state. Stateless: it's
+# correct whenever the status line renders (override the window with CC_CACHE_TTL).
+cache_seg=""
+: "${CC_CACHE_TTL:=300}"
+if [ -n "$tpath" ] && [ -f "$tpath" ]; then
+  last_ts=$(tail -20 "$tpath" 2>/dev/null | jq -r 'select(.timestamp) | .timestamp' 2>/dev/null | tail -1)
+  if [ -n "$last_ts" ]; then
+    last_epoch=$(date -d "$last_ts" +%s 2>/dev/null)
+    if [ -n "$last_epoch" ]; then
+      remaining=$(( CC_CACHE_TTL - ( $(date +%s) - last_epoch ) ))
+      if [ "$remaining" -gt 30 ]; then
+        cache_seg=" \033[32mcache:hot\033[0m"          # green
+      elif [ "$remaining" -gt 0 ]; then
+        cache_seg=" \033[33mcache:${remaining}s\033[0m" # yellow countdown
+      else
+        cache_seg=" \033[90mcache:cold\033[0m"          # dim grey
+      fi
+    fi
+  fi
+fi
+
 if [ -n "$pct" ]; then
   pct_fmt=$(printf '%s' "$pct" | awk '{printf "%.1f", $1}')
   if command -v cc_ctx_color >/dev/null 2>&1; then
@@ -103,7 +127,7 @@ if [ -n "$pct" ]; then
   else
     color="\033[31m"
   fi
-  printf "%b%b  %s %s %b(%s%%)\033[0m%b%b" "$badge" "$ad_badge" "$model" "$tok_fmt" "$color" "$pct_fmt" "$loc" "$spar_badge"
+  printf "%b%b  %s %s %b(%s%%)\033[0m%b%b%b" "$badge" "$ad_badge" "$model" "$tok_fmt" "$color" "$pct_fmt" "$cache_seg" "$loc" "$spar_badge"
 else
-  printf "%b%b  %s %s%b%b" "$badge" "$ad_badge" "$model" "$tok_fmt" "$loc" "$spar_badge"
+  printf "%b%b  %s %s%b%b%b" "$badge" "$ad_badge" "$model" "$tok_fmt" "$cache_seg" "$loc" "$spar_badge"
 fi
