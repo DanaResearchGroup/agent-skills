@@ -29,6 +29,10 @@ fi
 #  - auto-handoff-watch: context-% threshold -> handoff/compact/reload.
 #  - session-resume-watch (Phoenix): usage/session-limit banner -> usage-credits or
 #    wait-for-reset -> continue.
+#  - cache-warm-watch: prompt-cache TTL -> countdown in the tab label. Turn end is
+#    exactly when the cache starts ageing unobserved, because the status line
+#    stops being rendered the moment CC goes idle.
 setsid "$HERE/auto-handoff-watch.sh" "$sid" </dev/null >/dev/null 2>&1 &
 setsid "$HERE/session-resume-watch.sh" "$sid" </dev/null >/dev/null 2>&1 &
+setsid "$HERE/cache-warm-watch.sh" "$sid" "$tpath" </dev/null >/dev/null 2>&1 &
 exit 0

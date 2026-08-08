@@ -11,6 +11,9 @@ keeps such a run alive across the two things that normally kill it:
 - **Phoenix** (session-limit auto-resume) — on a usage/session-limit stop, runs
   `/usage-credits` or waits until past the stated reset time, then sends `continue`.
 
+It also ships the **cache-warmth badge**, which counts the prompt cache down to expiry in the
+herdr *tab label* rather than the status line — see [Cache warmth](#cache-warmth-why-the-tab-label).
+
 Everything is **bundled inside this skill** (`bin/`) and self-locating, so it is reusable on
 any machine: copy the skill, run `bin/install.sh`, arm it.
 
@@ -23,8 +26,9 @@ autodev/
   bin/
     install.sh                 # wire the hooks/statusLine into ~/.claude/settings.json
     mux-lib.sh                 # multiplexer abstraction (herdr preferred, tmux fallback)
-    cc-statusline.sh           # statusLine: writes context % + herdr/tmux pane; renders the badge
-    cc-stop-hook.sh            # Stop hook: marks idle, launches both watchers (via $HERE)
+    cc-statusline.sh           # statusLine: writes context % + herdr/tmux pane/tab; renders the badge
+    cc-stop-hook.sh            # Stop hook: marks idle, launches the watchers (via $HERE)
+    cache-warm-watch.sh        # prompt-cache TTL → countdown in the tab label (`--clear` strips it)
     cc-sessionstart-compact.sh # SessionStart(compact) hook: reload-after-compaction backup
     auto-handoff-watch.sh      # engine: context-threshold (or handoff-request marker) → handoff/compact/reload
     auto-handoff-sweep.sh      # LEVEL trigger: timer-driven; re-arms the engine for parked sessions
@@ -37,6 +41,7 @@ autodev/
     test-parked-session.sh     # the sweeper re-arms a session the Stop hook can no longer reach
     test-abort-recovery.sh     # aborts are counted, retried, then surfaced as STUCK
     test-install-sweeper.sh    # the generated systemd unit (incl. the KillMode=process guard)
+    test-cache-warmth.sh       # the cache badge: countdown in the tab, deadline in the status line
 ```
 
 **Edge vs. level.** `cc-stop-hook.sh` launches the watcher at a *turn end* — an edge. The
@@ -73,6 +78,7 @@ Must run Claude Code **inside herdr or tmux** for the send-keys automation to wo
 | `disable-auto-compact` | Global kill switch (beats armed). Badge ⇒ ⛔. |
 | `disable-auto-resume` | Phoenix only off. |
 | `no-usage-credits` | Phoenix skips the paid `/usage-credits` step; always waits for the free reset. |
+| `disable-cache-badge` | Cache-warmth badge off. Honoured at the next poll (≤ `CC_CACHE_NAP_MAX`), and it strips any badge already on a tab on its way out. |
 
 Status-line badge: 🟡 DRY-RUN · 🔴 ARMED · ⛔ OFF · ⏳ AUTO-RESUME @ `<time>` (Phoenix waiting).
 Logs: `$AUTODEV_HOME/logs/{auto-handoff,auto-resume}.log`.
@@ -82,6 +88,27 @@ Logs: `$AUTODEV_HOME/logs/{auto-handoff,auto-resume}.log`.
 - `auto-handoff-watch.sh`: `THRESHOLD=35`, `COOLDOWN=900`, `WAIT_IDLE/WAIT_COMPACT`, `SETTLE`.
 - `session-resume-watch.sh`: `BUFFER_MIN=4` (minutes past reset), `CREDITS_WAIT`, `WAKE`, `MAX_WAIT`.
 - `auto-handoff-watch.sh`: `REQUEST_MAX_AGE=3600` — TTL for a `handoff-request` / `compact-request` marker.
+- `cache-warm-watch.sh` (env, not constants): `CC_CACHE_TTL=300` (the prompt-cache window),
+  `CC_CACHE_WARN=30` (when the countdown appears), `CC_CACHE_MAXLIFE=7200`, `CC_CACHE_NAP_MAX=60`.
+
+## Cache warmth: why the tab label
+
+Claude Code invokes the `statusLine` command **only on conversation updates**. Measured on a live
+session: across 120 s of idle it was not invoked once. So the status line is a photograph, and
+anything in it that decays with wall-clock time becomes a lie the moment the session goes idle —
+a `cache:hot` that stays green for an hour, with the countdown and expiry states unreachable
+precisely when they would be useful. The split follows from that:
+
+| Surface | Shows | Why there |
+|---|---|---|
+| status line (`cc_cache_seg`) | `cache⌛07:06:12` — the wall-clock time the cache lapses | An absolute deadline is still true however stale the render is. Fixed colour, for the same reason. |
+| herdr tab label (`cache-warm-watch.sh`) | ` ⌛28s` in the last 30 s, then ` •cold` | herdr repaints its own tab bar while Claude Code is idle, so it can actually count down. |
+
+The watcher is launched per turn by the Stop hook, exits as soon as a newer transcript entry shows
+the cache was refreshed, and never memorises a label: it reads the live one and appends or strips
+only its own suffix, so renaming a tab mid-countdown is safe and a killed watcher leaves nothing
+to restore. The status line clears a stale badge on its first render of a new turn (`--clear`),
+since a render happening at all is proof the cache was just refreshed.
 
 ## Voluntary handoff-request (hand off below threshold)
 
