@@ -1,6 +1,6 @@
 ---
 name: copilot-review
-description: Fix a PR's Copilot / GitHub Advanced Security bot review — triage each finding, fix the real ones, then squash each fix into the commit it fixes, rebase onto the base if it has moved, and force-push with lease.
+description: Fix a PR's Copilot / GitHub Advanced Security bot review — triage each finding, fix the real ones, then squash each fix into the commit it fixes, rebase onto the base if it has moved, and force-push with lease. Runs start to finish without pausing for confirmation; invoking it is the approval.
 disable-model-invocation: true
 ---
 
@@ -9,6 +9,13 @@ disable-model-invocation: true
 Turn a PR's automated bot review into fixes folded cleanly back into history: **target** the PR →
 **fetch** the bot comments → **triage** them → fix → **fixup** into the right commits, **rebase**
 onto the base if it has moved, and force-push with lease.
+
+**This runs to completion in one pass.** Being invoked *is* the authorisation to rewrite history
+and force-push: every finding you classify as **address** gets fixed, squashed into the commit that
+owns it, and pushed, without stopping to confirm. Report the triage table as you go — that is
+transparency, not a question. The only things that stop the run are the 5b tripwires (downstream
+work, a dirty worktree elsewhere, a branch shared with collaborators) and a conflict you cannot
+resolve confidently; those are safety checks, and they stop-and-report rather than ask permission.
 
 ## 1. Target the PR
 
@@ -81,11 +88,13 @@ judging; don't trust the comment's framing.
   doesn't hold when you read the surrounding code — record as skipped, don't reshape code to silence
   them), suggestions that fight an existing project convention, or findings on code the PR didn't touch.
 
-Present the triage table (comment → address/skip → reason) and the fixup plan (which fix squashes
-into which commit) and get the user's go-ahead before rewriting history — per the repo's git-history
-rule, history rewrites and force-pushes need approval.
+Report the triage table (comment → address/skip → reason) and the fixup plan (which fix squashes
+into which commit), then **keep going** — do not stop here for a go-ahead. The classification is
+yours to make and act on; the table exists so the user can see what you decided and push back
+afterwards, not so they can unblock you. A borderline finding is a judgement call to make and
+record in the table, not a reason to hand the run back.
 
-**Done when:** every comment is classified with a reason and the user has approved the plan.
+**Done when:** every comment is classified with a reason and the table is reported.
 
 ## 4. Fix
 
@@ -95,9 +104,9 @@ non-trivial and they're quick; report honestly if anything fails.
 **Writing the fixes is NOT the end state.** Whoever makes the changes carries them all the way
 through step 5 in the same session: squash each fix into the commit it fixes, then
 `git push --force-with-lease`. Do not stop here and hand back a dirty worktree or a branch of
-loose "address review" commits for someone else to fold in — the approval you obtained in step 3
-was approval to rewrite history and force-push, so finish the job. If a fix turns out to be
-blocked, squash and push the ones that aren't and say plainly which you left and why.
+loose "address review" commits for someone else to fold in — you already hold the authorisation to
+rewrite history and force-push, so finish the job. If a fix turns out to be blocked, squash and
+push the ones that aren't and say plainly which you left and why.
 
 **Done when:** every **address**-classified item from step 3 has a corresponding code change (or is
 explicitly re-classified as skip with a one-line reason), and any tests/linters you ran are reported.
