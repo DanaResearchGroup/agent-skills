@@ -48,6 +48,12 @@ mux_register(){ # $1 = sid
     o=$(mux_owner_file herdr "$HERDR_PANE_ID")
     printf '%s\n' "$sid" > "$o.tmp" 2>/dev/null && mv "$o.tmp" "$o" 2>/dev/null
   fi
+  # The TAB owning this pane, for the label badges (cache-warm-watch.sh). herdr
+  # exports it alongside the pane id, so this stays env-only and subprocess-free.
+  if [ "${HERDR_ENV:-}" = "1" ] && [ -n "${HERDR_TAB_ID:-}" ]; then
+    f="$STATE/$sid.herdr-tab"
+    printf '%s\n' "$HERDR_TAB_ID" > "$f.tmp" 2>/dev/null && mv "$f.tmp" "$f" 2>/dev/null
+  fi
   if [ -n "${TMUX_PANE:-}" ]; then
     f="$STATE/$sid.tmux-pane"
     printf '%s\n' "$TMUX_PANE" > "$f.tmp" 2>/dev/null && mv "$f.tmp" "$f" 2>/dev/null
@@ -57,11 +63,13 @@ mux_register(){ # $1 = sid
 }
 
 # --- driver side (runs detached in the watchers) -----------------------------
-# Resolve MUX + PANE from the registered state files. herdr takes precedence.
+# Resolve MUX + PANE (+ TAB, when the backend has one) from the registered state
+# files. herdr takes precedence.
 # Returns 0 when a registration exists, 1 when none (caller should exit).
 mux_init(){ # $1 = sid
   local sid="$1" v
-  MUX=""; PANE=""
+  MUX=""; PANE=""; TAB=""
+  [ -s "$STATE/$sid.herdr-tab" ] && TAB=$(cat "$STATE/$sid.herdr-tab" 2>/dev/null)
   if [ -s "$STATE/$sid.herdr-pane" ]; then
     v=$(cat "$STATE/$sid.herdr-pane" 2>/dev/null)
     if [ -n "$v" ]; then MUX="herdr"; PANE="$v"; return 0; fi
@@ -143,6 +151,34 @@ mux_session_name(){
   case "$MUX" in
     tmux)  tmux display-message -p -t "$PANE" '#{session_name}' 2>/dev/null ;;
     *) : ;;
+  esac
+}
+
+# --- tab label (the one surface that repaints while Claude Code is idle) -----
+# Claude Code renders its status line only on conversation updates, so nothing
+# time-varying can live there. The multiplexer's own tab bar can: herdr repaints
+# it independently of the agent. These two are what cache-warm-watch.sh drives.
+#
+# tmux is a deliberate no-op here, following mux_session_name's precedent of
+# printing nothing for the backend it cannot serve: tmux window names are shared
+# by every pane in the window, so a per-session badge would fight its neighbours.
+
+# Print the tab's current label; non-zero (and nothing) if the tab is gone.
+mux_tab_label(){
+  [ -n "${TAB:-}" ] || return 1
+  case "$MUX" in
+    herdr) herdr tab get "$TAB" 2>/dev/null \
+             | grep -o '"label":"[^"]*"' | head -1 | cut -d'"' -f4 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Set the tab's label. Non-zero if the backend has no tab or the call failed.
+mux_tab_rename(){ # $1 = label
+  [ -n "${TAB:-}" ] || return 1
+  case "$MUX" in
+    herdr) herdr tab rename "$TAB" "$1" >/dev/null 2>&1 ;;
+    *) return 1 ;;
   esac
 }
 

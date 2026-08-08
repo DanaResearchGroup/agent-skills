@@ -24,29 +24,9 @@ command -v cc_location >/dev/null 2>&1 && loc=$(cc_location "$dir")
 
 c_model='\033[0;36m' r='\033[0m'
 
-# ---- prompt-cache TTL segment (hot / <30s countdown / cold) ----
-# Claude's ephemeral prompt cache has a sliding TTL (default 5 min) refreshed on
-# every API call. The newest transcript entry's timestamp is when we last hit the
-# API, so elapsed-since-then vs the TTL tells us the cache state. Stateless: it's
-# correct whenever the status line renders (override the window with CC_CACHE_TTL).
+# ---- prompt-cache segment: when the cache lapses (see cc_cache_seg) ----
 cache_seg=''
-: "${CC_CACHE_TTL:=300}"
-if [ -n "$tpath" ] && [ -f "$tpath" ]; then
-  last_ts=$(tail -20 "$tpath" 2>/dev/null | jq -r 'select(.timestamp) | .timestamp' 2>/dev/null | tail -1)
-  if [ -n "$last_ts" ]; then
-    last_epoch=$(date -d "$last_ts" +%s 2>/dev/null)
-    if [ -n "$last_epoch" ]; then
-      remaining=$(( CC_CACHE_TTL - ( $(date +%s) - last_epoch ) ))
-      if [ "$remaining" -gt 30 ]; then
-        cache_seg=' \033[32mcache:hot\033[0m'          # green
-      elif [ "$remaining" -gt 0 ]; then
-        cache_seg=" \033[33mcache:${remaining}s\033[0m" # yellow countdown
-      else
-        cache_seg=' \033[90mcache:cold\033[0m'          # dim grey
-      fi
-    fi
-  fi
-fi
+command -v cc_cache_seg >/dev/null 2>&1 && cache_seg=$(cc_cache_seg "$tpath")
 
 if [ -n "$pct" ]; then
   pct_fmt=$(printf '%s' "$pct" | awk '{printf "%.1f", $1}')

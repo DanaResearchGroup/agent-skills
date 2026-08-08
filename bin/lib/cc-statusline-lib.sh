@@ -20,6 +20,57 @@ cc_ctx_color() {
   }'
 }
 
+# cc_cache_seg <transcript_path> -> prints the prompt-cache segment, or nothing
+# when the transcript is missing/unreadable.
+#
+# Claude's ephemeral prompt cache has a sliding TTL (default 5 min, override with
+# CC_CACHE_TTL) refreshed on every API call, so the newest transcript timestamp
+# plus the TTL is the wall-clock moment the cache lapses.
+#
+# This prints that DEADLINE rather than a hot/cold state, deliberately: Claude
+# Code invokes the statusLine command only on conversation updates — measured, it
+# is not called once across 120 s of idle — so whatever this returns is frozen on
+# screen until the next turn. A decaying state ("hot", "12s") becomes a lie the
+# moment it stops being redrawn, and the countdown and expiry states could never
+# appear while idle, which is the only time they carry information. An absolute
+# clock time stays true however stale the render is. The colour is fixed for the
+# same reason: one derived from remaining-at-render-time would freeze and lie
+# exactly like the text did.
+#
+# The live countdown lives where it can actually redraw — autodev/bin/
+# cache-warm-watch.sh puts it in the herdr tab label, which herdr repaints on its
+# own cadence while Claude Code sits idle.
+cc_cache_seg() {
+  local last_epoch when
+  last_epoch=$(cc_cache_epoch "${1:-}") || return 0
+  [ -n "$last_epoch" ] || return 0
+  when=$(date -d "@$(( last_epoch + ${CC_CACHE_TTL:-300} ))" +%H:%M:%S 2>/dev/null) || return 0
+  [ -n "$when" ] || return 0
+  printf '%b' " \033[2;36mcache⌛${when}\033[0m"
+}
+
+# cc_cache_epoch <transcript_path> -> prints the epoch seconds of the newest
+# transcript entry that represents an API call on THIS session's prompt prefix,
+# i.e. the moment the prompt cache was last refreshed. Prints nothing and
+# returns non-zero when that cannot be determined.
+#
+# Shared by cc_cache_seg (which turns it into a deadline) and by
+# autodev/bin/cache-warm-watch.sh (which turns it into a live countdown), so the
+# two halves of the cache badge can never disagree about when the cache lapses.
+cc_cache_epoch() {
+  local tpath=${1:-} last_ts
+  [ -n "$tpath" ] && [ -f "$tpath" ] || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  # -R + fromjson? tolerates a half-written trailing line while CC is appending.
+  # isSidechain entries are subagent turns: they ride a different prompt prefix
+  # and so do not refresh THIS session's cache — they must not read as activity.
+  last_ts=$(tail -20 "$tpath" 2>/dev/null \
+    | jq -rR 'fromjson? | select(.timestamp and (.isSidechain != true)) | .timestamp' 2>/dev/null \
+    | tail -1)
+  [ -n "$last_ts" ] || return 1
+  date -d "$last_ts" +%s 2>/dev/null
+}
+
 # cc_location <dir> -> prints "  repo@branch[*] [marker]" (ANSI-coloured), or
 # nothing when <dir> is empty, git is absent, or <dir> is not in a work tree.
 #   repo       cyan    main repo name — stable across worktrees

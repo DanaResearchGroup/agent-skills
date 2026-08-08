@@ -20,8 +20,13 @@ sandbox_new() {
   mkdir -p "$BIN"
   cp "$SKILL_DIR"/bin/*.sh "$BIN"/
   chmod +x "$BIN"/*.sh
+  # The prompt-cache clock lives in the repo-root status-line lib, outside
+  # autodev/bin, so the sandboxed copy cannot resolve it by relative path. Point
+  # the watcher at the REAL lib through its test seam — the clock the status line
+  # uses is then the clock under test, which is the whole point of sharing it.
+  export CC_STATUSLINE_LIB="$SKILL_DIR/../bin/lib/cc-statusline-lib.sh"
   # Tests drive the watcher directly; never let a stray env id leak in.
-  unset CLAUDE_CODE_SESSION_ID HERDR_ENV HERDR_PANE_ID TMUX_PANE
+  unset CLAUDE_CODE_SESSION_ID HERDR_ENV HERDR_PANE_ID HERDR_TAB_ID TMUX_PANE
 }
 
 sandbox_rm() { [ -n "${SB:-}" ] && rm -rf "$SB"; }
@@ -33,6 +38,27 @@ session_new() { # $1 = sid, $2 = pct, $3 = pane id
   printf 'pct=%s ts=%s\n' "$2" "$(date +%s)" > "$STATE/$1.ctx"
   printf '%s\n' "$3" > "$STATE/$1.herdr-pane"
   printf '%s\n' "$1" > "$STATE/.paneowner-herdr-$(printf '%s' "$3" | tr ':%' '__')"
+}
+
+# Give a session a tab with a starting label. The label lives in a file the mux
+# stub reads and writes, so a test can inspect it, rename it behind the watcher's
+# back, or delete it to model the tab being closed.
+session_tab() { # $1 = sid, $2 = tab id, $3 = initial label
+  printf '%s\n' "$2" > "$STATE/$1.herdr-tab"
+  printf '%s' "$3" > "$SB/tab-$2"
+}
+tab_label() { cat "$SB/tab-$1" 2>/dev/null; }
+
+# A transcript whose newest entry is <age> seconds old — i.e. the session last
+# hit the API that long ago, which is what the cache clock reads.
+#
+# Pass $3 whenever the test also derives an expected deadline from the clock:
+# reading `date` a second time can straddle a second boundary, leaving the
+# expectation one second ahead of what the code under test computed.
+transcript_aged() { # $1 = path, $2 = age in seconds, $3 = "now" epoch (default: read the clock)
+  local now=${3:-$(date +%s)}
+  printf '{"type":"assistant","isSidechain":false,"timestamp":"%s"}\n' \
+    "$(date -u -d "@$(( now - $2 ))" +%Y-%m-%dT%H:%M:%S.000Z)" > "$1"
 }
 
 # --- multiplexer stub ------------------------------------------------------
@@ -48,9 +74,18 @@ MUX_BUSY_RE='esc to interrupt'
 mux_owner_file(){ printf '%s/.paneowner-%s-%s' "$STATE" "$1" "$(printf '%s' "$2" | tr ':%' '__')"; }
 mux_register(){ :; }
 mux_init(){
-  MUX=""; PANE=""
+  MUX=""; PANE=""; TAB=""
+  [ -s "$STATE/$1.herdr-tab" ] && TAB=$(cat "$STATE/$1.herdr-tab")
   [ -s "$STATE/$1.herdr-pane" ] || return 1
   PANE=$(cat "$STATE/$1.herdr-pane"); MUX="herdr"; [ -n "$PANE" ]
+}
+# Tab labels live in $SB/tab-<id>. A missing file means the tab is gone, which is
+# how the real herdr backend reports a closed tab: the query simply fails.
+mux_tab_label(){ [ -n "${TAB:-}" ] && [ -f "$SB/tab-$TAB" ] && cat "$SB/tab-$TAB"; }
+mux_tab_rename(){
+  [ -n "${TAB:-}" ] && [ -f "$SB/tab-$TAB" ] || return 1
+  printf '%s' "$1" > "$SB/tab-$TAB"
+  printf '%s\n' "$1" >> "$SB/renames.log"
 }
 mux_pane_live(){ case " ${MUX_LIVE_PANES:-} " in *" $PANE "*) return 0;; *) return 1;; esac; }
 mux_pane_owner(){ local o; o=$(mux_owner_file "$MUX" "$PANE"); [ -s "$o" ] && cat "$o"; }
@@ -62,6 +97,7 @@ mux_send_line(){ printf '%s\n' "$1" >> "$SB/sent.log"; }
 mux_send_key(){ :; }
 STUB
   : > "$SB/sent.log"
+  : > "$SB/renames.log"
 }
 
 # --- assertions ------------------------------------------------------------

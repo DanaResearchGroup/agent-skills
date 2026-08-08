@@ -9,7 +9,8 @@ STATE="$AUTODEV_HOME/state"
 mkdir -p "$STATE" 2>/dev/null
 
 # Multiplexer abstraction (herdr | tmux) for pane registration.
-_MUXLIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/mux-lib.sh"
+_HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_MUXLIB="$_HERE/mux-lib.sh"
 [ -f "$_MUXLIB" ] && . "$_MUXLIB"
 
 sid=$(printf '%s' "$input" | jq -r '.session_id // empty')
@@ -29,6 +30,16 @@ if [ -n "$sid" ]; then
     # Fallback if mux-lib.sh is missing: preserve the original tmux behavior.
     printf '%s\n' "$TMUX_PANE" > "$STATE/$sid.tmux-pane.tmp" 2>/dev/null \
       && mv "$STATE/$sid.tmux-pane.tmp" "$STATE/$sid.tmux-pane" 2>/dev/null
+  fi
+  # Drop a stale cache badge off the tab label. This script runs ONLY on a
+  # conversation update, so the fact that it is running at all proves an API call
+  # just refreshed the cache and any badge cache-warm-watch.sh left on the tab is
+  # now wrong. The watcher polls lazily once cold (there is no inotify here and
+  # there can be dozens of idle sessions), so without this the badge would linger
+  # into the new turn. One stat(2) on the common path; the subprocess only ever
+  # runs when there is genuinely a badge to strip.
+  if [ -f "$STATE/$sid.cachewarm-badge" ] && [ -x "$_HERE/cache-warm-watch.sh" ]; then
+    setsid "$_HERE/cache-warm-watch.sh" --clear "$sid" </dev/null >/dev/null 2>&1 &
   fi
 fi
 
@@ -94,29 +105,11 @@ if [ -n "$_sp_slug" ] && [ -f "$_scf" ]; then
   fi
 fi
 
-# ---- prompt-cache TTL badge (hot / <30s countdown / cold) ----
-# Claude's ephemeral prompt cache has a sliding TTL (default 5 min) refreshed on
-# every API call. The newest transcript entry's timestamp is when we last hit the
-# API, so elapsed-since-then vs the TTL tells us the cache state. Stateless: it's
-# correct whenever the status line renders (override the window with CC_CACHE_TTL).
+# ---- prompt-cache badge: when the cache lapses (see cc_cache_seg in the lib) ----
+# The live countdown is deliberately NOT here: the status line cannot redraw
+# while CC is idle, so cache-warm-watch.sh owns it, in the herdr tab label.
 cache_seg=""
-: "${CC_CACHE_TTL:=300}"
-if [ -n "$tpath" ] && [ -f "$tpath" ]; then
-  last_ts=$(tail -20 "$tpath" 2>/dev/null | jq -r 'select(.timestamp) | .timestamp' 2>/dev/null | tail -1)
-  if [ -n "$last_ts" ]; then
-    last_epoch=$(date -d "$last_ts" +%s 2>/dev/null)
-    if [ -n "$last_epoch" ]; then
-      remaining=$(( CC_CACHE_TTL - ( $(date +%s) - last_epoch ) ))
-      if [ "$remaining" -gt 30 ]; then
-        cache_seg=" \033[32mcache:hot\033[0m"          # green
-      elif [ "$remaining" -gt 0 ]; then
-        cache_seg=" \033[33mcache:${remaining}s\033[0m" # yellow countdown
-      else
-        cache_seg=" \033[90mcache:cold\033[0m"          # dim grey
-      fi
-    fi
-  fi
-fi
+command -v cc_cache_seg >/dev/null 2>&1 && cache_seg=$(cc_cache_seg "$tpath")
 
 if [ -n "$pct" ]; then
   pct_fmt=$(printf '%s' "$pct" | awk '{printf "%.1f", $1}')
