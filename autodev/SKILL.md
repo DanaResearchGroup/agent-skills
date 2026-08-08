@@ -12,11 +12,11 @@ loop survives across compactions.
 Be autonomous. Do not stop for routine choices — use judgment and keep going. Only stop
 for a genuine blocker, a real user decision, or completion.
 
-**Core rule of this mode: Codex is consulted before you ever ask the user.** Whenever you
-would normally pause and call AskUserQuestion on a technical/design/architectural decision,
-you FIRST spar with Codex and, if Codex resolves it, you proceed on your own. See
-"Decision points" below. This is what makes the loop autonomous instead of bottlenecking
-on the user.
+**Core rule of this mode: the user is asked only when you and Codex agree they must be.**
+Whenever you would normally pause and call AskUserQuestion on a technical/design/architectural
+decision, you FIRST spar with Codex, and that round ends in an explicit `ESCALATE: yes/no`
+vote. A `no` means you take Codex's option and keep going. See "Decision points" below. This
+is what makes the loop autonomous instead of bottlenecking on the user.
 
 **Use subagents heavily.** Do the real work in dispatched subagents wherever possible —
 implementation, searching, reading large files, running/parsing test output, exploration —
@@ -100,8 +100,21 @@ slug: <slug>   updated: <YYYY.MM.DD HH.MM.SS>
 ### Prime Codex once (first `/spar` of the run)
 
 On the **first** `/spar` invocation of this run only — i.e. when the per-project Codex
-session is created (`~/agents/adversarial/<slug>/.session-id` did not yet exist) — prepend
-a one-time priming instruction telling Codex to ground itself in the real code:
+session is created (`~/agents/adversarial/<slug>/.session-id` did not yet exist) — prepend a
+**mission brief**, so Codex critiques against the actual target instead of inferring it from a
+diff. A reviewer who never learned the goal reviews the code you wrote, not the feature you owe.
+The brief has two parts.
+
+**1. The mission**, quoted from `$DEV/progress.md` so the goal has one source of truth:
+
+- the `## Goal` paragraph verbatim, and the full `## Milestones` list — including the ones not
+  yet built, so Codex can tell a deliberate stub from an omission;
+- which milestone this round covers, and what has already landed (`## Done`);
+- the constraints fixed for the whole run: stack, interfaces that must not break, standards the
+  repo enforces, anything the user ruled in or out at Step 1;
+- what **done and verified** means for this feature — the tests/build that must go green.
+
+**2. The grounding prime:**
 
 > Before answering, load and read the actual code in this repository, and review the
 > feature branch we are working on if it is relevant: determine the current branch and its
@@ -109,13 +122,16 @@ a one-time priming instruction telling Codex to ground itself in the real code:
 > changed files. Base your critique on what the code actually does, not assumptions.
 
 Codex runs with `-C <repo> -s read-only`, so it can run git and read any in-repo file.
-Because the session is persistent (`codex exec resume`), this grounding carries forward to
-every later round — **do not repeat it** on subsequent spars.
+Because the session is persistent (`codex exec resume`), both parts carry forward to every later
+round — **do not repeat them**. Later rounds carry only what changed: the increment and the
+question.
 
 **Codex context is self-managed by `/spar`.** The persistent Codex session fills up over a long
 run; `/spar` handles this on its own — when the session gets too full it has the outgoing session
 write a successor handoff, rotates to a fresh Codex session reseeded with it (and re-applies the
-grounding prime), and announces the rotation. You do **nothing** extra for this. When you see a
+grounding prime), and announces the rotation. Re-attach the **mission brief** on your first round
+after a rotation — the predecessor handoff carries Codex's own open threads, not your goal.
+Otherwise you do **nothing** extra for this. When you see a
 `/spar` round announce an auto-handoff, note it in `progress.md` Decisions ("Codex context rotated
 to a fresh session at round N — arc carried via predecessor handoff") so a compacted resume knows
 the Codex memory was rolled over. (This is separate from the Claude Code auto-handoff, which gates
@@ -140,26 +156,39 @@ For each milestone, in order:
 
 Spar at EVERY milestone, not just once. The point is continuous adversarial pressure.
 
-## Decision points — consult Codex, then auto-proceed
+## Decision points — Codex concurs before the user is asked
 
-This overrides the normal "ask the user" reflex for the duration of the run.
+This overrides the normal "ask the user" reflex for the duration of the run. The user is asked
+only when **both** of you agree the question is theirs — a **concurrence gate**.
 
 Whenever you reach a point where you would otherwise call AskUserQuestion about a
-**technical / design / architectural / chemistry-modeling** decision (which approach,
-how to resolve a failure, which fix, etc.):
+**technical / design / architectural / chemistry-modeling** decision (which approach, how to
+resolve a failure, which fix), or you are about to declare a blocker:
 
-1. **Do NOT ask the user yet.** First invoke `/spar`, handing Codex the decision and the
-   concrete options + tradeoffs (e.g. `/spar "Resolve X: option A <...> vs B <...> vs C
-   <...>. Which is correct and why? Favor fixing the real defect over bypassing checks."`).
-   Codex resumes the same persistent session, so it has the full arc.
-2. **Auto-proceed if resolved.** If Codex's analysis points to a clear best option with no
-   irreversible risk, take that option, record it in `progress.md` Decisions ("chose A —
-   Codex: <reason>"), and keep working. Do not surface the question to the user.
-3. **Only escalate to the user when** the decision is still genuinely ambiguous after
-   Codex, OR it is irreversible/destructive (deleting data, force-push, dropping schema,
-   spending money, changing public scope), OR it needs information only the user has
-   (product intent, priorities, external constraints). In those cases call AskUserQuestion
-   and fold Codex's take into the options.
+1. **Spar first.** Invoke `/spar` with the decision and the concrete options + tradeoffs (e.g.
+   `/spar "Resolve X: option A <...> vs B <...> vs C <...>. Which is correct and why? Favor
+   fixing the real defect over bypassing checks."`). Codex resumes the same persistent session,
+   so it has the full arc. Close the question with the vote request:
+
+   > End your answer with a line `ESCALATE: yes` or `ESCALATE: no`, plus one sentence of reason.
+   > Answer `yes` only if this genuinely requires the human — it stays ambiguous after your own
+   > analysis, or it turns on information only they hold. If you can resolve it, answer `no` and
+   > name the option to take.
+
+2. **`ESCALATE: no` → auto-proceed.** Take the option Codex named, record it in `progress.md`
+   Decisions ("chose A — Codex: <reason>"), and keep working. The user is not asked, and the
+   round file under `~/agents/adversarial/<slug>/` stands as the record of what was decided
+   without them. Still convinced the call is theirs? Fire exactly **one** tiebreak round saying
+   what Codex's read misses; a second `ESCALATE: no` binds you — proceed.
+
+3. **`ESCALATE: yes` → ask.** You concur, so call AskUserQuestion with Codex's take folded into
+   the options.
+
+4. **Escalate unilaterally — no vote needed** — when the action is irreversible or destructive
+   (deleting data, force-push, dropping a schema, spending money, changing public scope), or the
+   answer is information only the user holds (product intent, priorities, external constraints,
+   what they actually want built). Codex cannot hold the user's intent, so a `no` there would
+   authorize the very thing that needs their consent. Ask directly and skip the round.
 
 Honor the user's standing rules when reading Codex: prefer fixing the real defect over
 "building to pass the check," and treat bypass flags (e.g. asserting a reference state the
@@ -274,10 +303,12 @@ mid-run is fully recoverable — keep `progress.md` current at every checkpoint 
 
 - All milestones done and verification green → set progress.md `status: done`, write a
   final `/handoff`, summarize what shipped, and stop.
-- Genuine user decision required — only *after* Codex could not resolve it (still
-  ambiguous, or irreversible/destructive/out-of-scope, or needs user-only info per
-  "Decision points") → write `/handoff`, ask via AskUserQuestion, stop.
-- Same step fails 3 times → stop, write progress.md Blockers, escalate with what you tried.
+- User decision required — Codex voted `ESCALATE: yes`, or it falls in the unilateral
+  carve-out (irreversible/destructive, or user-only info) per "Decision points" → write
+  `/handoff`, ask via AskUserQuestion, stop.
+- Same step fails 3 times → spar it as a decision point. On `ESCALATE: no`, take Codex's
+  option and keep going; on `yes`, stop, write progress.md Blockers, and escalate with what
+  you tried.
 
 When you stop for any of the above, clear the autodev status-line marker:
 `rm -f "$S/$MYSID.autodev"` (harmless if `$S`/`$MYSID` aren't in scope — it just
@@ -306,7 +337,8 @@ session, so install/relocation takes effect for **new** sessions only.
 
 ## Rules
 
-- Autonomous by default. Routine choices are yours; only stop for real blockers/decisions.
+- Autonomous by default. Routine choices are yours; the user is asked on `ESCALATE: yes`
+  or the carve-out, and nowhere else.
 - `/spar` every milestone. Fix P1 findings before advancing.
 - Never advance on failing tests.
 - Keep `progress.md` and handoffs resumable across compaction — that is what makes the
