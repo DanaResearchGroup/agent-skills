@@ -100,8 +100,21 @@ slug: <slug>   updated: <YYYY.MM.DD HH.MM.SS>
 ### Prime Codex once (first `/spar` of the run)
 
 On the **first** `/spar` invocation of this run only — i.e. when the per-project Codex
-session is created (`~/agents/adversarial/<slug>/.session-id` did not yet exist) — prepend
-a one-time priming instruction telling Codex to ground itself in the real code:
+session is created (`~/agents/adversarial/<slug>/.session-id` did not yet exist) — prepend a
+**mission brief**, so Codex critiques against the actual target instead of inferring it from a
+diff. A reviewer who never learned the goal reviews the code you wrote, not the feature you owe.
+The brief has two parts.
+
+**1. The mission**, quoted from `$DEV/progress.md` so the goal has one source of truth:
+
+- the `## Goal` paragraph verbatim, and the full `## Milestones` list — including the ones not
+  yet built, so Codex can tell a deliberate stub from an omission;
+- which milestone this round covers, and what has already landed (`## Done`);
+- the constraints fixed for the whole run: stack, interfaces that must not break, standards the
+  repo enforces, anything the user ruled in or out at Step 1;
+- what **done and verified** means for this feature — the tests/build that must go green.
+
+**2. The grounding prime:**
 
 > Before answering, load and read the actual code in this repository, and review the
 > feature branch we are working on if it is relevant: determine the current branch and its
@@ -109,13 +122,16 @@ a one-time priming instruction telling Codex to ground itself in the real code:
 > changed files. Base your critique on what the code actually does, not assumptions.
 
 Codex runs with `-C <repo> -s read-only`, so it can run git and read any in-repo file.
-Because the session is persistent (`codex exec resume`), this grounding carries forward to
-every later round — **do not repeat it** on subsequent spars.
+Because the session is persistent (`codex exec resume`), both parts carry forward to every later
+round — **do not repeat them**. Later rounds carry only what changed: the increment and the
+question.
 
 **Codex context is self-managed by `/spar`.** The persistent Codex session fills up over a long
 run; `/spar` handles this on its own — when the session gets too full it has the outgoing session
 write a successor handoff, rotates to a fresh Codex session reseeded with it (and re-applies the
-grounding prime), and announces the rotation. You do **nothing** extra for this. When you see a
+grounding prime), and announces the rotation. Re-attach the **mission brief** on your first round
+after a rotation — the predecessor handoff carries Codex's own open threads, not your goal.
+Otherwise you do **nothing** extra for this. When you see a
 `/spar` round announce an auto-handoff, note it in `progress.md` Decisions ("Codex context rotated
 to a fresh session at round N — arc carried via predecessor handoff") so a compacted resume knows
 the Codex memory was rolled over. (This is separate from the Claude Code auto-handoff, which gates
