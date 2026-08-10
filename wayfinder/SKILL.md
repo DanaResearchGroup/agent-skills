@@ -60,6 +60,11 @@ Each ticket is a **child issue** of the map; the tracker's issue id is its ident
 ## Question
 
 <the decision or investigation this ticket resolves>
+
+## Cost   <!-- research tickets only; drop this whole section on every other type -->
+
+<the probe's expected price — agent-hours, dollars, or a rough order of magnitude — so
+the decision it blocks can be deferred against a real number>
 ```
 
 Each ticket carries a `wayfinder:<type>` label — one of `research`, `prototype`, `grilling`, `task` (see [Ticket Types](#ticket-types)).
@@ -74,7 +79,7 @@ The answer isn't part of the body — it's recorded on resolution (see [Work thr
 
 Every ticket is either **HITL** — human in the loop, worked *with* a human who speaks for themselves — or **AFK**, driven by the agent alone. A HITL ticket only resolves through that live exchange; the agent never stands in for the human's side of it (a grilling agent that answers its own questions has broken this).
 
-- **Research** (AFK): Reading documentation, third-party APIs, or local resources like knowledge bases to surface a fact a decision waits on. Resolved by a `/research` **subagent**. Use when knowledge outside the current working directory is required.
+- **Research** (AFK to run, but firing is cost-gated): Reading documentation, third-party APIs, or local resources like knowledge bases to surface a fact a decision waits on. Resolved by a `/research` **subagent**. Use when knowledge outside the current working directory is required. A research ticket is a priced probe — `probe` (see [probe](../probe/SKILL.md)) owns how the question is written and priced; `wayfinder` owns whether and when the ticket actually fires. Its `## Cost` field carries the price. A cheap ticket fires the moment it's created, same as any AFK ticket. An expensive one (judge against the effort's usual ticket cost; ask if unsure) waits unfired until the user approves it — the Cost field only lets the blocked decision be deferred against a real number if firing is what's being approved, not a foregone conclusion by the time the user sees the number.
 - **Prototype** (HITL): Raise the fidelity of the discussion by making a cheap, rough, concrete artifact to react to — an outline, a rough take, a stub, or UI/logic code via the /prototype skill. Links the prototype as an asset. Use when "how should it look" or "how should it behave" is the key question.
 - **Grilling** (HITL): Conversation via the /grilling and /domain-modeling skills, one question at a time. The default case.
 - **Task** (HITL or AFK): Manual work that must happen before a *decision* can be made — nothing to decide, prototype, or research, but the discussion is blocked until it's done. Signing up for a service so its API can be judged, provisioning access, moving data so its shape can be seen. This is the one type that *does* rather than decides — and it earns its place by unblocking a decision, not by delivering the destination. The agent drives it alone where it can (AFK); otherwise it hands the human a precise checklist (HITL). Resolved when the work is done; the answer records what was done and any resulting facts (credentials location, new URLs, row counts) later tickets depend on.
@@ -89,6 +94,8 @@ The map's **Not yet specified** section is where that dim view is written down: 
 
 - **Ticket when** the question is already sharp — even if it's blocked and you can't act on it yet.
 - **Not yet specified when** you can't yet phrase it that sharply. Don't pre-slice the fog into ticket-sized pieces: it's coarser than a ticket, and one patch may graduate into several tickets, or none, once the frontier reaches it.
+
+A question can pass that test and still be pitched at the wrong level: sharp about the wrong thing. Before ticketing, check the question is aimed at the level actually in play — a sharp question about the subject is no use when the live question is about the medium carrying it (or the reverse).
 
 **Not yet specified** excludes what's already decided (Decisions so far), what's already a live ticket, and what's out of scope (the next section).
 
@@ -112,7 +119,7 @@ User invokes with a loose idea.
 2. **Map the frontier.** Grill again, **breadth-first** this time: fan out across the whole space rather than deep on any one thread, surfacing the open decisions and the first steps takeable now. **If this surfaces no fog** — the way to the destination is already clear, the whole journey small enough for one session — you don't need a map. Stop and ask the user how they'd like to proceed.
 3. **Create the map** (label `wayfinder:map`): Destination and Notes filled in, Decisions-so-far empty, the fog sketched into **Not yet specified**.
 4. **Create the tickets you can specify now** as child issues of the map — then wire blocking edges in a **second pass** (issues need ids before they can reference each other). Wiring sorts them into the frontier and the blocked; everything you can't yet specify stays in the fog — the **Not yet specified** section.
-5. **Fire the research subagents.** For each `research` ticket you just created, spin up a `/research` subagent to resolve it in parallel, capturing its findings on a throwaway `research/<name>` branch with a context pointer from the ticket.
+5. **Fire the cheap research subagents.** For each `research` ticket you just created whose `## Cost` is cheap by the effort's own scale, spin up a `/research` subagent to resolve it in parallel, capturing its findings on a throwaway `research/<name>` branch with a context pointer from the ticket. For an expensive one, leave it unfired and put the Cost to the user as a decision — firing it is the approval, not a formality after the fact. Record the deferral on the ticket itself with a `wayfinder:needs-approval` label: an unfired ticket that looks identical to a takeable one gets fired by the next session that walks the frontier, which spends the money the deferral existed to withhold. Treat that label as off-frontier until the user clears it.
 6. Stop — charting is one session's work; it hand-resolves nothing.
 
 ### Work through the map
@@ -123,6 +130,6 @@ User invokes with a map (URL or number). A ticket is **optional** — without on
 2. Choose the ticket. If the user named one, use it. Otherwise take the first frontier ticket in order. **Claim it**: assign it to yourself before any work.
 3. Resolve it — **zoom as needed**: fetch the full body of any related or closed ticket on demand; invoke the skills the `## Notes` block names. If in doubt, use `/grilling` and `/domain-modeling`.
 4. Record the resolution: post the answer as a **resolution comment**, **close** the issue, and **append a context pointer** to the map's Decisions-so-far.
-5. Add newly-surfaced tickets (create-then-wire); graduate any fog the answer has made specifiable, clearing each graduated patch from **Not yet specified** so it lives only as its new ticket. If the answer reveals a ticket — this one or another — sits beyond the destination, **rule it out of scope** rather than resolving it on the route. If the decision invalidates other parts of the map, update or delete those tickets.
+5. Add newly-surfaced tickets (create-then-wire); graduate any fog the answer has made specifiable, clearing each graduated patch from **Not yet specified** so it lives only as its new ticket. If the answer reveals a ticket — this one or another — sits beyond the destination, **rule it out of scope** rather than resolving it on the route. If the resolution or finding **retires** another ticket's question — settles it without answering it, the way a changed premise voids what it was asked about — close that ticket the same loud way: leave one line explaining what retired it, and surface it to the user as a decision rather than silently updating or deleting it. Ask yourself first: given what we just found, is the original destination still worth reaching?
 
 The user may run unblocked tickets in parallel, so expect other sessions to be editing the tracker concurrently.
