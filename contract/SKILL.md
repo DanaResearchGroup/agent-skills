@@ -17,11 +17,22 @@ Announce: "Using contract to define the work before implementing."
 before you have read, nothing more. An Intent written without reading the code is the misread
 it exists to catch.
 
-**2. Negotiate four fields with the user.**
+**2. Negotiate the fields with the user.** Intent, Verifier, Non-goals, and Gates are always
+present. Premise is conditional — include it whenever the work rests on a load-bearing claim
+worth checking; skip it when the ground is already firm.
 
 - **Intent** — one paragraph *in your own words*. Restate the request; a paraphrase makes a
   misread visible where a verbatim echo hides it. When the user corrects your restatement, the
   skill has just paid for itself.
+- **Premise** *(conditional)* — the load-bearing claim the work rests on, the cheapest check
+  that would kill it, and that check's result. See [probe](../probe/SKILL.md) for how to run the
+  check. Most tickets rest on nothing worth probing: **omit the field entirely** rather than
+  writing `none`. An honest omission beats a ritual line, and a field that is always present
+  is a mandatory field wearing a conditional label. Carry it when skipping it would mean
+  building on an unverified premise. `contract new` seeds a placeholder comment for this field;
+  answer it with a real `## Premise` section or delete the placeholder block outright — `contract
+  lint` fails on the sentinel if the boilerplate survives untouched, so omission stays legal but
+  indecision does not.
 - **Verifier** — a command plus its expected outcome, or an artifact plus what makes it
   correct. "Tests pass" is not a verifier; a command that exits 0 is. Where none exists yet,
   write one or name the artifact review that makes correctness visible — and if you catch
