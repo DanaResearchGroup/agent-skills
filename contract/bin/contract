@@ -96,6 +96,15 @@ cmd_lint() {
     found=1
   fi
 
+  # The Premise placeholder carries a stable sentinel so lint can tell "decided
+  # to omit" from "never decided." Its survival means the author never
+  # answered it: fill it in with a real "## Premise" section, or delete the
+  # placeholder block outright.
+  if grep -qF '[PREMISE-UNANSWERED]' "$f"; then
+    printf '%s: Premise placeholder left unanswered — add a "## Premise" section or delete the placeholder block\n' "$f" >&2
+    found=1
+  fi
+
   return "$found"
 }
 
@@ -155,6 +164,13 @@ Opened: $(date -u +%Y-%m-%dT%H:%M:%SZ) · Worktree: $WT · Base: $base@$sha
 
 <One paragraph, in the agent's own words, on what changes and for whom.
  Echoed, never transcribed — restating is what makes a misread visible.>
+
+<!-- [PREMISE-UNANSWERED] Conditional section. Does this work rest on a load-bearing claim worth
+     checking? If so, invoke the probe skill, run the cheapest check that would kill the claim,
+     and replace this comment with a "## Premise" heading carrying the claim, the check, and its
+     result. If not, delete this comment and move on — an omitted section beats a ritual "none".
+     \`contract lint\` fails on the literal token [PREMISE-UNANSWERED] surviving untouched: that
+     is how it tells "decided to omit" from "never decided." -->
 
 ## Verifier
 

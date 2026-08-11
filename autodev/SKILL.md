@@ -190,6 +190,19 @@ resolve a failure, which fix), or you are about to declare a blocker:
    what they actually want built). Codex cannot hold the user's intent, so a `no` there would
    authorize the very thing that needs their consent. Ask directly and skip the round.
 
+5. **A finding that retires the mission is always the user's call.** When something you learn mid-run
+   undercuts the premise the whole feature rests on — the evidence base retires the goal, a probe
+   inverts the load-bearing assumption, the thing being built turns out already to exist — stop and
+   surface it as a decision rather than executing the remaining milestones. This is the carve-out
+   above (only they hold the intent), and it is the failure that autonomous loops make most often:
+   the verdict sits in your own findings while you keep building against it.
+
+   The finding is a premise like any other: corroborate it (probe, re-check, a second look) before
+   acting on it — an uncorroborated retirement claim is not grounds to stop. Once corroborated,
+   run the checkpoint beat's quiesce step (collect every running background agent) and update
+   `progress.md` and the handoff before you ask, exactly as at any other phase boundary — do not
+   surface the finding mid-phase with agents still in flight and no record of where you stopped.
+
 Honor the user's standing rules when reading Codex: prefer fixing the real defect over
 "building to pass the check," and treat bypass flags (e.g. asserting a reference state the
 thermo can't actually support) as a last resort to be flagged, not a default.

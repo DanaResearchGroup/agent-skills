@@ -80,4 +80,50 @@ out=$("$CONTRACT" lint "$prose_v" 2>&1); rc=$?
 assert_eq 0 "$rc" "a bolded prose Verifier label satisfies the check"
 assert_not_contains "$out" "no Verifier" "no missing-Verifier finding for a prose label"
 
+# The Premise placeholder `contract new` seeds carries a sentinel. Left
+# untouched it means the author never decided whether a premise applies, so
+# lint fails. Filling it in with a real Premise section, or deleting the
+# placeholder block outright, are both legal answers and both pass.
+premise_untouched="$SANDBOX/premise-untouched.md"
+cat > "$premise_untouched" <<'EOF'
+Fix the schema validator in /abs/path/repo/src/parser.py.
+
+<!-- [PREMISE-UNANSWERED] Conditional section. Does this work rest on a load-bearing claim worth
+     checking? If so, invoke the probe skill, run the cheapest check that would kill the claim,
+     and replace this comment with a "## Premise" heading carrying the claim, the check, and its
+     result. If not, delete this comment and move on — an omitted section beats a ritual "none".
+     `contract lint` fails on the literal token [PREMISE-UNANSWERED] surviving untouched: that is
+     how it tells "decided to omit" from "never decided." -->
+
+## Verifier
+pytest /abs/path/repo/tests/test_parser.py  # exits 0
+EOF
+out=$("$CONTRACT" lint "$premise_untouched" 2>&1); rc=$?
+assert_eq 1 "$rc" "an unanswered Premise placeholder fails lint"
+assert_contains "$out" "Premise placeholder left unanswered" "the finding names the unanswered placeholder"
+
+premise_answered="$SANDBOX/premise-answered.md"
+cat > "$premise_answered" <<'EOF'
+Fix the schema validator in /abs/path/repo/src/parser.py.
+
+## Premise
+The validator is assumed to run on every commit. Checked: grep the CI config for the pytest
+invocation — confirmed, it runs on every push.
+
+## Verifier
+pytest /abs/path/repo/tests/test_parser.py  # exits 0
+EOF
+out=$("$CONTRACT" lint "$premise_answered" 2>&1); rc=$?
+assert_eq 0 "$rc" "a real Premise section passes lint"
+
+premise_deleted="$SANDBOX/premise-deleted.md"
+cat > "$premise_deleted" <<'EOF'
+Fix the schema validator in /abs/path/repo/src/parser.py.
+
+## Verifier
+pytest /abs/path/repo/tests/test_parser.py  # exits 0
+EOF
+out=$("$CONTRACT" lint "$premise_deleted" 2>&1); rc=$?
+assert_eq 0 "$rc" "a deleted Premise placeholder passes lint — omission stays legal"
+
 finish

@@ -72,3 +72,15 @@ Only offer to create an ADR when all three are true:
 3. **The result of a real trade-off** — there were genuine alternatives and you picked one for specific reasons
 
 If any of the three is missing, skip the ADR. Use the format in [ADR-FORMAT.md](./ADR-FORMAT.md).
+
+### Sweep decisions before the session ends
+
+Decisions accumulate in prose during a session and, left there, vanish when the conversation is compacted. Before the session ends, reconcile every decision that settled: write the ones that clear the ADR gate above, and for the rest, confirm each is recorded somewhere durable — `CONTEXT.md`, a ticket, a comment — not left living only in prose.
+
+### Keep the open-questions list synchronised
+
+If the session is tracking open questions in some document, strike each one the moment it's settled, or delete the list. A list that only gets appended to is worse than no list: the next session will re-litigate ground this one already settled.
+
+### Retract dead claims
+
+When a probe or a check inverts a claim already written down, don't just move past it — record the retraction the moment it happens, pairing the dead claim with the evidence that killed it and the repaired formulation to use in its place, and mark the claim's original location (a glossary entry, an ADR) dead in place so a session that never opens `RETRACTIONS.md` doesn't ingest it as live. Use the format in [RETRACTION-FORMAT.md](./RETRACTION-FORMAT.md).

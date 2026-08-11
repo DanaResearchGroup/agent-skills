@@ -1,0 +1,3 @@
+interface:
+  display_name: "Ask One By One"
+  short_description: "Put each decision to the user as one explained menu"
