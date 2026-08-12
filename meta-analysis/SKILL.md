@@ -78,7 +78,13 @@ by the tally.
 Numbered. Each gets a detectable early signal and a tripwire that would catch it next time. A
 failure mode without a tripwire is a complaint, not a finding.
 
-Done when every numbered mode carries a tripwire.
+**Every tripwire names what it does not cover.** A tripwire is written against the failure that just
+happened, and the next one arrives somewhere the tripwire cannot see — a process fix aimed at last
+run's mode reads, on the next run, as protection it never offered. Say in one clause what class of
+failure this tripwire would miss, so the next analysis starts from a known blind spot rather than a
+false sense of coverage.
+
+Done when every numbered mode carries a tripwire, and every tripwire states its blind spot.
 
 ## 6. Waste accounting
 
