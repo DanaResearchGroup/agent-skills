@@ -1,13 +1,20 @@
 ---
 name: merged
-description: After a PR merges, sync local main, prune every fully-merged branch and its worktree, and offer to rebase the remaining open PRs onto the new main.
-disable-model-invocation: true
+description: Use immediately after a PR is merged - sync local main, prune every fully-merged branch and its worktree, and offer to rebase the remaining open PRs onto the new main.
 ---
 
 # merged
 
 A PR just merged. Reconcile the local repo with the new `main` and offer the downstream cleanup:
 **confirm** the merge → **sync** main → **prune** every merged branch → **rebase** the other open PRs.
+
+**Invoke this yourself the moment a merge is confirmed** — it does not wait to be asked. What keeps
+it safe is the tripwires, not who typed the command. The split is by act, not by step number: every
+*local* act is recoverable and gates itself — `-d` refuses an unmerged branch, a worktree must be
+clean before it is touched, and a dirty or detached worktree is a live session to report, not debris
+to collect. The two *outward-facing* acts still stop for the user, and one of them sits inside a
+step that is otherwise local: deleting a branch on the shared remote (the "On the remote" half of
+step 3) and force-pushing a rebase (step 4).
 
 Anchor to the PR this session just discussed or merged — don't re-derive it. If none is in hand, ask
 which one merged. The canonical remote is whatever `git remote -v` shows (often `official`, not
