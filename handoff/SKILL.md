@@ -88,6 +88,12 @@ rh="$HOME/.claude/skills/autodev/bin/request-handoff.sh"
 [ -x "$rh" ] && bash "$rh" --compact-only --handoff "$hf" 2>/dev/null || true
 ```
 
+**ALWAYS print the handoff's absolute path to the user — every time, no exceptions.** The full
+expanded path exactly as `$hf` holds it: not `~/agents/handoffs/…`, not a bare filename, not "the
+handoff file". The user has to open, move, or hand that file to another session, and a path they
+must reconstruct is a path they cannot click. This holds when the write was routine, when a tool
+call already showed the filename, and when nothing else in the turn is worth saying.
+
 **Then VERIFY the trigger exists — do not assume the script filed one.** `request-handoff.sh`
 legitimately declines to file when the watcher is already mid-cycle, and it is a silent no-op
 when autodev is not installed. Running it is therefore not proof that anything will happen:
@@ -122,7 +128,8 @@ a substitute for filing and verifying the marker. Do both.
 Then emit this explicit instruction block:
 
 ```text
-Handoff written, .latest updated, compact-request filed.
+Handoff written: <absolute path — the full expanded $hf, always, no exceptions>
+.latest updated, compact-request filed.
 
 • If this session's status line shows the 🔴 AUTO-HANDOFF badge AND the marker was verified to
   exist above: end the turn — the auto-handoff watcher will run /compact and reload at the next
