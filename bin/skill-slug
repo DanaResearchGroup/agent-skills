@@ -19,22 +19,64 @@ PROJECT_DIR="$(pwd)"
 CACHE_KEY=$(printf '%s' "$PROJECT_DIR" | tr '/' '_')
 CACHE_FILE="${CACHE_DIR}/${CACHE_KEY}"
 
+# slug_from_remote <remote-name> -- echoes the owner-repo slug, or nothing.
+slug_from_remote() {
+  local url raw
+  url=$(git remote get-url "$1" 2>/dev/null) || return 0
+  [[ -n "$url" ]] || return 0
+  raw=$(printf '%s' "$url" | sed 's|.*[:/]\([^/]*/[^/]*\)\.git$|\1|;s|.*[:/]\([^/]*/[^/]*\)$|\1|' | tr '/' '-')
+  printf '%s' "$raw" | tr -cd 'a-zA-Z0-9._-'
+}
+
+# compute_slug -- the remote-derived slug, or nothing when no remote resolves.
+#
+# `origin` is tried FIRST and its precedence must not change: every slug that
+# resolves correctly today resolves through it, and this file's own header warns
+# that changing the algorithm silently detaches accumulated learnings from their
+# project. The names after it only ADD resolution where there was none, so no
+# existing slug moves.
+#
+# They are needed because `origin` is not a safe assumption here: the canonical
+# remote in this group's repos is routinely `official` (a personal fork is never
+# a PR source), and agent-skills has no `origin` at all. Without this the next
+# branch fell through to `basename "$PWD"` -- which is the WORKTREE directory
+# name, so every feature worktree filed its learnings under a throwaway slug
+# that died with the branch. ARC and Carmel each ended up quartered that way.
+compute_slug() {
+  local s name
+  for name in origin official upstream; do
+    s=$(slug_from_remote "$name")
+    [[ -n "$s" ]] && { printf '%s' "$s"; return 0; }
+  done
+  # Exactly one remote under some other name is unambiguous; two or more is a
+  # guess, and guessing wrong here splits a project's store in half.
+  if [[ $(git remote 2>/dev/null | wc -l) -eq 1 ]]; then
+    slug_from_remote "$(git remote 2>/dev/null)"
+  fi
+}
+
 # 1. Try cached slug first (guarantees consistency across sessions)
 if [[ -f "$CACHE_FILE" ]]; then
   SLUG=$(cat "$CACHE_FILE")
 fi
 
-# 2. If no cache, compute from git remote (separated from pipeline to avoid
-#    pipefail swallowing the error and producing an empty slug)
-if [[ -z "${SLUG:-}" ]]; then
-  REMOTE_URL=$(git remote get-url origin 2>/dev/null) || REMOTE_URL=""
-  if [[ -n "$REMOTE_URL" ]]; then
-    RAW_SLUG=$(printf '%s' "$REMOTE_URL" | sed 's|.*[:/]\([^/]*/[^/]*\)\.git$|\1|;s|.*[:/]\([^/]*/[^/]*\)$|\1|' | tr '/' '-')
-    SLUG=$(printf '%s' "$RAW_SLUG" | tr -cd 'a-zA-Z0-9._-')
-  fi
+# 2. Heal a cache poisoned by the origin-only era. A cached slug that is merely
+#    this directory's basename, in a checkout where a remote DOES now resolve,
+#    was written by the old fallback -- keep it and the directory stays pinned to
+#    a dead slug forever. Narrow on purpose: an entry that does not look like the
+#    basename is left alone, so a legitimately basename-shaped repo name is only
+#    ever rewritten to the same value.
+if [[ -n "${SLUG:-}" && "$SLUG" == "$(basename "$PWD" | tr -cd 'a-zA-Z0-9._-')" ]]; then
+  HEALED=$(compute_slug)
+  [[ -n "$HEALED" ]] && SLUG="$HEALED"
 fi
 
-# 3. Fallback to basename only when there's truly no git remote configured
+# 3. If no cache, compute from the git remotes
+if [[ -z "${SLUG:-}" ]]; then
+  SLUG=$(compute_slug)
+fi
+
+# 4. Fallback to basename only when there's truly no git remote configured
 SLUG="${SLUG:-$(basename "$PWD" | tr -cd 'a-zA-Z0-9._-')}"
 
 # 3b. Re-sanitize unconditionally before the value is echoed into `eval`/`source`

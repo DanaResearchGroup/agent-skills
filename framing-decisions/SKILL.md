@@ -26,6 +26,14 @@ Work the open decisions in priority order, one pass per decision:
 6. **Defer where fan-out is high.** On a decision whose answer is expensive to unwind later, "defer — here is the probe that would settle it, and what the probe costs" is itself a legal option, not a fallback you reach for only once stuck. But when the reason for deferring is that some set isn't enumerated yet — "a criterion over an unknown set is not a criterion" — spend one round on what *generates* the set before you record the deferral. The generator is usually already in hand, and finding it collapses the deferral into a one-line rule.
 7. **Adapt on the answer.** After each answer, re-derive what is still open: the next question may shift on what they just said, and some planned questions fall away. Compose the next one fresh rather than reading down a fixed list. Check first that the answer answers *your* question — a selection matching no option you offered, or text replying to something you didn't ask, is a harness fault rather than a preference. Re-pose the question verbatim instead of interpreting it.
 
+**An override is evidence — capture it.** When the answer is anything but the option you recommended — a different pick, a rewritten option, an addition where you offered a choice, a rejected frame — your model of what they want was measurably wrong, and that is the most informative thing that happens in this protocol. Log it before acting on it:
+
+```bash
+~/.claude/skills/bin/skill-learnings-log '{"type":"preference","key":"<kebab-slug>","insight":"<what you would have done, what they chose instead, and their reason if given>","confidence":8,"source":"user-stated"}'
+```
+
+Overrides only, and only where the answer would change your default next time on a question not yet asked — a store full of one-off situational choices buries the few that generalise. Agreement with your recommendation teaches nothing and is not logged. Never let logging delay the work or become something you ask about. Store rules, and the line between this and a memory file, are in [`COMPOUNDING.md`](../COMPOUNDING.md).
+
 **Think long, write short.** The thinking in steps 2 and 3 runs deep; what reaches the screen stays lean — a few sentences of explanation, one line for the premise, one line per option. Cut prose that restates the options, recaps analysis the user just read, or pads the recommendation.
 
 **Frame rejection means go up, not re-draft.** When the answer rejects the premise rather than the options — *"I'm not sure X is the right frame"*, or an answer that adds to the menu instead of picking from it — a better menu at the same layer is never the repair. Re-ask the parent question the rejection just exposed. Treat an addition as settled: if they said "and" where you offered "or", the composition *is* the answer, and every still-open question gets re-derived against it rather than asked as drafted.
