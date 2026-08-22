@@ -34,6 +34,8 @@ By fan-out, not by the order you happened to write them down. First the decision
 
 One `AskUserQuestion` call per decision, composed under `framing-decisions`, each awaiting its answer before the next is drafted.
 
+Being invoked by name means decisions were already going unasked here, so these answers are unusually likely to correct a default you did not know you held. Log every answer that **overrode** your recommendation, per `framing-decisions`' capture rule and [`COMPOUNDING.md`](../COMPOUNDING.md) — one call per override, never a reason to pause the work.
+
 When the gates are closed, spend two lines on what you surfaced that they had not seen — the silently-settled calls — and act. Don't summarize their own answers back to them.
 
 **Done when** nothing is left that would change what you do next without guessing, and every assumption still in play has been said out loud rather than buried.

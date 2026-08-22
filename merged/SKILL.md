@@ -101,3 +101,23 @@ Before rebasing each approved branch, clear the three tripwires the global git r
 
 **Done when:** every `BEHIND` open PR is either rebased-and-force-pushed (no longer BEHIND) or left with
 a one-line reason, and each rebase was approved before its force-push.
+
+## 5. Capture what the cycle taught
+
+A merge is the last moment the whole arc is still in context — what the PR set out to do, what
+review caught, what turned out to be wrong on the way. Log anything durable that `spar` and
+`copilot-review` did not already capture, and correct anything **their** captures got wrong now
+that the work has landed.
+
+```bash
+~/.claude/skills/bin/skill-learnings-search --limit 5    # what is already there
+~/.claude/skills/bin/skill-learnings-log '{"type":"architecture","key":"<kebab-slug>","insight":"...","confidence":8,"source":"observed"}'
+```
+
+Read before writing: a near-duplicate under a fresh slug is worse than nothing, because both
+survive and neither supersedes the other. Re-logging an existing key supersedes it, so this is
+where a learning that proved half-right gets corrected — say what changed and why. Rules:
+[`COMPOUNDING.md`](../COMPOUNDING.md).
+
+**Done when:** the arc's durable lessons are logged or explicitly judged already-captured, and any
+superseded learning names what changed.

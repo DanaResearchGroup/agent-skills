@@ -332,6 +332,21 @@ CODEX SAYS (/spar round-N):
 Recommendation: <one sentence engaging one specific Codex finding>
 ```
 
+## Capture what the round taught
+
+A confirmed finding is the cheapest learning available: an outside model just showed you something
+your own reading missed. Once you have verified it against the code — verified, not merely
+received — log it.
+
+```bash
+~/.claude/skills/bin/skill-learnings-log '{"type":"pitfall","key":"<kebab-slug>","insight":"<the defect class, and what made it invisible>","confidence":8,"source":"cross-model"}'
+```
+
+Log what generalises past this diff, above all a finding that **inverted a premise you held** —
+that class is the likeliest to repeat, because the belief that produced it is still yours. Skip
+what Codex got wrong, and skip findings that only describe this change. One call per learning,
+never a reason to delay the report. Rules: [`COMPOUNDING.md`](../COMPOUNDING.md).
+
 If Claude Code context is around or above 35%, proactively suggest `/handoff` at the next natural
 checkpoint. Note that `$STORE/.session-id` persists on disk, so a compacted or fresh Claude Code
 session can resume the same Codex sparring session.

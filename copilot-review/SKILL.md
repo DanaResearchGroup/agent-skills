@@ -253,3 +253,21 @@ let it abort the run — report which threads you could not resolve so the user 
 **Done when:** every addressed thread is resolved, the important ones carry a one-line reply naming
 the fix, and the run summary tells the user which comments were skipped and why (and any threads the
 API would not let you resolve).
+
+## 7. Capture the defect class
+
+A finding you triaged as **address** and fixed is worth logging when it was an instance of a *class*
+rather than a one-off — a shape of mistake makeable again in this repo. A vacuous assertion, a
+guard that a whitespace change evades, a term colliding with an established one: those recur. A single
+typo does not.
+
+```bash
+~/.claude/skills/bin/skill-learnings-log '{"type":"pitfall","key":"<kebab-slug>","insight":"<the class, and the tell that would catch it earlier>","confidence":8,"source":"observed"}'
+```
+
+A **skipped** finding is worth logging only when the bot was wrong for a reason that will recur —
+a repo convention it keeps misreading — so the next run triages it faster. One call per learning,
+after the push, never blocking it. Rules: [`COMPOUNDING.md`](../COMPOUNDING.md).
+
+**Done when:** every addressed finding that was a class rather than a one-off is logged, or there
+were none and the run summary says so.

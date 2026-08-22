@@ -131,7 +131,7 @@ Each pass receives:
 
 1. its checklist, read from the file named above
 2. the pinned base and head SHAs, and the review worktree path
-3. the repo's accumulated learnings — `bin/skill-learnings-search --limit 5`
+3. the repo's accumulated learnings — `~/.claude/skills/bin/skill-learnings-search --limit 5`
 4. the repo's read prohibitions, quoted from its `CLAUDE.md`
 
 That fourth item is load-bearing where a repo holds pre-registered evaluation splits or other
@@ -187,7 +187,7 @@ And store every finding that would change how the *next* review of this repo beh
 that lies, a suite that passes for the wrong reason, a constant no test pins:
 
 ```bash
-bin/skill-learnings-log '{"type":"pitfall","key":"<slug>","insight":"...","confidence":8,"source":"observed"}'
+~/.claude/skills/bin/skill-learnings-log '{"type":"pitfall","key":"<slug>","insight":"...","confidence":8,"source":"observed"}'
 ```
 
 **Done when:** the artifact is dropped, the review record is written, and every finding meeting
