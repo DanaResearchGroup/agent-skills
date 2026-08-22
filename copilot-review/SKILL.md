@@ -1,6 +1,6 @@
 ---
 name: copilot-review
-description: Fix a PR's Copilot / GitHub Advanced Security bot review — triage each finding, fix the real ones, then squash each fix into the commit it fixes, rebase onto the base if it has moved, and force-push with lease. Runs start to finish without pausing for confirmation; invoking it is the approval.
+description: Fix a PR's Copilot / GitHub Advanced Security bot review — triage each finding, fix the real ones, squash each fix into the commit it fixes, rebase onto the base if it has moved, force-push with lease, then reply briefly to the important threads and resolve every one it addressed. Runs start to finish without pausing for confirmation; invoking it is the approval.
 disable-model-invocation: true
 ---
 
@@ -8,7 +8,8 @@ disable-model-invocation: true
 
 Turn a PR's automated bot review into fixes folded cleanly back into history: **target** the PR →
 **fetch** the bot comments → **triage** them → fix → **fixup** into the right commits, **rebase**
-onto the base if it has moved, and force-push with lease.
+onto the base if it has moved, force-push with lease, then **respond** briefly to the important
+threads and **resolve** every one you addressed.
 
 **This runs to completion in one pass.** Being invoked *is* the authorisation to rewrite history
 and force-push: every finding you classify as **address** gets fixed, squashed into the commit that
@@ -51,7 +52,7 @@ threads already marked resolved.
 # Inline review comments — where Copilot and the security bot post line-level findings
 gh api --paginate repos/OWNER/REPO/pulls/N/comments \
   --jq '.[] | select(.user.login|ascii_downcase|test("copilot|advanced-security|code-scanning"))
-        | {login:.user.login, path, line, body, url:.html_url, created:.created_at}'
+        | {id, login:.user.login, path, line, body, url:.html_url, created:.created_at}'
 
 # Copilot's overall review verdict / summary
 gh api --paginate repos/OWNER/REPO/pulls/N/reviews \
@@ -62,13 +63,17 @@ gh api --paginate repos/OWNER/REPO/pulls/N/reviews \
 To avoid re-addressing threads already resolved, check thread resolution and keep only unresolved:
 ```bash
 gh api graphql -f query='query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){
-  pullRequest(number:$n){reviewThreads(first:100){nodes{isResolved
+  pullRequest(number:$n){reviewThreads(first:100){nodes{id isResolved
   comments(first:1){nodes{author{login} path body url}}}}}}}' \
   -f o=OWNER -f r=REPO -F n=N \
   --jq '.data.repository.pullRequest.reviewThreads.nodes[]
         | select(.isResolved==false)
         | select(.comments.nodes[0].author.login|ascii_downcase|test("copilot|advanced-security|code-scanning"))'
 ```
+
+This query (and the step-6 listing query) caps at `reviewThreads(first:100)` — fine for almost every
+PR, but on one with more than 100 threads paginate with `after:$cursor`/`pageInfo{hasNextPage endCursor}`
+or you will silently miss the overflow.
 
 Optionally pull code-scanning alerts scoped to the PR head for security findings not surfaced as
 comments: `gh api repos/OWNER/REPO/code-scanning/alerts -f ref=refs/pull/N/head` (needs security read).
@@ -198,5 +203,53 @@ of getting clobbered. If the lease is stale, re-fetch and reconcile — don't ov
 
 **Done when:** each fix is squashed into its target commit, the branch sits on top of the current
 base (or is explicitly left behind it with a reason), it is force-pushed with lease, and the PR head
-reflects the new history. Optionally reply to or resolve the addressed threads and tell the user
-which comments were skipped and why.
+reflects the new history. Then close the loop on GitHub — step 6.
+
+## 6. Respond and resolve the threads
+
+Once the new history is on the remote, close every thread you addressed on GitHub itself. This is
+not optional — a fixed finding left as an open thread reads as ignored, and the next reviewer
+re-treads it. Two moves, both on the **addressed** threads only:
+
+- **Reply briefly to the important ones.** For a finding that was a real bug, a security issue, or
+  where the fix isn't obvious from the diff, post a one-line reply saying what you changed — e.g.
+  "Fixed in `abc1234` — now closes the file handle in a `finally`." Skip the reply for trivial or
+  self-evident fixes; a resolved thread with no comment is fine there. Do **not** reply to threads
+  you skipped in triage — those get accounted for to the user in the run summary, not argued with on
+  the PR.
+- **Resolve every addressed thread**, whether or not you replied. Resolution is the signal the
+  finding is handled; leave only genuinely-open threads unresolved.
+
+Reply to a review thread's comment (post under the same conversation):
+
+```bash
+# COMMENT_ID is the numeric `id` of the bot's inline comment (not the html_url) — step 2's fetch
+# already emits it as `.id`.
+gh api repos/OWNER/REPO/pulls/N/comments/COMMENT_ID/replies -f body='Fixed in abc1234 — <what changed>.'
+```
+
+Resolve a thread — needs the thread's GraphQL node id (`.id` per node, which the step-2 resolution
+query already selects). The self-contained listing below re-fetches it alongside each thread's first
+comment, to map finding → thread id:
+
+```bash
+gh api graphql -f query='query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){
+  pullRequest(number:$n){reviewThreads(first:100){nodes{id isResolved
+  comments(first:1){nodes{author{login} path line body}}}}}}}' \
+  -f o=OWNER -f r=REPO -F n=N \
+  --jq '.data.repository.pullRequest.reviewThreads.nodes[]
+        | select(.isResolved==false)
+        | select(.comments.nodes[0].author.login|ascii_downcase|test("copilot|advanced-security|code-scanning"))
+        | {id, path:.comments.nodes[0].path, line:.comments.nodes[0].line}'
+
+# Mark one thread resolved (THREAD_ID is the `id` above, e.g. PRRT_...):
+gh api graphql -f query='mutation($t:ID!){resolveReviewThread(input:{threadId:$t}){thread{isResolved}}}' \
+  -f t=THREAD_ID
+```
+
+If a resolve or reply call fails (permissions, a thread that isn't resolvable via the API), don't
+let it abort the run — report which threads you could not resolve so the user can click them shut.
+
+**Done when:** every addressed thread is resolved, the important ones carry a one-line reply naming
+the fix, and the run summary tells the user which comments were skipped and why (and any threads the
+API would not let you resolve).
