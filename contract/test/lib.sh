@@ -7,6 +7,11 @@ CONTRACT="$_HERE/bin/contract"
 HOOKS="$_HERE/hooks"
 FAILURES=0
 
+# See the guard block below (near the assertion helpers) for why this file
+# exists: it is the only channel out of a bash command_not_found_handle,
+# which always runs in a subshell.
+HARNESS_FAULTS="$(mktemp "${TMPDIR:-/tmp}/contract-harness-faults.XXXXXX")"
+
 pass() { printf '  \033[32mPASS\033[0m %s\n' "$1"; }
 fail() { printf '  \033[31mFAIL\033[0m %s\n' "$1"; FAILURES=1; }
 
@@ -30,6 +35,21 @@ assert_no_file() {  # path label
   if [ -e "$1" ]; then fail "$2 (unexpected file: $1)"; else pass "$2"; fi
 }
 
+# An unknown command is a HARNESS failure, not a silence: a test that calls a
+# helper this lib never defined prints "command not found" to stderr, and its
+# assertions count as neither pass nor fail -- the suite reports green over a
+# property nothing checked. (That is not hypothetical; it is why the sibling
+# private repo grew this guard.)
+#
+# The handler runs in a SUBSHELL (probed, bash 5.2.21), so a counter it
+# increments is discarded when the subshell exits. A subshell can still make a
+# filesystem effect, so the fault is recorded as a file and `finish` fails on it.
+command_not_found_handle() {
+  fail "harness: unknown command '$1' -- a test called a helper this harness does not define; the assertions in that section did not run"
+  printf '%s\n' "$1" >>"$HARNESS_FAULTS"
+  return 127
+}
+
 # Temp repo + one linked worktree. Sets SANDBOX, REPO, WT, COMMON.
 sandbox_new() {
   SANDBOX=$(mktemp -d "${TMPDIR:-/tmp}/contract-test-XXXXXX")
@@ -48,4 +68,14 @@ sandbox_new() {
 
 sandbox_rm() { [ -n "${SANDBOX:-}" ] && rm -rf "$SANDBOX"; }
 
-finish() { sandbox_rm; exit "$FAILURES"; }
+finish() {
+  # The guard above runs in a SUBSHELL, so its fail never reached FAILURES
+  # -- this file is the only channel out of it.
+  if [ -s "$HARNESS_FAULTS" ]; then
+    FAILURES=1
+  fi
+  rm -f "$HARNESS_FAULTS"
+
+  sandbox_rm
+  exit "$FAILURES"
+}

@@ -9,6 +9,11 @@ TESTS_RUN=0
 TESTS_FAIL=0
 SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# See the guard block below (near the assertion helpers) for why this file
+# exists: it is the only channel out of a bash command_not_found_handle,
+# which always runs in a subshell.
+HARNESS_FAULTS="$(mktemp "${TMPDIR:-/tmp}/autodev-harness-faults.XXXXXX")"
+
 # --- sandbox ---------------------------------------------------------------
 sandbox_new() {
   SB=$(mktemp -d "${TMPDIR:-/tmp}/autodev-test.XXXXXX")
@@ -121,6 +126,22 @@ assert_line_start() { printf '%s\n' "$2" | grep -qF -- "$3" && printf '%s\n' "$2
 assert_file()         { [ -f "$2" ] && _pass "$1" || _fail "$1" "missing file: $2"; }
 assert_no_file()      { [ -f "$2" ] && _fail "$1" "file should not exist: $2" || _pass "$1"; }
 
+# An unknown command is a HARNESS failure, not a silence: a test that calls a
+# helper this lib never defined prints "command not found" to stderr, and its
+# assertions count as neither pass nor fail -- the suite reports green over a
+# property nothing checked. (That is not hypothetical; it is why the sibling
+# private repo grew this guard.)
+#
+# The handler runs in a SUBSHELL (probed, bash 5.2.21), so a counter it
+# increments is discarded when the subshell exits. A subshell can still make a
+# filesystem effect, so the fault is recorded as a file and `finish` fails on it.
+command_not_found_handle() {
+  _fail "harness: unknown command '$1'" \
+    "a test called a helper this harness does not define; the assertions in that section did not run"
+  printf '%s\n' "$1" >>"$HARNESS_FAULTS"
+  return 127
+}
+
 # Replace the watcher with a recorder, so sweeper tests observe which sessions
 # would be driven without running a real cycle.
 stub_watcher() {
@@ -146,6 +167,16 @@ assert_launched()     { wait_for_line "$2" && _pass "$1" || _fail "$1" "watcher 
 assert_not_launched() { sleep 2; grep -qxF "$2" "$SB/launched.log" 2>/dev/null && _fail "$1" "watcher was launched for $2" || _pass "$1"; }
 
 finish() {
+  # The guard above runs in a SUBSHELL, so its fail never reached these counters
+  # -- this file is the only channel out of it.
+  if [ -s "$HARNESS_FAULTS" ]; then
+    while IFS= read -r _missing; do
+      TESTS_RUN=$((TESTS_RUN + 1))
+      TESTS_FAIL=$((TESTS_FAIL + 1))
+    done <"$HARNESS_FAULTS"
+  fi
+  rm -f "$HARNESS_FAULTS"
+
   printf '\n%s: %d run, %d failed\n' "${0##*/}" "$TESTS_RUN" "$TESTS_FAIL"
   [ "$TESTS_FAIL" -eq 0 ]
 }
