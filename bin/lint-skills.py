@@ -109,6 +109,51 @@ def link_targets(body: str) -> list[str]:
     return out
 
 
+def find_unignored_check_candidates(root: Path) -> list[Path]:
+    """Every real (non-symlink) top-level dir containing a SKILL.md.
+
+    Symlinked skill dirs are deliberately skipped: those are the private
+    skills linked in from a separate private repo, and being git-ignored is
+    the *correct* state for them — that's the whole point of the allowlist
+    in .gitignore. This check exists to catch the opposite mistake: a real,
+    tracked-in-this-repo skill directory that got forgotten from the
+    allowlist and is therefore silently invisible to `git add`.
+    """
+    return sorted(
+        p.parent for p in root.glob("*/SKILL.md")
+        if p.parent.name not in EXCLUDE_DIRS
+        and not p.parent.name.startswith(".")
+        and not p.parent.is_symlink()
+    )
+
+
+def check_not_gitignored(root: Path, errors: list[str]) -> None:
+    candidates = find_unignored_check_candidates(root)
+    if not candidates:
+        return
+    try:
+        result = subprocess.run(
+            # --no-index: evaluate .gitignore patterns regardless of whether the
+            # path is already tracked. Plain `check-ignore` silently reports
+            # tracked paths as "not ignored" even when a pattern matches them,
+            # which would hide exactly the forgotten-allowlist-line case this
+            # check exists to catch (a skill dir tracked today, then dropped
+            # from .gitignore's allowlist by mistake).
+            ["git", "-C", str(root), "check-ignore", "--no-index", *[str(p) for p in candidates]],
+            capture_output=True, text=True,
+        )
+    except FileNotFoundError:
+        return  # no git available; nothing we can check here
+    ignored = set(result.stdout.splitlines())
+    for p in candidates:
+        if str(p) in ignored:
+            rel = p.relative_to(root)
+            errors.append(
+                f"{rel}: real skill directory is git-ignored — add `!/{rel}/` "
+                f"to .gitignore's allowlist"
+            )
+
+
 def main() -> int:
     root = Path(__file__).resolve().parent.parent
     errors: list[str] = []
@@ -116,6 +161,8 @@ def main() -> int:
     if not skills:
         print("lint-skills: no SKILL.md files found", file=sys.stderr)
         return 1
+
+    check_not_gitignored(root, errors)
 
     for skill in skills:
         rel = skill.relative_to(root)
