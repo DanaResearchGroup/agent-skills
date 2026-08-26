@@ -15,6 +15,8 @@ Plus, across the whole repo root:
   6. No untracked top-level file or directory is silently dropped by
      .gitignore's deny-by-default allowlist with no rule of its own — see
      check_not_gitignored().
+  7. No tracked top-level directory contains a nested .gitignore — see
+     check_no_nested_gitignore().
 
 Deliberately NOT checked: cross-skill `/other-skill` references — many legitimately
 point at superpowers skills that don't live in this repo, so checking them
@@ -246,6 +248,51 @@ def check_not_gitignored(root: Path, errors: list[str]) -> None:
         )
 
 
+def check_no_nested_gitignore(root: Path, errors: list[str]) -> None:
+    """No tracked top-level directory may contain a nested .gitignore.
+
+    .gitignore's deny-by-default allowlist re-includes a skill directory with
+    `!/<skill>/`, but that re-inclusion does not reach *inside* the
+    directory — rules further down (secrets, cruft) still apply there (see
+    the comment above the allowlist in .gitignore). A .gitignore file nested
+    inside a re-included directory can add its own `!` pattern that
+    un-ignores something the root file deliberately keeps out, e.g.
+    `!.slack-bot-token` — silently re-exposing that secret pattern for just
+    that one directory. Verified empirically: a nested
+    `some-skill/.gitignore` containing `!.slack-bot-token` makes
+    `git check-ignore` report the token file as no longer ignored, and
+    `git add -n` shows it would actually be staged.
+
+    Disallowing nested .gitignore entirely (rather than trying to parse
+    which un-ignore patterns are "secret-shaped", which needs a name
+    heuristic that has to be kept in sync forever) is the simpler and more
+    maintainable rule here: no skill in this repo has ever needed its own
+    .gitignore, so banning the file outright costs nothing and closes the
+    whole class of risk, not just today's known secret names.
+    """
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(root), "ls-files"],
+            capture_output=True, text=True, check=True,
+        ).stdout
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return
+    tracked_top_dirs = {
+        line.split("/", 1)[0] for line in out.splitlines() if "/" in line
+    }
+    for name in sorted(tracked_top_dirs):
+        d = root / name
+        if not d.is_dir() or d.is_symlink():
+            continue
+        for gi in sorted(d.rglob(".gitignore")):
+            rel = gi.relative_to(root)
+            errors.append(
+                f"{rel}: nested .gitignore is not allowed inside a tracked skill "
+                f"directory — its allowlist re-include does not extend to un-ignoring "
+                f"secrets inside it; put any rule it needs in the root .gitignore instead"
+            )
+
+
 def main() -> int:
     root = Path(__file__).resolve().parent.parent
     errors: list[str] = []
@@ -255,6 +302,7 @@ def main() -> int:
         return 1
 
     check_not_gitignored(root, errors)
+    check_no_nested_gitignore(root, errors)
     n_md, n_links = check_relative_links(root, errors, skip=set(skills))
 
     for skill in skills:
