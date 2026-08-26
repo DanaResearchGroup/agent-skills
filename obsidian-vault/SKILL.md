@@ -34,7 +34,31 @@ anything.**
 | Where | Convention |
 |---|---|
 | **Inside the Vault** (`~/Dropbox/Apps/remotely-save/Vault/`) | **Title Case**, no date — `Tools Index.md`. A few legacy index notes are lowercase (`knowledge/wiki/index.md`). |
-| **Elsewhere in Dropbox** (`~/Dropbox/remote-work/`, and any other non-Vault Dropbox folder) | **`YYYY.MM.DD <a\|b\|c> <Name>.<ext>`** — e.g. `2026.08.26 a ERC B1 Science Skeleton.md`. The letter is a **same-day revision counter**, so the newest date+letter is the live version. A second revision the same day is `b`, not a new date. |
+| **Elsewhere in Dropbox** (`~/Dropbox/remote-work/`, and any other non-Vault Dropbox folder) | **`YYYY.MM.DD <a\|b\|c> <Name>.<ext>`** — e.g. `2026.08.26 a ERC B1 Science Skeleton.md`. See the letter rule below. |
+
+### The letter
+
+**It is per document, per day.** The letter distinguishes successive versions of *one document*
+saved on *one date*. It restarts at `a` on every new date, and a document not yet saved today
+starts at `a` no matter what else was saved today. It is not a running version number, and it is
+not a counter over the folder.
+
+```
+2026.08.12 a TS Metrics.pdf
+2026.08.12 b TS Metrics.pdf     <- second version of THAT document, same day
+2026.08.13 a TS Metrics.pdf     <- NEW DATE, back to "a" - not "c"
+2026.08.13 a Other Report.md    <- different document, also "a" - letters do not run across docs
+```
+
+**To pick it:** list what exists for today's date **with the same document name**, and take the
+next unused letter.
+
+```bash
+DIR="$HOME/Dropbox/remote-work/SCM"; D=$(date +%Y.%m.%d); NAME="ERC B1 Science Skeleton"
+ls "$DIR" | grep -c "^$D . $NAME\."      # 0 -> "a", 1 -> "b", 2 -> "c", ...
+```
+
+**The live version of a document** is its newest date, then the highest letter within that date.
 
 Authority: `Vault/CLAUDE.md` § A5 *"Naming, dates and language"*, which also fixes date formats
 (`DD/MM/YYYY` in HQ, ISO `YYYY-MM-DD` in `knowledge/`), English for all structure (filenames,
