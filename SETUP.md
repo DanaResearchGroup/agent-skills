@@ -67,16 +67,30 @@ Create once (workspace-global; reuse the same token on every machine):
 
 Place the token on each machine (keep it out of git **and** out of shell
 history — `read -s` takes the value from the terminal without echoing it or
-passing it as a command-line argument):
+passing it as a command-line argument). Capture into a mode-600 temp file
+first and `mv` it into place only once the capture succeeds, so an
+interrupted `read`, a failed paste, or a killed shell can never leave you
+with a truncated or empty token file — any existing token stays untouched
+until the new one is fully written:
 ```bash
-install -m 600 /dev/null ~/.claude/.slack-bot-token
-read -r -s -p 'Slack bot token: ' token
-printf '%s' "$token" > ~/.claude/.slack-bot-token && unset token
+(
+  umask 077
+  tmp="$(mktemp ~/.claude/.slack-bot-token.XXXXXX)"
+  trap 'unset token; rm -f "$tmp"' EXIT
+  read -r -s -p 'Slack bot token: ' token
+  printf '%s' "$token" > "$tmp"
+  mv "$tmp" ~/.claude/.slack-bot-token
+)
 ```
-If you ever entered the token as a literal command-line argument instead (an
-earlier revision of this page showed that form), treat it as exposed — it is
-recorded in your shell history — and rotate it: reinstall the app at
-api.slack.com to mint a fresh token, then redo this step.
+If you ever entered the token as a literal command-line argument, or ran the
+old two-step form of this recipe (`install -m 600 /dev/null
+~/.claude/.slack-bot-token` followed by a separate `read` — that form zeroed
+the file *before* capturing the replacement, so an interrupted `read` or a
+failed `printf` left it empty or truncated), treat the token as exposed —
+either it's recorded in your shell history, or the file may be silently
+empty/partial — and rotate it: reinstall the app at api.slack.com to mint a
+fresh token, then redo this step. Don't try to recover or print whatever is
+currently in the file; just rotate.
 
 ### 3. Channel id + allowlist — per machine
 Merge into `~/.claude/settings.json` (not in this repo), with your own channel
