@@ -27,7 +27,6 @@ re-apply each one onto the new upstream base at every sync (current base: v1.2.2
 | File | Local edit |
 | --- | --- |
 | `grilling/SKILL.md` | Present each round's questions through the `AskUserQuestion` tool with 2-4 concrete options; the recommended answer is the first option, marked "(Recommended)"; upstream's prose format is kept as the fallback for questions that can't be framed as options. (Originally applied to `grill-me` before upstream moved the family's content into `grilling`.) |
-| `wait-what/SKILL.md` | Upstream reads the shared vocabulary from `CONTEXT.md`; our repos don't standardize that file, so the reference is generalized to "the project's shared-vocabulary doc (`CONTEXT.md`, or this repo's domain model / `CLAUDE.md`)". |
 | `grill-with-docs/SKILL.md` | Typo fix in the description: "ADR's" → "ADRs". |
 
 ## Checklist

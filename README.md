@@ -2,12 +2,12 @@
 
 [![CI](https://github.com/DanaResearchGroup/agent-skills/actions/workflows/ci.yml/badge.svg)](https://github.com/DanaResearchGroup/agent-skills/actions/workflows/ci.yml)
 [![Claude Code](https://img.shields.io/badge/Claude%20Code-skills-8A2BE2)](https://docs.anthropic.com/en/docs/claude-code)
-[![skills](https://img.shields.io/badge/skills-40-blue)](#whats-in-here)
+[![skills](https://img.shields.io/badge/skills-31-blue)](#whats-in-here)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Personal [Claude Code](https://docs.anthropic.com/en/docs/claude-code) skills for our
 research group. A skill is a Markdown playbook (`<skill>/SKILL.md`) that Claude Code loads
-on demand — debugging discipline, TDD, issue triage, running ARC/T3 campaigns, Slack
+on demand — debugging discipline, TDD, running ARC/T3 campaigns, Slack
 notifications, and more.
 
 This repo **is** your skills directory: you symlink the whole thing into
@@ -83,7 +83,7 @@ Verify with `/plugin` — you should see `superpowers` enabled. Full docs:
 | Group | Skills |
 | --- | --- |
 | **Notifications** | `slack-ask`, `slack-notify` — reach you over Slack during unattended runs |
-| **Matt Pocock** ([`mattpocock/skills`](https://github.com/mattpocock/skills), MIT — see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)) | `tdd`, `to-spec`, `to-tickets`, `implement`, `code-review`, `triage`, `prototype`, `codebase-design`, `domain-modeling`, `improve-codebase-architecture`, `grilling`, `grill-me`, `grill-with-docs`, `resolving-merge-conflicts`, `setup-matt-pocock-skills`, `writing-for-agents`, `to-questionnaire`, `wait-what`, `handoff`, `edit-article`, `obsidian-vault`, `wayfinder` |
+| **Matt Pocock** ([`mattpocock/skills`](https://github.com/mattpocock/skills), MIT — see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)) | `tdd`, `to-spec`, `implement`, `code-review`, `domain-modeling`, `grilling`, `grill-me`, `grill-with-docs`, `resolving-merge-conflicts`, `setup-matt-pocock-skills`, `writing-for-agents`, `handoff`, `obsidian-vault` |
 | **Review** | `fleet-review` — pre-landing review of a PR or diff, sizing the agent fleet to the change's breadth and routing each pass to a model that fits its job; `copilot-review` — fold a PR's Copilot/security bot review back into history; `drop-review` — drop the review you just ran as a markdown artifact in the OS temp directory, written for the session that wrote the code |
 | **Workflow** | `writing-git-commits`; `contract` — settle what a change must do, and how you'll know it did it, before writing it; `merged` — after a PR lands, sync `main` and rebase the open PRs onto it; `sync-matt-pocock-skills` — pull a newer `mattpocock/skills` release into our vendored copies, keeping local edits; `writing-great-skills` — this repo's skill-authoring conventions, a thin wrapper over `writing-for-agents`; `framing-decisions` — put one decision at a time to the user: solve it as the field's expert first, audit that the option set can even hold that answer (parent settled, mechanisms composed, premise named), then send it through `AskUserQuestion` explained, with the next question re-derived from the last answer; `ask-me` — sweep a conversation for every decision left buried in prose, softened, deferred, or silently settled, cut what changes nothing, order the rest by fan-out, and gate each one through `framing-decisions` |
 | **Epistemics** | `probe` — check a load-bearing premise empirically before you propose or build on it, and report what you could not reach; `meta-analysis` — post-mortem how a long conversation or campaign actually moved: inflection ledger, input-yield scoreboard, failure modes with tripwires, and forward predictions that get scored rather than deleted |
@@ -98,13 +98,10 @@ The Matt Pocock engineering skills chain into one *idea → shipped* flow. For a
 non-trivial feature, drive them in order:
 
 1. **`/grill-with-docs`** — interview the idea into a sharp, documented design
-   (ADRs + glossary). For work too big to hold in one session, start with
-   **`/wayfinder`** instead to chart it as a shared map of tickets first.
+   (ADRs + glossary).
 2. **`/to-spec`** — synthesize the conversation into a spec on your issue tracker.
-3. **`/to-tickets`** — break the spec into tracer-bullet tickets, each with its
-   blocking edges.
-4. **`/implement`** — build the tickets; drives **`/tdd`** as its red-green engine.
-5. **`/code-review`** — review the diff against your repo's standards and the spec.
+3. **`/implement`** — build against the spec; drives **`/tdd`** as its red-green engine.
+4. **`/code-review`** — review the diff against your repo's standards and the spec.
 
 Run **`/setup-matt-pocock-skills`** once per repo first, so the skills know where
 your issue tracker, triage labels, and domain docs live.
