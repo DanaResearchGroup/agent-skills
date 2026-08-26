@@ -16,28 +16,18 @@ The following skill directories originate from that project and are included
 here (copied from upstream; some adapted for this repository, in places
 substantially). Each remains under the upstream MIT license reproduced below:
 
-- `codebase-design/`
 - `code-review/`
 - `domain-modeling/`
-- `edit-article/` — upstream folded this skill into `obsidian-vault` in v1.2; we
-  deliberately retain the standalone copy (frozen at its pre-v1.2 content)
 - `grilling/`
 - `grill-me/`
 - `grill-with-docs/`
 - `handoff/`
 - `implement/`
-- `improve-codebase-architecture/`
 - `obsidian-vault/`
-- `prototype/`
 - `resolving-merge-conflicts/`
 - `setup-matt-pocock-skills/`
 - `tdd/`
-- `to-questionnaire/`
 - `to-spec/`
-- `to-tickets/`
-- `triage/`
-- `wait-what/`
-- `wayfinder/`
 - `writing-for-agents/`
 
 `writing-great-skills/` was vendored from upstream through v1.1.0; as of the

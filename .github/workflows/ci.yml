@@ -12,6 +12,74 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Diff-scoped on PRs (only the commits the PR introduces) and tree-scoped on
+  # pushes: pre-publication history is accepted as-is and is not being purged,
+  # so a full-history scan would be permanently red — and a permanently red
+  # scanner is one everybody learns to ignore.
+  secret-scan:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history, so the PR base..head range below resolves.
+          fetch-depth: 0
+      - name: Install gitleaks
+        env:
+          GITLEAKS_VERSION: 8.30.1
+          # sha256 of gitleaks_8.30.1_linux_x64.tar.gz, from the release's
+          # gitleaks_8.30.1_checksums.txt.
+          GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+        run: |
+          curl -fsSL -o /tmp/gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  /tmp/gitleaks.tar.gz" | sha256sum -c -
+          tar -C /tmp -xzf /tmp/gitleaks.tar.gz gitleaks
+      - name: Scan for secrets
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.event.after }}
+        # gitleaks exits 1 when it finds a leak. Each invocation below is
+        # checked explicitly and OR'd into $failed rather than relying on `set
+        # -e` across an if/else, so no branch can silently swallow a nonzero
+        # exit; the step's own exit code is $failed, so a finding still fails
+        # the job. `--redact` keeps any found secret out of the CI logs;
+        # `--config` pins the repo's .gitleaks.toml rather than auto-discovery.
+        #
+        # Every path scans both a commit range and the checked-out tree,
+        # because either alone misses cases the other catches:
+        #   - PR range without `--no-merges`: a secret introduced only by a
+        #     merge/conflict-resolution commit inside the PR must not be
+        #     skipped.
+        #   - PR tree scan: catches a secret already present at HEAD even if
+        #     history scanning above has a blind spot (e.g. a shallow/rewritten
+        #     ref), so the actual checked-out state is never unexamined.
+        #   - push before..after range: catches a secret added and then
+        #     removed within the same push, which a tree-only scan of the
+        #     final state would never see.
+        #   - push tree scan: catches a secret already committed before this
+        #     push if the range scan is unavailable (first push on a ref,
+        #     `before` is the all-zeros SHA).
+        run: |
+          failed=0
+
+          if [ -n "$BASE_SHA" ]; then
+            /tmp/gitleaks git --config .gitleaks.toml --redact --no-banner --verbose \
+              --log-opts "$BASE_SHA..$HEAD_SHA" . || failed=1
+            /tmp/gitleaks dir --config .gitleaks.toml --redact --no-banner --verbose . || failed=1
+          else
+            zero_sha="0000000000000000000000000000000000000000"
+            if [ -n "$BEFORE_SHA" ] && [ "$BEFORE_SHA" != "$zero_sha" ]; then
+              /tmp/gitleaks git --config .gitleaks.toml --redact --no-banner --verbose \
+                --log-opts "$BEFORE_SHA..$AFTER_SHA" . || failed=1
+            fi
+            /tmp/gitleaks dir --config .gitleaks.toml --redact --no-banner --verbose . || failed=1
+          fi
+
+          exit "$failed"
+
   skill-lint:
     name: Skill lint
     runs-on: ubuntu-latest

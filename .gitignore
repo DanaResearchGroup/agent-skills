@@ -1,3 +1,74 @@
+# ── deny-by-default allowlist ─────────────────────────────────────────────
+# Ignore everything at the root, then explicitly re-include what is genuinely
+# tracked in this PUBLIC repo. This replaces the old deny-by-name scheme,
+# where private skills (symlinked in from a separate private repo) were kept
+# out only by listing their names in .git/info/exclude — untracked, so it
+# protected nothing beyond this one clone. A forgotten name there was a
+# silent leak; a forgotten name here is a directory that git still ignores,
+# so a bare `git add -A` can never stage it by accident.
+#
+# TRAP: this must be `/*`, not `/*/`. `/*/` matches directories only, and git
+# classifies a symlink-to-directory as a FILE, not a directory — so `/*/`
+# would leave every private skill symlink unignored and `git add -A` would
+# stage it. `/*` ignores symlinks too; the `!/<skill>/` re-includes below
+# (trailing slash) only match real directories, so a symlink of the same
+# name stays ignored. Verified empirically in a throwaway repo: with `/*/`
+# a symlink `privskill -> target-dir` was staged by `git add -A`
+# (`A  privskill`); with `/*` the same symlink was left untracked while a
+# real re-included directory was staged normally.
+/*
+
+# Root files that belong to this repo.
+!/.gitignore
+!/.gitleaks.toml
+!/README.md
+!/ADAPTATION.md
+!/COMPOUNDING.md
+!/SECURITY.md
+!/SETUP.md
+!/THIRD_PARTY_NOTICES.md
+!/UPDATING.md
+!/LICENSE
+
+# Root directories that belong to this repo.
+!/.github/
+!/bin/
+!/ask-me/
+!/autodev/
+!/code-review/
+!/contract/
+!/copilot-review/
+!/domain-modeling/
+!/drop-review/
+!/fleet-review/
+!/framing-decisions/
+!/grilling/
+!/grill-me/
+!/grill-with-docs/
+!/handoff/
+!/herdr/
+!/implement/
+!/merged/
+!/meta-analysis/
+!/obsidian-vault/
+!/paper-outline/
+!/probe/
+!/resolving-merge-conflicts/
+!/setup-matt-pocock-skills/
+!/slack-ask/
+!/slack-notify/
+!/spar/
+!/sync-matt-pocock-skills/
+!/tdd/
+!/to-spec/
+!/writing-for-agents/
+!/writing-git-commits/
+!/writing-great-skills/
+
+# Once re-included, the allowlist doesn't reach *inside* those directories —
+# git still applies the rules below (secrets, cruft, node_modules) to their
+# contents, which is what we want.
+
 # Secrets & local config (never commit) — see SETUP.md
 .slack-bot-token
 *.token
@@ -12,8 +83,12 @@ Thumbs.db
 __pycache__/
 *.pyc
 
-# Superpowers working files must never be tracked (global rule)
-docs/superpowers/
+# Local scratch — brainstorming specs, contract notes, superpowers working
+# files. Never tracked in this public repo (global rule). Named explicitly
+# here (not just caught by the `/*` deny-all above) so the lint check in
+# bin/lint-skills.py can tell "we decided this stays ignored" from "nobody
+# has decided anything about this yet" for a brand-new top-level entry.
+docs/
 
 # Externally-managed marketplace plugins installed into this skills dir
 # (their own repos — install/update from their marketplaces, don't vendor here)

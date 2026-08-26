@@ -15,7 +15,7 @@ After edits, run `python3 bin/lint-skills.py` to confirm nothing broke.
 | # | Applies if you… | Files | What to change |
 | --- | --- | --- | --- |
 | 1 | …are on any machine (everyone) | `handoff/SKILL.md`, `slack-ask/SKILL.md`, `slack-notify/SKILL.md`, `SETUP.md`, `~/.claude/settings.json` | Repo docs use `$HOME/...` and usually need no home-dir edits. `handoff` saves to `$HOME/agents/handoffs/`, and the Slack skills call `$HOME/.claude/bin/cc-slack-post.py`. The `~/.claude/settings.json` allow-rule is the exception: write the literal absolute helper path there, because allow-rules do not expand `$HOME`. |
-| 2 | …want Slack notifications | `slack-ask/SKILL.md`, `slack-notify/SKILL.md`, `SETUP.md`, `~/.claude/settings.json` | Create your own Slack bot token (`~/.claude/.slack-bot-token`, never committed), set your channel (default is `#cc-comm` / `CC_SLACK_CHANNEL`), and allowlist the helper path. Full walkthrough in [SETUP.md](SETUP.md). Otherwise mark N/A and ignore these skills. |
+| 2 | …want Slack notifications | `slack-ask/SKILL.md`, `slack-notify/SKILL.md`, `SETUP.md`, `~/.claude/settings.json` | Create your own Slack bot token (`~/.claude/.slack-bot-token`, never committed), set your channel id in `CC_SLACK_CHANNEL` (required — the helper refuses to send without it), and allowlist the helper path. Full walkthrough in [SETUP.md](SETUP.md). Otherwise mark N/A and ignore these skills. |
 | 3 | …use an Obsidian vault | `obsidian-vault/SKILL.md`, your private `~/.claude/CLAUDE.md` | Point it at **your** vault path (the author's is under Dropbox). N/A if you don't use Obsidian. |
 | 4 | …everyone (global config) | `~/.claude/CLAUDE.md` (private, **not** in this repo) | Build your own global instructions: your Obsidian path and any personal preferences. Don't copy the author's verbatim. |
 
@@ -27,7 +27,6 @@ re-apply each one onto the new upstream base at every sync (current base: v1.2.2
 | File | Local edit |
 | --- | --- |
 | `grilling/SKILL.md` | Present each round's questions through the `AskUserQuestion` tool with 2-4 concrete options; the recommended answer is the first option, marked "(Recommended)"; upstream's prose format is kept as the fallback for questions that can't be framed as options. (Originally applied to `grill-me` before upstream moved the family's content into `grilling`.) |
-| `wait-what/SKILL.md` | Upstream reads the shared vocabulary from `CONTEXT.md`; our repos don't standardize that file, so the reference is generalized to "the project's shared-vocabulary doc (`CONTEXT.md`, or this repo's domain model / `CLAUDE.md`)". |
 | `grill-with-docs/SKILL.md` | Typo fix in the description: "ADR's" → "ADRs". |
 
 ## Checklist

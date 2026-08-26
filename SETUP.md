@@ -62,18 +62,45 @@ Create once (workspace-global; reuse the same token on every machine):
 2. **OAuth & Permissions** → Bot Token Scopes → add **`chat:write`** →
    **Install to Workspace** → copy the **Bot User OAuth Token** (`xoxb-…`).
 3. In Slack, invite the bot to the channel: `/invite @<your app>` in **#cc-comm**.
+4. Note the channel's id for the next step: channel name → **About** →
+   **Copy channel ID** (ids look like `C0123456789`).
 
-Place the token on each machine (keep it out of git — paste it directly in a
-terminal, e.g. via Claude Code's `!` prefix):
+Place the token on each machine (keep it out of git **and** out of shell
+history — `read -s` takes the value from the terminal without echoing it or
+passing it as a command-line argument). Capture into a mode-600 temp file
+first and `mv` it into place only once the capture succeeds, so an
+interrupted `read`, a failed paste, or a killed shell can never leave you
+with a truncated or empty token file — any existing token stays untouched
+until the new one is fully written:
 ```bash
-install -m 600 /dev/null ~/.claude/.slack-bot-token
-printf '%s' 'xoxb-...' > ~/.claude/.slack-bot-token
+(
+  umask 077
+  tmp="$(mktemp ~/.claude/.slack-bot-token.XXXXXX)"
+  trap 'unset token; rm -f "$tmp"' EXIT
+  read -r -s -p 'Slack bot token: ' token
+  printf '%s' "$token" > "$tmp"
+  mv "$tmp" ~/.claude/.slack-bot-token
+)
 ```
+If you ever entered the token as a literal command-line argument, or ran the
+old two-step form of this recipe (`install -m 600 /dev/null
+~/.claude/.slack-bot-token` followed by a separate `read` — that form zeroed
+the file *before* capturing the replacement, so an interrupted `read` or a
+failed `printf` left it empty or truncated), treat the token as exposed —
+either it's recorded in your shell history, or the file may be silently
+empty/partial — and rotate it: reinstall the app at api.slack.com to mint a
+fresh token, then redo this step. Don't try to recover or print whatever is
+currently in the file; just rotate.
 
-### 3. Allowlist (so it runs without prompts) — per machine
-Merge into `~/.claude/settings.json` (not in this repo):
+### 3. Channel id + allowlist — per machine
+Merge into `~/.claude/settings.json` (not in this repo), with your own channel
+id from step 2 (there is no default channel — the helper refuses to send
+without `CC_SLACK_CHANNEL`):
 ```json
 {
+  "env": {
+    "CC_SLACK_CHANNEL": "C0123456789"
+  },
   "permissions": {
     "allow": [
       "Bash(/home/USER/.claude/bin/cc-slack-post.py:*)",
@@ -97,8 +124,12 @@ The sender (`bin/cc-slack-post.py`) reads:
 
 | Env var | Default | Meaning |
 |---|---|---|
-| `CC_SLACK_CHANNEL` | `C0B993YLDPT` (#cc-comm) | Target channel id; set to a user id to DM |
+| `CC_SLACK_CHANNEL` | — (required) | Target channel id, e.g. `C0123456789`; set to a member id to DM. The helper exits with an error when unset |
 | `CC_SLACK_TOKEN_FILE` | `~/.claude/.slack-bot-token` | Path to the `xoxb-` token |
+
+The `slack-ask` skill additionally reads `CC_SLACK_USER` — your own Slack member id, e.g.
+`U0123456789` (Profile → ⋮ → Copy member ID). It is how the skill tells your reply from the bot's
+or anyone else's, so a thread answer is only recognised when that id is set.
 
 ## Portability note
 

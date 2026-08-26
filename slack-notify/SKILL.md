@@ -14,13 +14,15 @@ identity is what actually triggers a notification.
 
 ## Config
 
-- **Channel**: `#cc-comm` → `channel_id` = `C0B993YLDPT`.
+- **Channel**: the id in `$CC_SLACK_CHANNEL` (e.g. `C0123456789`; find yours in
+  Slack via channel name → About → **Copy channel ID**). The helper requires it
+  and exits with `ERR` when unset — wiring in [SETUP.md](../SETUP.md).
 - **Send helper**: `$HOME/.claude/bin/cc-slack-post.py "<message>"`
   — posts as the bot (token from `~/.claude/.slack-bot-token`), allowlisted so it
   runs without a prompt. The command may use `$HOME`, but the
   `~/.claude/settings.json` allow-rule must use the literal absolute helper path.
-  To DM instead of the channel, set
-  `CC_SLACK_CHANNEL=U01FB823VSR` in the environment for the call.
+  To DM instead of the channel, set `CC_SLACK_CHANNEL` to your Slack member id
+  (e.g. `U0123456789` — profile → **Copy member ID**) for the call.
 
 ## Procedure
 
