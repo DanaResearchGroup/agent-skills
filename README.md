@@ -133,7 +133,8 @@ So on Codex, do step 1 as `ln -s ~/Code/agent-skills ~/.codex/skills` instead. C
 
 - **Lint locally before pushing:** `python3 bin/lint-skills.py` (also runs in CI on every PR).
 - CI also runs a [gitleaks](https://github.com/gitleaks/gitleaks) secret scan — never commit
-  tokens. The Slack bot token lives outside the repo (see [SETUP.md](SETUP.md)).
+  tokens. The Slack bot token lives outside the repo (see [SETUP.md](SETUP.md)). Scan scope,
+  history policy, and how to report a finding: [SECURITY.md](SECURITY.md).
 - Pull vendored skill updates from upstream (Matt Pocock) with the `sync-matt-pocock-skills` skill —
   it reconciles our copies with a new [`mattpocock/skills`](https://github.com/mattpocock/skills)
   release while preserving local edits.
