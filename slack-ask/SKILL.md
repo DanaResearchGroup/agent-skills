@@ -15,7 +15,9 @@ see `slack-notify` for the full rationale.)
 
 ## Config
 
-- **Channel**: `#cc-comm` → `channel_id` = `C0B993YLDPT` (stable across machines).
+- **Channel**: the id in `$CC_SLACK_CHANNEL` (e.g. `C0123456789`; find yours in
+  Slack via channel name → About → **Copy channel ID**). The helper requires it
+  and exits with `ERR` when unset — wiring in [SETUP.md](../SETUP.md).
 - **Send helper**: `$HOME/.claude/bin/cc-slack-post.py "<message>" [thread_ts]`
   — posts as the bot (reads the bot token from `~/.claude/.slack-bot-token`),
   prints `OK` then the message `ts`. It's allowlisted in settings.json, so it
@@ -62,7 +64,7 @@ see `slack-notify` for the full rationale.)
    | 65 min onward | `sleep 1800` (every 30 min) |
 
    On each wake:
-   - Call `slack_read_thread` with `channel_id` `C0B993YLDPT` and
+   - Call `slack_read_thread` with `channel_id` = the `$CC_SLACK_CHANNEL` id and
      `message_ts = <ts>`.
    - Look for the **last** message whose `user` is `U01FB823VSR` and whose `ts`
      is greater than the root `ts`.

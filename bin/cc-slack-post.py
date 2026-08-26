@@ -5,8 +5,9 @@ Usage:
     cc-slack-post.py "<message>" [thread_ts]
 
 Prints "OK" then the message ts on success; "ERR <error>" and exits 1 on failure.
-Config via env (with sane defaults):
-    CC_SLACK_CHANNEL     default "C0B993YLDPT" (#cc-comm)
+Config via env:
+    CC_SLACK_CHANNEL     required — target channel id, e.g. "C0123456789"
+                         (Slack: channel name → About → Copy channel ID); see SETUP.md
     CC_SLACK_TOKEN_FILE  default "~/.claude/.slack-bot-token"
 """
 import json
@@ -14,7 +15,7 @@ import os
 import sys
 import urllib.request
 
-CHANNEL = os.environ.get("CC_SLACK_CHANNEL", "C0B993YLDPT")
+CHANNEL = os.environ.get("CC_SLACK_CHANNEL")
 TOKEN_FILE = os.path.expanduser(
     os.environ.get("CC_SLACK_TOKEN_FILE", "~/.claude/.slack-bot-token")
 )
@@ -23,6 +24,12 @@ TOKEN_FILE = os.path.expanduser(
 def main():
     if len(sys.argv) < 2 or not sys.argv[1].strip():
         sys.exit("usage: cc-slack-post.py <message> [thread_ts]")
+    if not CHANNEL:
+        print(
+            "ERR CC_SLACK_CHANNEL is not set — export your Slack channel id "
+            "(see SETUP.md, 'Configuration reference')"
+        )
+        sys.exit(1)
     message = sys.argv[1]
     thread = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] not in ("", "-") else None
 
