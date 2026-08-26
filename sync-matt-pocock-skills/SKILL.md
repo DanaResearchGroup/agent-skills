@@ -11,8 +11,10 @@ repo with a newer upstream release **without losing our local modifications**. T
 one move done per skill: treat upstream's new version as the base and re-apply our edits on top — a
 **stash** and pop.
 
-`THIRD_PARTY_NOTICES.md` lists which skills are vendored — that list is the source of truth for what
-this skill governs. Work in a git worktree, never the shared checkout.
+`THIRD_PARTY_NOTICES.md` lists which skills are vendored — that list is the **explicit vendored
+allowlist**, the source of truth for what this skill governs. It is deliberately narrower than
+upstream's inventory: skills we audited and deleted are absent on purpose, and a sync must never
+re-add them (details in step 4). Work in a git worktree, never the shared checkout.
 
 ## 1. Read the changelog first
 
@@ -23,8 +25,8 @@ gh release list --repo mattpocock/skills
 gh release view <tag> --repo mattpocock/skills      # or read its CHANGELOG.md
 ```
 
-Sort every change into four kinds: **renames** (`to-prd`→`to-spec`), **deletions** (`to-issues`
-merged into `to-tickets`), **new skills**, and **per-skill edits**. Flag any new **cross-skill
+Sort every change into four kinds: **renames** (`to-prd`→`to-spec`), **deletions** (a skill
+removed outright, or folded into another), **new skills**, and **per-skill edits**. Flag any new **cross-skill
 dependency** — a skill that now calls a `/skill` we don't vendor yet (v1.1.0 pointed several skills
 at the new `/grilling` primitive).
 
@@ -65,10 +67,20 @@ Put every vendored skill in one bucket:
 
 ## 4. Apply renames, deletions, and additions
 
-`git rm` the deleted and renamed-away skills. Copy in the replacements, plus any new skill a
-cross-dependency needs — a `/skill` reference dangles if its target isn't vendored.
+`git rm` the deleted and renamed-away skills, and copy in their replacements.
 
-**Done when:** `git status` matches the change-list from step 1.
+**Additions are gated by the allowlist.** When you walk upstream's skills deciding what to pull
+in, the rule is: a skill absent from `THIRD_PARTY_NOTICES.md` must **not** be silently added — no
+matter whether it is new upstream, or one we once vendored and later deliberately deleted (an
+upstream dir with no local counterpart looks identical in both cases, and re-vendoring an audited
+deletion silently undoes it). For each candidate — a genuinely new upstream skill, or one a new
+cross-skill dependency needs (a `/skill` reference dangles if its target isn't vendored) — put it
+to the human with a one-line case for vendoring it. Only on their explicit yes do you copy it in
+and add it to both `THIRD_PARTY_NOTICES.md` and the README table; on no, adapt or drop the
+dangling reference instead.
+
+**Done when:** `git status` matches the change-list from step 1, and every addition was
+explicitly accepted by the human and recorded in the notices file.
 
 ## 5. Chase dangling references
 
@@ -82,7 +94,8 @@ Then confirm every `/skill` cross-reference in the changed files resolves to a s
 
 ## 6. Update the docs
 
-- `THIRD_PARTY_NOTICES.md` — the vendored-skill list.
+- `THIRD_PARTY_NOTICES.md` — the vendored allowlist (additions were already recorded in step 4;
+  reflect deletions and renames here too).
 - `README.md` — the skills-count badge and the Matt Pocock attribution row.
 - `ADAPTATION.md` — only if the update introduced a new machine- or group-specific assumption.
 
