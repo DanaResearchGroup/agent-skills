@@ -65,12 +65,18 @@ Create once (workspace-global; reuse the same token on every machine):
 4. Note the channel's id for the next step: channel name → **About** →
    **Copy channel ID** (ids look like `C0123456789`).
 
-Place the token on each machine (keep it out of git — paste it directly in a
-terminal, e.g. via Claude Code's `!` prefix):
+Place the token on each machine (keep it out of git **and** out of shell
+history — `read -s` takes the value from the terminal without echoing it or
+passing it as a command-line argument):
 ```bash
 install -m 600 /dev/null ~/.claude/.slack-bot-token
-printf '%s' 'xoxb-...' > ~/.claude/.slack-bot-token
+read -r -s -p 'Slack bot token: ' token
+printf '%s' "$token" > ~/.claude/.slack-bot-token && unset token
 ```
+If you ever entered the token as a literal command-line argument instead (an
+earlier revision of this page showed that form), treat it as exposed — it is
+recorded in your shell history — and rotate it: reinstall the app at
+api.slack.com to mint a fresh token, then redo this step.
 
 ### 3. Channel id + allowlist — per machine
 Merge into `~/.claude/settings.json` (not in this repo), with your own channel
