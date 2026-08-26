@@ -39,19 +39,46 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        # gitleaks exits 1 when it finds a leak; nothing here catches or masks
-        # that, so a finding fails the job. `--redact` keeps any found secret
-        # out of the CI logs; `--config` pins the repo's .gitleaks.toml rather
-        # than trusting auto-discovery.
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.event.after }}
+        # gitleaks exits 1 when it finds a leak. Each invocation below is
+        # checked explicitly and OR'd into $failed rather than relying on `set
+        # -e` across an if/else, so no branch can silently swallow a nonzero
+        # exit; the step's own exit code is $failed, so a finding still fails
+        # the job. `--redact` keeps any found secret out of the CI logs;
+        # `--config` pins the repo's .gitleaks.toml rather than auto-discovery.
+        #
+        # Every path scans both a commit range and the checked-out tree,
+        # because either alone misses cases the other catches:
+        #   - PR range without `--no-merges`: a secret introduced only by a
+        #     merge/conflict-resolution commit inside the PR must not be
+        #     skipped.
+        #   - PR tree scan: catches a secret already present at HEAD even if
+        #     history scanning above has a blind spot (e.g. a shallow/rewritten
+        #     ref), so the actual checked-out state is never unexamined.
+        #   - push before..after range: catches a secret added and then
+        #     removed within the same push, which a tree-only scan of the
+        #     final state would never see.
+        #   - push tree scan: catches a secret already committed before this
+        #     push if the range scan is unavailable (first push on a ref,
+        #     `before` is the all-zeros SHA).
         run: |
+          failed=0
+
           if [ -n "$BASE_SHA" ]; then
-            # PR: scan only the commits this PR introduces.
             /tmp/gitleaks git --config .gitleaks.toml --redact --no-banner --verbose \
-              --log-opts "--no-merges $BASE_SHA..$HEAD_SHA" .
+              --log-opts "$BASE_SHA..$HEAD_SHA" . || failed=1
+            /tmp/gitleaks dir --config .gitleaks.toml --redact --no-banner --verbose . || failed=1
           else
-            # Push: scan the checked-out tree (current files, not history).
-            /tmp/gitleaks dir --config .gitleaks.toml --redact --no-banner --verbose .
+            zero_sha="0000000000000000000000000000000000000000"
+            if [ -n "$BEFORE_SHA" ] && [ "$BEFORE_SHA" != "$zero_sha" ]; then
+              /tmp/gitleaks git --config .gitleaks.toml --redact --no-banner --verbose \
+                --log-opts "$BEFORE_SHA..$AFTER_SHA" . || failed=1
+            fi
+            /tmp/gitleaks dir --config .gitleaks.toml --redact --no-banner --verbose . || failed=1
           fi
+
+          exit "$failed"
 
   skill-lint:
     name: Skill lint
