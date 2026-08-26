@@ -7,6 +7,10 @@ Checks, per top-level `<skill>/SKILL.md`:
   3. `description:` exists and is non-empty.
   4. Every relative markdown link target (`](foo.md)`, `](scripts/x.sh)`) exists.
 
+Plus, across every tracked `.md` file in the repo:
+  5. Every relative markdown link resolves — against the directory of the file
+     containing the link, never the repo root.
+
 Deliberately NOT checked: cross-skill `/other-skill` references — many legitimately
 point at superpowers skills that don't live in this repo, so checking them
 here would only produce false positives.
@@ -109,6 +113,48 @@ def link_targets(body: str) -> list[str]:
     return out
 
 
+def check_relative_links(root: Path, errors: list[str], skip: set[Path]) -> tuple[int, int]:
+    """Assert every relative markdown link in every tracked `.md` file resolves.
+
+    Targets are resolved against the directory of the file containing the link.
+    That base matters: an external review tool once resolved them against the
+    repo root instead and reported four perfectly-good links (in
+    writing-for-agents, writing-great-skills, contract, probe) as dead.
+
+    Two regions are excluded from the scan:
+      - Fenced code blocks — illustrative, not real links (see strip_fenced_code).
+      - YAML frontmatter — it is YAML, not markdown prose. A `description:`
+        value that mentions `references/foo.md` (probe/SKILL.md does) is a
+        plain-text path for the model, not a markdown link; treating
+        frontmatter as prose would re-create exactly the false positives this
+        check exists to kill. parse_frontmatter() hands back the body only.
+
+    `skip` holds files already link-checked elsewhere (the top-level SKILL.md
+    set), so a genuine break there is reported once, not twice.
+
+    Returns (files_scanned, links_checked) for the summary line.
+    """
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "*.md"],
+            capture_output=True, text=True, check=True,
+        ).stdout
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return 0, 0  # no git: the tracked-file set is unknowable here
+    n_files = n_links = 0
+    for line in out.splitlines():
+        md = root / line
+        if md in skip or not md.is_file():
+            continue
+        n_files += 1
+        _, body = parse_frontmatter(md.read_text(encoding="utf-8"))
+        for target in link_targets(body):
+            n_links += 1
+            if not (md.parent / target).exists():
+                errors.append(f"{line}: broken relative link `{target}`")
+    return n_files, n_links
+
+
 def find_unignored_check_candidates(root: Path) -> list[Path]:
     """Every real (non-symlink) top-level dir containing a SKILL.md.
 
@@ -163,6 +209,7 @@ def main() -> int:
         return 1
 
     check_not_gitignored(root, errors)
+    n_md, n_links = check_relative_links(root, errors, skip=set(skills))
 
     for skill in skills:
         rel = skill.relative_to(root)
@@ -193,7 +240,10 @@ def main() -> int:
             print(f"  ✗ {e}", file=sys.stderr)
         return 1
 
-    print(f"lint-skills: OK — {len(skills)} skills passed")
+    print(
+        f"lint-skills: OK — {len(skills)} skills passed; "
+        f"{n_links} relative links resolved across {n_md} other tracked markdown files"
+    )
     return 0
 
 
