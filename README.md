@@ -129,6 +129,12 @@ So on Codex, do step 1 as `ln -s ~/Code/agent-skills ~/.codex/skills` instead. C
 ## Maintaining this repo
 
 - **Lint locally before pushing:** `python3 bin/lint-skills.py` (also runs in CI on every PR).
+- **Adding a new top-level skill or root file?** `.gitignore` is deny-by-default — everything at
+  the repo root is ignored unless explicitly re-included with a `!/name/` (or `!/name.md`) line.
+  A brand-new skill directory or a new root file like `CONTRIBUTING.md` is otherwise silently
+  invisible to `git add`: no error, just nothing staged. `lint-skills.py` catches this locally
+  (it can't run in CI — an ignored, never-staged file never reaches CI) and tells you the exact
+  `.gitignore` line to add.
 - CI also runs a [gitleaks](https://github.com/gitleaks/gitleaks) secret scan — never commit
   tokens. The Slack bot token lives outside the repo (see [SETUP.md](SETUP.md)). Scan scope,
   history policy, and how to report a finding: [SECURITY.md](SECURITY.md).

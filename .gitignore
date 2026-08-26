@@ -83,8 +83,12 @@ Thumbs.db
 __pycache__/
 *.pyc
 
-# Superpowers working files must never be tracked (global rule)
-docs/superpowers/
+# Local scratch — brainstorming specs, contract notes, superpowers working
+# files. Never tracked in this public repo (global rule). Named explicitly
+# here (not just caught by the `/*` deny-all above) so the lint check in
+# bin/lint-skills.py can tell "we decided this stays ignored" from "nobody
+# has decided anything about this yet" for a brand-new top-level entry.
+docs/
 
 # Externally-managed marketplace plugins installed into this skills dir
 # (their own repos — install/update from their marketplaces, don't vendor here)

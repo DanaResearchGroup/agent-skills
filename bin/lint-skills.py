@@ -11,6 +11,11 @@ Plus, across every tracked `.md` file in the repo:
   5. Every relative markdown link resolves — against the directory of the file
      containing the link, never the repo root.
 
+Plus, across the whole repo root:
+  6. No untracked top-level file or directory is silently dropped by
+     .gitignore's deny-by-default allowlist with no rule of its own — see
+     check_not_gitignored().
+
 Deliberately NOT checked: cross-skill `/other-skill` references — many legitimately
 point at superpowers skills that don't live in this repo, so checking them
 here would only produce false positives.
@@ -156,24 +161,55 @@ def check_relative_links(root: Path, errors: list[str], skip: set[Path]) -> tupl
 
 
 def find_unignored_check_candidates(root: Path) -> list[Path]:
-    """Every real (non-symlink) top-level dir containing a SKILL.md.
+    """Every untracked top-level entry that isn't a symlink.
 
-    Symlinked skill dirs are deliberately skipped: those are the private
-    skills linked in from a separate private repo, and being git-ignored is
-    the *correct* state for them — that's the whole point of the allowlist
-    in .gitignore. This check exists to catch the opposite mistake: a real,
-    tracked-in-this-repo skill directory that got forgotten from the
-    allowlist and is therefore silently invisible to `git add`.
+    Symlinked top-level entries are deliberately skipped: those are the
+    private skills linked in from a separate private repo, and being
+    git-ignored is the *correct* state for them — that's the whole point of
+    the deny-by-default allowlist in .gitignore. This check exists to catch
+    the opposite mistake: a real, meant-to-be-tracked top-level file or
+    directory (a brand-new skill, CONTRIBUTING.md, a docs/ directory —
+    anything, not just a directory containing SKILL.md) that got forgotten
+    from the allowlist and is therefore silently invisible to `git add`,
+    with no error and no warning from git itself.
     """
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(root), "ls-files"],
+            capture_output=True, text=True, check=True,
+        ).stdout
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return []  # no git available; nothing we can check here
+    tracked_top = {line.split("/", 1)[0] for line in out.splitlines()}
     return sorted(
-        p.parent for p in root.glob("*/SKILL.md")
-        if p.parent.name not in EXCLUDE_DIRS
-        and not p.parent.name.startswith(".")
-        and not p.parent.is_symlink()
+        p for p in root.iterdir()
+        if p.name != ".git"
+        and p.name not in tracked_top
+        and not p.is_symlink()
     )
 
 
 def check_not_gitignored(root: Path, errors: list[str]) -> None:
+    """Flag any untracked top-level entry `git add` would silently skip.
+
+    A deny-by-default `.gitignore` means an untracked top-level file or
+    directory with no matching `!` re-include is invisible to `git add` — no
+    error, no warning, just silence; CI can't catch this either, since a file
+    that was never staged never reaches CI. That silence is *correct* for
+    entries a specific rule already accounts for on purpose (cruft like
+    __pycache__, secrets like *.token, scratch like docs/, named
+    known-not-ours skill directories) — those are deliberate decisions and
+    must stay quiet. It's a real gap for anything caught only by the blanket
+    `/*` deny-all with no rule of its own: that's exactly a brand-new skill
+    directory, a new root file like CONTRIBUTING.md, or any other top-level
+    entry nobody has made a decision about yet.
+
+    We tell the two apart by asking `git check-ignore -v` which .gitignore
+    line matched: the bare `/*` deny-all vs. anything more specific. This
+    does NOT weaken the allowlist itself — nothing here adds a `!` rule; it
+    only decides which existing outcome deserves a loud error instead of
+    silence.
+    """
     candidates = find_unignored_check_candidates(root)
     if not candidates:
         return
@@ -183,21 +219,31 @@ def check_not_gitignored(root: Path, errors: list[str]) -> None:
             # path is already tracked. Plain `check-ignore` silently reports
             # tracked paths as "not ignored" even when a pattern matches them,
             # which would hide exactly the forgotten-allowlist-line case this
-            # check exists to catch (a skill dir tracked today, then dropped
-            # from .gitignore's allowlist by mistake).
-            ["git", "-C", str(root), "check-ignore", "--no-index", *[str(p) for p in candidates]],
+            # check exists to catch.
+            ["git", "-C", str(root), "check-ignore", "--no-index", "-v",
+             *[str(p) for p in candidates]],
             capture_output=True, text=True,
         )
     except FileNotFoundError:
         return  # no git available; nothing we can check here
-    ignored = set(result.stdout.splitlines())
+    # Each matched line looks like "<source>:<line-no>:<pattern>\t<path>".
+    matched_pattern: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        meta, _, path = line.partition("\t")
+        matched_pattern[path] = meta.rsplit(":", 1)[-1]
     for p in candidates:
-        if str(p) in ignored:
-            rel = p.relative_to(root)
-            errors.append(
-                f"{rel}: real skill directory is git-ignored — add `!/{rel}/` "
-                f"to .gitignore's allowlist"
-            )
+        pattern = matched_pattern.get(str(p))
+        if pattern is None:
+            continue  # not ignored at all — a plain `git status` already surfaces it
+        if pattern != "/*":
+            continue  # a specific rule accounts for it on purpose — not our concern
+        rel = p.relative_to(root)
+        suffix = "/" if p.is_dir() else ""
+        errors.append(
+            f"{rel}: untracked and silently ignored by the deny-by-default allowlist "
+            f"(no rule covers it but the blanket `/*`) — add `!/{rel}{suffix}` to "
+            f".gitignore to track it, or a specific ignore rule if it should stay out"
+        )
 
 
 def main() -> int:
