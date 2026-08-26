@@ -113,6 +113,10 @@ The sender (`bin/cc-slack-post.py`) reads:
 | `CC_SLACK_CHANNEL` | — (required) | Target channel id, e.g. `C0123456789`; set to a member id to DM. The helper exits with an error when unset |
 | `CC_SLACK_TOKEN_FILE` | `~/.claude/.slack-bot-token` | Path to the `xoxb-` token |
 
+The `slack-ask` skill additionally reads `CC_SLACK_USER` — your own Slack member id, e.g.
+`U0123456789` (Profile → ⋮ → Copy member ID). It is how the skill tells your reply from the bot's
+or anyone else's, so a thread answer is only recognised when that id is set.
+
 ## Portability note
 
 The `slack-ask` / `slack-notify` skills call

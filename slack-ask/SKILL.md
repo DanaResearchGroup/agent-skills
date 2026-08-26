@@ -29,8 +29,11 @@ see `slack-notify` for the full rationale.)
   broadcast the user never learns a message is pending. Never post a thread
   reply through any other mechanism (e.g. an MCP send tool) without the
   equivalent broadcast flag.
-- **Human user id**: `U01FB823VSR` (Alon). Only a reply from this user (not the
-  bot, not yourself) counts as the answer.
+- **Human user id**: the id in `$CC_SLACK_USER` (e.g. `U0123456789`; find yours
+  in Slack under Profile → ⋮ → Copy member ID). Only a reply from that user (not
+  the bot, not yourself) counts as the answer. If `$CC_SLACK_USER` is unset,
+  stop and say so — the same way the send helper refuses an unset channel.
+  Accepting whoever replies first is not the fallback.
 
 ## Procedure
 
@@ -66,7 +69,7 @@ see `slack-notify` for the full rationale.)
    On each wake:
    - Call `slack_read_thread` with `channel_id` = the `$CC_SLACK_CHANNEL` id and
      `message_ts = <ts>`.
-   - Look for the **last** message whose `user` is `U01FB823VSR` and whose `ts`
+   - Look for the **last** message whose `user` is `$CC_SLACK_USER` and whose `ts`
      is greater than the root `ts`.
    - If found → that text is the answer. Go to step 4.
    - If not found → start the next backgrounded `sleep` per the table and repeat.
@@ -74,7 +77,7 @@ see `slack-notify` for the full rationale.)
      budget (default ~4 h) and report a timeout to the user.
 
    Note: background-task completion events are NOT the user's reply — only a
-   `slack_read_thread` message from `U01FB823VSR` counts.
+   `slack_read_thread` message from `$CC_SLACK_USER` counts.
 
 4. **Acknowledge and continue.** Post a short threaded confirmation by passing
    the root `ts` as the second arg, then use the answer to proceed:
@@ -87,5 +90,5 @@ see `slack-notify` for the full rationale.)
 - If the answer is ambiguous, ask a follow-up **in the same thread** (pass the
   root `ts` again) rather than starting a new message.
 - Never treat your own/bot messages as the answer — filter strictly on
-  `user == U01FB823VSR`.
+  `user == $CC_SLACK_USER`.
 - For a one-way notification that needs no reply, use the `slack-notify` skill.
