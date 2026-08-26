@@ -24,8 +24,20 @@ The current tree carries no such references.
 - **CI secret scan** — the `secret-scan` job in
   [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs
   [gitleaks](https://github.com/gitleaks/gitleaks) with the repo's
-  `.gitleaks.toml` on every PR (diff-scoped: only the commits the PR
-  introduces) and every push (working tree). A finding fails the build.
+  `.gitleaks.toml`. Both a **commit range** and the **working tree** are
+  scanned, on pull requests and on pushes alike, because either alone has a
+  blind spot the other covers:
+  - on a PR, the range is `base..head` *without* `--no-merges`, so a secret
+    introduced by a merge or conflict resolution inside the PR is not skipped;
+    the tree is scanned too, so the state actually checked out is never
+    unexamined.
+  - on a push, the range is `before..after`, so a secret added and then removed
+    within that same push is still caught — a tree-only scan of the final state
+    would never see it. On the first push to a ref (`before` is the all-zeros
+    SHA) there is no range, and the tree scan stands alone.
+
+  Every invocation is checked separately and a finding in any of them fails the
+  build. `--redact` keeps a found secret out of the CI logs.
 - **No baked-in private ids** — the Slack helper (`bin/cc-slack-post.py`)
   requires `CC_SLACK_CHANNEL` and refuses to send without it, instead of
   defaulting to a real private channel id.
