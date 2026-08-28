@@ -43,6 +43,16 @@ command -v mux_init >/dev/null 2>&1 || exit 0
 THRESHOLD=35
 COOLDOWN=900
 REQUEST_MAX_AGE=3600
+# Opportunistic "compact while the cache is already cold" trigger — see
+# auto-handoff-watch.sh for the full rationale. Compacting once the cache has
+# already expired turns an already-owed full-context prefix rewrite into a
+# rewrite of the small compacted context instead, at zero incremental cost.
+# COLD_MIN and CACHE_TTL MUST match auto-handoff-watch.sh; a divergence
+# between the two would be silent. The watcher alone can never observe this
+# condition (at turn end idle_age is ~0) — only this sweeper, polling a
+# parked/idle session later, can see idle_age >= CACHE_TTL.
+COLD_MIN=25
+CACHE_TTL=300
 # After this many consecutive aborted cycles, stop retrying and mark the session
 # stuck (the status line surfaces it) rather than typing /compact at a wedged
 # pane every few minutes forever.
@@ -106,16 +116,27 @@ for pf in "$STATE"/*.herdr-pane "$STATE"/*.tmux-pane; do
     [ -f "$ctxf" ] || continue
     pct=$(sed -n 's/^pct=\([0-9.]*\).*/\1/p' "$ctxf")
     [ -n "$pct" ] || continue
-    awk "BEGIN{exit !($pct > $THRESHOLD)}" || continue
+    if awk "BEGIN{exit !($pct > $THRESHOLD)}"; then
+      reason="pct=$pct > $THRESHOLD"
+    elif [ ! -f "$STATE/disable-cold-cache-compact" ] \
+         && awk "BEGIN{exit !($pct > $COLD_MIN)}" \
+         && [ -f "$STATE/$sid.idle" ] \
+         && [ "$(( now - $(cat "$STATE/$sid.idle" 2>/dev/null || echo "$now") ))" -ge "$CACHE_TTL" ]; then
+      reason="pct=$pct > $COLD_MIN, idle >= ${CACHE_TTL}s (cold-cache)"
+    else
+      continue
+    fi
     # Guard against re-compacting an idle session forever: once a cycle has
     # COMPLETED, only fire again if the session has actually done something
     # since (its context reading moved). A session with aborted cycles is
-    # exempt — retrying those is precisely the bug this sweeper fixes.
+    # exempt — retrying those is precisely the bug this sweeper fixes. Binds
+    # BOTH branches above (threshold and cold-cache) — without it a session
+    # sitting above COLD_MIN and idle would get compacted every COOLDOWN
+    # period forever.
     if [ "$aborts" -eq 0 ] && [ -f "$STATE/$sid.cooldown" ] &&
        [ "$(mtime "$ctxf")" -le "$(mtime "$STATE/$sid.cooldown")" ]; then
       continue
     fi
-    reason="pct=$pct > $THRESHOLD"
   fi
 
   # --- the pane must be live AND still ours ---------------------------------

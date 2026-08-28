@@ -14,7 +14,8 @@
 # can reset) -> "read <handoff> and continue execution".
 # A .compact-request marker triggers a COMPACT-ONLY variant: the /handoff step is
 # skipped (a handoff is already written) and the cycle starts at /compact.
-# Triggers: pct > THRESHOLD | .handoff-request (full cycle) | .compact-request (compact-only).
+# Triggers: pct > THRESHOLD | pct > COLD_MIN and idle >= CACHE_TTL (cold-cache) |
+# .handoff-request (full cycle) | .compact-request (compact-only).
 sid="$1"
 [ -n "$sid" ] || exit 0
 # sid is used to build state-file paths (incl. `rm -rf` of the cycle lock), so
@@ -33,9 +34,23 @@ _HERE="$(cd "$(dirname "$0")" && pwd)"
 [ -f "$_HERE/mux-lib.sh" ] && . "$_HERE/mux-lib.sh"
 
 THRESHOLD=35        # act only when used_percentage > THRESHOLD
+# Opportunistic "compact while the cache is already cold" trigger. Compaction
+# always pays a full prompt-prefix rewrite; whether that rewrite is expensive
+# depends entirely on WHEN it happens. Compact while the cache is warm and you
+# discard a live prefix and pay to rewrite the new one. Compact after the cache
+# has already expired and the next turn owed a full rewrite of the WHOLE
+# context anyway — compacting first makes the rewrite it owes a rewrite of the
+# small compacted context instead of the large one, and the saving is the
+# difference between those two sizes. Measured across 4,625 transcripts:
+# writes following a gap of 5-60 minutes are 18.5% of all cache-write volume,
+# $7,409 — and they are rewrites of full-size contexts. The 5-minute ephemeral
+# TTL is what makes 300s the threshold below.
+COLD_MIN=25          # only contexts big enough for the saved rewrite to be worth a cycle
+CACHE_TTL=300        # the 5m ephemeral prompt-cache TTL
 # Wait timings are env-overridable so the tests can drive a whole cycle in
-# seconds. THRESHOLD and COOLDOWN deliberately are NOT — auto-handoff-sweep.sh
-# hard-codes the same values, and a divergence between the two would be silent.
+# seconds. THRESHOLD, COOLDOWN, COLD_MIN and CACHE_TTL deliberately are NOT —
+# auto-handoff-sweep.sh hard-codes the same values, and a divergence between
+# the two would be silent.
 SETTLE=${AUTODEV_SETTLE:-2}              # settle before the first idle check
 POLL=${AUTODEV_POLL:-3}                  # poll interval while waiting
 PRECHECK=${AUTODEV_PRECHECK:-45}         # max seconds to wait for an idle window before deferring
@@ -127,7 +142,14 @@ if [ -z "$reason" ] && [ -f "$creq" ]; then
   fi
 fi
 if [ -z "$reason" ]; then
-  if awk "BEGIN{exit !($pct > $THRESHOLD)}"; then reason=threshold; else exit 0; fi
+  if awk "BEGIN{exit !($pct > $THRESHOLD)}"; then
+    reason=threshold
+  elif [ ! -f "$STATE/disable-cold-cache-compact" ] && awk "BEGIN{exit !($pct > $COLD_MIN)}" \
+       && [ -f "$STATE/$sid.idle" ]; then
+    idle_age=$(( $(date +%s) - $(cat "$STATE/$sid.idle" 2>/dev/null || echo "$(date +%s)") ))
+    [ "$idle_age" -ge "$CACHE_TTL" ] && reason=cold-cache
+  fi
+  [ -n "$reason" ] || exit 0
 fi
 
 # --- cooldown gate ---
