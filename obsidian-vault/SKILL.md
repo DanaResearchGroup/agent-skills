@@ -60,6 +60,14 @@ ls "$DIR" | grep -c "^$D . $NAME\."      # 0 -> "a", 1 -> "b", 2 -> "c", ...
 
 **The live version of a document** is its newest date, then the highest letter within that date.
 
+### The name
+
+**`<Name>` is Title Case**, in both locations — `2026.08.26 a ERC B1 Science Skeleton.md`, not
+`2026.08.26 a ERC B1 science skeleton.md`. Acronyms keep their own casing. Both locations hold
+legacy files that disagree — the lowercase index notes in the Vault, sentence-case files in
+Dropbox — and they predate the rule rather than qualifying it; they are not worth renaming, so
+do not take a neighbour's casing as the convention.
+
 Authority: `Vault/CLAUDE.md` § A5 *"Naming, dates and language"*, which also fixes date formats
 (`DD/MM/YYYY` in HQ, ISO `YYYY-MM-DD` in `knowledge/`), English for all structure (filenames,
 frontmatter, headings — bodies follow the source language), and **preserving upstream spelling in
