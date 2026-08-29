@@ -1,0 +1,6 @@
+# Dependencies for pm-nudge-compose.py, installed into $AUTODEV_HOME/venv/pm-nudge
+# by pm-nudge-install.sh. Kept to exactly one direct dependency on purpose: this
+# venv exists so the daemon never has to care what the ambient interpreter can or
+# cannot import (anaconda here cannot import the SDK at all), and every extra
+# package is another way for that isolation to rot.
+anthropic==1.2.0
