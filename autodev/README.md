@@ -34,6 +34,7 @@ autodev/
     auto-handoff-sweep.sh      # LEVEL trigger: timer-driven; re-arms the engine for parked sessions
     request-handoff.sh         # helper: raise/cancel a voluntary below-threshold handoff-request for this session
     session-resume-watch.sh    # Phoenix engine: usage/session-limit → credits / wait → continue
+    fleet-digest.sh            # cron'able: one JSON snapshot of sessions/panes/worktrees/PRs (evidence only)
   test/                        # bash tests: sandboxed, never touch your real ~/agents
     ci.sh                      # the repo's CI entrypoint (fixed name); runs every suite below
     lib.sh                     # harness: throwaway AUTODEV_HOME, copied bin/, stubbed multiplexer
@@ -42,6 +43,7 @@ autodev/
     test-abort-recovery.sh     # aborts are counted, retried, then surfaced as STUCK
     test-install-sweeper.sh    # the generated systemd unit (incl. the KillMode=process guard)
     test-cache-warmth.sh       # the cache badge: countdown in the tab, deadline in the status line
+    test-fleet-digest.sh       # forced gh-missing / unreadable-root failures: section isolation, not just happy path
 ```
 
 **Edge vs. level.** `cc-stop-hook.sh` launches the watcher at a *turn end* — an edge. The
@@ -179,6 +181,83 @@ Resolution of "this session" is `explicit arg` → `$CLAUDE_CODE_SESSION_ID` →
 pane-owner file, and it **hard-fails if the env id and the pane owner disagree** rather than
 risk targeting a different live session (herdr recycles pane ids). Call it only from the
 **mother** session — a subagent resolves to its own child id, not the driving session.
+
+## fleet-digest: one JSON snapshot instead of 20+ Bash calls
+
+`fleet-digest.sh` is a read-only, no-judgment **collector**, not a decision-maker: it snapshots
+fleet state — recent Claude Code sessions (`*.ctx`), herdr panes, git worktrees under one or
+more roots, and open GitHub PRs per remote — into one atomically-written JSON file. Nothing in
+it fetches, writes, or acts; it exists so a PM/fleet session (or any future consumer) can read
+one small file instead of firing 20+ Bash calls whose output then sits in its prompt prefix on
+every later turn. No LLM involved.
+
+```bash
+bash ~/.claude/skills/autodev/bin/fleet-digest.sh                      # writes $AUTODEV_HOME/state/fleet-digest.json (+ a companion summary, see below)
+bash .../fleet-digest.sh --out /path/to/digest.json --root ~/Code --root ~/other-code
+bash .../fleet-digest.sh --session-max-age 3600 --timeout 45           # tune windows
+```
+
+**Output contract** (`schema_version: 1`): a top-level `generated_at`/`generated_at_iso`,
+`duration_ms`, `host`, and four sections — `sessions`, `panes`, `worktrees`, `prs`. Every
+section independently carries `ok` (bool), `error` (string or `null`), and `collected_at`, so a
+consumer can tell **"empty" apart from "failed"** — an empty `worktrees` array with `ok:true`
+means no repos were found; `ok:false` means the walk itself broke, and any array present alongside
+it is a **partial, best-effort result** (e.g. worktrees from every root except the one that
+failed), never a silent empty-vs-failure conflation. Sections fail independently: a missing `gh`
+only downs `prs`; an unreadable root only downs `worktrees`; `sessions` and `panes` are unaffected
+either way. `ok` and `error` are not strictly coupled: `prs` can be `ok:true` with a non-null
+`error` when PR listing itself succeeded but a secondary step degraded (see PR labelling below) —
+`ok:false` is reserved for "the section's actual job broke." The digest is always written, even
+if every section failed, via an atomic write-to-temp-then-`mv` in the output directory.
+
+**PR authorship is labelled, never dropped.** Under a broad `--root` most PRs found belong to
+upstream repos you don't own (clones of e.g. googletest, Catch2) — real signal, not something to
+filter out, since dropping data reintroduces the exact "not collected" vs. "not present" ambiguity
+the ok/error contract exists to prevent. Instead every PR carries `author_login` and `is_mine`
+(`true`/`false`), compared against the authenticated `gh` user — resolved **once per run**
+(`gh api user -q .login`, not once per PR) and exposed at `prs.my_login`. If that resolution
+fails, `prs.my_login` is `null`, every PR's `is_mine` is `null` (never `false` — `false` would
+assert "definitely not mine" about data that was never actually checked), and `prs.error` says so
+even though `prs.ok` stays `true` (PR listing itself still worked).
+
+**The companion summary is what a session should read by default.** The full digest runs
+~250 KB (~64k tokens) on a machine with a few hundred worktrees and remotes — reading the whole
+thing on every turn defeats the point of collecting it out-of-band in the first place, costing
+more prefix than the 20+ Bash calls it replaces. `fleet-digest.sh` also writes a second file,
+`--summary-out` (default: `--out` with `.json` replaced by `-summary.json`, e.g.
+`fleet-digest-summary.json`), with the same atomic-write discipline, containing only:
+per-section counts, a `failed_sources` list (section + source + error, so a consumer knows what
+to distrust without re-deriving it), worktrees that are dirty/ahead/behind (not all of them), and
+PRs where `is_mine:true` (not all of them). Measured on this machine the summary is ~50 KB against
+the full digest's ~320 KB — an 84% cut, but not the "few KB" the design aimed at, because the
+signal itself is genuinely that big: ~100 of ~375 worktrees really are dirty or diverged, and ~29
+open PRs really are yours. That is worth knowing before you plan around this file: at ~13k tokens
+the summary is cheap to `jq` a projection out of and still expensive to read whole, so **project
+what you need rather than reading either file end to end** — `jq '.prs.remotes[].prs[]'`,
+`jq '.worktrees.entries[] | select(.dirty)'`, and so on. **Read the summary by default; reach
+for the full `--out` digest only when the summary's counts say there's more to look at than the
+summary itself carries** (e.g. `worktrees.count` is much larger than
+`worktrees.dirty_or_ahead_behind_count`, and you need every worktree's path, not just the dirty
+ones). A summary build/write failure is logged to stderr as a warning but never fails the run or
+rolls back the full digest, which by that point has already been written and remains the
+authoritative artifact.
+
+**Staleness caveat.** The collector never runs `git fetch` — `worktrees`' ahead/behind counts and
+`prs`' open-PR lists reflect whatever the last fetch (by you, or anything else) already pulled
+down, not live upstream state. Treat the digest as a cache of local knowledge, not a live query.
+
+**Scheduling.** Not wired into `install.sh` (it's a standalone artifact, not a hook/watcher pair);
+run it from cron or a systemd user timer the same way `auto-handoff-sweep.sh` is scheduled (see
+`bin/install.sh` for the timer-with-cron-fallback pattern this repo already uses):
+
+```
+*/15 * * * * bash ~/.claude/skills/autodev/bin/fleet-digest.sh >>~/agents/logs/fleet-digest.log 2>&1
+```
+
+Bounded runtime (parallelized per-worktree/per-remote collection; ~25s observed against ~370
+worktrees and ~57 remotes on the reference machine) makes a 15-minute cadence comfortable; tune
+`--timeout` down if a section is timing out rather than genuinely erroring, or the interval down
+if the fleet is much smaller.
 
 ## Known limits (the fragile, unsupported link)
 
