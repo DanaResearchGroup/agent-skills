@@ -286,6 +286,27 @@ threads, each carrying a one-line reason it is closed. Two moves:
   it was rejected instead of re-opening the question. State the reason; don't argue or re-litigate.
   Then **resolve every bot thread** — addressed and skipped — whether or not the reply was trivial.
 
+**When the fix is delegated, the resolve is still yours.** This skill assumes one agent triages,
+fixes and closes out. If instead you triage here and hand the fixing to someone else — a worker
+session, a subagent, a colleague — **the thread does not close itself when their fix lands.** Name
+the owner explicitly, and default it to *you*: whoever ran the triage is the one who knows which
+finding each thread carried and whether the fix actually answered it.
+
+Two failure modes, both observed:
+
+- **Nobody resolves.** You wait for the fixer to close the thread; the fixer never had the triage
+  table and assumes the dispatcher or the reviewer will. The thread outlives the fix, and the next
+  reviewer re-treads a finding that was dealt with hours ago.
+- **You tell the fixer to leave it open**, reasoning that the thread is the reviewer's to close.
+  That instinct is right for a **human** reviewer and wrong for a **bot** — a bot never comes back
+  to close anything, so "leave it for the reviewer" means "leave it open forever." Don't let the
+  human rule below leak onto a bot thread.
+
+So when you delegate the fix, come back once it is pushed and run this step yourself against the
+updated PR head: reply naming the commit that fixed it, then resolve. Verifying the fix before
+resolving is the point — resolving on the fixer's say-so is how a thread gets closed over a fix that
+did not actually answer the finding.
+
 **Human threads — reply to every one, but resolve only what you addressed.** A human's thread is
 theirs to close by convention; you resolve it only as the unambiguous signal "done, as asked."
 
