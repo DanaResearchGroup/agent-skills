@@ -28,6 +28,14 @@ before asking the new question. See **Codex Context Auto-Handoff** below.
 Run setup before any new round:
 
 ```bash
+# Clear the ambient git environment FIRST. GIT_DIR, GIT_WORK_TREE and
+# GIT_COMMON_DIR each make `git rev-parse` describe a different repository than
+# the one you are standing in, so an inherited value silently computes $REPO_ROOT
+# — and therefore the slug and the binding — for somebody else's repo. Hardening
+# the binding resolver alone does not close this: it faithfully binds whatever
+# $REPO_ROOT names.
+unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_CEILING_DIRECTORIES \
+      GIT_DISCOVERY_ACROSS_FILESYSTEM GIT_INDEX_FILE GIT_OBJECT_DIRECTORY
 eval "$(~/.claude/skills/bin/skill-slug 2>/dev/null)" 2>/dev/null || true
 [ -z "${SLUG:-}" ] && SLUG=$(basename "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" | tr -cd 'a-zA-Z0-9._-')
 SLUG="${SLUG:-unknown}"
@@ -51,31 +59,75 @@ exits, printing nothing and returning 0, so the check below never fires.
 If it prints `AUTH_FAILED` or exits non-zero, stop and tell the user:
 `No Codex authentication found. Run codex login or set $CODEX_API_KEY / $OPENAI_API_KEY, then re-run /spar.`
 
-Bind the store to the current repo before using any persisted session. This avoids accidentally
-resuming a session from another repo with the same slug:
-
-```bash
-META_FILE="$STORE/.project"
-CANON_ROOT=$(cd "$REPO_ROOT" && pwd -P)
-if [ -f "$META_FILE" ] && ! grep -qx "repo_root=$CANON_ROOT" "$META_FILE"; then
-  echo "ERROR: $STORE is already bound to a different repo root. Use a different slug or /spar reset."
-  exit 1
-fi
-if [ ! -f "$META_FILE" ]; then
-  {
-    printf 'repo_root=%s\n' "$CANON_ROOT"
-    printf 'created_at=%s\n' "$(date +"%Y.%m.%d %H.%M.%S")"
-  } > "$META_FILE.tmp" && mv "$META_FILE.tmp" "$META_FILE"
-fi
-```
-
-Take a per-project lock before computing round numbers or touching `.session-id`, round files, or
-`sparring-log.md`:
+Take a per-project lock before computing round numbers or touching `.project`, `.session-id`, round
+files, or `sparring-log.md`:
 
 ```bash
 LOCKDIR="$STORE/.lock"
 until mkdir "$LOCKDIR" 2>/dev/null; do sleep 1; done
 trap 'rmdir "$LOCKDIR" 2>/dev/null || true' EXIT
+```
+
+Then bind the store to the current **repository** before using any persisted session. This avoids
+accidentally resuming a session from another repo with the same slug:
+
+```bash
+# Preserve the exit code: 1 is "bound elsewhere", 3 is "cannot resolve this
+# checkout". Collapsing both to 1 throws away the distinction this script exists
+# to draw, and the outcomes below document them separately.
+# Note the `||` form: inside an `if ! ...; then` branch $? is the NEGATION's
+# status, which is always 0, so that spelling would exit successfully on a
+# refusal. Measured, not assumed.
+BIND=$(~/.claude/skills/spar/bin/spar-binding.sh "$STORE" "$REPO_ROOT") || exit $?
+```
+
+Bind **inside** the lock, not before it. The binding can WRITE to `.project` (it upgrades, adopts,
+and creates), and it does so with a read-modify-write that `mv` makes atomic only at the final
+replace — so two sessions binding the same store concurrently can lose each other's lines, and two
+sessions that both see an unbound store can both decide it is theirs. The lock is what serialises
+that; an earlier draft of this file ran the binding above the lock and had both races.
+
+Bind to the repository, never to the worktree. `$REPO_ROOT` is a *checkout* path, and the
+worktree-per-feature rule deletes that path at every merge — so a binding recorded as `repo_root=`
+names a directory that stops existing partway through the arc, and the next round hard-errors on a
+store that was never wrong. `spar-binding.sh` records `repo_id=`, the canonicalised
+`git rev-parse --git-common-dir`, which is identical from every worktree of one repository. Do not
+reintroduce a `--show-toplevel` comparison here: 26 of 67 stores on this machine had already died
+that way, and the `gracie` store accumulated seven hand-written rebinds before this was fixed.
+
+Surface whatever the script printed on stderr. Four of its outcomes are worth reading rather than
+skipping past:
+
+- **Refused** (exit 1) — the file vouches for a repository and it is not this one, either through a
+  `repo_id=` line or a `repo_root=` path that still exists. Use a different slug. Never answer this
+  with `/spar reset`: reset discards `.session-id`, and the sparring arc's whole memory with it.
+- **Upgraded** — a legacy `repo_root=` still resolved to this repository, so the store gained a
+  `repo_id=` line. Nothing else changes.
+- **Adopted** (a loud `NOTICE`) — nothing on disk vouched for any repository, so nothing could say
+  which one the arc belonged to, and the script bound it to this one and wrote `rebound_at=`. This
+  is **not** an approval gate: the round proceeds. The notice is an audit record, so read it — if
+  the arc is not this repository's, stop before the round runs, or Codex resumes another project's
+  review session against this code.
+- **Unresolvable** (exit 3) — `$REPO_ROOT` has a `.git` that git cannot resolve, usually a linked
+  worktree whose gitdir was deleted. It refuses rather than fall back to treating the checkout as a
+  plain directory, which would mint the *worktree* path as the repository's identity.
+
+Both kinds of evidence are read, and any match is a match. `repo_id=` is not authoritative on its
+own: a store part-way through migration can hold `repo_id=A` alongside a live `repo_root=B` that is
+equally valid, and one arc can legitimately span two repositories. A `repo_id=` quoted inside a
+`note=` line does **not** bind; the check is whole-line.
+
+What the binding does *not* protect against: the same repository reachable by two absolute paths
+(bind mounts, `/home` vs `/export/home`) records two identities and will refuse itself through the
+other path — add the second `repo_id=` line by hand if that happens.
+
+Stores created before this existed are upgraded in place on their next round. To migrate them all at
+once instead — worth doing, because a store can only be migrated while one of its recorded paths
+still exists, and a pruned worktree takes that proof with it:
+
+```bash
+~/.claude/skills/spar/bin/migrate-spar-bindings.sh            # dry run
+~/.claude/skills/spar/bin/migrate-spar-bindings.sh --apply
 ```
 
 ## Codex Context Auto-Handoff
