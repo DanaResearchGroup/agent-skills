@@ -17,7 +17,7 @@ assert_eq 0 "$rc" "the skipping session is unblocked"
 (cd "$WT" && "$CONTRACT" skipped sess-B); rc=$?
 assert_eq 1 "$rc" "a different session is still gated"
 
-log=$(cat "$COMMON/contract-skips.log")
+log=$(cat "$STATE/skips.log")
 assert_contains "$log" "typo in a comment" "the reason is recorded permanently"
 assert_contains "$log" "sess-A"            "the session id is recorded"
 
@@ -37,19 +37,19 @@ assert_eq 1 "$rc" "a refused skip does not unblock"
 out=$(cd "$WT" && "$CONTRACT" skip '<session_id>' "copied verbatim" 2>&1); rc=$?
 assert_eq 2 "$rc" "skip refuses a session id with invalid characters"
 assert_contains "$out" "session id" "the refusal explains what is wrong"
-assert_no_file "$COMMON/contract-skips/<session_id>" "no marker file created for an invalid session id"
+assert_no_file "$STATE/skips/<session_id>" "no marker file created for an invalid session id"
 (cd "$WT" && "$CONTRACT" skipped '<session_id>'); rc=$?
 assert_eq 1 "$rc" "a refused invalid session id does not unblock"
 
 # Log integrity: embedded newline and tab must not corrupt the one-record-per-line invariant.
-lines_before=$(wc -l < "$COMMON/contract-skips.log")
+lines_before=$(wc -l < "$STATE/skips.log")
 (cd "$WT" && "$CONTRACT" skip sess-D "reason with
 embedded	tabs" >/dev/null); rc=$?
 assert_eq 0 "$rc" "skip with embedded newline and tab succeeds"
-lines_after=$(wc -l < "$COMMON/contract-skips.log")
+lines_after=$(wc -l < "$STATE/skips.log")
 lines_added=$((lines_after - lines_before))
 assert_eq 1 "$lines_added" "exactly one physical line added to log"
-log=$(cat "$COMMON/contract-skips.log")
+log=$(cat "$STATE/skips.log")
 assert_contains "$log" "sess-D" "session id is in sanitized log line"
 # Verify the whitespace is collapsed to spaces (newline and tab both become spaces)
 assert_contains "$log" "reason with embedded tabs" "newline and tab collapsed to spaces"

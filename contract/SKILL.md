@@ -49,7 +49,9 @@ worth checking; skip it when the ground is already firm.
 contract new <slug>
 ```
 
-Fill it in. The gate opens as soon as the note exists.
+Fill it in at the path `new` prints — normally outside the repo under
+`~/agents/state/contracts/` ([install](reference/install.md) says why, and covers the one case
+that still resolves in-repo). The gate opens as soon as the note exists.
 
 **4. Implement.** Dispatching a subagent? Paste the contract, then a `paste below this line`
 marker, then the task detail the worker sees, then:

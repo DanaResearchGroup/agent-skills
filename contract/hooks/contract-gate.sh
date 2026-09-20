@@ -68,6 +68,18 @@ status=$(cd "$dir" 2>/dev/null && "$CONTRACT" status 2>/dev/null) || allow
 enabled=$(printf '%s\n' "$status" | sed -n 's/^enabled=//p')
 active=$(printf '%s\n' "$status" | sed -n 's/^active=//p')
 
+# A broken state root reads as enabled=unknown: the tool could not tell whether
+# this worktree is gated. That is a configuration error the user must see, not
+# an infrastructure failure to fail open on — so deny, and name it.
+if [ "$enabled" = "unknown" ]; then
+  reason="contract: the state root is unusable, so the gate cannot tell whether this worktree is gated.
+Run \`$CONTRACT status\` here and fix what it reports (CONTRACT_STATE_DIR must be an absolute path outside the worktree)."
+  esc=$(printf '%s' "$reason" | sed 's/\\/\\\\/g; s/"/\\"/g' | awk 'BEGIN{ORS="\\n"}1')
+  esc=${esc%\\n}
+  printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"%s"}}\n' "$esc"
+  exit 0
+fi
+
 [ "$enabled" = "yes" ] || allow
 [ "$active" = "none" ] || allow
 
