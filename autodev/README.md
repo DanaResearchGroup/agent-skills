@@ -76,11 +76,10 @@ Use the runtime-specific mode. Both are idempotent and preserve unrelated hooks:
 
 ```bash
 # Claude Code
-bash ~/.agents/skills/autodev/bin/install.sh
+bash ~/.claude/skills/autodev/bin/install.sh
 
 # Codex
-bash ~/.agents/skills/autodev/bin/install.sh --codex
-
+bash ~/.codex/skills/autodev/bin/install.sh --codex
 # Optional custom paths
 CLAUDE_SETTINGS=/path/settings.json bash .../bin/install.sh
 CODEX_HOOKS=/path/hooks.json bash .../bin/install.sh --codex
