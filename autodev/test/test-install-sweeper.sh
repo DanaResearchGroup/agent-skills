@@ -31,6 +31,12 @@ run_install() { # any args are extra VAR=value assignments, applied after ours
       "$@" bash "$BIN/install.sh" >"$SB/install.out" 2>&1
 }
 
+run_codex_install() {
+  env PATH="$FAKEBIN:$PATH" HOME="$SB/home" \
+      CODEX_HOOKS="$SB/hooks.json" AUTODEV_HOME="$SB/home/agents" \
+      bash "$BIN/install.sh" --codex >"$SB/install.out" 2>&1
+}
+
 UNIT_DIR_REL=".config/systemd/user"
 
 echo "== the generated systemd unit =="
@@ -55,6 +61,23 @@ assert_line "default sweep interval is 3min" "$(cat "$tmr")" "OnUnitActiveSec=3m
 assert_line "timer is wanted by timers.target" "$(cat "$tmr")" "WantedBy=timers.target"
 assert_contains "install enables the timer" "$(cat "$SB/calls.log")" "enable --now auto-handoff-sweep.timer"
 assert_contains "install reports how the sweeper was wired" "$(cat "$SB/install.out")" "sweeper"
+sandbox_rm
+
+echo "== Codex hooks preserve existing configuration =="
+
+setup_install
+cat > "$SB/hooks.json" <<'JSON'
+{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"existing-session-hook"}]}]}}
+JSON
+run_codex_install
+run_codex_install
+stop=$(jq -r '[.hooks.Stop[]?.hooks[]?.command] | map(select(test("codex-stop-hook"))) | length' "$SB/hooks.json")
+assert_eq "Codex install adds one Stop hook idempotently" "$stop" "1"
+ss=$(jq -r '[.hooks.SessionStart[]? | select(.matcher == "^compact$") | .hooks[]?.command] | map(select(test("sessionstart-compact"))) | length' "$SB/hooks.json")
+assert_eq "Codex install adds one compact SessionStart hook" "$ss" "1"
+assert_eq "Codex install preserves an existing SessionStart hook" \
+  "$(jq -r '[.hooks.SessionStart[]?.hooks[]?.command] | index("existing-session-hook") != null' "$SB/hooks.json")" "true"
+assert_contains "Codex install explains hook trust" "$(cat "$SB/install.out")" "/hooks"
 sandbox_rm
 
 echo "== the sweep interval is configurable =="

@@ -1,11 +1,11 @@
 # autodev — autonomous build loop + automation harness
 
 The `autodev` skill drives a long, autonomous feature build (implement → adversarial Codex
-`/spar` at every milestone → verify → checkpoint) and ships the **automation harness** that
+review at every milestone → verify → checkpoint) and ships the **automation harness** that
 keeps such a run alive across the two things that normally kill it:
 
 - **auto-handoff watcher** — past a context threshold, at an idle turn boundary, drives
-  `/handoff` → `/compact` → `/rename` → "read the handoff and continue" by sending keys to the
+  handoff → `/compact` → `/rename` → "read the handoff and continue" by sending keys to the
   session's pane (herdr or tmux). A session can also **voluntarily** request this below the
   threshold via `request-handoff.sh` (see below) — e.g. to hand off *before* opening a heavy phase.
 - **Phoenix** (session-limit auto-resume) — on a usage/session-limit stop, runs
@@ -27,12 +27,14 @@ autodev/
   SKILL.md                     # the skill the model follows
   README.md                    # this file
   bin/
-    install.sh                 # wire the hooks/statusLine into ~/.claude/settings.json
+    install.sh                 # wire Claude Code or Codex hooks and the sweeper
     mux-lib.sh                 # multiplexer abstraction (herdr preferred, tmux fallback)
     cc-statusline.sh           # statusLine: writes context % + herdr/tmux pane/tab; renders the badge
     cc-stop-hook.sh            # Stop hook: marks idle, launches the watchers (via $HERE)
+    codex-stop-hook.sh         # Stop hook: effective Codex context % + handoff watcher
     cache-warm-watch.sh        # prompt-cache TTL → countdown in the tab label (`--clear` strips it)
     cc-sessionstart-compact.sh # SessionStart(compact) hook: reload-after-compaction backup
+    sessionstart-compact.sh    # shared Claude Code/Codex compact reload implementation
     auto-handoff-watch.sh      # engine: context-threshold (or handoff-request marker) → handoff/compact/reload
     auto-handoff-sweep.sh      # LEVEL trigger: timer-driven; re-arms the engine for parked sessions
     request-handoff.sh         # helper: raise/cancel a voluntary below-threshold handoff-request for this session
@@ -68,17 +70,31 @@ cycles it stops retrying and raises `<sid>.stuck`, which the status line shows a
 state, logs, handoffs, sparring records, autodev progress — lives under **`AUTODEV_HOME`**
 (default `~/agents`), never in the repo. Override with the `AUTODEV_HOME` env var.
 
-## Install (any system)
+## Install
+
+Use the runtime-specific mode. Both are idempotent and preserve unrelated hooks:
 
 ```bash
+# Claude Code
 bash ~/.claude/skills/autodev/bin/install.sh
-# or, custom data home / settings path:
-AUTODEV_HOME=~/agents CLAUDE_SETTINGS=~/.claude/settings.json bash .../bin/install.sh
+
+# Codex
+bash ~/.codex/skills/autodev/bin/install.sh --codex
+# Optional custom paths
+CLAUDE_SETTINGS=/path/settings.json bash .../bin/install.sh
+CODEX_HOOKS=/path/hooks.json bash .../bin/install.sh --codex
 ```
 
-Requires `jq`. Idempotent (re-running never duplicates entries) and preserves any other hooks
-you already have. Takes effect for **new** Claude Code sessions (hooks load at session start).
-Must run Claude Code **inside herdr or tmux** for the send-keys automation to work (herdr preferred).
+Requires `jq`. Hooks take effect for **new** sessions. Codex users must open `/hooks` once to
+review and trust the installed hooks; lifecycle hooks must be enabled (`features.hooks=true`, the
+default on current stable builds). Run the agent **inside herdr or tmux** for send-keys automation
+to work (herdr preferred).
+
+Claude Code supplies `.context_window.used_percentage` through its configurable status-line
+command. Codex has no external status-line command, so its Stop hook reads the newest transcript
+`token_count` event and records `last_token_usage.total_tokens / model_context_window`. This is the
+effective active-context percentage shown by Codex, not cumulative thread usage and not a model's
+larger theoretical maximum.
 
 ## Control switches (`$AUTODEV_HOME/state/`, default `~/agents/state/`)
 
@@ -91,7 +107,9 @@ Must run Claude Code **inside herdr or tmux** for the send-keys automation to wo
 | `pm-nudge.armed` / `disable-pm-nudge` | PM-nudger arm / kill switch — see [PM-nudger](#pm-nudger-nudge-a-pm-whose-fleet-has-finished). Independent of the files above. |
 | `disable-cache-badge` | Cache-warmth badge off. Honoured at the next poll (≤ `CC_CACHE_NAP_MAX`), and it strips any badge already on a tab on its way out. |
 
-Status-line badge: 🟡 DRY-RUN · 🔴 ARMED · ⛔ OFF · ⏳ AUTO-RESUME @ `<time>` (Phoenix waiting).
+Claude Code status-line badge: 🟡 DRY-RUN · 🔴 ARMED · ⛔ OFF · ⏳ AUTO-RESUME @ `<time>`.
+Codex keeps its native status line; inspect the state files or log instead. Phoenix remains a
+Claude Code-only feature; Codex support in this harness covers handoff/compact/reload.
 Logs: `$AUTODEV_HOME/logs/{auto-handoff,auto-resume}.log`.
 
 ## Tunables (top of the engine scripts)
@@ -129,14 +147,14 @@ the threshold *inside* the phase — where there is no idle window for the watch
 ask to hand off *before* opening that phase:
 
 ```bash
-bash ~/.claude/skills/autodev/bin/request-handoff.sh            # raise for THIS session
-bash ~/.claude/skills/autodev/bin/request-handoff.sh --cancel   # withdraw it
-bash ~/.claude/skills/autodev/bin/request-handoff.sh <sid>      # operate on an explicit session id
+bash ~/.agents/skills/autodev/bin/request-handoff.sh            # raise for THIS session
+bash ~/.agents/skills/autodev/bin/request-handoff.sh --cancel   # withdraw it
+bash ~/.agents/skills/autodev/bin/request-handoff.sh <sid>      # operate on an explicit session id
 ```
 
 This drops an empty `~/agents/state/<sid>.handoff-request` marker — a **second trigger path**
 into the same watcher. On the next idle Stop the watcher runs the normal
-`/handoff` → `/compact` → reload **even below `THRESHOLD`**. The marker bypasses *only* the
+handoff → `/compact` → reload **even below `THRESHOLD`**. The marker bypasses *only* the
 threshold gate; every other safety gate (idle, pane-live, pane-ownership, cooldown, cycle-lock)
 still applies, and it is consumed the moment the watcher commits, so it fires **once**. A marker
 older than `REQUEST_MAX_AGE` (default 1h) is treated as stale, ignored, and removed, so a
@@ -145,26 +163,26 @@ forgotten request can't fire arbitrarily later.
 ### Compact-request (handoff already written — just compact + reload)
 
 `--compact-only` is a **third trigger path** for the case where a handoff is *already written*
-(you ran `/handoff` yourself, or the `handoff` skill did) and all that's left is the compact +
+(you invoked the `handoff` skill yourself) and all that's left is the compact +
 reload. The reactive `THRESHOLD` gate never fires below 35%, and a plain `handoff-request` would
 make the watcher write a *second, redundant* handoff — so neither fits.
 
 ```bash
-bash ~/.claude/skills/autodev/bin/request-handoff.sh --compact-only            # raise
-bash ~/.claude/skills/autodev/bin/request-handoff.sh --compact-only --cancel   # withdraw
+bash ~/.agents/skills/autodev/bin/request-handoff.sh --compact-only            # raise
+bash ~/.agents/skills/autodev/bin/request-handoff.sh --compact-only --cancel   # withdraw
 ```
 
 This drops `~/agents/state/<sid>.compact-request`. The watcher honors it as a **compact-only**
-cycle: it **skips `/handoff`** and goes straight to `/compact` → reload (same safety gates, same
-TTL, consumed once). The `handoff` skill files this automatically after every `/handoff`, which
+cycle: it **skips a second handoff** and goes straight to `/compact` → reload (same safety gates,
+same TTL, consumed once). The `handoff` skill files this automatically after every handoff, which
 is what makes a below-threshold handoff actually compact instead of silently stalling. It
-**defers** (no marker) when the watcher is already mid-cycle, so a watcher-driven `/handoff`
+**defers** (no marker) when the watcher is already mid-cycle, so a watcher-driven handoff
 never double-fires a compact.
 
 `--compact-only --handoff <path>` records the **per-session** reload pointer
 `~/agents/handoffs/.latest.<sid>`, naming the file the session just wrote. It does so **before**
 the deferral above, and therefore records it even when no marker is filed. That ordering is
-load-bearing rather than tidy: on the threshold path the watcher sends the `/handoff` itself, so
+load-bearing rather than tidy: on the threshold path the watcher invokes the handoff itself, so
 its cycle lock is *always* live while the handoff skill runs, and the deferral is the common case,
 not an edge case. A pointer written after the check would never be written on the harness's main
 route — the reload would fall back to the mtime bridge below, which a concurrent writer can
@@ -183,11 +201,12 @@ Always pass `--handoff`. Without it the helper can only *copy* the shared `.late
 race, not a safeguard: another session can clobber it between the handoff being written and the
 copy, permanently caching their mission as ours. That legacy path is kept only for older handoff
 skills and logs a `WARN`. In the threshold path the watcher accepts the shared `.latest` solely
-when the file it names was written during the `/handoff` turn the watcher itself just drove
+when the file it names was written during the handoff turn the watcher itself just drove
 (mtime proof) — the one moment it is provably ours.
 
-Resolution of "this session" is `explicit arg` → `$CLAUDE_CODE_SESSION_ID` → the reverse
-pane-owner file, and it **hard-fails if the env id and the pane owner disagree** rather than
+Resolution of "this session" is `explicit arg` → the host session environment
+(`$CLAUDE_CODE_SESSION_ID`, `$CODEX_SESSION_ID`, or `$CODEX_THREAD_ID`) → the reverse pane-owner
+file, and it **hard-fails if identities disagree** rather than
 risk targeting a different live session (herdr recycles pane ids). Call it only from the
 **mother** session — a subagent resolves to its own child id, not the driving session.
 
@@ -431,12 +450,12 @@ its panes sit in `.../scm-pm2`, and the ticket label on `wH:p28` is what makes `
 
 ## Known limits (the fragile, unsupported link)
 
-- Driving CC by sending keys to its pane (herdr or tmux) is **not officially supported**; mid-typing collisions are
+- Driving an agent by sending keys to its pane (herdr or tmux) is **not officially supported**; mid-typing collisions are
   possible. Both watchers gate on a real idle check and **defer** while the pane is busy
-  (long turn, `/compact`, or background agents) — CC queues input while busy, so a
+  (long turn, `/compact`, or background agents) — the host queues input while busy, so a
   perpetually-busy run may have no safe injection window until it next goes idle.
 - `/compact` cannot be triggered by the model or a hook — only the user or the external
-  watcher (via herdr or tmux). CC does not auto-continue after `/compact`; the watcher's explicit
+  watcher (via herdr or tmux). The host does not reliably auto-continue after `/compact`; the watcher's explicit
   continue-send (and the `SessionStart(compact)` hook) is what resumes.
 - **PM-nudger's pane-buffer check is a heuristic over rendered text**, not a supported API: it
   greps the visible buffer for permission-prompt and menu markers. It is deliberately biased —

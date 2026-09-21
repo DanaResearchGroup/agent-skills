@@ -1,13 +1,16 @@
 ---
 name: autodev
-description: Use when you want to autonomously build a large or long feature end-to-end in one driven session, with automatic adversarial Codex (/spar) review at every milestone, automatic context handoff/compact/resume past 35%, and automatic recovery from usage/session-limit stops (Phoenix). Invoke with the feature description or a path to a spec.
+description: Use when you want to autonomously build a large or long feature end-to-end in one driven session, with automatic adversarial Codex review at every milestone, automatic context handoff/compact/resume past 35%, and Claude Code recovery from usage/session-limit stops (Phoenix). Invoke with the feature description or a path to a spec.
 argument-hint: "<feature to build, or path to a spec>"
 ---
 
 You are an autonomous feature-development driver. You run a long build loop with two
-always-on behaviors: (1) adversarial Codex review at every milestone via `/spar`, and
+always-on behaviors: (1) adversarial Codex review at every milestone via the `spar` skill, and
 (2) reliance on the auto-handoff watcher to handle context compaction past 35% so the
 loop survives across compactions.
+
+Skill syntax is runtime-specific: Claude Code uses `/spar` and `/handoff`; Codex uses `$spar`
+and `$handoff`. Where this workflow says to invoke a skill, use the current host's syntax.
 
 Be autonomous. Do not stop for routine choices — use judgment and keep going. Only stop
 for a genuine blocker, a real user decision, or completion.
@@ -30,13 +33,19 @@ watcher. Reserve the mother turn for orchestration and decisions, not bulk work.
 ## Step 0 — Preflight (run once)
 
 ```bash
-eval "$(~/.claude/skills/bin/skill-slug 2>/dev/null)" 2>/dev/null || true
+SKILLS_ROOT=""
+for root in "$HOME/.agents/skills" "$HOME/.claude/skills" "$HOME/.codex/skills"; do
+  [ -d "$root/autodev" ] && { SKILLS_ROOT="$root"; break; }
+done
+AUTODEV_BIN="$SKILLS_ROOT/autodev/bin"
+eval "$("$SKILLS_ROOT/bin/skill-slug" 2>/dev/null)" 2>/dev/null || true
 [ -z "${SLUG:-}" ] && SLUG=$(basename "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" | tr -cd 'a-zA-Z0-9._-')
 SLUG="${SLUG:-unknown}"
 DEV="$HOME/agents/autodev/$SLUG"; mkdir -p "$DEV"
 S="$HOME/agents/state"
-# Resolve THIS session's own context-% file by matching our pane (herdr preferred, tmux fallback).
-MYSID=$(grep -l "^${HERDR_PANE_ID:-__none__}$" "$S"/*.herdr-pane 2>/dev/null | head -1 | xargs -r -n1 basename | sed 's/\.herdr-pane$//')
+# Prefer the host's authoritative session id, then resolve by pane for older sessions.
+MYSID="${CLAUDE_CODE_SESSION_ID:-${CODEX_SESSION_ID:-${CODEX_THREAD_ID:-}}}"
+[ -z "$MYSID" ] && MYSID=$(grep -l "^${HERDR_PANE_ID:-__none__}$" "$S"/*.herdr-pane 2>/dev/null | head -1 | xargs -r -n1 basename | sed 's/\.herdr-pane$//')
 [ -z "$MYSID" ] && MYSID=$(grep -l "^${TMUX_PANE:-__none__}$" "$S"/*.tmux-pane 2>/dev/null | head -1 | xargs -r -n1 basename | sed 's/\.tmux-pane$//')
 CTXFILE="$S/${MYSID:-unknown}.ctx"
 # Status-line: mark this session as an autodev run (lights the AUTODEV badge).
@@ -46,7 +55,11 @@ echo "PROGRESS=$DEV/progress.md"
 echo "CTXFILE=$CTXFILE   (read your live context % from here)"
 echo -n "MUX: "; if [ "${HERDR_ENV:-}" = "1" ]; then echo "herdr"; elif [ -n "${TMUX:-}" ]; then echo "tmux"; else echo "NONE"; fi
 echo -n "AUTO_HANDOFF: "; if [ -f "$S/disable-auto-compact" ]; then echo "DISABLED"; elif [ -f "$S/auto-handoff.armed" ]; then echo "ARMED"; else echo "DRY-RUN"; fi
-echo -n "PHOENIX (limit-resume): "; if [ -f "$S/disable-auto-compact" ] || [ -f "$S/disable-auto-resume" ]; then echo "DISABLED"; elif [ -f "$S/auto-handoff.armed" ]; then echo "ARMED"; else echo "DRY-RUN"; fi
+if [ -n "${CODEX_SESSION_ID:-${CODEX_THREAD_ID:-}}" ]; then
+  echo "PHOENIX (limit-resume): CLAUDE-ONLY"
+else
+  echo -n "PHOENIX (limit-resume): "; if [ -f "$S/disable-auto-compact" ] || [ -f "$S/disable-auto-resume" ]; then echo "DISABLED"; elif [ -f "$S/auto-handoff.armed" ]; then echo "ARMED"; else echo "DRY-RUN"; fi
+fi
 ```
 
 Remember `$CTXFILE` — you read your own live context percentage from it at every phase
@@ -58,7 +71,7 @@ actually active for this run. It is active ONLY if: running inside herdr or tmux
 `ARMED` AND this is a session started AFTER the hooks were installed (hooks load per
 session). If any of those is false, say so plainly:
 - not in herdr/tmux or `DRY-RUN`/`DISABLED` → "Auto-handoff is NOT active; I'll proactively
-  run `/handoff` near 35% and ask you to run `/compact`." (Codex review still works.)
+  invoke the handoff skill near 35% and ask you to run `/compact`." (Codex review still works.)
 - all true → "Auto-handoff active — I'll keep working through compactions hands-free."
 
 ## Step 1 — Scope and plan
@@ -97,9 +110,9 @@ slug: <slug>   updated: <YYYY.MM.DD HH.MM.SS>
 
 ## Step 2 — Development loop (repeat per milestone until done)
 
-### Prime Codex once (first `/spar` of the run)
+### Prime Codex once (first `spar` round of the run)
 
-On the **first** `/spar` invocation of this run only — i.e. when the per-project Codex
+On the **first** `spar` invocation of this run only — i.e. when the per-project Codex
 session is created (`~/agents/adversarial/<slug>/.session-id` did not yet exist) — prepend a
 **mission brief**, so Codex critiques against the actual target instead of inferring it from a
 diff. A reviewer who never learned the goal reviews the code you wrote, not the feature you owe.
@@ -126,23 +139,23 @@ Because the session is persistent (`codex exec resume`), both parts carry forwar
 round — **do not repeat them**. Later rounds carry only what changed: the increment and the
 question.
 
-**Codex context is self-managed by `/spar`.** The persistent Codex session fills up over a long
-run; `/spar` handles this on its own — when the session gets too full it has the outgoing session
+**Codex context is self-managed by the `spar` skill.** The persistent Codex session fills up over a long
+run; `spar` handles this on its own — when the session gets too full it has the outgoing session
 write a successor handoff, rotates to a fresh Codex session reseeded with it (and re-applies the
 grounding prime), and announces the rotation. Re-attach the **mission brief** on your first round
 after a rotation — the predecessor handoff carries Codex's own open threads, not your goal.
 Otherwise you do **nothing** extra for this. When you see a
-`/spar` round announce an auto-handoff, note it in `progress.md` Decisions ("Codex context rotated
+`spar` round announce an auto-handoff, note it in `progress.md` Decisions ("Codex context rotated
 to a fresh session at round N — arc carried via predecessor handoff") so a compacted resume knows
-the Codex memory was rolled over. (This is separate from the Claude Code auto-handoff, which gates
-on *your* context, not Codex's.)
+the Codex memory was rolled over. (This is separate from the host session's auto-handoff, which
+gates on *your* context, not the sparring session's.)
 
 For each milestone, in order:
 
 1. **Implement.** Prefer test-first (invoke the `tdd` skill discipline). Make the
    smallest correct increment.
-2. **Adversarial Codex review — ALWAYS.** Invoke `/spar` on the increment or the
-   decision behind it (e.g. `/spar "challenge the design of <thing> I just built"`).
+2. **Adversarial Codex review — ALWAYS.** Invoke the `spar` skill on the increment or the
+   decision behind it (e.g. `challenge the design of <thing> I just built`).
    Codex resumes the same persistent session each round, so it sees the whole arc.
    Treat Codex's P1/serious findings as must-fix: fix them before moving on. Record the
    round (the spar skill persists Q/A under `~/agents/adversarial/<slug>/`).
@@ -165,8 +178,8 @@ Whenever you reach a point where you would otherwise call AskUserQuestion about 
 **technical / design / architectural / chemistry-modeling** decision (which approach, how to
 resolve a failure, which fix), or you are about to declare a blocker:
 
-1. **Spar first.** Invoke `/spar` with the decision and the concrete options + tradeoffs (e.g.
-   `/spar "Resolve X: option A <...> vs B <...> vs C <...>. Which is correct and why? Favor
+1. **Spar first.** Invoke the `spar` skill with the decision and the concrete options + tradeoffs (e.g.
+   `Resolve X: option A <...> vs B <...> vs C <...>. Which is correct and why? Favor
    fixing the real defect over bypassing checks."`). Codex resumes the same persistent session,
    so it has the full arc. Close the question with the vote request:
 
@@ -209,9 +222,9 @@ thermo can't actually support) as a last resort to be flagged, not a default.
 
 ## Phase discipline & checkpoint beats (gives the watcher its injection window)
 
-The auto-handoff watcher can only inject `/handoff`/`/compact` when CC is at a genuine
+The auto-handoff watcher can only invoke the handoff skill and `/compact` when the host is at a genuine
 **idle** prompt — never while a turn is running or **background agents** are still going
-(CC queues input while busy, so the keystrokes are lost). A perpetually-busy run therefore
+(the host queues input while busy, so the keystrokes are lost). A perpetually-busy run therefore
 never gets checkpointed and blows past 35%. Prevent that:
 
 - **Do not overlap phases.** Parallelize *within* a phase (dispatch several subagents at
@@ -221,7 +234,7 @@ never gets checkpointed and blows past 35%. Prevent that:
 
   1. Confirm quiesced — **zero background agents still running.** This is mandatory, not
      cosmetic: while any background agent runs, the pane shows "Waiting for N background
-     agents" and CC queues (loses) injected input, so the auto-handoff watcher CANNOT
+     agents" and the host queues (loses) injected input, so the auto-handoff watcher CANNOT
      compact. Never write a handoff / hit a checkpoint with an agent still running on the
      theory that "the reload will collect it" — it won't, because compaction can't fire on
      a busy pane. Collect every agent first, then checkpoint.
@@ -235,9 +248,9 @@ never gets checkpointed and blows past 35%. Prevent that:
        update `progress.md`, then **end your turn now** with one line, e.g.
        `Checkpoint: ctx <pct>%, quiesced at phase boundary — yielding for auto-handoff.`
        Do NOT spawn the next phase. The watcher (idle pane + high %) will run
-       `/handoff` → `/compact` → inject "continue," and you resume by reading the handoff
+       handoff → `/compact` → inject "continue," and you resume by reading the handoff
        + `progress.md` and starting the next phase. This is the deliberate idle beat.
-     - **Auto-handoff NOT active**: run `/handoff` yourself, update `progress.md`, tell the
+     - **Auto-handoff NOT active**: invoke the handoff skill yourself, update `progress.md`, tell the
        user to run `/compact` then `continue`, and stop.
   4. **Else** (`pct` comfortable): proceed straight into the next phase — no yield, no stall,
      **unless** the voluntary-handoff case below applies.
@@ -253,29 +266,29 @@ idle window for the watcher to use. In that case, hand off *before* opening the 
 than partway through it: raise a voluntary request, then end your turn.
 
 ```bash
-bash ~/.claude/skills/autodev/bin/request-handoff.sh   # drops this session's handoff-request marker
+bash "$AUTODEV_BIN/request-handoff.sh"   # drops this session's handoff-request marker
 ```
 
 This writes `~/agents/state/<sid>.handoff-request`, a second trigger path that makes the
-watcher run the normal `/handoff` → `/compact` → reload on its **next idle Stop even below
+watcher run the normal handoff → `/compact` → reload on its **next idle Stop even below
 35%**. It bypasses ONLY the threshold — every other safety gate (idle, pane-live,
 pane-ownership, cooldown, cycle-lock) still applies, and the marker has a TTL so a forgotten
 request cannot fire much later. After raising it, update `progress.md` and **end the turn** —
-do not open the heavy phase, and do **not** run `/handoff` yourself: the watcher runs its own
-`/handoff` → `/compact` → reload on the next idle Stop, so a manual `/handoff` here would just
+do not open the heavy phase, and do **not** invoke the handoff skill yourself: the watcher runs its own
+handoff → `/compact` → reload on the next idle Stop, so a manual handoff here would just
 duplicate it. Changed your mind before the watcher acts? `request-handoff.sh --cancel` removes
 it. Only the **mother** session should call this (it resolves *its own* sid); never from a
 subagent. This is opt-in — the default remains the reactive `pct > 35` beat above.
 
-**Already wrote a handoff below threshold?** (You ran `/handoff` yourself, or the `handoff` skill
+**Already wrote a handoff below threshold?** (You invoked the `handoff` skill
 did.) Do **nothing** — the `handoff` skill files a `compact-request`, and the watcher runs a
-**compact-only** cycle: it skips a second `/handoff` and goes straight to `/compact` → reload, even
+**compact-only** cycle: it skips a second handoff and goes straight to `/compact` → reload, even
 below 35%. File it by hand only if needed — `request-handoff.sh --compact-only` (`--cancel` withdraws).
 
 ## Step 3 — Context / compaction (resumable by design)
 
 - The auto-handoff watcher (when active) will, past 35% at a turn boundary, automatically
-  run `/handoff` → `/compact` → inject "read the handoff and continue execution." You do
+  run handoff → `/compact` → inject "read the handoff and continue execution." You do
   not trigger it. Just keep `progress.md` current so a resumed session continues cleanly.
 - When a handoff is written (auto or manual), ensure it names this autodev loop and points
   to `$DEV/progress.md`, stating "resume the /autodev loop for <feature> from Next."
@@ -283,7 +296,7 @@ below 35%. File it by hand only if needed — `request-handoff.sh --compact-only
   handoff): read that handoff AND `$DEV/progress.md`, then CONTINUE the loop from `Next`.
   Do not restart from milestone 1; do not re-ask the user what to do.
 - If auto-handoff is NOT active (preflight said so): self-monitor; near ~35% at a clean
-  checkpoint, run `/handoff` yourself, update progress.md, and ask the user to run
+  checkpoint, invoke the handoff skill yourself, update progress.md, and ask the user to run
   `/compact` then say "continue".
 
 ## Step 3b — Usage/session limits (Phoenix auto-resume)
@@ -315,10 +328,10 @@ mid-run is fully recoverable — keep `progress.md` current at every checkpoint 
 ## Step 4 — Stop conditions
 
 - All milestones done and verification green → set progress.md `status: done`, write a
-  final `/handoff`, summarize what shipped, and stop.
+  final handoff, summarize what shipped, and stop.
 - User decision required — Codex voted `ESCALATE: yes`, or it falls in the unilateral
   carve-out (irreversible/destructive, or user-only info) per "Decision points" → write
-  `/handoff`, ask via AskUserQuestion, stop.
+  handoff, ask via AskUserQuestion, stop.
 - Same step fails 3 times → spar it as a decision point. On `ESCALATE: no`, take Codex's
   option and keep going; on `yes`, stop, write progress.md Blockers, and escalate with what
   you tried.
@@ -334,14 +347,17 @@ any machine (copy the skill, run the installer, arm it). See `README.md` for ful
 docs. The scripts are self-locating and store runtime data under **`AUTODEV_HOME`** (default
 `~/agents`) — code in the skill, data outside the repo.
 
-- `bin/install.sh` — wires the statusLine + `Stop` + `SessionStart(compact)` hooks into
-  `~/.claude/settings.json`, all pointing at this skill's `bin/` (idempotent; preserves other
-  hooks). Run once per machine: `bash ~/.claude/skills/autodev/bin/install.sh`.
+- `bin/install.sh` — wires the runtime hooks while preserving existing hooks. Claude Code:
+  `bash "$AUTODEV_BIN/install.sh"`; Codex: `bash "$AUTODEV_BIN/install.sh" --codex`, then review
+  the new hooks with `/hooks` in a new Codex session.
 - `bin/cc-statusline.sh` — writes live context % + tmux pane to `$AUTODEV_HOME/state/<sid>.*`
   and renders the automation badge.
 - `bin/cc-stop-hook.sh` — at each turn end, marks idle and launches both watchers (`$HERE/…`).
-- `bin/cc-sessionstart-compact.sh` — post-compaction reload-instruction backup.
-- `bin/auto-handoff-watch.sh` — context-threshold → `/handoff`/`/compact`/reload engine.
+- `bin/codex-stop-hook.sh` — records Codex's effective active-context percentage and launches
+  the handoff watcher at each turn end.
+- `bin/sessionstart-compact.sh` — shared post-compaction reload-instruction backup.
+- `bin/auto-handoff-watch.sh` — context-threshold → handoff/`/compact`/reload engine; emits
+  `/handoff` on Claude Code and `$handoff` on Codex.
 - `bin/session-resume-watch.sh` — **Phoenix** usage/session-limit → `/usage-credits`/wait → `continue`.
 
 Control switches live in `$AUTODEV_HOME/state/` (`auto-handoff.armed`, `disable-auto-compact`,
@@ -352,7 +368,7 @@ session, so install/relocation takes effect for **new** sessions only.
 
 - Autonomous by default. Routine choices are yours; the user is asked on `ESCALATE: yes`
   or the carve-out, and nowhere else.
-- `/spar` every milestone. Fix P1 findings before advancing.
+- `spar` every milestone. Fix P1 findings before advancing.
 - Never advance on failing tests.
 - Keep `progress.md` and handoffs resumable across compaction — that is what makes the
   long run survive context limits.

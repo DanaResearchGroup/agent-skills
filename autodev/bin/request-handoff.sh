@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # request-handoff.sh — voluntarily ask the auto-handoff watcher to hand off THIS
-# Claude Code session at the next idle Stop, even below the context threshold.
+# agent session at the next idle Stop, even below the context threshold.
 #
-# Why: the watcher (auto-handoff-watch.sh) normally fires /handoff -> /compact ->
+# Why: the watcher normally runs the host's handoff skill -> /compact ->
 # reload only when context % > THRESHOLD. A session quiesced at a clean phase
 # boundary that KNOWS its next phase is heavy has no way to hand off *before*
 # opening it. This helper drops a `~/agents/state/<sid>.handoff-request` marker,
@@ -17,9 +17,9 @@
 #
 # Usage:
 #   request-handoff.sh [sid] [--cancel] [--compact-only]
-#     (no args)      raise a handoff-request (full /handoff -> /compact -> reload)
+#     (no args)      raise a handoff-request (full handoff -> /compact -> reload)
 #     --compact-only raise a compact-request instead: the handoff is ALREADY
-#                    written, so the watcher skips /handoff and only compacts +
+#                    written, so the watcher skips a second handoff and compacts +
 #                    reloads. Defers (files no marker) if the watcher is already
 #                    mid-cycle — but still records the per-session reload pointer,
 #                    since that is the common case and the pointer is what makes
@@ -43,7 +43,7 @@ LOG="$LOGDIR/auto-handoff.log"
 
 _HERE="$(cd "$(dirname "$0")" && pwd)"
 # mux-lib gives mux_owner_file() for the reverse pane->owner lookup. Optional:
-# without it we fall back to $CLAUDE_CODE_SESSION_ID.
+# without it we fall back to the host agent's session-id environment.
 [ -f "$_HERE/mux-lib.sh" ] && . "$_HERE/mux-lib.sh"
 
 usage(){ echo "usage: $(basename "$0") [sid] [--cancel] [--compact-only] [--handoff <path>]" >&2; exit 2; }
@@ -51,7 +51,7 @@ usage(){ echo "usage: $(basename "$0") [sid] [--cancel] [--compact-only] [--hand
 # --- parse args (a lone non-flag token is an explicit sid) ---
 # --compact-only raises a *compact-request* instead of a handoff-request: the
 # session has ALREADY written its handoff and only needs the watcher to finish
-# (skip /handoff, go straight to /compact -> reload). It also records the
+# (skip handoff, go straight to /compact -> reload). It also records the
 # per-session reload pointer .latest.<sid>.
 # --handoff <path> names the handoff this session just wrote. ALWAYS pass it:
 # without it we can only copy the shared, machine-wide .latest, which any of the
@@ -76,15 +76,15 @@ done
 [ "$want_handoff" = 1 ] && { echo "--handoff requires a path" >&2; usage; }
 
 # --- resolve this session's sid ---
-# Priority: explicit arg > $CLAUDE_CODE_SESSION_ID > reverse pane-owner file.
+# Priority: explicit arg > host session env > reverse pane-owner file.
 #
 # The env var is the AUTHORITATIVE identity of the calling process — it cannot
 # mis-name us as a different session. The reverse pane-owner file is a *shared*,
 # last-writer-wins resource: because herdr recycles short pane ids, a stale entry
 # can name a DIFFERENT live session that now occupies "our" pane id, and the
 # watcher's ownership gate would then happily hand THAT session off. So the env
-# var wins, and the pane-owner file is only a fallback for an older Claude Code
-# that doesn't export it. If BOTH resolve and DISAGREE, we refuse to guess (it
+# var wins, and the pane-owner file is only a fallback for an older host that
+# doesn't export it. If BOTH resolve and DISAGREE, we refuse to guess (it
 # signals a recycled pane, or the helper being run from a subagent whose child
 # sid differs from the pane's owner) and require an explicit sid.
 pane_owner_sid(){
@@ -104,7 +104,16 @@ pane_owner_sid(){
 if [ -n "$SID_ARG" ]; then
   sid="$SID_ARG"
 else
-  env_sid="${CLAUDE_CODE_SESSION_ID:-}"
+  env_sid=""
+  for candidate in "${CLAUDE_CODE_SESSION_ID:-}" "${CODEX_SESSION_ID:-}" "${CODEX_THREAD_ID:-}"; do
+    [ -z "$candidate" ] && continue
+    if [ -n "$env_sid" ] && [ "$env_sid" != "$candidate" ]; then
+      echo "refusing to guess: agent session environment ids disagree" >&2
+      echo "pass the target sid explicitly: $(basename "$0") <sid>" >&2
+      exit 2
+    fi
+    env_sid="$candidate"
+  done
   pane_sid=$(pane_owner_sid || true)
   if [ -n "$env_sid" ] && [ -n "$pane_sid" ] && [ "$env_sid" != "$pane_sid" ]; then
     echo "refusing to guess: session env id '$env_sid' disagrees with pane owner '$pane_sid'" >&2

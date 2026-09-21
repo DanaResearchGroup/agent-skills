@@ -31,7 +31,8 @@ sandbox_new() {
   # uses is then the clock under test, which is the whole point of sharing it.
   export CC_STATUSLINE_LIB="$SKILL_DIR/../bin/lib/cc-statusline-lib.sh"
   # Tests drive the watcher directly; never let a stray env id leak in.
-  unset CLAUDE_CODE_SESSION_ID HERDR_ENV HERDR_PANE_ID HERDR_TAB_ID TMUX_PANE
+  unset CLAUDE_CODE_SESSION_ID CODEX_SESSION_ID CODEX_THREAD_ID \
+    HERDR_ENV HERDR_PANE_ID HERDR_TAB_ID TMUX_PANE
 }
 
 sandbox_rm() { [ -n "${SB:-}" ] && rm -rf "$SB"; }
@@ -95,11 +96,11 @@ mux_tab_rename(){
 mux_pane_live(){ case " ${MUX_LIVE_PANES:-} " in *" $PANE "*) return 0;; *) return 1;; esac; }
 mux_pane_owner(){ local o; o=$(mux_owner_file "$MUX" "$PANE"); [ -s "$o" ] && cat "$o"; }
 mux_status(){ [ "${MUX_BUSY:-0}" = 1 ] && echo working || echo idle; }
-mux_capture(){ :; }
+mux_capture(){ printf '%s' "${MUX_CAPTURE_TEXT:-}"; }
 mux_busy(){ [ "${MUX_BUSY:-0}" = 1 ]; }
 mux_session_name(){ :; }
 mux_send_line(){ printf '%s\n' "$1" >> "$SB/sent.log"; }
-mux_send_key(){ :; }
+mux_send_key(){ printf 'KEY:%s\n' "$1" >> "$SB/sent.log"; }
 STUB
   : > "$SB/sent.log"
   : > "$SB/renames.log"
@@ -121,6 +122,7 @@ assert_not_contains() { case "$2" in *"$3"*) _fail "$1" "must NOT contain [$3], 
 # match for "KillMode=process" also matches the prose describing it and passes
 # with the directive deleted — a guard that guards nothing.
 assert_line()       { printf '%s\n' "$2" | grep -qxF -- "$3" && _pass "$1" || _fail "$1" "no line exactly [$3]"; }
+assert_no_line()    { printf '%s\n' "$2" | grep -qxF -- "$3" && _fail "$1" "line must not exist exactly [$3]" || _pass "$1"; }
 assert_line_start() { printf '%s\n' "$2" | grep -qF -- "$3" && printf '%s\n' "$2" | grep -q "^$(printf '%s' "$3" | sed 's/[][\.*^$\/]/\\&/g')" && _pass "$1" || _fail "$1" "no line starting [$3]"; }
 
 assert_file()         { [ -f "$2" ] && _pass "$1" || _fail "$1" "missing file: $2"; }

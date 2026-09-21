@@ -19,6 +19,8 @@ tpath=$(printf '%s' "$input" | jq -r '.transcript_path // empty')
 pct=$(printf '%s' "$input" | jq -r '.context_window.used_percentage // empty')
 
 if [ -n "$sid" ]; then
+  printf 'claude\n' > "$STATE/$sid.runtime.tmp" 2>/dev/null \
+    && mv "$STATE/$sid.runtime.tmp" "$STATE/$sid.runtime" 2>/dev/null
   if [ -n "$pct" ]; then
     printf 'pct=%s ts=%s\n' "$pct" "$(date +%s)" > "$STATE/$sid.ctx.tmp" 2>/dev/null \
       && mv "$STATE/$sid.ctx.tmp" "$STATE/$sid.ctx" 2>/dev/null
