@@ -6,6 +6,8 @@ argument-hint: "What will the next session be used for?"
 
 Write or load a handoff document so a fresh agent can continue the work after compaction.
 
+Explicit invocation is runtime-specific: Claude Code uses `/handoff`; Codex uses `$handoff`.
+
 Save handoffs into `$HOME/agents/handoffs/` - not the current workspace and not the OS temp
 directory. Create the directory if it does not already exist. Name new files:
 `$(date +"%Y.%m.%d %H.%M.%S") handoff-<short-kebab-topic>.md`.
@@ -15,9 +17,11 @@ cron job. If the cron still targets `$HOME/handoffs/`, update it outside this sk
 
 ## Load
 
-If the user asks `/handoff load`, read this session's own pointer,
-`$HOME/agents/handoffs/.latest.<session-uuid>` (the uuid in your scratchpad path), then read
-and present that handoff document.
+If the user asks `/handoff load` (Claude Code) or `$handoff load` (Codex), resolve this session's
+identity exactly as the writer does: `${CLAUDE_CODE_SESSION_ID}` for Claude Code, or
+`${CODEX_SESSION_ID:-${CODEX_THREAD_ID:-}}` for Codex. Read
+`$HOME/agents/handoffs/.latest.<resolved-session-id>`, then read and present that handoff document.
+Do not infer a Codex identity from a scratchpad path.
 
 If that pointer is missing, do NOT silently fall back to `$HOME/agents/handoffs/.latest` or to
 "the newest file in the directory". Both are machine-wide and last-writer-wins: on a box with
@@ -31,7 +35,7 @@ Every handoff MUST contain these sections, in this order. Do not drop any of the
 1. **Broad context** — orient a reader with ZERO prior context: what this work is, why it matters, where it sits in the larger effort, and the current state (repo, branch, tip commit, what's shipped, what's green, what's pushed). Give the through-line of the whole arc, not just the latest task. Reference artifacts by path/URL for detail rather than duplicating them.
 2. **Standing items** — every open thread with its state made EXPLICIT (e.g. DONE / DEFERRED-with-named-closer / BLOCKED-on-X / AWAITING-USER). Include what's waiting on the user specifically (pushes, approvals, rebases, decisions) and each blocker's unblock condition.
 3. **Next phases / steps** — the concrete sequence of work the next session should pick up, in order, with any ordering constraints or dependencies between steps spelled out ("do X before Y because …").
-4. **CC's recommendation** — your explicit, opinionated recommendation for how to tackle the next steps: which item to start with and why, the approach you would take, the traps to avoid, and any sequencing/leverage judgment. Make the call you would make — this is your judgment, not a neutral menu of options.
+4. **Recommendation** — your explicit, opinionated recommendation for how to tackle the next steps: which item to start with and why, the approach you would take, the traps to avoid, and any sequencing/leverage judgment. Make the call you would make — this is your judgment, not a neutral menu of options.
 5. **Insights from this session** — the non-obvious things learned that are NOT captured in code or commits: inverted premises, false-positives found, decisions and their *why*, antipatterns avoided, dead ends not worth re-treading, and any discipline/meta-lessons. These are the most perishable and often the most valuable part of the handoff — record them so the next session does not rediscover them the hard way. Write every one of them down here; the only question is whether a *copy* also belongs somewhere permanent. Handoffs are pruned after a month, so an insight that would still be true long after this work ends outlives its handoff: if the project has a durable home for it — a PM repo's `INSIGHTS.md`, an ADR, the repo's own docs — put it there too and cite that path here. Where no such home exists, this section is the home.
 6. **Suggested skills** — skills the next agent should invoke (e.g. brainstorming, writing-plans, subagent-driven-development), each with a one-line reason.
 
@@ -84,7 +88,10 @@ printf '%s\n' "$hf" > "$tmp" && mv "$tmp" "$HOME/agents/handoffs/.latest"
 # It also files the compact-request that makes the watcher run /compact + reload
 # even below the 35% threshold. No-op when autodev is not installed; defers on
 # its own when the watcher is already mid-cycle.
-rh="$HOME/.claude/skills/autodev/bin/request-handoff.sh"
+rh=""
+for root in "$HOME/.agents/skills" "$HOME/.claude/skills" "$HOME/.codex/skills"; do
+  [ -x "$root/autodev/bin/request-handoff.sh" ] && { rh="$root/autodev/bin/request-handoff.sh"; break; }
+done
 [ -x "$rh" ] && bash "$rh" --compact-only --handoff "$hf" 2>/dev/null || true
 ```
 
@@ -99,7 +106,7 @@ legitimately declines to file when the watcher is already mid-cycle, and it is a
 when autodev is not installed. Running it is therefore not proof that anything will happen:
 
 ```bash
-sid=<session-uuid from your scratchpad path>
+sid="${CLAUDE_CODE_SESSION_ID:-${CODEX_SESSION_ID:-${CODEX_THREAD_ID:-}}}"
 ls -la "$HOME/agents/state/$sid".{compact-request,handoff-request} 2>/dev/null
 ls -la "$HOME/agents/handoffs/.latest.$sid" 2>/dev/null   # the reload pointer
 cat "$HOME/agents/state/$sid.ctx" 2>/dev/null             # authoritative pct — never guess it
@@ -109,7 +116,7 @@ Resolve as follows:
 
 - **A marker file exists** → the cycle will run. Emit the block below and end the turn.
 - **No marker, but the script said it was already mid-cycle** → fine, the in-flight cycle will
-  compact. This is the *normal* outcome when the watcher itself sent the `/handoff` you are
+  compact. This is the *normal* outcome when the watcher itself invoked the handoff skill you are
   answering: its cycle lock is live for the whole turn. Say so explicitly in your message so the
   user can see why nothing was filed, and check `.latest.$sid` below — the pointer is recorded even
   on this path, so if it is missing something else is wrong.
@@ -131,20 +138,21 @@ Then emit this explicit instruction block:
 Handoff written: <absolute path — the full expanded $hf, always, no exceptions>
 .latest updated, compact-request filed.
 
-• If this session's status line shows the 🔴 AUTO-HANDOFF badge AND the marker was verified to
-  exist above: end the turn — the auto-handoff watcher will run /compact and reload at the next
-  idle Stop (the verified compact-request is what makes this fire below the 35% threshold; the
-  threshold alone never fires on an idle session). It CANNOT act while a background agent or
-  turn is still running (input would be queued), so make sure nothing is left running.
-  "Do nothing" is correct ONLY because a marker was verified — it is never correct on its own.
-• If there is NO badge (an older session started before the watcher was installed, or not in
-  tmux): the automation is not attached here — run /compact yourself now.
+• End the turn only when the marker and this session's registered pane were verified above. The
+  watcher will run /compact and reload at the next idle Stop; the marker is what makes this fire
+  below the 35% threshold. It cannot act while a background agent or turn is still running because
+  input would be queued. "Do nothing" is correct only because the state was verified.
+• Claude Code also shows the 🔴 AUTO-HANDOFF badge when attached. Codex uses its native status
+  line and has no custom badge, so its marker, `.ctx`, `.runtime`, and registered pane files are
+  the authority. If the required state is absent, run /compact yourself now.
 
-Reload contract: after compaction, the next Claude Code turn is handed THIS session's handoff to
-read, via the SessionStart hook reading ~/agents/handoffs/.latest.<session-uuid>. If that pointer
+Reload contract: after compaction, the next agent turn is handed THIS session's handoff to read,
+via the SessionStart hook reading ~/agents/handoffs/.latest.<resolved-session-id> (using
+CLAUDE_CODE_SESSION_ID, or CODEX_SESSION_ID with CODEX_THREAD_ID as its fallback). If that pointer
 is missing the reload fails closed on purpose — it will never hand you the shared ~/agents/handoffs/.latest,
 because that file is machine-wide and would resume another session's mission.
 ```
 
-Claude Code cannot self-trigger `/compact` — only the user or the (badge-confirmed) watcher can.
-The badge is the definitive signal for whether this session has the automation attached.
+The agent cannot self-trigger the interactive `/compact` command — only the user or the
+state-verified watcher can. On Codex, the watcher confirms the command only when the pane visibly
+contains an explicit compact/summarize confirmation prompt.

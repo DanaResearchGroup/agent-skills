@@ -122,6 +122,9 @@ So on Codex, do step 1 as `ln -s ~/Code/agent-skills ~/.codex/skills` instead. C
 
 - The **Slack** and **babysit** skills hard-code `~/.claude/...` paths — adapt them to your
   agent's home (e.g. `~/.codex`) per [ADAPTATION.md](ADAPTATION.md).
+- The **autodev auto-handoff harness** supports both runtimes. Install Claude Code hooks with
+  `autodev/bin/install.sh`; install Codex hooks with `autodev/bin/install.sh --codex`, then review
+  them with `/hooks` in a new Codex session.
 - **Superpowers** (step 3) ships its own Codex/Copilot/Gemini install — see
   [its docs](https://github.com/obra/superpowers).
 - Skills that dispatch sub-agents need Codex's multi-agent tools enabled in `~/.codex/config.toml`.

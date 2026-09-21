@@ -5,14 +5,14 @@
 #   - Arming:              ~/agents/state/auto-handoff.armed      (absent  => dry-run)
 #   - Per-session pane:    ~/agents/state/<sid>.{herdr,tmux}-pane (required to act)
 #   - Cycle lock + cooldown prevent recursion / double-sends.
-#   - IDLE GATE: never send keys into a busy CC (which would queue them instead of
+#   - IDLE GATE: never send keys into a busy agent (which would queue them instead of
 #     running the command). Confirms the pane is at an idle prompt first.
 #   - Every decision and action is logged to ~/agents/logs/auto-handoff.log
 #
-# Sequence when triggered (armed, idle): /handoff -> wait idle -> /compact -> wait
+# Sequence when triggered (armed, idle): handoff skill -> wait idle -> /compact -> wait
 # compaction -> /rename <session name> (re-assert the display name, which compaction
 # can reset) -> "read <handoff> and continue execution".
-# A .compact-request marker triggers a COMPACT-ONLY variant: the /handoff step is
+# A .compact-request marker triggers a COMPACT-ONLY variant: the handoff step is
 # skipped (a handoff is already written) and the cycle starts at /compact.
 # Triggers: pct > THRESHOLD | pct > COLD_MIN and idle >= CACHE_TTL (cold-cache) |
 # .handoff-request (full cycle) | .compact-request (compact-only).
@@ -93,6 +93,15 @@ ctxf="$STATE/$sid.ctx"
 [ -f "$ctxf" ] || exit 0
 pct=$(sed -n 's/^pct=\([0-9.]*\).*/\1/p' "$ctxf")
 [ -n "$pct" ] || exit 0
+
+# A missing runtime tag means a pre-upgrade Claude Code session. Codex writes
+# its tag from the Stop hook and uses the host's explicit `$skill` syntax.
+runtime=claude
+[ -s "$STATE/$sid.runtime" ] && runtime=$(cat "$STATE/$sid.runtime" 2>/dev/null)
+case "$runtime" in
+  codex) handoff_cmd='$handoff' ;;
+  *) runtime=claude; handoff_cmd='/handoff' ;;
+esac
 
 # --- heartbeat (throttled) ---
 # Proves the watcher is alive during quiet, BELOW-threshold periods, where every
@@ -205,7 +214,7 @@ fi
 printf '%s\n' "$$" > "$lock/pid" 2>/dev/null
 trap 'rm -rf "$lock" 2>/dev/null || true' EXIT
 
-# --- idle helpers (pre-send safety gate; avoids queuing into a busy CC) ---
+# --- idle helpers (pre-send safety gate; avoids queuing into a busy agent) ---
 pane_busy(){ mux_busy; }  # 0 = busy (herdr agent_status, or tmux visible-pane scrape)
 wait_pane_idle(){ # $1 timeout; 0 when idle (confirmed twice), 1 on timeout
   local deadline=$(( $(date +%s) + $1 ))
@@ -278,15 +287,15 @@ fi
 
 # 1) handoff — skipped in compact-only mode (a handoff is already written).
 if [ "$compact_only" = 1 ]; then
-  log "compact-only: skipping /handoff (handoff already written by session)"
+  log "compact-only: skipping handoff (already written by session)"
 else
   t0=$(date +%s)
-  send "/handoff"
+  send "$handoff_cmd"
   if [ "$DRY" = 0 ]; then
     if ! wait_turn_done "$t0" "$WAIT_IDLE"; then
-      abort_cycle "/handoff did not complete within ${WAIT_IDLE}s"
+      abort_cycle "handoff did not complete within ${WAIT_IDLE}s"
     fi
-    log "/handoff turn completed"
+    log "handoff turn completed"
   fi
   # The handoff skill writes THIS session's own pointer (.latest.<sid>) directly,
   # so there is normally nothing to do here. Copying the shared .latest — as this
@@ -305,10 +314,10 @@ else
       ptmp="$per.tmp.$$"
       printf '%s\n' "$cand" > "$ptmp" 2>/dev/null &&
         mv -f "$ptmp" "$per" 2>/dev/null || rm -f "$ptmp" 2>/dev/null
-      log "legacy /handoff: adopted .latest by mtime proof (written during our turn)"
+      log "legacy handoff: adopted .latest by mtime proof (written during our turn)"
     else
       rm -f "$per" 2>/dev/null
-      log "WARN /handoff wrote no per-session pointer, and .latest is not provably ours"
+      log "WARN handoff wrote no per-session pointer, and .latest is not provably ours"
     fi
   fi
 fi
@@ -320,6 +329,23 @@ fi
 t1=$(date +%s)
 send "/compact"
 if [ "$DRY" = 0 ]; then
+  # Codex versions that present a compact confirmation remain idle/blocked at a
+  # prompt rather than emitting SessionStart. Confirm only when the visible pane
+  # contains an explicit compact/summarize question; never send Enter blindly.
+  if [ "$runtime" = codex ]; then
+    confirm_deadline=$(( $(date +%s) + ${AUTODEV_CODEX_CONFIRM_WAIT:-5} ))
+    while [ "$(date +%s)" -lt "$confirm_deadline" ]; do
+      [ -f "$STATE/$sid.compacted" ] && break
+      compact_prompt=$(mux_capture | tail -30)
+      if printf '%s\n' "$compact_prompt" | grep -Eiq \
+        'confirm.*compact|compact.*context|summari[sz]e.*(chat|context)|press enter.*compact'; then
+        mux_send_key Enter
+        log "confirmed Codex /compact prompt"
+        break
+      fi
+      sleep 1
+    done
+  fi
   deadline=$(( t1 + WAIT_COMPACT )); ok=0
   while [ "$(date +%s)" -lt "$deadline" ]; do
     if [ -f "$STATE/$sid.compacted" ]; then
