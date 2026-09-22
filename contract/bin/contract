@@ -1,16 +1,92 @@
 #!/usr/bin/env bash
 # contract — start gate and durable work note, keyed on the git worktree.
-# State layout:
-#   <worktree>/docs/contracts/<slug>.md             the note
-#   <worktree>/docs/contracts/ACTIVE                 slug of the active note
-#   <git-common-dir>/contract-enabled                 per-repo opt-in marker
-#   <git-common-dir>/contract-skips.log               permanent skip record
-#   <git-common-dir>/contract-skips/<session_id>      session-scoped skip
-#   <git-common-dir>/contract-abandons.log            permanent abandon record
+#
+# Every mutable file lives OUTSIDE the worktree, under $CONTRACT_STATE_DIR
+# (default ~/agents/state/contracts). State layout, per repo then per worktree:
+#   <state>/<repo-key>/enabled                        per-repo opt-in marker
+#   <state>/<repo-key>/skips/<session_id>             session-scoped skip
+#   <state>/<repo-key>/skips.log                      permanent skip record
+#   <state>/<repo-key>/abandons.log                   permanent abandon record
+#   <state>/<repo-key>/worktrees/<wt-key>/ACTIVE      slug of the active note
+#   <state>/<repo-key>/worktrees/<wt-key>/<slug>.md   the note
+#   <state>/<repo-key>/worktrees/<wt-key>/closed/     archived notes
+#
+# Why not in the repo, where the notes used to live: Claude Code denies Bash
+# writes anywhere inside a skills/hooks tree, so in the skills repo itself the
+# note, the ACTIVE marker and even a skip were all unwritable while the gate
+# stayed armed — a deadlock only a shell outside the sandbox could break.
+#
+# Keys are derived from the canonical path of the git common dir (per repo) and
+# of the worktree, so state follows the repo and the worktree, never the cwd. A
+# key is a readable tail plus a hash of the whole path: the readable part alone
+# both collided (/a/b and /a-b slug alike) and blew past NAME_MAX on a long
+# path. What a path key cannot survive is the path CHANGING — `git worktree
+# move`, a relocated checkout, or a fresh clone at a retired path. Enablement
+# rides that out, because `enable` prefers a marker inside the git dir and only
+# falls back to state when that is unwritable; an active note does not, and
+# shows up as a worktree with no contract (gate armed, `new` works). Reusing a
+# path for a DIFFERENT repo inherits everything keyed to it — skips, logs, the
+# fallback enable marker, and an ACTIVE with its note, so an old contract can
+# open the new repo's gate. `contract status` prints `state=`, which is the only
+# way to see which directory that is.
 set -uo pipefail
+# Notes carry Intent and Gates; skips.log is an audit trail. Nothing this tool
+# writes is for other local accounts, whatever the caller's umask.
+umask 077
+
+# An inherited GIT_DIR / GIT_WORK_TREE makes `git -C <dir>` describe a
+# DIFFERENT repository than the one the caller is standing in — so the gate
+# would consult, and this tool would key state on, somebody else's repo. The
+# spar skill was bitten by exactly this; clear them before any git call.
+unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_CEILING_DIRECTORIES \
+      GIT_DISCOVERY_ACROSS_FILESYSTEM GIT_INDEX_FILE GIT_OBJECT_DIRECTORY
+
+# Path -> collision-free, length-bounded state key: a readable tail (the last
+# two components) plus 16 hex of the path's digest. Without a real hash tool
+# the digest degrades to cksum — a 32-bit CRC with the byte count appended, so
+# path-specific but not collision-proof; every platform this runs on has one of
+# the two sha tools.
+pathkey() {
+  local tail hash=""
+  tail=$(printf '%s' "$1" | sed 's|.*/\([^/]*/[^/]*\)$|\1|' \
+    | tr -c 'A-Za-z0-9._-' '-' | sed 's/^-*//' | cut -c1-60)
+  # Every branch computes the SAME digest (sha256), so which tool happens to be
+  # on PATH cannot change a repo's key — an earlier draft fell back to cksum and
+  # a hook with a restricted PATH resolved a different state dir for one repo.
+  if command -v sha256sum >/dev/null 2>&1; then
+    hash=$(printf '%s' "$1" | sha256sum 2>/dev/null | cut -c1-16)
+  elif command -v shasum >/dev/null 2>&1; then
+    hash=$(printf '%s' "$1" | shasum -a 256 2>/dev/null | cut -c1-16)
+  elif command -v python3 >/dev/null 2>&1; then
+    hash=$(printf '%s' "$1" | python3 -c 'import hashlib,sys; sys.stdout.write(hashlib.sha256(sys.stdin.buffer.read()).hexdigest()[:16])' 2>/dev/null)
+  fi
+  case "${hash:-}" in
+    [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) ;;
+    *) return 1 ;;
+  esac
+  printf '%s-%s\n' "$tail" "$hash"
+}
+
+# Canonical absolute path, for a directory that need not exist yet.
+canon() {
+  realpath -m -- "$1" 2>/dev/null || readlink -f -- "$1" 2>/dev/null || printf '%s' "$1"
+}
+
+# A slug names a file and is read back out of ACTIVE, where a hand-edited value
+# could point anywhere. Both ends validate: "none" is refused because `status`
+# uses it as the no-contract sentinel the gate reads, and "." / ".." because
+# they escape the notes dir.
+slug_ok() {
+  case "${1:-}" in
+    ''|none|.|..) return 1 ;;
+    *[!a-zA-Z0-9._-]*) return 1 ;;
+  esac
+  return 0
+}
 
 # Resolve state paths from $1 (a file or dir; defaults to $PWD).
-# Returns 1 when not inside a git worktree. Never exits non-zero itself.
+# Returns 1 when not inside a git worktree. Never exits non-zero itself, and
+# never WRITES: the gate calls this on every Edit, through `status`.
 resolve_paths() {
   local from="${1:-$PWD}"
   [ -d "$from" ] || from=$(dirname "$from")
@@ -23,30 +99,140 @@ resolve_paths() {
     /*) COMMON="$common" ;;
     *)  COMMON=$(cd "$from" && cd "$common" 2>/dev/null && pwd) || return 1 ;;
   esac
-  # docs/contracts/ is the current home. docs/superpowers/contracts/ is the legacy one
-  # and is still honoured wherever it already exists, so a repo that is mid-contract
-  # does not silently lose its ACTIVE marker -- and therefore its gate -- the moment
-  # this tool is updated. A repo with neither directory gets the current location.
-  CDIR="$WT/docs/contracts"
-  if [ ! -d "$CDIR" ] && [ -d "$WT/docs/superpowers/contracts" ]; then
-    CDIR="$WT/docs/superpowers/contracts"
+  # A relative root would resolve against each caller's cwd — the CLI's and the
+  # hook's are different — and could land inside the repo, recreating the very
+  # deadlock this layout exists to escape. Refuse instead of guessing.
+  STATE_ROOT="${CONTRACT_STATE_DIR:-}"
+  if [ -z "$STATE_ROOT" ]; then
+    [ -n "${HOME:-}" ] || { printf 'contract: HOME is unset and CONTRACT_STATE_DIR is not set\n' >&2; return 2; }
+    STATE_ROOT="$HOME/agents/state/contracts"
+  fi
+  # Absolute, and outside this worktree. A relative root resolves against each
+  # caller's cwd — the CLI's and the hook's differ — and a root inside the
+  # worktree puts state back in the repo, which is the deadlock this layout
+  # exists to escape. HOME is checked too: it is a root by default.
+  case "$STATE_ROOT" in
+    /*) ;;
+    *) printf 'contract: state root must be an absolute path (got %s)\n' "$STATE_ROOT" >&2; return 2 ;;
+  esac
+  # Compare canonical paths: `/elsewhere/../<worktree>/state` and a symlink
+  # pointing into the worktree are both inside it, and both were accepted while
+  # the check was lexical.
+  local canon_root canon_wt
+  canon_root=$(canon "$STATE_ROOT"); canon_wt=$(canon "$WT")
+  case "$canon_root" in
+    "$canon_wt"|"$canon_wt"/*) printf 'contract: state root %s resolves inside the worktree — that is what this layout avoids\n' \
+         "$STATE_ROOT" >&2; return 2 ;;
+  esac
+  local rkey wkey
+  rkey=$(pathkey "$COMMON") || { printf 'contract: no sha256 tool on PATH — cannot key state\n' >&2; return 2; }
+  wkey=$(pathkey "$WT") || { printf 'contract: no sha256 tool on PATH — cannot key state\n' >&2; return 2; }
+  RDIR="$STATE_ROOT/$rkey"
+  WDIR="$RDIR/worktrees/$wkey"
+  ENABLED="$RDIR/enabled"
+  SKIPDIR="$RDIR/skips"
+  SKIPLOG="$RDIR/skips.log"
+  ABANDONLOG="$RDIR/abandons.log"
+  EXTERNAL_PIN="$WDIR/.external"
+  # Markers from before state moved out of the repo. Read for back-compat, so a
+  # repo enabled years ago stays enabled and a session already skipped stays
+  # unblocked. Only `disable` ever touches them, to remove the enable marker.
+  ENABLED_LEGACY="$COMMON/contract-enabled"
+  SKIPDIR_LEGACY="$COMMON/contract-skips"
+  # In-worktree note homes, in order of recency, each honoured only while it
+  # holds a LIVE contract (an ACTIVE whose note exists) and this worktree has
+  # not been migrated. An ACTIVE alone is not enough: a stale one whose note was
+  # deleted would send `new` back into the repo — unwritable in a skills tree,
+  # which is the deadlock again. `new` and `contract migrate` write .external,
+  # which pins this worktree to state for good, so a leftover in-repo file can
+  # never resurrect itself.
+  CDIR="$WDIR"
+  if [ ! -f "$EXTERNAL_PIN" ]; then
+    local legacy slug
+    for legacy in "$WT/docs/contracts" "$WT/docs/superpowers/contracts"; do
+      [ -s "$legacy/ACTIVE" ] || continue
+      slug=$(cat "$legacy/ACTIVE" 2>/dev/null)
+      slug_ok "$slug" || continue
+      [ -f "$legacy/$slug.md" ] || continue
+      CDIR="$legacy"
+      break
+    done
   fi
   ACTIVE_FILE="$CDIR/ACTIVE"
-  ENABLED="$COMMON/contract-enabled"
-  SKIPLOG="$COMMON/contract-skips.log"
-  SKIPDIR="$COMMON/contract-skips"
-  ABANDONLOG="$COMMON/contract-abandons.log"
   return 0
 }
 
+is_enabled() { [ -f "$ENABLED" ] || [ -f "$ENABLED_LEGACY" ]; }
+
+# Serialise the mutating commands. Two sessions in one worktree could otherwise
+# both pass the already-active check, or have one's close delete the other's
+# ACTIVE — each reporting success. The gate's own read stays lock-free (and so
+# stays racy by construction: a contract can close between its check and the
+# edit it allowed).
+# A SIGKILLed holder must not gate the tool forever, so the lock records its
+# pid and a live-looking lock whose process is gone is stolen. Failures to
+# create the state dir are reported as themselves, not as contention.
+take_lock() {
+  local lock waited=0 holder="" before_rdir
+  # A legacy contract in a writable repo must stay closable even when external
+  # state is unusable — locking it there would make back-compat depend on the
+  # very directory the repo cannot reach.
+  if (umask 077 && mkdir -p "$RDIR") 2>/dev/null; then
+    lock="$RDIR/.lock"
+  else
+    case "$CDIR" in
+      "$WT"/*) lock="$CDIR/.lock" ;;
+      *) die "cannot create $RDIR" ;;
+    esac
+  fi
+  until mkdir "$lock" 2>/dev/null; do
+    holder=$(cat "$lock/pid" 2>/dev/null || true)
+    if [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; then
+      printf 'contract: stealing the lock from dead process %s\n' "$holder" >&2
+      rm -f "$lock/pid"; rmdir "$lock" 2>/dev/null
+      continue
+    fi
+    # A lock with no pid is a holder that died between mkdir and its pid write.
+    # Give it a grace period, then take it: otherwise it is permanent.
+    if [ -z "$holder" ] && [ "$waited" -ge 20 ]; then
+      printf 'contract: stealing a lock that never recorded a pid\n' >&2
+      rmdir "$lock" 2>/dev/null
+      continue
+    fi
+    waited=$((waited + 1))
+    [ "$waited" -lt 50 ] || die "another contract command (pid ${holder:-unknown}) is holding $lock"
+    sleep 0.1
+  done
+  LOCKDIR="$lock"
+  trap 'rm -f "$LOCKDIR/pid"; rmdir "$LOCKDIR" 2>/dev/null || true' EXIT
+  printf '%s\n' "$$" > "$lock/pid" || die "cannot record the lock holder in $lock"
+  # Resolution happened BEFORE the wait, so it may now be stale — a `migrate` in
+  # another session can have moved this worktree's notes out of the repo while
+  # this command queued. Re-read it under the lock, and refuse if the lock we
+  # hold no longer belongs to the state we resolved.
+  before_rdir="$RDIR"
+  resolve_paths "$PWD" || die "state no longer resolves for $PWD"
+  [ "$RDIR" = "$before_rdir" ] || die "state moved from $before_rdir to $RDIR while waiting — rerun"
+}
+
+# `enabled=unknown` is the third answer the gate must be able to read: a broken
+# state root is not the same as "this directory has no gate", and reporting it
+# as enabled=no is what silently disarmed the gate for a misconfigured root.
 cmd_status() {
-  if ! resolve_paths "${1:-$PWD}"; then
-    printf 'wt=none\ncommon=none\nenabled=no\nactive=none\n'
+  resolve_paths "${1:-$PWD}"; local rc=$?
+  if [ "$rc" = 2 ]; then
+    printf 'wt=%s\ncommon=none\nstate=error\nnotes=none\nenabled=unknown\nactive=none\n' "${WT:-none}"
+    return 0
+  fi
+  if [ "$rc" != 0 ]; then
+    printf 'wt=none\ncommon=none\nstate=none\nnotes=none\nenabled=no\nactive=none\n'
     return 0
   fi
   printf 'wt=%s\n' "$WT"
   printf 'common=%s\n' "$COMMON"
-  if [ -f "$ENABLED" ]; then printf 'enabled=yes\n'; else printf 'enabled=no\n'; fi
+  printf 'state=%s\n' "$RDIR"
+  printf 'notes=%s\n' "$CDIR"
+  if is_enabled; then printf 'enabled=yes\n'; else printf 'enabled=no\n'; fi
   local slug; slug=$(active_slug)
   if [ -n "$slug" ]; then
     printf 'active=%s\n' "$slug"
@@ -56,6 +242,16 @@ cmd_status() {
 }
 
 die() { printf 'contract: %s\n' "$1" >&2; exit 2; }
+
+# Appended to any failure that is writing inside the worktree: the only way a
+# write there is attempted is a contract still living in the old in-repo home,
+# and `migrate` is the way out of it.
+legacy_hint() {
+  case "$CDIR" in
+    "$WT"/*) printf 'this contract still lives in-repo at %s; run `contract migrate` to move it into state' "$CDIR" ;;
+    *) printf 'check permissions on %s' "$CDIR" ;;
+  esac
+}
 
 # Checks for leaked bare identifiers and a missing Verifier section.
 # Necessary, never sufficient — the same caveat pm-creator's lint-prompt carries.
@@ -112,15 +308,44 @@ require_repo() {
   resolve_paths "$PWD" || die "not inside a git worktree"
 }
 
-cmd_enable() {
-  require_repo
-  : > "$ENABLED"
-  printf 'contract: gate enabled for %s (covers every worktree of this repo)\n' "$COMMON"
+# State dirs hold the Intent, the Gates and the skip log, so they are CREATED
+# 0700 whatever the caller's umask. Creation-time mode only: chmod'ing the root
+# would re-permission a directory the user chose and may share (a
+# CONTRACT_STATE_DIR of /tmp was measurably turned 700 by an earlier draft).
+ensure_state_dir() {
+  [ -d "$1" ] && return 0
+  (umask 077 && mkdir -p "$1") || die "cannot create $1"
 }
 
+cmd_enable() {
+  require_repo
+  # Prefer the marker inside the git dir: it travels with the repo, so a moved
+  # or renamed checkout stays gated. Fall back to state when that write is
+  # refused, which is exactly the skills-tree case.
+  if : > "$ENABLED_LEGACY" 2>/dev/null; then
+    printf 'contract: gate enabled for %s (covers every worktree of this repo)\n' "$COMMON"
+    return 0
+  fi
+  ensure_state_dir "$RDIR"
+  : > "$ENABLED" || die "cannot write $ENABLED"
+  printf 'contract: gate enabled for %s (marker in %s — this repo denies writes to its git dir)\n' \
+    "$COMMON" "$ENABLED"
+}
+
+# Enablement can live in either of two places, so disable removes both and
+# names whichever survived — a marker inside .git is unremovable from a
+# sandboxed shell, and reporting that as a clean disable would be a lie.
 cmd_disable() {
   require_repo
-  rm -f "$ENABLED"
+  # Trust rm's own status, not a re-test: an unreadable directory makes `[ -f ]`
+  # answer "gone" for a marker that is still there, which is how disable came to
+  # report success over a live gate.
+  local left=""
+  rm -f "$ENABLED" 2>/dev/null || left="$ENABLED"
+  rm -f "$ENABLED_LEGACY" 2>/dev/null || left="${left:+$left and }$ENABLED_LEGACY"
+  [ -f "$ENABLED" ] && left="${left:+$left and }$ENABLED"
+  [ -f "$ENABLED_LEGACY" ] && left="${left:+$left and }$ENABLED_LEGACY"
+  [ -z "$left" ] || die "still enabled — could not remove $left; delete it from a shell that can write there"
   printf 'contract: gate disabled for %s\n' "$COMMON"
 }
 
@@ -131,27 +356,53 @@ active_slug() {
   local slug
   { [ -f "$ACTIVE_FILE" ] && [ -s "$ACTIVE_FILE" ]; } || return 0
   slug=$(cat "$ACTIVE_FILE")
+  slug_ok "$slug" || return 0
   [ -f "$CDIR/$slug.md" ] || return 0
   printf '%s\n' "$slug"
+}
+
+# Archive path that never overwrites: a reused slug closed twice would other-
+# wise silently destroy the first contract's record. A timestamp alone was not
+# enough — fifteen closes inside one second collapsed to three files — so the
+# search walks until it finds a name nothing occupies.
+archive_path() {
+  local slug="$1" target="$CDIR/closed/$1.md" stamp n=1
+  [ -e "$target" ] || { printf '%s\n' "$target"; return 0; }
+  stamp=$(date -u +%Y%m%dT%H%M%SZ)
+  target="$CDIR/closed/$slug.$stamp.md"
+  while [ -e "$target" ]; do
+    n=$((n + 1))
+    target="$CDIR/closed/$slug.$stamp-$n.md"
+  done
+  printf '%s\n' "$target"
 }
 
 cmd_new() {
   local slug="${1:-}"
   [ -n "$slug" ] || die "usage: contract new <slug>"
-  case "$slug" in *[!a-zA-Z0-9._-]*) die "slug must be [a-zA-Z0-9._-]" ;; esac
+  slug_ok "$slug" || die "slug must be [a-zA-Z0-9._-] and not \"none\", \".\" or \"..\""
   require_repo
+  take_lock
   local cur; cur=$(active_slug)
   if [ -n "$cur" ]; then
     printf 'contract: %s is already active in this worktree; close it first\n' "$cur" >&2
     exit 3
   fi
-  mkdir -p "$CDIR/closed" || die "cannot create $CDIR"
-  # The contracts dir must ignore itself: rollout repos do not globally
-  # ignore docs/superpowers/, and a tracked note would become git-tracked
-  # runtime state. Idempotent: an existing .gitignore is left alone.
-  if [ ! -f "$CDIR/.gitignore" ]; then
-    printf '*\n' > "$CDIR/.gitignore" || die "cannot write $CDIR/.gitignore"
+  if [ -e "$CDIR/$slug.md" ]; then
+    die "$CDIR/$slug.md already exists — pick another slug, or close/abandon what left it behind"
   fi
+  mkdir -p "$CDIR/closed" 2>/dev/null || ensure_state_dir "$CDIR/closed"
+  # A notes dir INSIDE the worktree — only a legacy one now — must ignore
+  # itself: rollout repos do not globally ignore docs/superpowers/, and a
+  # tracked note would become git-tracked runtime state. Idempotent: an
+  # existing .gitignore is left alone. External state needs none.
+  case "$CDIR" in
+    "$WT"/*)
+      if [ ! -f "$CDIR/.gitignore" ]; then
+        printf '*\n' > "$CDIR/.gitignore" || die "cannot write $CDIR/.gitignore — $(legacy_hint)"
+      fi
+      ;;
+  esac
   local base sha
   base=$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)
   sha=$(git -C "$WT" rev-parse --short HEAD 2>/dev/null || echo unknown)
@@ -189,14 +440,21 @@ Opened: $(date -u +%Y-%m-%dT%H:%M:%SZ) · Worktree: $WT · Base: $base@$sha
 
 EOF
   then
-    die "cannot write $CDIR/$slug.md"
+    die "cannot write $CDIR/$slug.md — $(legacy_hint)"
   fi
   if ! printf '%s\n' "$slug" > "$ACTIVE_FILE"; then
     # Leave no orphan: a note on disk with no ACTIVE claims success while
     # the gate still denies.
     rm -f "$CDIR/$slug.md"
-    die "cannot write $ACTIVE_FILE — note removed, no contract is active"
+    die "cannot write $ACTIVE_FILE — note removed, no contract is active; $(legacy_hint)"
   fi
+  # Pin LAST, once the note and ACTIVE are both on disk: a pin written before
+  # them survives a failed `new` and permanently hides any in-repo contract.
+  # Without it, an in-repo pair appearing later would mask this contract at the
+  # next resolve and the gate would consult the wrong one.
+  case "$CDIR" in
+    "$WDIR") : > "$EXTERNAL_PIN" || die "opened $slug but cannot write $EXTERNAL_PIN" ;;
+  esac
   printf 'contract: opened %s\n' "$CDIR/$slug.md"
 }
 
@@ -209,6 +467,7 @@ cmd_show() {
 
 cmd_close() {
   require_repo
+  take_lock
   local slug; slug=$(active_slug)
   [ -n "$slug" ] || die "no active contract in this worktree"
   local note="$CDIR/$slug.md"
@@ -219,9 +478,13 @@ cmd_close() {
     printf 'contract: Evidence is empty in %s — run the verifier and paste its real output first\n' "$note" >&2
     exit 4
   fi
-  mkdir -p "$CDIR/closed"
-  mv "$note" "$CDIR/closed/$slug.md"
+  mkdir -p "$CDIR/closed" || die "cannot create $CDIR/closed — $(legacy_hint)"
+  local archived; archived=$(archive_path "$slug")
+  mv "$note" "$archived" || die "cannot archive $note — $(legacy_hint)"
   rm -f "$ACTIVE_FILE"
+  # A close that cannot clear ACTIVE leaves the contract active while claiming
+  # otherwise — the one outcome worse than refusing.
+  [ -e "$ACTIVE_FILE" ] && die "archived the note but cannot remove $ACTIVE_FILE — $slug is still active; $(legacy_hint)"
   printf 'contract: closed %s\n' "$slug"
 }
 
@@ -230,21 +493,29 @@ cmd_close() {
 # so a contract whose note was hand-deleted can still be cleaned up.
 cmd_abandon() {
   require_repo
+  take_lock
   local slug=""
   [ -f "$ACTIVE_FILE" ] && [ -s "$ACTIVE_FILE" ] && slug=$(cat "$ACTIVE_FILE")
   [ -n "$slug" ] || die "no active contract in this worktree"
+  slug_ok "$slug" || die "$ACTIVE_FILE holds an unusable slug — delete it by hand"
   local reason="${*:-no reason given}"
   local note="$CDIR/$slug.md"
-  if [ -f "$note" ]; then
-    mkdir -p "$CDIR/closed" || die "cannot create $CDIR/closed"
-    printf '\n## ABANDONED\n\n%s — %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$reason" >> "$note" \
-      || die "cannot mark $note abandoned"
-    mv "$note" "$CDIR/closed/$slug.md" || die "cannot archive $note"
-  fi
-  rm -f "$ACTIVE_FILE"
   local sanitized
   sanitized=$(printf '%s' "$reason" | tr '\n\r\t' ' ')
-  printf '%s\t%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$slug" "$WT" "$sanitized" >> "$ABANDONLOG"
+  ensure_state_dir "$RDIR"
+  # Same order as skip: prove the log is appendable before touching anything,
+  # so neither a false record nor a silent abandon is possible.
+  : >> "$ABANDONLOG" || die "cannot append to $ABANDONLOG — nothing abandoned"
+  if [ -f "$note" ]; then
+    mkdir -p "$CDIR/closed" || die "cannot create $CDIR/closed — $(legacy_hint)"
+    printf '\n## ABANDONED\n\n%s — %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$reason" >> "$note" \
+      || die "cannot mark $note abandoned — $(legacy_hint)"
+    mv "$note" "$(archive_path "$slug")" || die "cannot archive $note — $(legacy_hint)"
+  fi
+  rm -f "$ACTIVE_FILE"
+  [ -e "$ACTIVE_FILE" ] && die "cannot remove $ACTIVE_FILE — $slug is still active; $(legacy_hint)"
+  printf '%s\t%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$slug" "$WT" "$sanitized" >> "$ABANDONLOG" \
+    || die "abandoned $slug but could not append to $ABANDONLOG — record it by hand"
   printf 'contract: abandoned %s — the gate is re-armed\n' "$slug"
 }
 
@@ -252,25 +523,90 @@ cmd_skip() {
   local sid="${1:-}"; shift 2>/dev/null || true
   local reason="$*"
   [ -n "$sid" ] || die "usage: contract skip <session_id> <reason>"
-  case "$sid" in
-    *[!A-Za-z0-9._-]*) die "session id must match [A-Za-z0-9._-]+ — got '$sid' (do not paste the <session_id> placeholder verbatim)" ;;
-  esac
+  # Same validation as a slug: the id names a marker file, so "." and ".." would
+  # log a skip and then fail to write it — an audit record of a bypass that
+  # never happened.
+  slug_ok "$sid" || die "session id must match [A-Za-z0-9._-]+ and not be '.', '..' or 'none' — got '$sid' (do not paste the <session_id> placeholder verbatim)"
   [ -n "$reason" ] || die "a reason is required — the escape hatch is logged, not silent"
   require_repo
-  mkdir -p "$SKIPDIR"
-  printf '%s\n' "$reason" > "$SKIPDIR/$sid"
+  ensure_state_dir "$SKIPDIR"
   # Sanitize reason for log: collapse newlines, carriage returns, and tabs to single spaces
   local sanitized_reason
   sanitized_reason=$(printf '%s' "$reason" | tr '\n\r\t' ' ')
-  printf '%s\t%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$sid" "$WT" "$sanitized_reason" >> "$SKIPLOG"
+  # "The only bypass that leaves a record" is the whole argument for this hatch,
+  # so: prove the log can be appended, THEN grant the bypass, THEN record it.
+  # Logging first recorded skips that failed to take; logging last left an
+  # unlogged bypass when the append failed.
+  : >> "$SKIPLOG" || die "cannot append to $SKIPLOG — refusing to skip unlogged"
+  printf '%s\n' "$reason" > "$SKIPDIR/$sid" || die "cannot write $SKIPDIR/$sid"
+  printf '%s\t%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$sid" "$WT" "$sanitized_reason" >> "$SKIPLOG" \
+    || { rm -f "$SKIPDIR/$sid"; die "cannot append to $SKIPLOG — the skip was withdrawn"; }
   printf 'contract: gate skipped for this session — logged to %s\n' "$SKIPLOG"
 }
 
+# Adopt a contract left in the old in-repo home into external state, so it can
+# be closed from a session that cannot write the repo — the case the whole move
+# exists for, and the one where `close` on a legacy note still fails. Writes the
+# external pin, after which in-repo notes are never consulted for this worktree
+# again; leftover files there are reported, not silently trusted.
+cmd_migrate() {
+  require_repo
+  take_lock
+  if [ -f "$EXTERNAL_PIN" ]; then
+    printf 'contract: %s already pinned to %s\n' "$WT" "$WDIR"
+    return 0
+  fi
+  case "$CDIR" in
+    "$WT"/*) ;;
+    *) ensure_state_dir "$WDIR/closed"
+       : > "$EXTERNAL_PIN" || die "cannot write $EXTERNAL_PIN"
+       printf 'contract: nothing in-repo to migrate; %s is now pinned to %s\n' "$WT" "$WDIR"
+       return 0 ;;
+  esac
+  # Two live in-repo homes cannot both be adopted, and picking one by list order
+  # would retire the other's contract silently. Make the human choose.
+  local other live_others=""
+  for other in "$WT/docs/contracts" "$WT/docs/superpowers/contracts"; do
+    [ "$other" = "$CDIR" ] && continue
+    [ -s "$other/ACTIVE" ] || continue
+    local oslug; oslug=$(cat "$other/ACTIVE" 2>/dev/null)
+    slug_ok "$oslug" && [ -f "$other/$oslug.md" ] && live_others="$other"
+  done
+  [ -z "$live_others" ] || die "two in-repo homes hold live contracts ($CDIR and $live_others) — close or delete one first"
+  local legacy="$CDIR" slug; slug=$(cat "$legacy/ACTIVE" 2>/dev/null)
+  slug_ok "$slug" || die "$legacy/ACTIVE holds an unusable slug — delete it by hand"
+  # Never migrate over external state: an ACTIVE or a note already there belongs
+  # to a contract of its own, and cp would destroy it.
+  [ -e "$WDIR/ACTIVE" ] && die "$WDIR/ACTIVE already names an active contract — close or abandon it before migrating"
+  [ -e "$WDIR/$slug.md" ] && die "$WDIR/$slug.md already exists — move it aside before migrating"
+  ensure_state_dir "$WDIR/closed"
+  # Roll back on any failure: a half-migration (note copied, no pin) makes every
+  # retry fail on the external ACTIVE it left behind, with no command to undo it.
+  cp "$legacy/$slug.md" "$WDIR/$slug.md" || die "cannot copy $legacy/$slug.md to $WDIR"
+  if ! printf '%s\n' "$slug" > "$WDIR/ACTIVE"; then
+    rm -f "$WDIR/$slug.md"
+    die "cannot write $WDIR/ACTIVE — nothing migrated"
+  fi
+  if ! : > "$EXTERNAL_PIN"; then
+    rm -f "$WDIR/ACTIVE" "$WDIR/$slug.md"
+    die "cannot write $EXTERNAL_PIN — nothing migrated"
+  fi
+  printf 'contract: migrated %s to %s\n' "$slug" "$WDIR/$slug.md"
+  if rm -f "$legacy/ACTIVE" "$legacy/$slug.md" 2>/dev/null && [ ! -e "$legacy/ACTIVE" ]; then
+    printf 'contract: removed the in-repo copies under %s\n' "$legacy"
+  else
+    printf 'contract: %s could not be cleaned up (this repo denies writes there); it is now ignored\n' "$legacy"
+  fi
+}
+
+# The gate passes the session id straight from its payload, so this is
+# untrusted input naming a file: "../skips.log" exists as soon as any skip has
+# been taken, and answered "yes, skipped" for every session.
 cmd_skipped() {
   local sid="${1:-}"
-  [ -n "$sid" ] || return 1
+  slug_ok "$sid" || return 1
   resolve_paths "$PWD" || return 1
-  [ -f "$SKIPDIR/$sid" ]
+  [ -f "$SKIPDIR/$sid" ] || [ -f "$SKIPDIR_LEGACY/$sid" ]
 }
 
 main() {
@@ -285,6 +621,7 @@ main() {
     abandon) cmd_abandon "$@" ;;
     skip)    cmd_skip "$@" ;;
     skipped) cmd_skipped "$@" ;;
+    migrate) cmd_migrate ;;
     lint)    cmd_lint "$@" ;;
     *) printf 'contract: unknown subcommand %s\n' "$sub" >&2; return 2 ;;
   esac
