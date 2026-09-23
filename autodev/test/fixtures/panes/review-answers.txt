@@ -1,0 +1,16 @@
+  Steps 1-2 of the handoff are done; step 3 is the one that needs you.
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+←  ☒ Push/PR  ☒ Ruling  ✔ Submit  →
+
+Review your answers
+
+ │ ● The probe is committed but has never been pushed. How should the evidence reach the reviewer?
+   → Push the branch only (Recommended)
+ │ ● Both candidate metrics are now refuted. What should the evaluation report instead?
+   → I'll rule later, just record it
+
+Ready to submit your answers?
+
+❯ 1. Submit answers
+  2. Cancel

@@ -78,13 +78,18 @@ _HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Hard ceiling on the nudge text. Also enforced inside the composer; duplicated
 # here because this is the last point before the characters reach a live pane.
 : "${PM_NUDGE_MAX_CHARS:=240}"
-: "${PM_NUDGE_READ_LINES:=40}"
 : "${PM_NUDGE_COMPOSE_TIMEOUT:=30}"
 # fleet-digest.json is a nice-to-have extra fact source that does not exist on
 # every machine, so it is read opportunistically and never gates anything.
 : "${PM_NUDGE_DIGEST:=$STATE/fleet-digest.json}"
 : "${PM_NUDGE_DIGEST_MAX_AGE:=3600}"
 : "${PM_NUDGE_HERDR:=herdr}"
+# Every read of the PM's screen and every keystroke into it goes through
+# mux-lib.sh's shared gate, which refuses to type into a pane awaiting the human.
+# Without the library there is no gate, so there is nothing safe to do.
+# shellcheck disable=SC2034  # read by mux-lib.sh
+MUX_HERDR="$PM_NUDGE_HERDR"
+[ -f "$_HERE/mux-lib.sh" ] && . "$_HERE/mux-lib.sh"
 : "${PM_NUDGE_VENV:=$AUTODEV_HOME/venv/pm-nudge}"
 : "${PM_NUDGE_PY:=$PM_NUDGE_VENV/bin/python}"
 : "${PM_NUDGE_COMPOSER:=$_HERE/pm-nudge-compose.py}"
@@ -142,6 +147,7 @@ fi
 
 command -v jq >/dev/null 2>&1 || { log "-" "ERROR jq not found; cannot parse herdr JSON"; exit 0; }
 command -v "$PM_NUDGE_HERDR" >/dev/null 2>&1 || { log "-" "ERROR herdr not found ($PM_NUDGE_HERDR)"; exit 0; }
+command -v mux_awaiting_human >/dev/null 2>&1 || { log "-" "ERROR mux-lib.sh not found next to $0; no send gate, not acting"; exit 0; }
 
 # --- cycle lock --------------------------------------------------------------
 # One cycle can outlive a timer tick, because the composer is a network call.
@@ -239,26 +245,16 @@ if fresh "$PM_NUDGE_DIGEST" "$PM_NUDGE_DIGEST_MAX_AGE"; then
 fi
 
 # --- pane-buffer safety check ------------------------------------------------
-# Three-valued on purpose:
-#   0 clear        — nothing that looks like a menu; Enter is safe
-#   1 menu         — something IS waiting for a keystroke; do not stage, do not send
-#   2 inconclusive — herdr would not tell us; stage only, never Enter
-#
-# The three-way split is the whole point. A two-valued check has to fold
-# "inconclusive" into one of the other two, and either choice is wrong: fold it
-# into "clear" and a failed read becomes a blind Enter into an unknown pane; fold
-# it into "menu" and one transient herdr hiccup silently kills the feature.
-#
-# Note this is stricter than the obvious design: a POSITIVE menu detection
-# suppresses even send-text, because send-text into an open permission dialog
-# types into that dialog's filter box rather than into a prompt.
-MENU_RE='(Do you want to |Would you like to |❯[[:space:]]*[0-9]+\.|^[[:space:]]*[0-9]+\.[[:space:]]+(Yes|No)\b|\(y/n\)|\[y/N\]|\[Y/n\]|Select an option|Choose an option|esc to interrupt|Press Enter to continue)'
-buffer_state(){ # $1 = pane id
-  local out
-  out=$("$PM_NUDGE_HERDR" pane read "$1" --source visible --lines "$PM_NUDGE_READ_LINES" --format text 2>/dev/null) || return 2
-  [ -n "$(printf '%s' "$out" | tr -d '[:space:]')" ] || return 2
-  printf '%s\n' "$out" | tail -n 15 | grep -Eq "$MENU_RE" && return 1
-  return 0
+# mux_awaiting_human (mux-lib.sh) is the one detector every pane injector shares:
+# an open question menu, permission prompt or other dialog at the bottom of the
+# pane, or herdr reporting `blocked`. It fails SAFE — a pane that cannot be read,
+# or reads blank, counts as awaiting — so an unknown pane gets nothing: not
+# Enter, and not staged text either, because in a select menu typed characters
+# are keystrokes and a digit picks an option. The send helpers re-check it at
+# the keystroke. A deferred workspace records no cooldown, so the next pass
+# simply tries again.
+pm_awaiting_human(){ # $1 = pane id
+  MUX=herdr PANE="$1" mux_awaiting_human
 }
 
 # Re-read the pane's own status straight from herdr immediately before acting.
@@ -452,12 +448,10 @@ while IFS= read -r rec; do
     continue
   fi
 
-  buffer_state "$pm_pane"; bstate=$?
-  case "$bstate" in
-    1) log "$ws" "ABORT $pm_pane shows an interactive prompt/menu; not staging anything"
-       continue ;;
-    2) log "$ws" "DEGRADE could not read $pm_pane's buffer; stage-only (never Enter)" ;;
-  esac
+  if pm_awaiting_human "$pm_pane"; then
+    log "$ws" "DEFER awaiting-human: $pm_pane shows an open question/prompt or could not be read; not staging anything"
+    continue
+  fi
 
   # -- compose (model), with the baseline as the guaranteed floor -------------
   facts=$(jq -n -c \
@@ -489,25 +483,32 @@ while IFS= read -r rec; do
   [ -n "$text" ] || { text=$(sanitize "$WS_BASELINE"); src=baseline; }
   log "$ws" "TEXT ($src) $text"
 
-  if ! "$PM_NUDGE_HERDR" pane send-text "$pm_pane" "$text" >/dev/null 2>&1; then
+  MUX=herdr PANE="$pm_pane" mux_stage_text "$text"; rc=$?
+  if [ "$rc" = "$MUX_REFUSED" ]; then
+    log "$ws" "DEFER awaiting-human: $pm_pane opened a question/prompt before staging; nothing staged"
+    continue
+  elif [ "$rc" != 0 ]; then
     log "$ws" "ERROR send-text failed for $pm_pane; nothing staged, no cooldown recorded"
     continue
   fi
   log "$ws" "STAGED into $pm_pane ($src, ${#text} chars)"
 
-  if [ "$MODE" = send ] && [ "$bstate" = 0 ]; then
-    if "$PM_NUDGE_HERDR" pane send-keys "$pm_pane" Enter >/dev/null 2>&1; then
+  if [ "$MODE" = send ]; then
+    MUX=herdr PANE="$pm_pane" mux_send_key Enter; rc=$?
+    if [ "$rc" = 0 ]; then
       log "$ws" "SENT Enter to $pm_pane"
+    elif [ "$rc" = "$MUX_REFUSED" ]; then
+      log "$ws" "DEFER awaiting-human: $pm_pane opened a question/prompt after staging; text staged, Enter withheld"
+      continue
     else
       log "$ws" "ERROR send-keys Enter failed for $pm_pane; text remains staged"
     fi
-  elif [ "$MODE" = send ]; then
-    log "$ws" "STAGE-ONLY (degraded) — text is staged in $pm_pane but NOT submitted"
   fi
 
-  # The cooldown is recorded once anything reached the pane, submitted or not:
-  # re-staging on top of already-staged text is exactly the repeat-nudge this
-  # cooldown exists to prevent.
+  # Stage-only deliberately records a cooldown because staging is its completed
+  # action. Send mode records one after Enter succeeds, or after a backend error
+  # leaves text staged. A safety refusal above is a deferral and retries without
+  # consuming the cooldown.
   : > "$cool_f"
 done <<< "$CLASS"
 

@@ -77,17 +77,28 @@ has_limit(){ mux_capture | grep -Eiq "$LIMIT_RE"; }
 pane_busy(){ mux_busy; }
 pane_live(){ mux_pane_live; }
 
+# The pane shows a question or prompt put to the HUMAN; typing would answer it.
+# Stand down as for a busy pane: the next Stop re-launches this watcher, and
+# nothing here ever escalates into sending anyway.
+defer_awaiting(){ # $1 = what was refused
+  log "DEFER awaiting-human: refused [$1]; pane shows an open question/permission prompt"
+  exit 0
+}
 send(){ # one literal line + Enter to the pane (via herdr/tmux)
   local text="$1"
   if [ "$DRY" = 1 ]; then log "DRY would send: [$text]"; else
     mux_send_line "$text" 2>>"$LOG"
+    [ "$?" = "${MUX_REFUSED:-3}" ] && defer_awaiting "$text"
     log "SENT: [$text]"
   fi
 }
-send_key(){ # a named key (e.g. Escape), no literal
+send_key(){ # [--own-prompt] a named key (e.g. Escape), no literal
+  local own=""; [ "$1" = --own-prompt ] && { own="$1"; shift; }
   local key="$1"
   if [ "$DRY" = 1 ]; then log "DRY would send-key: [$key]"; else
-    mux_send_key "$key" 2>>"$LOG"; log "SENT key: [$key]"
+    mux_send_key ${own:+"$own"} "$key" 2>>"$LOG"
+    [ "$?" = "${MUX_REFUSED:-3}" ] && defer_awaiting "key $key"
+    log "SENT key: [$key]"
   fi
 }
 wait_pane_idle(){ local d=$(( $(date +%s) + ${1:-30} )); while [ "$(date +%s)" -lt "$d" ]; do pane_busy || return 0; sleep "$POLL"; done; return 1; }
@@ -138,7 +149,10 @@ if [ ! -f "$STATE/no-usage-credits" ]; then
       log "CYCLE COMPLETE via usage-credits (dry=$DRY)"; exit 0
     fi
     log "usage-credits did not clear the limit; falling back to wait-for-reset"
-    send_key Escape   # dismiss any dialog it may have opened before we wait
+    # Dismiss any dialog /usage-credits itself opened. That is our own prompt: a
+    # limit-stopped session runs no turn, so it cannot have put a question to the
+    # human since the guarded /usage-credits send above found none open.
+    send_key --own-prompt Escape
     sleep 1
   fi
 else
