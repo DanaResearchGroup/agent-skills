@@ -136,8 +136,10 @@ mux_busy(){
     herdr)
       st=$(mux_status)
       case "$st" in
-        working)           return 0 ;;                       # running a turn => busy
-        idle|done|blocked) return 1 ;;                       # at a prompt => safe
+        working|blocked)   return 0 ;;                       # running a turn, or parked at a
+                                                             # question/permission menu => busy:
+                                                             # an injected Enter would answer it
+        idle|done)         return 1 ;;                       # at the input prompt => safe
         *) mux_capture | tail -15 | grep -Eq "$MUX_BUSY_RE" ;; # unknown => scrape
       esac ;;
     tmux)  tmux capture-pane -t "$PANE" -p 2>/dev/null | tail -15 | grep -Eq "$MUX_BUSY_RE" ;;
