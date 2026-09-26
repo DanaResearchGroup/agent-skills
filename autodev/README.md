@@ -349,11 +349,10 @@ Two things worth stating outright rather than leaving to be discovered:
 | `--send` | Stage, then `send-keys Enter`. Requires `$STATE/pm-nudge.armed`; without it, degrades to a dry run and logs `NOT ARMED`. |
 
 Before acting, `--send`/`--stage-only` re-read the pane's status **live** (the list snapshot can be
-tens of seconds stale by the time the composer returns) and inspect the visible buffer. The buffer
-check is three-valued, which is the whole point: *clear* → Enter is allowed; *menu detected* → stage
-nothing at all (send-text into an open permission dialog types into that dialog's filter box);
-*inconclusive*, because herdr would not answer → stage, but **never** Enter. A two-valued check has
-to fold "inconclusive" into one of the others, and both choices are wrong.
+tens of seconds stale by the time the composer returns) and run the shared awaiting-human gate
+(below). A pane showing a question or prompt, or one herdr will not let us read, gets **nothing**:
+not Enter, and not staged text either, because in a select menu typed characters are keystrokes and
+a digit picks an option. It records no cooldown, so the next pass retries.
 
 Newlines are stripped from the nudge text, in the composer and again in the shell. An embedded
 newline in a `send-text` payload submits it — which would silently turn `--stage-only` into a send.
@@ -419,7 +418,7 @@ never `python3`. Two traps the installer works around, both live on this machine
 | `pm-nudge/<ws>.dry-noted` | Rate-limits the dry-run "would have fired" notice to one per cooldown. Nothing consumes dry-run state, so an unarmed daemon would otherwise log the same line 288×/day forever. Deliberately a *separate* file: a dry run must never be able to suppress the first real nudge after arming. |
 
 Env tunables: `PM_NUDGE_DEBOUNCE=300`, `PM_NUDGE_COOLDOWN=7200`, `PM_NUDGE_MAX_CHARS=240`,
-`PM_NUDGE_READ_LINES=40`, `PM_NUDGE_COMPOSE_TIMEOUT=30`, `PM_NUDGE_PM_RE`, `PM_NUDGE_WORKER_RE`,
+`PM_NUDGE_COMPOSE_TIMEOUT=30`, `PM_NUDGE_PM_RE`, `PM_NUDGE_WORKER_RE`,
 `PM_NUDGE_HERDR`, `PM_NUDGE_VENV`, `PM_NUDGE_PY`, `PM_NUDGE_PY_ARGS`, `PM_NUDGE_COMPOSER`,
 `PM_NUDGE_DIGEST`, `PM_NUDGE_DIGEST_MAX_AGE`. Log: `$AUTODEV_HOME/logs/pm-nudge.log`.
 
@@ -454,15 +453,28 @@ its panes sit in `.../scm-pm2`, and the ticket label on `wH:p28` is what makes `
   possible. Both watchers gate on a real idle check and **defer** while the pane is busy
   (long turn, `/compact`, or background agents) — the host queues input while busy, so a
   perpetually-busy run may have no safe injection window until it next goes idle.
+- **A pane awaiting the human is never typed into.** An open `AskUserQuestion` menu or permission
+  prompt does not queue input: Enter *answers* it with the pre-highlighted option (usually the
+  `(Recommended)` one), and the agent records that as the owner's decision. This happened twice on
+  2026-09-23. `mux_awaiting_human` in `mux-lib.sh` detects it from herdr's `blocked` status or from
+  the dialog's own chrome at the bottom of the pane (`Esc to cancel`/`Enter to select` footers, the
+  `❯ N.` selector, numbered Yes/No rows), and fails **safe**: an unreadable or blank pane counts as
+  awaiting. `mux_send_line`, `mux_stage_text` and `mux_send_key` all re-check it and refuse
+  (exit 3) at the keystroke, so no sender can skip it; `mux_busy` also counts it as busy so the
+  watchers' waits treat it like a running turn. Senders log `DEFER awaiting-human` and retry on the
+  next sweep/Stop; a deferral stamps no cooldown and no abort count, and never escalates into a send.
+  `mux_send_key --own-prompt` is the one bypass, for a dialog the caller's own command just opened
+  (Codex's `/compact` confirmation, the dialog `/usage-credits` opens on a limit-stopped session).
+  Fixtures: `test/fixtures/panes/`; tests: `test/test-awaiting-human.sh`.
 - `/compact` cannot be triggered by the model or a hook — only the user or the external
   watcher (via herdr or tmux). The host does not reliably auto-continue after `/compact`; the watcher's explicit
   continue-send (and the `SessionStart(compact)` hook) is what resumes.
-- **PM-nudger's pane-buffer check is a heuristic over rendered text**, not a supported API: it
-  greps the visible buffer for permission-prompt and menu markers. It is deliberately biased —
-  an unreadable or ambiguous buffer degrades to stage-only rather than pressing Enter — but a
-  novel dialog it has never seen could still read as "clear". The classification regexes are
-  likewise inferred from observed campaign naming, not guaranteed by herdr; both are
-  env-overridable for exactly that reason.
+- **The awaiting-human check is a heuristic over rendered text**, not a supported API: it greps
+  the bottom of the pane for dialog chrome. It is deliberately biased (unreadable means awaiting),
+  but a novel dialog with chrome it has never seen could still read as "clear" unless herdr's own
+  detector reports it `blocked`.
+- **PM-nudger's classification regexes are inferred** from observed campaign naming, not
+  guaranteed by herdr, and are env-overridable for exactly that reason.
 - **Phoenix unverified-live premises** (can't be probed without a real limit; the
   parse→wait→continue path is dry-run-verified): (a) that the `Stop` hook fires when a turn
   is cut off by the limit; (b) exactly what `/usage-credits` does in the TUI — if it opens a

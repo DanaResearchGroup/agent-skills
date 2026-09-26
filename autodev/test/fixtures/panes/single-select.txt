@@ -1,0 +1,21 @@
+● Bash(git -C /repo worktree list)
+  ⎿  /repo   1a2b3c4d [main]
+
+● Verified before asking: both premises in the handoff still hold, and the branch is clean.
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+←  ☐ Next work  ☐ Stray files  ✔ Submit  →
+
+│ The previous mission is delivered and there is no live work. What should this session do?
+
+❯ 1. File the follow-up issue (Recommended)
+     Write one issue covering the confirmed defect, with the file:line anchors re-verified just now.
+     Read-only until you approve the issue text.
+  2. Retire the stale contract
+     Close it against its Verifier and dispose of the worktree. Bookkeeping only.
+  3. Nothing, park the session
+     Stop here and file a compact-request so nothing is left in flight.
+  4. Type something.
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · Tab/Arrow keys to navigate · Esc to cancel

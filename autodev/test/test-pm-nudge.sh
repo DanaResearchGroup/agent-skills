@@ -10,7 +10,7 @@
 #
 # The properties under test are the ones where being wrong means typing into
 # somebody's live session: never while anything is blocked, never before the
-# debounce, never twice inside the cooldown, and never Enter when the pane's
+# debounce, never twice inside the cooldown, and never a keystroke when the pane's
 # buffer could not be read.
 
 . "$(dirname "$0")/lib.sh"
@@ -26,6 +26,9 @@ setup_nudge() {
   : > "$SB/sent-keys.log"
   : > "$SB/herdr/ws.tsv"
   : > "$SB/herdr/panes.tsv"
+  # Every pane reads as a plain idle prompt unless a test says otherwise: the
+  # send gate fails safe, so a pane with no readable screen is never typed at.
+  cp "$SKILL_DIR/test/fixtures/panes/idle-prompt.txt" "$SB/herdr/read-default.txt"
 
   cat > "$SB/fakebin/herdr" <<'STUB'
 #!/usr/bin/env bash
@@ -44,12 +47,14 @@ case "${1:-} ${2:-}" in
       fi ;;
   "pane read")
       [ -f "$H/read-fail" ] && exit 1
-      f="$H/read-$(safe "$3").txt"; [ -f "$f" ] || exit 1
+      f="$H/read-$(safe "$3").txt"; [ -f "$f" ] || f="$H/read-default.txt"
+      [ -f "$f" ] || exit 1
       cat "$f" ;;
   "pane send-text")
       [ -f "$H/sendtext-fail" ] && exit 1
       shift 2; p="$1"; shift
-      printf '%s\t%s\n' "$p" "$*" >> "$SB/sent-text.log" ;;
+      printf '%s\t%s\n' "$p" "$*" >> "$SB/sent-text.log"
+      [ ! -f "$H/after-sendtext.txt" ] || cp "$H/after-sendtext.txt" "$H/read-$(safe "$p").txt" ;;
   "pane send-keys")
       shift 2; p="$1"; shift
       printf '%s\t%s\n' "$p" "$*" >> "$SB/sent-keys.log" ;;
@@ -246,7 +251,6 @@ run_sweep --stage-only
 assert_eq "the cooldown suppresses the immediate re-nudge" "$(wc -l < "$SB/sent-text.log")" "1"
 run_sweep --report
 assert_contains "and --report attributes the silence to the cooldown" "$(report)" "COOLDOWN:"
-COOLDOWN=1 run_sweep --stage-only
 cooldown_since wG 2
 COOLDOWN=1 run_sweep --stage-only
 assert_eq "fires again once the cooldown has lapsed" "$(wc -l < "$SB/sent-text.log")" "2"
@@ -308,15 +312,19 @@ echo "== the pre-send buffer check =="
 setup_nudge; fx_ready; : > "$STATE/pm-nudge.armed"
 : > "$SB/herdr/read-fail"          # herdr will not tell us what is on screen
 run_sweep --send
-assert_eq "an unreadable buffer still stages" "$(wc -l < "$SB/sent-text.log")" "1"
+# In a select menu, staged characters are keystrokes and a digit picks an
+# option, so an unknown screen gets no text at all, not just no Enter.
+assert_eq "an unreadable buffer stages nothing" "$(wc -l < "$SB/sent-text.log")" "0"
 assert_eq "an unreadable buffer NEVER presses Enter" "$(wc -l < "$SB/sent-keys.log")" "0"
-assert_contains "the degrade is logged" "$(nudgelog)" "DEGRADE"
+assert_contains "the deferral is logged" "$(nudgelog)" "DEFER awaiting-human"
+assert_no_file "and records no cooldown, so the next pass retries" "$STATE/pm-nudge/wG.cooldown"
 sandbox_rm
 
 setup_nudge; fx_ready; : > "$STATE/pm-nudge.armed"
 printf '   \n\n  \n' > "$SB/herdr/read-wG_p4F.txt"   # readable, but empty
 run_sweep --send
-assert_eq "a blank buffer reads as inconclusive, not as clear" "$(wc -l < "$SB/sent-keys.log")" "0"
+assert_eq "a blank buffer reads as awaiting, not as clear" "$(wc -l < "$SB/sent-keys.log")" "0"
+assert_eq "and stages nothing" "$(wc -l < "$SB/sent-text.log")" "0"
 sandbox_rm
 
 setup_nudge; fx_ready; : > "$STATE/pm-nudge.armed"
@@ -329,7 +337,38 @@ BUF
 run_sweep --send
 assert_eq "an open permission menu blocks Enter" "$(wc -l < "$SB/sent-keys.log")" "0"
 assert_eq "an open permission menu blocks send-text too" "$(wc -l < "$SB/sent-text.log")" "0"
-assert_contains "and is logged as an abort" "$(nudgelog)" "interactive prompt/menu"
+assert_contains "and is logged as a deferral" "$(nudgelog)" "DEFER awaiting-human"
+sandbox_rm
+
+# The old private regex scanned the last 15 lines for a "❯ N." row; the preview
+# and long-description layouts push that row far above the footer, so it read
+# them as clear and pressed Enter on the recommended option.
+for fx in preview single-select multi-select review-answers; do
+  setup_nudge; fx_ready; : > "$STATE/pm-nudge.armed"
+  cp "$SKILL_DIR/test/fixtures/panes/$fx.txt" "$SB/herdr/read-wG_p4F.txt"
+  run_sweep --send
+  assert_eq "an open $fx question gets no Enter" "$(wc -l < "$SB/sent-keys.log")" "0"
+  assert_eq "an open $fx question gets no staged text" "$(wc -l < "$SB/sent-text.log")" "0"
+  sandbox_rm
+done
+
+# The pane can open a question after text was staged but before Enter. The
+# second chokepoint refuses Enter, and a refusal remains immediately retryable.
+setup_nudge; fx_ready; : > "$STATE/pm-nudge.armed"
+cp "$SKILL_DIR/test/fixtures/panes/single-select.txt" "$SB/herdr/after-sendtext.txt"
+run_sweep --send
+assert_eq "a question opening after staging gets no Enter" "$(wc -l < "$SB/sent-keys.log")" "0"
+assert_eq "the nudge text was staged before the race" "$(wc -l < "$SB/sent-text.log")" "1"
+assert_contains "the mid-send refusal is logged as a deferral" "$(nudgelog)" "opened a question/prompt after staging"
+assert_no_file "a refused Enter records no cooldown, so the next pass retries" "$STATE/pm-nudge/wG.cooldown"
+sandbox_rm
+
+# herdr's own detector calls an open question form `blocked`; the live
+# re-read must not treat that as quiet even if the screen read looked clear.
+setup_nudge; fx_ready; : > "$STATE/pm-nudge.armed"
+printf 'blocked\n' > "$SB/herdr/get-wG_p4F.status"
+run_sweep --send
+assert_eq "a PM herdr calls blocked is not typed at" "$(wc -l < "$SB/sent-text.log")" "0"
 sandbox_rm
 
 echo "== re-confirmation against live herdr, not the opening snapshot =="

@@ -1,0 +1,16 @@
+● I have what I need for the release notes except which checks to gate on.
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+←  ☐ Checks  ✔ Submit  →
+
+│ Which checks should gate the merge?
+
+❯ 1. [ ] Unit tests
+     Fast; runs in about 20 seconds.
+  2. [✔] Shell suite
+     autodev/test/ci.sh, the watcher tests.
+  3. [ ] Lint
+     shellcheck over bin/.
+  4. [ ] Type something
+     Submit
+
+Enter to select · ↑/↓ to navigate · Esc to cancel
