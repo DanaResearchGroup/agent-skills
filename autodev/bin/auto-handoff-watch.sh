@@ -236,17 +236,40 @@ wait_turn_done(){ # $1 = since epoch, $2 = timeout: idle marker newer AND pane i
   return 1
 }
 
+# The pane is showing a question or prompt put to the HUMAN. Typing now would
+# answer it, so stand down exactly as for a busy pane: no cooldown, no abort
+# count, and the sweeper re-invokes us later. Nothing here ever escalates into
+# sending anyway. If nothing has reached the pane yet this cycle, re-file the
+# request marker consumed at TRIGGER (with its original age), so the refusal
+# costs a retry, not the request.
+landed=0
+defer_awaiting(){ # $1 = where
+  if [ "$landed" = 0 ] && [ -n "${consumed:-}" ]; then
+    : > "$consumed" 2>/dev/null && touch -d "@$consumed_mtime" "$consumed" 2>/dev/null
+  fi
+  log "DEFER awaiting-human ($1): pane shows an open question/permission prompt pct=$pct — retry next sweep"
+  exit 0
+}
+
 send(){ # send one literal line + Enter to the registered pane (via herdr/tmux)
-  local text="$1"
+  local text="$1" rc
   if [ "$DRY" = 1 ]; then
     log "DRY would send: [$text]"
   else
-    mux_send_line "$text" 2>>"$LOG"
+    mux_send_line "$text" 2>>"$LOG"; rc=$?
+    [ "$rc" = "${MUX_REFUSED:-3}" ] && defer_awaiting "refused [$text]"
+    [ "$rc" = 0 ] || abort_cycle "send failed for [$text]"
+    landed=1
     log "SENT: [$text]"
   fi
 }
 
 sleep "$SETTLE"
+
+# --- Pre-send gate: never answer the human's open question. Checked before the
+# busy gate because waiting it out is pointless: it clears only when the human
+# answers, and mux_busy would report it as busy and then log the wrong reason.
+if [ "$DRY" = 0 ] && mux_awaiting_human; then defer_awaiting "pre-send"; fi
 
 # --- Pre-send idle gate: never inject into a busy session (it would queue). ---
 if [ "$DRY" = 0 ] && pane_busy; then
@@ -277,10 +300,13 @@ log "TRIGGER ($reason) pct=$pct thr=$THRESHOLD pane=$pane dry=$DRY"
 # leave the marker to re-fire on the reloaded, already-compacted session; a fresh
 # request is required to retry. Only touch the marker when it is what triggered us,
 # so a request dropped DURING a threshold cycle survives to be honored next idle.
+consumed=""
 if [ "$reason" = requested ]; then
+  consumed="$req"; consumed_mtime=$(date -r "$req" +%s 2>/dev/null || date +%s)
   rm -f "$req" 2>/dev/null
   [ -f "$req" ] && log "WARN could not remove handoff-request $req — may re-fire after cooldown"
 elif [ "$reason" = compact-requested ]; then
+  consumed="$creq"; consumed_mtime=$(date -r "$creq" +%s 2>/dev/null || date +%s)
   rm -f "$creq" 2>/dev/null
   [ -f "$creq" ] && log "WARN could not remove compact-request $creq — may re-fire after cooldown"
 fi
@@ -293,6 +319,7 @@ else
   send "$handoff_cmd"
   if [ "$DRY" = 0 ]; then
     if ! wait_turn_done "$t0" "$WAIT_IDLE"; then
+      mux_awaiting_human && defer_awaiting "after /handoff"
       abort_cycle "handoff did not complete within ${WAIT_IDLE}s"
     fi
     log "handoff turn completed"
@@ -324,6 +351,7 @@ fi
 
 # 2) compact (only when idle)
 if [ "$DRY" = 0 ] && ! wait_pane_idle 60; then
+  mux_awaiting_human && defer_awaiting "before /compact"
   abort_cycle "pane busy before /compact"
 fi
 t1=$(date +%s)
@@ -339,7 +367,7 @@ if [ "$DRY" = 0 ]; then
       compact_prompt=$(mux_capture | tail -30)
       if printf '%s\n' "$compact_prompt" | grep -Eiq \
         'confirm.*compact|compact.*context|summari[sz]e.*(chat|context)|press enter.*compact'; then
-        mux_send_key Enter
+        mux_send_key --own-prompt Enter   # the dialog our own /compact just opened
         log "confirmed Codex /compact prompt"
         break
       fi

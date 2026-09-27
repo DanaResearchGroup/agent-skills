@@ -7,7 +7,8 @@
 #
 # Sourced by:
 #   registration side — cc-statusline.sh, cc-stop-hook.sh  (run in CC's env)
-#   driver side       — auto-handoff-watch.sh, session-resume-watch.sh (detached)
+#   driver side       — auto-handoff-watch.sh, session-resume-watch.sh (detached),
+#                       pm-nudge-sweep.sh (sets MUX/PANE itself, no mux_init)
 #
 # Registration writes ~/agents/state/<sid>.{herdr-pane,tmux-pane}.
 # The driver calls `mux_init "<sid>"` once, which sets two globals:
@@ -22,6 +23,32 @@
 # Used for tmux busy-detection and as the herdr fallback when agent_status is
 # unavailable. Single source of truth (was duplicated in each watcher).
 MUX_BUSY_RE='esc to interrupt|Crunching|Compacting|Waiting for [0-9]|Press up to edit queued|Running [0-9]+ (shell|command)|Running .*command…|Running .*shell'
+
+# "Awaiting the human" markers — an open AskUserQuestion menu, a permission
+# prompt, or any other dialog. Typed text plus Enter into one of these does not
+# queue: it ANSWERS it, with whatever option is pre-highlighted (usually the one
+# the agent marked "(Recommended)"), and the agent receives that as the owner's
+# decision. So these are matched on the dialog's own chrome, never on question
+# wording, and only at the very bottom of the pane, where Claude Code draws the
+# live dialog — the same strings further up are transcript, not a dialog.
+#
+#   footer (last 3 non-empty lines, case-insensitive): every question view
+#     (single-select, multi-select, multi-question tabs, preview) ends in
+#     "Enter to select · … to navigate · Esc to cancel"; permission prompts end
+#     in "Esc to cancel · Tab to amend"; MCP forms in "Enter to confirm".
+#   cursor (last 4 non-empty lines): a numbered row under the "❯" selector. The
+#     "Review your answers" screen draws no footer at all, only
+#     "❯ 1. Submit answers / 2. Cancel", so the footer alone misses it.
+#   yes/no (last 6 non-empty lines): numbered Yes/No rows of a permission prompt
+#     from builds that draw neither footer nor cursor on them.
+# Fixtures: autodev/test/fixtures/panes/.
+MUX_AWAIT_FOOTER_RE='esc to cancel|enter to select|enter to confirm|tab to amend|press enter to continue|\(y/n\)|\[y/n\]'
+MUX_AWAIT_CURSOR_RE='^[[:space:]]*❯[[:space:]]*[0-9]+\.'
+MUX_AWAIT_YESNO_RE='^[[:space:]]*(❯[[:space:]]*)?[0-9]+\.[[:space:]]+(Yes|No)([^[:alnum:]]|$)'
+
+# The herdr executable. A seam for the tests and for pm-nudge-sweep.sh, which
+# carries its own override (PM_NUDGE_HERDR).
+: "${MUX_HERDR:=herdr}"
 
 : "${AUTODEV_HOME:=$HOME/agents}"
 : "${STATE:=$AUTODEV_HOME/state}"
@@ -85,7 +112,7 @@ mux_init(){ # $1 = sid
 mux_pane_live(){
   case "$MUX" in
     tmux)  tmux list-panes -a -F '#{pane_id}' 2>/dev/null | grep -qx "$PANE" ;;
-    herdr) herdr pane get "$PANE" >/dev/null 2>&1 ;;
+    herdr) "$MUX_HERDR" pane get "$PANE" >/dev/null 2>&1 ;;
     *) return 1 ;;
   esac
 }
@@ -100,7 +127,7 @@ mux_pane_live(){
 mux_pane_owner(){
   local o v
   if [ "$MUX" = "herdr" ]; then
-    v=$(herdr pane get "$PANE" 2>/dev/null \
+    v=$("$MUX_HERDR" pane get "$PANE" 2>/dev/null \
           | grep -o '"agent_session":{[^}]*}' \
           | grep -o '"value":"[^"]*"' | head -1 | cut -d'"' -f4)
     if [ -n "$v" ]; then printf '%s\n' "$v"; return 0; fi
@@ -113,7 +140,7 @@ mux_pane_owner(){
 # Prints nothing under tmux (no native state; callers fall back to the scrape).
 mux_status(){
   case "$MUX" in
-    herdr) herdr pane get "$PANE" 2>/dev/null \
+    herdr) "$MUX_HERDR" pane get "$PANE" 2>/dev/null \
              | grep -o '"agent_status":"[^"]*"' | head -1 | cut -d'"' -f4 ;;
     *) : ;;
   esac
@@ -123,15 +150,53 @@ mux_status(){
 mux_capture(){
   case "$MUX" in
     tmux)  tmux capture-pane -t "$PANE" -p 2>/dev/null ;;
-    herdr) herdr pane read "$PANE" --source recent --lines 200 2>/dev/null ;;
+    herdr) "$MUX_HERDR" pane read "$PANE" --source recent --lines 200 2>/dev/null ;;
     *) : ;;
   esac
 }
 
-# 0 = pane is BUSY (typed input would queue), 1 = safe to send. Under herdr use
-# native agent_status; fall back to the text scrape when state is unknown.
+# Print the pane's recent text with soft-wrapped lines joined, so a footer never
+# splits across rows. Non-zero when the pane cannot be read.
+mux_read_screen(){
+  case "$MUX" in
+    herdr) "$MUX_HERDR" pane read "$PANE" --source recent-unwrapped --lines 80 2>/dev/null ;;
+    tmux)  tmux capture-pane -J -p -t "$PANE" 2>/dev/null ;;
+    *) return 1 ;;
+  esac
+}
+
+# 0 = the pane text on stdin ends in a dialog waiting on the human. Pure: reads
+# stdin only, so the fixtures test exactly what the watchers run.
+mux_text_awaiting_human(){
+  local bottom
+  bottom=$(awk 'NF' | tail -n 6)
+  printf '%s\n' "$bottom" | tail -n 3 | grep -Eiq "$MUX_AWAIT_FOOTER_RE" && return 0
+  printf '%s\n' "$bottom" | tail -n 4 | grep -Eq "$MUX_AWAIT_CURSOR_RE" && return 0
+  printf '%s\n' "$bottom" | grep -Eq "$MUX_AWAIT_YESNO_RE"
+}
+
+# 0 = the pane is waiting on the HUMAN (open question menu, permission prompt,
+# any dialog), so nothing may be typed into it. Fails SAFE: an unreadable or
+# blank pane counts as awaiting. Elsewhere this library fails open as a cost
+# control; here failing open forges an owner decision, so it must not.
+# herdr's own detector reports these dialogs as `blocked` (its claude manifest,
+# rule live_blocked_form), which is trusted as a positive but never as a
+# negative — `idle` is still checked against the screen.
+mux_awaiting_human(){
+  local out
+  [ "$MUX" = herdr ] && [ "$(mux_status)" = blocked ] && return 0
+  out=$(mux_read_screen) || return 0
+  [ -n "$(printf '%s' "$out" | tr -d '[:space:]')" ] || return 0
+  printf '%s\n' "$out" | mux_text_awaiting_human
+}
+
+# 0 = pane is BUSY (typed input would queue, or would answer a dialog), 1 = safe
+# to send. A pane awaiting the human is busy: every watcher's retry loop then
+# waits it out exactly as it waits out a running turn. Under herdr use native
+# agent_status; fall back to the text scrape when state is unknown.
 mux_busy(){
   local st
+  mux_awaiting_human && return 0
   case "$MUX" in
     herdr)
       st=$(mux_status)
@@ -169,7 +234,7 @@ mux_session_name(){
 mux_tab_label(){
   [ -n "${TAB:-}" ] || return 1
   case "$MUX" in
-    herdr) herdr tab get "$TAB" 2>/dev/null \
+    herdr) "$MUX_HERDR" tab get "$TAB" 2>/dev/null \
              | grep -o '"label":"[^"]*"' | head -1 | cut -d'"' -f4 ;;
     *) return 1 ;;
   esac
@@ -179,25 +244,64 @@ mux_tab_label(){
 mux_tab_rename(){ # $1 = label
   [ -n "${TAB:-}" ] || return 1
   case "$MUX" in
-    herdr) herdr tab rename "$TAB" "$1" >/dev/null 2>&1 ;;
+    herdr) "$MUX_HERDR" tab rename "$TAB" "$1" >/dev/null 2>&1 ;;
     *) return 1 ;;
   esac
 }
 
+# --- sending: every keystroke into a pane goes through here -----------------
+# Each sender below refuses, returning MUX_REFUSED (3) and typing nothing, while
+# mux_awaiting_human holds. The check sits here, at the keystroke, rather than
+# only in mux_busy, because this is the one place no caller can route around:
+# a future sender that forgets mux_busy still cannot answer a question, and the
+# check runs as late as possible, after any wait the caller did. Callers log the
+# refusal as `DEFER awaiting-human` and retry later exactly as for a busy pane;
+# nothing escalates a refusal into a send.
+MUX_REFUSED=3
+_mux_refuse_if_awaiting(){
+  mux_awaiting_human || return 0
+  printf 'mux: refused: pane %s is awaiting the human (open question or prompt)\n' "$PANE" >&2
+  return 1
+}
+
 # Send one literal line followed by Enter (the /handoff, /compact, continue text).
+# tmux needs two commands for that operation, so re-check after staging the
+# literal text and immediately before Enter. A dialog can open between the two
+# commands; in that race, leave the text staged and refuse the decisive key.
 mux_send_line(){ # $1 = text
+  _mux_refuse_if_awaiting || return "$MUX_REFUSED"
   case "$MUX" in
-    tmux)  tmux send-keys -t "$PANE" -l "$1" && tmux send-keys -t "$PANE" Enter ;;
-    herdr) herdr pane run "$PANE" "$1" >/dev/null 2>&1 ;;
+    tmux)  tmux send-keys -t "$PANE" -l "$1" || return 1
+           _mux_refuse_if_awaiting || return "$MUX_REFUSED"
+           tmux send-keys -t "$PANE" Enter ;;
+    herdr) "$MUX_HERDR" pane run "$PANE" "$1" >/dev/null 2>&1 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Type literal text into the input line WITHOUT Enter (pm-nudge --stage-only).
+# Guarded too: in a select menu the typed characters are keystrokes, and a digit
+# picks an option.
+mux_stage_text(){ # $1 = text
+  _mux_refuse_if_awaiting || return "$MUX_REFUSED"
+  case "$MUX" in
+    tmux)  tmux send-keys -t "$PANE" -l "$1" ;;
+    herdr) "$MUX_HERDR" pane send-text "$PANE" "$1" >/dev/null 2>&1 ;;
     *) return 1 ;;
   esac
 }
 
 # Send a single named key (e.g. Escape) with no literal text.
-mux_send_key(){ # $1 = key
+#   --own-prompt  skip the guard. ONLY for a dialog the caller itself opened a
+#                 moment ago with its own command in this same cycle (Codex's
+#                 /compact confirmation, the dialog /usage-credits opens on a
+#                 limit-stopped session), where no human question can be open.
+mux_send_key(){ # [--own-prompt] $1 = key
+  if [ "${1:-}" = --own-prompt ]; then shift
+  else _mux_refuse_if_awaiting || return "$MUX_REFUSED"; fi
   case "$MUX" in
     tmux)  tmux send-keys -t "$PANE" "$1" ;;
-    herdr) herdr pane send-keys "$PANE" "$1" >/dev/null 2>&1 ;;
+    herdr) "$MUX_HERDR" pane send-keys "$PANE" "$1" >/dev/null 2>&1 ;;
     *) return 1 ;;
   esac
 }

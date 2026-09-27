@@ -1,0 +1,19 @@
+  ⎿  /repo-feature-a        314991b5d [feature-a]
+     /repo-review-c5e700b   000000000 (detached HEAD) prunable
+     … +12 lines (ctrl+o to expand)
+
+  Read 1 file, recalled 1 memory, wrote 2 memories (ctrl+o to expand)
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+←  ☐ Remote branch  ☐ Upstream issue  ✔ Submit  →
+
+│ The closed PR's branch `feature-a` (tip 3a556eb15) still exists on the `official` remote. Delete it?
+
+❯ 1. Delete it (Recommended)
+     `git push official --delete feature-a`. The PR is closed as superseded and the change is on main.
+  2. Leave it on official
+     No push. Costs nothing but leaves a stale branch on the canonical repo.
+  3. Type something.
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  4. Chat about this
+
+Enter to select · Tab/Arrow keys to navigate · Esc to cancel

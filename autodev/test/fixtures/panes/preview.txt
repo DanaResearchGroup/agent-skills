@@ -1,0 +1,24 @@
+  ⎿  Allowed by auto mode classifier
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+←  ☒ Refusal text  ☐ Branch  ☐ Rehearsal  ✔ Submit  →
+│ The refusal message collapses four fault cases into two, so a supplied
+│ setting gets told "none was supplied". How should the refusal get its words?
+❯   Print the library's own     ✔    ┌───────────────────────────────────────────────────────────────┐
+ 1.detail (Recommended)           │ AMBIGUOUS, setting supplied but id absent:                    │
+  2. Two more sentences from      │   REFUSING: the pinned control id=5 matches 0 of the          │
+    you                           │   candidate controls on this device; a pin that does not      │
+  3. Only fix "none was           │   name exactly one candidate resolves nothing.                │
+    supplied"                     │   To fix it, re-pin from the list above, then run again.      │
+                                  │                                                               │
+                                  │ UNREADABLE, device answered, control has no level:            │
+                                  │   REFUSING: pinned control id=9 is a switch, which carries    │
+                                  │   no level to snapshot.                                       │
+                                  │   To fix it, re-pin, then run again.                          │
+                                  └───────────────────────────────────────────────────────────────┘
+
+                                  Notes: press n to add notes
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Chat about this
+
+Enter to select · ↑/↓ to navigate · n to add notes · Tab to switch questions · Esc to cancel

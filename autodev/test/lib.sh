@@ -71,6 +71,8 @@ transcript_aged() { # $1 = path, $2 = age in seconds, $3 = "now" epoch (default:
 # Replaces mux-lib.sh inside the sandboxed bin/. Behaviour is driven by env:
 #   MUX_LIVE_PANES  space-separated pane ids that are "live"
 #   MUX_BUSY        1 => pane is busy (input would queue), 0 => idle
+#   MUX_AWAITING    1 => pane shows a dialog awaiting the human; like the real
+#                   library, mux_busy then reports busy and every send refuses (3)
 # Every line the watcher would type is appended to $SB/sent.log instead.
 stub_mux() {
   cat > "$BIN/mux-lib.sh" <<'STUB'
@@ -97,10 +99,15 @@ mux_pane_live(){ case " ${MUX_LIVE_PANES:-} " in *" $PANE "*) return 0;; *) retu
 mux_pane_owner(){ local o; o=$(mux_owner_file "$MUX" "$PANE"); [ -s "$o" ] && cat "$o"; }
 mux_status(){ [ "${MUX_BUSY:-0}" = 1 ] && echo working || echo idle; }
 mux_capture(){ printf '%s' "${MUX_CAPTURE_TEXT:-}"; }
-mux_busy(){ [ "${MUX_BUSY:-0}" = 1 ]; }
+MUX_REFUSED=3
+mux_awaiting_human(){ [ "${MUX_AWAITING:-0}" = 1 ]; }
+mux_busy(){ mux_awaiting_human || [ "${MUX_BUSY:-0}" = 1 ]; }
 mux_session_name(){ :; }
-mux_send_line(){ printf '%s\n' "$1" >> "$SB/sent.log"; }
-mux_send_key(){ printf 'KEY:%s\n' "$1" >> "$SB/sent.log"; }
+mux_send_line(){ mux_awaiting_human && return 3; printf '%s\n' "$1" >> "$SB/sent.log"; }
+mux_send_key(){
+  if [ "$1" = --own-prompt ]; then shift; elif mux_awaiting_human; then return 3; fi
+  printf 'KEY:%s\n' "$1" >> "$SB/sent.log"
+}
 STUB
   : > "$SB/sent.log"
   : > "$SB/renames.log"

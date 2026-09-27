@@ -1,0 +1,12 @@
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+│ Which branch should the fix land on?
+
+  1. main (Recommended)
+     The fix is small and self-contained.
+  2. release-2.1
+     Only if the hotfix must ship before the next release.
+❯ 3. the one my colleague opened this morning
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  4. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel

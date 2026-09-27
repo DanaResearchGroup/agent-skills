@@ -1,0 +1,18 @@
+● Bash(cd /repo; D=evidence; rm -f $D/*.log; python run.py > >(tee $D/stdout.log) 2> >(tee…)
+  ⎿  Waiting…
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Bash command
+
+   │ cd /repo; D=evidence; rm -f $D/*.log; python run.py > >(tee $D/stdout.log) 2> >(tee $D/stderr.log >&2)
+   Rerun the baseline
+
+ │ Dangerous rm operation on possibly-empty variable path: $D/*.log in `rm -f $D/*.log`
+ ⚠ Claude Code will automatically deny this request in 0:22, to avoid blocking progress on an unattended session
+
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. No
+
+ Esc to cancel · Tab to amend
