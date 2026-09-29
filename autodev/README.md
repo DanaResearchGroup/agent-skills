@@ -424,11 +424,11 @@ Env tunables: `PM_NUDGE_DEBOUNCE=300`, `PM_NUDGE_COOLDOWN=7200`, `PM_NUDGE_MAX_C
 
 ### What the rule actually selects here
 
-`pm-nudge-sweep.sh --report`, run read-only against live herdr on 2026.08.28 23.41:
+`pm-nudge-sweep.sh --report`, run read-only against live herdr on 2026.08.28 23.41 (one workspace label anonymized):
 
 ```
 WS   LABEL      PM-PANE   PM-ST    VERDICT
-w1   CKMG       w1:p7G    blocked  HOLD: blocked pane(s) w1:p7G
+w1   ProjA      w1:p7G    blocked  HOLD: blocked pane(s) w1:p7G
 w7   main       -         -        excluded: no pane cwd matches the PM regex
 w8   ARC        -         -        excluded: no pane cwd matches the PM regex
 w9   Papers     -         -        excluded: no pane cwd matches the PM regex

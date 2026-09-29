@@ -58,7 +58,7 @@ _HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # purpose: the day a campaign is laid out differently the fix must not be a code
 # change.
 #
-#   PM pane := cwd basename matches PM_RE       (ckmg-pm4, carmel-pm, t3-pes-pm)
+#   PM pane := cwd basename matches PM_RE       (ProjA-pm4, carmel-pm, t3-pes-pm)
 #   worker  := label matches WORKER_RE          (i017-verify-v3-...-D016A01)
 #
 # WORKER_RE is load-bearing beyond mere labelling: it RECLASSIFIES. A worker
@@ -94,7 +94,7 @@ MUX_HERDR="$PM_NUDGE_HERDR"
 : "${PM_NUDGE_PY:=$PM_NUDGE_VENV/bin/python}"
 : "${PM_NUDGE_COMPOSER:=$_HERE/pm-nudge-compose.py}"
 # -E (ignore PYTHON* env vars) -s (skip the user site dir). NOT cosmetic: this
-# machine exports a PYTHONPATH listing RMG-Py, ARC, molecule, T3, CKMG and Carmel,
+# machine exports a PYTHONPATH listing RMG-Py, ARC, molecule, T3, ProjA and Carmel,
 # and those directories land AHEAD of the venv's site-packages in sys.path — so a
 # venv built precisely to be isolated is, by default, not. A daemon inherits
 # whatever environment the timer hands it, so the isolation has to be asserted at

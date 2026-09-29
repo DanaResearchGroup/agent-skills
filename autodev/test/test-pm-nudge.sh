@@ -133,15 +133,15 @@ echo "== classification: which workspaces are PM campaigns =="
 # (wJ), and four of Alon's ordinary working spaces that must never be campaigns.
 setup_nudge
 fx_ws w7 main;   fx_ws w8 ARC;   fx_ws w9 Papers; fx_ws wE House
-fx_ws w1 CKMG;   fx_ws wF plasma; fx_ws wH SCM;   fx_ws wJ NS
+fx_ws w1 ProjA;   fx_ws wF plasma; fx_ws wH SCM;   fx_ws wJ NS
 fx_ws wG Gracie; fx_ws wP Carmel
 fx_pane w7 w7:p5  idle /home/alon/Dropbox/Work/Office_of_Vice_Dean_UG i007-bsc-catalogue-D002A01
 fx_pane w7 w7:p2J idle /home/alon/Dropbox/Work/Proposals ''
 fx_pane w8 w8:pF  idle /home/alon/Code/ARC ''
 fx_pane w9 w9:p4  'done' '/home/alon/Dropbox/Apps/Overleaf/54. BEES' i010-bees-D-006A01
 fx_pane wE wE:pB  idle /home/alon/Code/agent-skills ''
-fx_pane w1 w1:p7G idle /home/alon/Code/ckmg-pm4 ''
-fx_pane w1 w1:p9N 'done' /home/alon/Code/CKMG-fast-subsystem ''
+fx_pane w1 w1:p7G idle /home/alon/Code/ProjA-pm4 ''
+fx_pane w1 w1:p9N 'done' /home/alon/Code/ProjA-fast-subsystem ''
 fx_pane wF wF:p1R 'done' /home/alon/Code/plasma-pm2 plasma-PM
 fx_pane wF wF:p5Y idle /home/alon/Code/RMG-Py-i151-m5-gate i151-m5-gate-D067A01
 fx_pane wH wH:p1B 'done' /home/alon/Code/scm-pm2 ''
