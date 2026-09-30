@@ -45,7 +45,7 @@ compaction_responder() { # $1 = sid
 
 echo "== SessionStart(compact) hook =="
 
-# The CKMG failure mode: CC's own built-in auto-compaction fires with no
+# The ProjA failure mode: CC's own built-in auto-compaction fires with no
 # per-session pointer written, so the hook falls back to the shared .latest.
 setup
 printf '%s\n' "$H1" > "$AUTODEV_HOME/handoffs/.latest"
