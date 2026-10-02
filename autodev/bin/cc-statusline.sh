@@ -107,6 +107,46 @@ if [ -n "$_sp_slug" ] && [ -f "$_scf" ]; then
   fi
 fi
 
+# ---- PM deferred-user-questions badge ----
+# Reads ONLY <pm-root>/.pm/state/user-questions.json (written by bin/user-questions):
+# no fold, no python. PM root = $PM_ROOT, else the nearest ancestor of the cwd with
+# .pm/config.json. Every failure path yields "" so the rest of the line is untouched.
+pq_badge=""
+_pq_badge() {
+  local dir=$1 root="${PM_ROOT:-}" cache n blocked ev
+  if [ -z "$root" ]; then
+    root=$dir
+    while [ -n "$root" ] && [ ! -f "$root/.pm/config.json" ]; do
+      case "$root" in /|.|"") return 0;; esac
+      root=$(dirname "$root")
+    done
+  fi
+  [ -n "$root" ] && [ -f "$root/.pm/config.json" ] || return 0
+  cache="$root/.pm/state/user-questions.json"
+  local row n blocked stale=0 sgr='1;30;43' txt
+  ev="$root/.pm/events.log"
+  [ -f "$ev" ] && [ -f "$cache" ] && [ "$ev" -nt "$cache" ] && stale=1
+  # One read: count and blocked come from the same snapshot; both must be well-typed.
+  if ! [ -f "$cache" ] || ! row=$(jq -er 'select(.schema=="pm-user-questions/1" and (.count|type=="number" and . >= 0 and . == floor) and (.blocked|type=="boolean")) | "\(.count)\t\(.blocked)"' "$cache" 2>/dev/null) || [ -z "$row" ]; then
+    printf ' \033[1;30;43m ❓ ? \033[0m'; return 0
+  fi
+  n=${row%%$'\t'*}; blocked=${row#*$'\t'}
+  if [ "$blocked" = "true" ]; then
+    sgr='1;97;41'; txt="❓ ${n} Qs — WAITING ON YOU"
+  elif [ "$n" -gt 0 ] 2>/dev/null; then
+    txt="❓ ${n} Qs"
+  elif [ "$stale" = 1 ]; then
+    txt="❓ ?"   # zero on a cache older than the log: unknown, not clear
+  else
+    return 0
+  fi
+  [ "$stale" = 1 ] && sgr="2;${sgr#1;}"
+  printf ' \033[%sm %s \033[0m' "$sgr" "$txt"
+}
+if [ -n "$_sp_dir" ] || [ -n "${PM_ROOT:-}" ]; then
+  pq_badge=$(_pq_badge "$_sp_dir" 2>/dev/null) || pq_badge=""
+fi
+
 # ---- prompt-cache badge: when the cache lapses (see cc_cache_seg in the lib) ----
 # The live countdown is deliberately NOT here: the status line cannot redraw
 # while CC is idle, so cache-warm-watch.sh owns it, in the herdr tab label.
@@ -122,7 +162,7 @@ if [ -n "$pct" ]; then
   else
     color="\033[31m"
   fi
-  printf "%b%b  %s %s %b(%s%%)\033[0m%b%b%b" "$badge" "$ad_badge" "$model" "$tok_fmt" "$color" "$pct_fmt" "$cache_seg" "$loc" "$spar_badge"
+  printf "%b%b  %s %s %b(%s%%)\033[0m%b%b%b%b" "$badge" "$ad_badge" "$model" "$tok_fmt" "$color" "$pct_fmt" "$cache_seg" "$loc" "$spar_badge" "$pq_badge"
 else
-  printf "%b%b  %s %s%b%b%b" "$badge" "$ad_badge" "$model" "$tok_fmt" "$cache_seg" "$loc" "$spar_badge"
+  printf "%b%b  %s %s%b%b%b%b" "$badge" "$ad_badge" "$model" "$tok_fmt" "$cache_seg" "$loc" "$spar_badge" "$pq_badge"
 fi

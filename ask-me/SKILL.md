@@ -30,6 +30,12 @@ Drop anything that fails one of these — asking it spends the user's attention 
 
 By fan-out, not by the order you happened to write them down. First the decision whose answer would re-derive the others — ontological, premise-fragile, or a parent whose contents the rest allocate. Ask it, wait, then re-derive the remaining list against the answer; some of it will have dissolved.
 
+## PM control plane
+
+Run this section ONLY when the user explicitly invoked `/ask-me` or explicitly asked to be asked the PM's questions. Never run it when the model invoked ask-me automatically (e.g. before ending a message).
+
+If the cwd is inside a PM control plane (`$PM_ROOT`, else the nearest ancestor holding `.pm/config.json`), also clear its deferred user questions, whatever the block state: run `bin/user-questions --list` from that PM root (`cd <pm-root> && bin/user-questions --list`, never from a subdirectory), then ask them by the procedure in the `review-gates` skill (it batches at most 4 per `AskUserQuestion`). Do not restate that procedure here.
+
 ## 4. Run, then report
 
 One `AskUserQuestion` call per decision, composed under `framing-decisions`, each awaiting its answer before the next is drafted.
