@@ -1,5 +1,15 @@
 # Installing the contract gate
 
+## Contents
+
+- [1. Wire the hooks](#1-wire-the-hooks)
+- [2. Enable a repo](#2-enable-a-repo)
+- [Where the state lives](#where-the-state-lives)
+  - [A contract left in the old in-repo home](#a-contract-left-in-the-old-in-repo-home)
+- [3. Put `contract` on your PATH](#3-put-contract-on-your-path)
+- [4. Roll out on evidence](#4-roll-out-on-evidence)
+- [Limits](#limits)
+
 The skill is inert until its two hooks are wired into `settings.json` and at
 least one repo is enabled.
 
