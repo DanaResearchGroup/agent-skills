@@ -164,3 +164,11 @@ if [ -n "$pct" ]; then
 else
   printf "%b%b  %s %s%b%b%b%b" "$badge" "$ad_badge" "$model" "$tok_fmt" "$cache_seg" "$loc" "$spar_badge" "$pq_badge"
 fi
+
+# ---- optional context-window bar (second row) ----
+# On only while the flag exists (toggled by the /context-bar skill). Any failure in
+# the renderer yields no row; the line above is already printed and stays intact.
+if [ -f "$STATE/context-bar.on" ] && [ -x "$_HERE/cc-context-bar.sh" ]; then
+  _cb=$(printf '%s' "$input" | "$_HERE/cc-context-bar.sh" "$STATE" "$sid" "$tpath" 2>/dev/null) || _cb=""
+  if [ -n "$_cb" ]; then printf '\n%s' "$_cb"; fi
+fi

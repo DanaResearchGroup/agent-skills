@@ -36,3 +36,13 @@ if [ -n "$pct" ]; then
 else
   printf '%b%s%b %s%b%b' "$c_model" "$model" "$r" "$tok" "$cache_seg" "$loc"
 fi
+
+# ---- optional context-window bar (second row), toggled by the /context-bar skill ----
+# Same renderer and flag as autodev/bin/cc-statusline.sh; any failure yields no row.
+_cb_state="${AUTODEV_HOME:-$HOME/agents}/state"
+if [ -f "$_cb_state/context-bar.on" ] && [ -x "$_here/../autodev/bin/cc-context-bar.sh" ]; then
+  _cb_sid=$(printf '%s' "$input" | jq -r '.session_id // empty')
+  _cb=$(printf '%s' "$input" | "$_here/../autodev/bin/cc-context-bar.sh" "$_cb_state" "$_cb_sid" "$tpath" 2>/dev/null) || _cb=""
+  if [ -n "$_cb" ]; then printf '\n%s' "$_cb"; fi
+fi
+exit 0
