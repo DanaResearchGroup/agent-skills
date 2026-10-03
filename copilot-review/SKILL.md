@@ -225,9 +225,8 @@ Clear the same three tripwires the global git rule names before rewriting:
 git rebase <remote>/BASE
 ```
 
-**On conflict:** resolve it, don't paper over it. Use the `resolving-merge-conflicts` skill — the
-short version is to read both sides and keep the intent of each, rather than taking whichever side
-makes the conflict markers disappear:
+**On conflict:** resolve it, don't paper over it. Read both sides and keep the intent of each,
+rather than taking whichever side makes the conflict markers disappear:
 
 ```bash
 git status --short                 # UU = both modified; resolve each

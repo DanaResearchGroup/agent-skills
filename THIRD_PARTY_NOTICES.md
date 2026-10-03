@@ -17,6 +17,7 @@ here (copied from upstream; some adapted for this repository, in places
 substantially). Each remains under the upstream MIT license reproduced below:
 
 - `code-review/`
+- `codebase-design/`
 - `domain-modeling/`
 - `grilling/`
 - `grill-me/`
@@ -24,7 +25,7 @@ substantially). Each remains under the upstream MIT license reproduced below:
 - `handoff/`
 - `implement/`
 - `obsidian-vault/`
-- `resolving-merge-conflicts/`
+- `pr/`
 - `setup-matt-pocock-skills/`
 - `tdd/`
 - `to-spec/`
@@ -34,6 +35,8 @@ substantially). Each remains under the upstream MIT license reproduced below:
 v1.2.2 sync it is this repository's own thin wrapper over `writing-for-agents`
 (upstream retired the skill in favor of `writing-for-agents`) and is no longer
 third-party material.
+
+`resolving-merge-conflicts/` was removed in the v1.3 sync because upstream retired it.
 
 ```
 MIT License
