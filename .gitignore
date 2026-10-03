@@ -36,6 +36,7 @@
 !/ask-me/
 !/autodev/
 !/code-review/
+!/codebase-design/
 !/contract/
 !/copilot-review/
 !/domain-modeling/
@@ -52,8 +53,8 @@
 !/meta-analysis/
 !/obsidian-vault/
 !/paper-outline/
+!/pr/
 !/probe/
-!/resolving-merge-conflicts/
 !/setup-matt-pocock-skills/
 !/slack-ask/
 !/slack-notify/

@@ -22,12 +22,17 @@ After edits, run `python3 bin/lint-skills.py` to confirm nothing broke.
 ## Deliberate drift from upstream (vendored Matt Pocock skills)
 
 These are intentional local edits to vendored skills. `/sync-matt-pocock-skills` must
-re-apply each one onto the new upstream base at every sync (current base: v1.2.2):
+re-apply each one onto the new upstream base at every sync (current base: v1.3, upstream `d81f3a1`):
 
 | File | Local edit |
 | --- | --- |
-| `grilling/SKILL.md` | Present each round's questions through the `AskUserQuestion` tool with 2-4 concrete options; the recommended answer is the first option, marked "(Recommended)"; upstream's prose format is kept as the fallback for questions that can't be framed as options. (Originally applied to `grill-me` before upstream moved the family's content into `grilling`.) |
-| `grill-with-docs/SKILL.md` | Typo fix in the description: "ADR's" → "ADRs". |
+| `grilling/SKILL.md` | Present each round's questions through the `AskUserQuestion` tool with 2-4 concrete options; the recommended answer is the first option, marked "(Recommended)"; upstream's prose format is kept as the fallback. Building each question is delegated to `framing-decisions` (via the Skill tool), and an ontological or premise-fragile question leaves the round and goes alone, first. An expensive fact whose question has wide fan-out is offered as a deferral option. |
+| `grill-with-docs/SKILL.md`, `grill-with-docs/agents/openai.yaml` | Model-invocable (no `disable-model-invocation`, no `allow_implicit_invocation: false`), with our own description and two paragraphs: the initiative is the user's, and prefer it over `/grill-me` when the answers should outlive the conversation. |
+| `code-review/SKILL.md` | Description scoped to conformance ("Two-axis conformance review ..."), so it does not present as a general PR review. |
+| `to-spec/SKILL.md` | "if earlier exploratory code produced a snippet" in place of upstream's `prototype` wording (we do not vendor `prototype`). |
+| `domain-modeling/SKILL.md`, `RETRACTION-FORMAT.md` | Three extra sections: sweep decisions before the session ends, keep the open-questions list synchronised, retract dead claims; plus `RETRACTION-FORMAT.md`. |
+| `setup-matt-pocock-skills/` | "Always: explore -> present -> confirm -> write" in place of the "not a deterministic script" line; a step-4 `Done when:` gate; Section B (triage labels) always runs because `to-spec` applies them (no `triage` skill here); the wayfinder, PRs-as-triage-surface and `improve-codebase-architecture` content is removed. |
+| `handoff/SKILL.md` | Local superset (model-invocable, Codex auto-handoff, absolute path, insights routing, reload pointer); upstream changes are ported only when compatible. |
 
 ## Checklist
 

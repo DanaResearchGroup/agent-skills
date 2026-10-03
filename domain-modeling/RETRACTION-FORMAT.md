@@ -1,6 +1,6 @@
 # Retraction Record Format
 
-A retraction is not an ADR — no decision was made; a claim died. It lives in `RETRACTIONS.md` at the same root as `CONTEXT.md`, a single append-only document created lazily when the first claim is refuted.
+A retraction is not an ADR — no decision was made; a claim died. It lives in `RETRACTIONS.md` at the same root as `GLOSSARY.md`, a single append-only document created lazily when the first claim is refuted.
 
 ## Template
 
@@ -23,7 +23,7 @@ callers exceeded 20 — the in-process path serializes on a single lock.
 
 ## When to append
 
-Whenever a probe or a check inverts something already written down — in `CONTEXT.md`, an ADR, or prose earlier in the session. Append immediately, not at session end.
+Whenever a probe or a check inverts something already written down — in `GLOSSARY.md`, an ADR, or prose earlier in the session. Append immediately, not at session end.
 
 ## What matters
 
@@ -38,7 +38,7 @@ When the same domain claim is tracked in both a campaign record and this codebas
 
 ## Mark the original dead
 
-A retraction entry alone doesn't stop a future session reading only `CONTEXT.md` or an ADR from ingesting the dead claim as live — mark the original in place too, pointing at its `RETRACTIONS.md` entry:
+A retraction entry alone doesn't stop a future session reading only `GLOSSARY.md` or an ADR from ingesting the dead claim as live — mark the original in place too, pointing at its `RETRACTIONS.md` entry:
 
-- **Glossary entry in `CONTEXT.md`**: prefix the definition with `[RETRACTED — see RETRACTIONS.md #N]`, N being the entry's position (first, second, ...).
+- **Glossary entry in `GLOSSARY.md`**: prefix the definition with `[RETRACTED — see RETRACTIONS.md #N]`, N being the entry's position (first, second, ...).
 - **ADR**: mark its status Retracted (or Superseded, if a replacement ADR exists) with a pointer to the same entry, the same way a superseding ADR is recorded.
