@@ -29,6 +29,7 @@ substantially). Each remains under the upstream MIT license reproduced below:
 - `setup-matt-pocock-skills/`
 - `tdd/`
 - `to-spec/`
+- `triage/`
 - `writing-for-agents/`
 
 `writing-great-skills/` was vendored from upstream through v1.1.0; as of the
