@@ -22,7 +22,7 @@ cache() { # $1 = count, $2 = blocked
   printf '{"schema":"pm-user-questions/1","count":%s,"blocked":%s,"questions":[]}' "$1" "$2" > "$CACHE"
   touch -d '1 minute ago' "$PM/.pm/events.log"   # cache is newer than the log
 }
-AMBER=$'\033[1;30;43m'; RED=$'\033[1;97;41m'; DIM_AMBER=$'\033[2;30;43m'; DIM_RED=$'\033[2;97;41m'
+AMBER=$'\033[1;33m'; RED=$'\033[1;31m'; DIM_AMBER=$'\033[2;33m'; DIM_RED=$'\033[2;31m'
 
 out=$(render "$SB/plain")
 assert_not_contains "no PM root: no badge" "$out" "❓"
@@ -42,15 +42,15 @@ assert_contains "blocked: red waiting text" "$out" "❓ 2 Qs — WAITING ON YOU"
 assert_contains "blocked: red" "$out" "$RED"
 
 rm -f "$CACHE"; out=$(render "$PM")
-assert_contains "missing cache: ?" "$out" "❓ ?"
+assert_not_contains "missing cache: no badge" "$out" "❓"
 assert_contains "missing cache: rest of line intact" "$out" "Opus 1.2k"
 
 printf '{not json' > "$CACHE"; out=$(render "$PM")
-assert_contains "corrupt cache: ?" "$out" "❓ ?"
+assert_not_contains "corrupt cache: no badge" "$out" "❓"
 assert_contains "corrupt cache: rest of line intact" "$out" "Opus 1.2k"
 
 printf '{"schema":"pm-user-questions/1","count":"x","blocked":false}' > "$CACHE"
-assert_contains "non-numeric count: ?" "$(render "$PM")" "❓ ?"
+assert_not_contains "non-numeric count: no badge" "$(render "$PM")" "❓"
 
 cache 3 false; touch "$PM/.pm/events.log"   # log newer than cache
 out=$(render "$PM")
@@ -65,20 +65,19 @@ assert_contains "nested subdirectory cwd finds the root" "$(render "$PM/sub/deep
 assert_contains "PM_ROOT honoured from outside the tree" "$(PM_ROOT="$PM" render "$SB/plain")" "❓ 3 Qs"
 
 cache 0 true; out=$(render "$PM")
-assert_contains "count 0 blocked: waiting text" "$out" "❓ 0 Qs — WAITING ON YOU"
-assert_contains "count 0 blocked: red" "$out" "$RED"
+assert_not_contains "count 0 blocked: no badge" "$out" "❓"
 
 cache 0 false; touch "$PM/.pm/events.log"
 out=$(render "$PM")
-assert_contains "stale zero: dimmed unknown" "$out" "${DIM_AMBER} ❓ ? "
+assert_not_contains "stale zero: no badge" "$out" "❓"
 
 printf '{"schema":"pm-user-questions/1","count":3,"questions":[]}' > "$CACHE"; touch -d '1 minute ago' "$PM/.pm/events.log"
-assert_contains "missing blocked: ?" "$(render "$PM")" "❓ ?"
+assert_not_contains "missing blocked: no badge" "$(render "$PM")" "❓"
 printf '{"schema":"pm-user-questions/1","count":3,"blocked":{"a":1}}' > "$CACHE"
-assert_contains "object blocked: ?" "$(render "$PM")" "❓ ?"
+assert_not_contains "object blocked: no badge" "$(render "$PM")" "❓"
 printf '{"schema":"pm-user-questions/1","count":3,"blocked":"true"}' > "$CACHE"
 out=$(render "$PM")
-assert_contains "string blocked: ?" "$out" "❓ ?"
+assert_not_contains "string blocked: no badge" "$out" "❓"
 assert_not_contains "string blocked: not a count" "$out" "Qs"
 
 # single read: a fake jq counts invocations on the cache

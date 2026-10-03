@@ -123,25 +123,23 @@ _pq_badge() {
   fi
   [ -n "$root" ] && [ -f "$root/.pm/config.json" ] || return 0
   cache="$root/.pm/state/user-questions.json"
-  local row n blocked stale=0 sgr='1;30;43' txt
+  local row n blocked stale=0 sgr='1;33' txt
   ev="$root/.pm/events.log"
   [ -f "$ev" ] && [ -f "$cache" ] && [ "$ev" -nt "$cache" ] && stale=1
   # One read: count and blocked come from the same snapshot; both must be well-typed.
-  if ! [ -f "$cache" ] || ! row=$(jq -er 'select(.schema=="pm-user-questions/1" and (.count|type=="number" and . >= 0 and . == floor) and (.blocked|type=="boolean")) | "\(.count)\t\(.blocked)"' "$cache" 2>/dev/null) || [ -z "$row" ]; then
-    printf ' \033[1;30;43m ❓ ? \033[0m'; return 0
-  fi
+  # Missing, corrupt or zero shows nothing: the badge only ever carries a real count.
+  [ -f "$cache" ] || return 0
+  row=$(jq -er 'select(.schema=="pm-user-questions/1" and (.count|type=="number" and . >= 0 and . == floor) and (.blocked|type=="boolean")) | "\(.count)\t\(.blocked)"' "$cache" 2>/dev/null) || return 0
+  [ -n "$row" ] || return 0
   n=${row%%$'\t'*}; blocked=${row#*$'\t'}
+  [ "$n" -gt 0 ] 2>/dev/null || return 0
   if [ "$blocked" = "true" ]; then
-    sgr='1;97;41'; txt="❓ ${n} Qs — WAITING ON YOU"
-  elif [ "$n" -gt 0 ] 2>/dev/null; then
-    txt="❓ ${n} Qs"
-  elif [ "$stale" = 1 ]; then
-    txt="❓ ?"   # zero on a cache older than the log: unknown, not clear
+    sgr='1;31'; txt="❓ ${n} Qs — WAITING ON YOU"
   else
-    return 0
+    txt="❓ ${n} Qs"
   fi
   [ "$stale" = 1 ] && sgr="2;${sgr#1;}"
-  printf ' \033[%sm %s \033[0m' "$sgr" "$txt"
+  printf ' \033[%sm%s\033[0m' "$sgr" "$txt"
 }
 if [ -n "$_sp_dir" ] || [ -n "${PM_ROOT:-}" ]; then
   pq_badge=$(_pq_badge "$_sp_dir" 2>/dev/null) || pq_badge=""
