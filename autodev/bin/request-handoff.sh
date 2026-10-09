@@ -197,6 +197,10 @@ fi
 # survive that cycle and fire a SECOND, spurious /compact on the reloaded session.
 # So detect the live lock and defer — the watcher will compact on its own. The
 # pointer above is already recorded, so that in-flight cycle reloads OUR handoff.
+# Best-effort only: from a sandboxed session the watcher's pid is in another PID
+# namespace, `kill -0` fails, and the marker is filed anyway. The watcher drops
+# such a marker once its own compaction lands; that, not this check, is what
+# prevents the double compact.
 if [ "$COMPACT_ONLY" = 1 ]; then
   lock="$STATE/$sid.cycle.lock"
   if [ -d "$lock" ]; then
