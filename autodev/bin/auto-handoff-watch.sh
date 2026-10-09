@@ -384,6 +384,27 @@ if [ "$DRY" = 0 ]; then
   done
   if [ "$ok" != 1 ]; then abort_cycle "/compact did not complete within ${WAIT_COMPACT}s"; fi
   log "compaction completed"
+  # A compact-request filed before this compaction landed asked for exactly what
+  # just happened. The usual source is the handoff skill running
+  # `request-handoff.sh --compact-only` inside the /handoff turn we drove: its
+  # mid-cycle deferral tests our lock pid with `kill -0`, which cannot see this
+  # process from a sandboxed session (separate PID namespace), so it files the
+  # marker anyway. Left in place, it fires a second /compact on the freshly
+  # reloaded session once the cooldown lapses. Drop it here, where the cycle
+  # knows it compacted. A request filed after the compaction completed is a new
+  # ask and stays. Compare against the .compacted file's mtime with `-newer`, not
+  # against the epoch second it contains, which ties with a request filed in the
+  # compaction's own second. Claim the marker by rename first, so a request filed
+  # between the check and the delete is never the one deleted.
+  done_stamp="$STATE/$sid.compacted"; claim="$creq.claim.$$"
+  if [ -f "$done_stamp" ] && mv "$creq" "$claim" 2>/dev/null; then
+    if [ -n "$(find "$claim" -newer "$done_stamp" 2>/dev/null)" ]; then
+      mv -n "$claim" "$creq" 2>/dev/null; rm -f "$claim" 2>/dev/null
+    else
+      rm -f "$claim" 2>/dev/null
+      log "DROP compact-request filed during this cycle (superseded by this /compact)"
+    fi
+  fi
 fi
 
 # 3) re-assert the session name (compaction can reset the display title), then continue
