@@ -394,15 +394,18 @@ if [ "$DRY" = 0 ]; then
   # knows it compacted. A request filed after the compaction completed is a new
   # ask and stays. Compare against the .compacted file's mtime with `-newer`, not
   # against the epoch second it contains, which ties with a request filed in the
-  # compaction's own second. Claim the marker by rename first, so a request filed
-  # between the check and the delete is never the one deleted.
+  # compaction's own second. Drop only when the stamp is strictly newer: an equal
+  # mtime (one coarse clock tick) cannot be ordered, and keeping it costs at most a
+  # spare /compact where dropping a real ask parks the session. Claim the marker by
+  # rename first, so a request filed between the check and the delete is never the
+  # one deleted.
   done_stamp="$STATE/$sid.compacted"; claim="$creq.claim.$$"
   if [ -f "$done_stamp" ] && mv "$creq" "$claim" 2>/dev/null; then
-    if [ -n "$(find "$claim" -newer "$done_stamp" 2>/dev/null)" ]; then
-      mv -n "$claim" "$creq" 2>/dev/null; rm -f "$claim" 2>/dev/null
-    else
+    if [ -n "$(find "$done_stamp" -newer "$claim" 2>/dev/null)" ]; then
       rm -f "$claim" 2>/dev/null
       log "DROP compact-request filed during this cycle (superseded by this /compact)"
+    else
+      mv -n "$claim" "$creq" 2>/dev/null; rm -f "$claim" 2>/dev/null
     fi
   fi
 fi
