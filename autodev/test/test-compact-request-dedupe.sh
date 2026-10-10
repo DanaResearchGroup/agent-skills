@@ -94,7 +94,10 @@ echo "== a compact-request filed around the compaction =="
 # .compacted, as the reloaded session would file a new ask; the short pause
 # clears the filesystem's coarse timestamp tick but stays inside the stamp's
 # one-second resolution, so the two compare equal by second.
-compact_responder() { # $1 = pending | after
+# tie: it lands with exactly the completion stamp's mtime (one coarse clock tick),
+# where the order is unknowable; it is kept, since a lost request parks the
+# session while a kept one costs at most one extra /compact.
+compact_responder() { # $1 = pending | after | tie
   (
     for _ in $(seq 1 200); do
       if grep -qxF '/handoff' "$SB/sent.log" 2>/dev/null; then
@@ -108,6 +111,8 @@ compact_responder() { # $1 = pending | after
         [ "$1" = pending ] && { : > "$STATE/$SID.compact-request"; sleep 0.05; }
         printf '%s\n' "$(date +%s)" > "$STATE/$SID.compacted"
         [ "$1" = after ] && { sleep 0.05; : > "$STATE/$SID.compact-request"; }
+        [ "$1" = tie ] && { : > "$STATE/$SID.compact-request"
+          touch -r "$STATE/$SID.compacted" "$STATE/$SID.compact-request"; }
         exit 0
       fi
       sleep 0.2
@@ -126,6 +131,12 @@ setup 40
 compact_responder after
 run_watch
 assert_file "a request filed after the compaction completed is kept" "$STATE/$SID.compact-request"
+sandbox_rm
+
+setup 40
+compact_responder tie
+run_watch
+assert_file "a request tied with the completion stamp is kept" "$STATE/$SID.compact-request"
 sandbox_rm
 
 finish
