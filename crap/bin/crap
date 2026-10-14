@@ -1,0 +1,301 @@
+#!/usr/bin/env python3
+"""Score Python functions by CRAP = cc^2 * (1 - cov)^3 + cc and gate on a threshold.
+
+cc is cyclomatic complexity from the AST; cov is the function's coverage from a coverage.py
+JSON report (`coverage json`). Exit 0 when every scored function is at or below the threshold,
+1 when any is above it, 2 on a usage or input error.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import fnmatch
+import json
+import math
+import os
+import re
+import subprocess
+import sys
+from dataclasses import asdict, dataclass
+from pathlib import Path
+
+DEFAULT_THRESHOLD = 6.0
+DEFAULT_EXCLUDES = ("*_test.py", "test_*.py", "*/tests/*", "*/test/*", "conftest.py")
+SCOPE_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+MATCH_CASE = getattr(ast, "match_case", ())  # Python < 3.10 has no match statement
+
+
+class InputError(Exception):
+    """Bad input: exit 2."""
+
+
+@dataclass
+class Score:
+    file: str
+    line: int
+    name: str
+    cc: int
+    coverage: float
+    crap: float
+    measured: bool
+
+
+def complexity(func: ast.AST) -> int:
+    """McCabe complexity of one function body; nested functions and classes are scored on their own."""
+    cc = 1
+    stack = list(ast.iter_child_nodes(func))
+    while stack:
+        node = stack.pop()
+        if isinstance(node, SCOPE_NODES):
+            continue
+        if isinstance(node, (ast.If, ast.IfExp, ast.For, ast.AsyncFor, ast.While, ast.ExceptHandler)):
+            cc += 1
+        elif isinstance(node, ast.BoolOp):
+            cc += len(node.values) - 1
+        elif isinstance(node, ast.comprehension):
+            cc += 1 + len(node.ifs)
+        elif isinstance(node, MATCH_CASE):
+            pattern = node.pattern
+            while isinstance(pattern, ast.MatchAs) and pattern.pattern is not None:
+                pattern = pattern.pattern  # `case (_ as y):` is as irrefutable as `case _:`
+            irrefutable = isinstance(pattern, ast.MatchAs)
+            if not (irrefutable and node.guard is None):
+                cc += 1
+        stack.extend(ast.iter_child_nodes(node))
+    return cc
+
+
+def functions(tree: ast.AST):
+    """Yield (qualname, node, own_lines) for every function, own_lines excluding nested scopes.
+
+    A lambda inside a function counts toward that function's complexity; one at module or class
+    level belongs to no function, so it is scored on its own as `<lambda>`.
+    """
+
+    def walk(node, prefix, in_func):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, SCOPE_NODES):
+                qual = f"{prefix}.{child.name}" if prefix else child.name
+                is_func = not isinstance(child, ast.ClassDef)
+                if is_func:
+                    yield qual, child, own_lines(child)
+                yield from walk(child, qual, is_func)
+            elif isinstance(child, ast.Lambda) and not in_func:
+                yield (f"{prefix}.<lambda>" if prefix else "<lambda>"), child, own_lines(child)
+            else:
+                yield from walk(child, prefix, in_func)
+
+    yield from walk(tree, "", False)
+
+
+def span(node) -> set[int]:
+    start = min([node.lineno] + [d.lineno for d in getattr(node, "decorator_list", [])])
+    return set(range(start, node.end_lineno + 1))
+
+
+def own_lines(func) -> set[int]:
+    lines = span(func)
+    for node in ast.walk(func):
+        if node is not func and isinstance(node, SCOPE_NODES):
+            lines -= span(node)
+    return lines
+
+
+def function_coverage(qual: str, lines: set[int], report: dict | None) -> tuple[float, bool]:
+    """(coverage fraction, measured). Prefer coverage.py's per-function region; else line spans."""
+    if report is None:
+        return 0.0, False
+    region = report.get("functions", {}).get(qual)
+    if region is not None:
+        summary = region["summary"]
+        if summary.get("num_branches"):
+            return summary["percent_covered"] / 100.0, True
+        statements = summary["num_statements"]
+        return (summary["covered_lines"] / statements if statements else 1.0), True
+    # no region (coverage.py < 7.5): lines plus the branches leaving them
+    executed = lines & set(report.get("executed_lines", []))
+    missing = lines & set(report.get("missing_lines", []))
+    hit = sum(1 for src, _ in report.get("executed_branches", []) if src in lines)
+    miss = sum(1 for src, _ in report.get("missing_branches", []) if src in lines)
+    total = len(executed) + len(missing) + hit + miss
+    return ((len(executed) + hit) / total if total else 1.0), True
+
+
+def crap_score(cc: int, cov: float) -> float:
+    return cc * cc * (1.0 - cov) ** 3 + cc
+
+
+def git(root: Path, *args: str) -> subprocess.CompletedProcess:
+    # quotePath pinned on so unquote() sees only ASCII, whatever the user's config says
+    return subprocess.run(["git", "-c", "core.quotePath=true", "-C", str(root), *args],
+                          capture_output=True, text=True)
+
+
+def unquote(path: str) -> str:
+    """Undo git's C-style quoting of a path with non-ASCII or control characters."""
+    if not (path.startswith('"') and path.endswith('"')):
+        return path
+    return path[1:-1].encode("ascii").decode("unicode_escape").encode("latin-1").decode("utf-8")
+
+
+def changed_lines(root: Path, base: str) -> dict[str, set[int] | None]:
+    """New-side line numbers each .py file changed since `base` (working tree vs base).
+
+    Untracked files map to None (every function counts as touched), since `git diff` cannot see them.
+    """
+    # prefixes pinned, external drivers and textconv off: config such as diff.mnemonicPrefix
+    # would otherwise rename `b/` and every changed file would silently match nothing
+    proc = git(root, "diff", "--relative", "-U0", "--no-color", "--no-ext-diff", "--no-textconv",
+               "--src-prefix=a/", "--dst-prefix=b/", "--diff-filter=AMR", base, "--", "*.py")
+    if proc.returncode != 0:
+        raise InputError(f"git diff against {base!r} failed: {proc.stderr.strip()}")
+    changed: dict[str, set[int] | None] = {}
+    current = None
+    for line in proc.stdout.splitlines():
+        if line.startswith("+++ "):
+            path = unquote(line[4:].rstrip("\t"))  # git appends a tab to names containing spaces
+            current = None if path == "/dev/null" else path[2:] if path.startswith("b/") else path
+            if current:
+                changed.setdefault(current, set())
+        elif current and (m := re.match(r"@@ -\S+ \+(\d+)(?:,(\d+))? @@", line)):
+            start, count = int(m.group(1)), int(m.group(2) or 1)
+            # a pure deletion (count 0) sits between lines `start` and `start + 1`; mark both, so a
+            # deletion at either end of a function (its decorator, its last statement) rescores it
+            changed[current].update(range(start, start + count) if count else {start, start + 1} - {0})
+    untracked = git(root, "ls-files", "-oz", "--exclude-standard", "--", "*.py")
+    changed.update(dict.fromkeys(filter(None, untracked.stdout.split("\0"))))
+    return changed
+
+
+def python_files(root: Path) -> set[str]:
+    """Every .py file under `root`: git's tracked and unignored files, else a walk skipping dot-dirs."""
+    proc = git(root, "ls-files", "-coz", "--exclude-standard", "--", "*.py")
+    if proc.returncode == 0:
+        return set(filter(None, proc.stdout.split("\0")))
+    return {p.relative_to(root).as_posix() for p in root.rglob("*.py")
+            if not any(part.startswith(".") for part in p.relative_to(root).parts)}
+
+
+def load_coverage(path: Path, root: Path) -> dict[str, dict]:
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError) as exc:  # ValueError covers bad JSON and non-UTF-8 bytes
+        raise InputError(f"cannot read coverage report {path}: {exc}") from exc
+    if not isinstance(data, dict) or not isinstance(data.get("files"), dict):
+        raise InputError(f"{path} is not a coverage.py JSON report (no 'files' object)")
+    reports = {}
+    for name, report in data["files"].items():
+        if not isinstance(report, dict) or not isinstance(report.get("functions", {}), dict):
+            raise InputError(f"{path}: malformed entry for {name}")
+        p = Path(name)
+        rel = p.relative_to(root) if p.is_absolute() and p.is_relative_to(root) else p
+        reports[rel.as_posix()] = report
+    return reports
+
+
+def excluded(rel: str, patterns) -> bool:
+    """A pattern without '/' matches the file name only, so `test_*.py` spares `test_utils/x.py`;
+    one with '/' matches the path, with a leading '/' so `*/tests/*` also catches a top-level tests/."""
+    name = rel.rsplit("/", 1)[-1]
+    return any(fnmatch.fnmatch("/" + rel, pat) or fnmatch.fnmatch(rel, pat) if "/" in pat
+               else fnmatch.fnmatch(name, pat) for pat in patterns)
+
+
+def relative_path(arg: str, root: Path) -> str:
+    """A path argument as root-relative posix: accepts `./x`, `x/`, and absolute paths under root."""
+    path = Path(arg)
+    if path.is_absolute():
+        if not path.resolve().is_relative_to(root):
+            raise InputError(f"{arg} is outside --root {root}")
+        path = path.resolve().relative_to(root)
+    return Path(os.path.normpath(path)).as_posix()
+
+
+def score(root: Path, coverage: dict[str, dict], targets: dict[str, set[int] | None]) -> list[Score]:
+    """Score every function in `targets` (file -> changed lines, or None for every function)."""
+    scores = []
+    for rel, touched in sorted(targets.items()):
+        try:
+            tree = ast.parse((root / rel).read_text(), filename=rel)
+        except (OSError, SyntaxError, ValueError) as exc:  # ValueError: non-UTF-8 or NUL bytes
+            raise InputError(f"cannot parse {rel}: {exc}") from exc
+        report = coverage.get(rel)
+        for qual, node, lines in functions(tree):
+            if touched is not None and not (span(node) & touched):
+                continue
+            cc = complexity(node)
+            try:
+                # a lambda shares its line with the code that defines it, so an executed line says
+                # nothing about whether the body ran: the JSON report cannot measure it at all
+                lam = isinstance(node, ast.Lambda)
+                cov, measured = (0.0, False) if lam else function_coverage(qual, lines, report)
+            except (AttributeError, KeyError, TypeError, ValueError) as exc:
+                raise InputError(f"malformed coverage entry for {rel} {qual}: {exc!r}") from exc
+            scores.append(Score(rel, node.lineno, qual, cc, cov, crap_score(cc, cov), measured))
+    return scores
+
+
+def finite(text: str) -> float:
+    """A threshold argparse accepts: nan or inf would make every `crap > threshold` false."""
+    try:
+        value = float(text)
+    except ValueError:
+        value = math.nan
+    if not math.isfinite(value):
+        raise argparse.ArgumentTypeError(f"must be a finite number, not {text!r}")
+    return value
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(prog="crap", description=__doc__.splitlines()[0])
+    ap.add_argument("--coverage", required=True, type=Path, help="coverage.py JSON report (`coverage json`)")
+    ap.add_argument("--root", type=Path, default=Path.cwd(), help="repo root the report's paths are relative to")
+    ap.add_argument("--diff", metavar="BASE", help="score only functions touched since this git revision")
+    ap.add_argument("--threshold", type=finite, default=DEFAULT_THRESHOLD)
+    ap.add_argument("--exclude", action="append", metavar="GLOB",
+                    help=f"skip matching files (repeatable; default: {' '.join(DEFAULT_EXCLUDES)})")
+    ap.add_argument("--top", type=int, default=20, help="rows to print (violations always print)")
+    ap.add_argument("--json", action="store_true", help="print every score as JSON")
+    ap.add_argument("paths", nargs="*", help="limit to these files or directories (relative to --root)")
+    args = ap.parse_args(argv)
+
+    root = args.root.resolve()
+    patterns = args.exclude if args.exclude else DEFAULT_EXCLUDES
+    try:
+        coverage = load_coverage(args.coverage, root)
+        if args.diff:
+            targets = dict(changed_lines(root, args.diff))
+        else:
+            # a file absent from the report is still scored, as uncovered, so it cannot slip the gate
+            files = python_files(root) | {rel for rel in coverage if rel.endswith(".py")}
+            targets = {rel: None for rel in files}
+        if args.paths:
+            prefixes = [relative_path(p, root) for p in args.paths]
+            targets = {r: t for r, t in targets.items()
+                       if any(p == "." or r == p or r.startswith(p + "/") for p in prefixes)}
+        targets = {r: t for r, t in targets.items() if not excluded(r, patterns) and (root / r).is_file()}
+        scores = score(root, coverage, targets)
+    except InputError as exc:
+        print(f"crap: {exc}", file=sys.stderr)
+        return 2
+
+    scores.sort(key=lambda s: s.crap, reverse=True)
+    violations = [s for s in scores if s.crap > args.threshold]
+    if args.json:
+        rows = [dict(asdict(s), coverage=round(s.coverage, 4), crap=round(s.crap, 2)) for s in scores]
+        print(json.dumps({"threshold": args.threshold, "violations": len(violations), "scores": rows}, indent=1))
+    else:
+        shown = violations if len(violations) > args.top else scores[: args.top]
+        for s in shown:
+            flag = "FAIL" if s.crap > args.threshold else "ok  "
+            cov = f"{s.coverage:6.1%}" if s.measured else "  n/a "
+            print(f"{flag} crap={s.crap:8.2f} cc={s.cc:3d} cov={cov}  {s.file}:{s.line} {s.name}")
+        unmeasured = sum(not s.measured for s in scores)
+        note = f", {unmeasured} unmeasured (scored as uncovered)" if unmeasured else ""
+        print(f"{len(scores)} function(s) scored, {len(violations)} above {args.threshold:g}{note}")
+    return 1 if violations else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
