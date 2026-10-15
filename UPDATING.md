@@ -11,9 +11,10 @@ git fetch origin
 git pull --ff-only
 ```
 
-`--ff-only` refuses to create a merge commit. If it succeeds, you are done — the
-symlink at `~/.claude/skills` already points here, so new/updated skills are live
-on your next Claude Code session.
+`--ff-only` refuses to create a merge commit. If it succeeds, updated skills are
+live on your next Claude Code session: each link in `~/.claude/skills` points into
+this clone. A skill added upstream has no link yet, so re-run the linking loop in
+[README.md](README.md), "Setup" step 1; it skips skills already linked.
 
 ## If `--ff-only` fails
 

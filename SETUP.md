@@ -15,8 +15,8 @@ for the full guided runbook your Claude Code can execute).
 # 1. Clone (not fork) into ~/Code
 git clone https://github.com/DanaResearchGroup/agent-skills ~/Code/agent-skills
 
-# 2. Make it your Claude Code skills dir
-ln -s ~/Code/agent-skills ~/.claude/skills
+# 2. Link the skills and bin/ into ~/.claude/skills: the loop in README.md, "Setup" step 1
+#    (macOS/Linux/WSL and Windows versions there)
 
 # 3. Wire the context-% status line in ~/.claude/settings.json:
 #      "statusLine": { "type": "command",
@@ -33,8 +33,7 @@ agent-skills"). That is all the non-Slack skills need.
 # 1. Clone this repo
 git clone https://github.com/DanaResearchGroup/agent-skills ~/Code/agent-skills
 
-# 2. Make it your skills dir (whole repo) + link the Slack sender
-ln -s ~/Code/agent-skills ~/.claude/skills
+# 2. Link the skills and bin/ (README.md, "Setup" step 1) + link the Slack sender
 mkdir -p ~/.claude/bin
 ln -s ~/Code/agent-skills/bin/cc-slack-post.py ~/.claude/bin/cc-slack-post.py
 chmod +x ~/Code/agent-skills/bin/cc-slack-post.py
