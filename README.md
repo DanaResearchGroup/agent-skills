@@ -10,28 +10,64 @@ research group. A skill is a Markdown playbook (`<skill>/SKILL.md`) that Claude 
 on demand — debugging discipline, TDD, running ARC/T3 campaigns, Slack
 notifications, and more.
 
-This repo **is** your skills directory: you symlink the whole thing into
-`~/.claude/skills`, so every skill here becomes available in Claude Code everywhere.
+You link each skill (and the shared `bin/`) into `~/.claude/skills`, so every skill here
+becomes available in Claude Code everywhere: the terminal, the Desktop app and VS Code.
 
 > **New group member?** Do the three steps below in order. Budget ~15 minutes.
 
 ## Prerequisites
 
-- [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) installed and signed in
-  (`claude --version` works).
-- `git` and `python3`.
+- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) installed and signed in: the
+  CLI, the Desktop app or the VS Code extension. All three read `~/.claude/skills`.
+- `git` and Python 3 (`python3` on macOS/Linux, `py` on Windows).
 
 ## Setup
 
-### 1. Clone and make it your skills directory
+### 1. Clone and link the skills
+
+Link each skill into `~/.claude/skills` rather than replacing the folder: it may already hold
+skills of your own or built-in ones, and replacing it would hide them. Also link `bin/`, which
+several skills (`spar`, `fleet-review`, `merged`, `copilot-review`) call as
+`~/.claude/skills/bin/...`.
+
+**macOS, Linux, WSL:**
 
 ```bash
 git clone https://github.com/DanaResearchGroup/agent-skills ~/Code/agent-skills
-ln -s ~/Code/agent-skills ~/.claude/skills
+mkdir -p ~/.claude/skills
+for d in ~/Code/agent-skills/*/; do d=$(basename "$d")
+  [ -f ~/Code/agent-skills/$d/SKILL.md ] || [ "$d" = bin ] || continue
+  [ -e ~/.claude/skills/$d ] && { echo "skip: $d (already there)"; continue; }
+  ln -s ~/Code/agent-skills/$d ~/.claude/skills/$d
+done
 ```
 
-Open a Claude Code session — the personal skills are now live. (The **Slack** skills need
-a little extra per-machine wiring; see [SETUP.md](SETUP.md).)
+**Windows** (PowerShell; directory junctions need no admin rights):
+
+```powershell
+git clone https://github.com/DanaResearchGroup/agent-skills $HOME\Code\agent-skills
+$src = "$HOME\Code\agent-skills"; $dst = "$HOME\.claude\skills"
+New-Item -ItemType Directory -Force $dst | Out-Null
+Get-ChildItem $src -Directory | Where-Object { (Test-Path "$($_.FullName)\SKILL.md") -or $_.Name -eq 'bin' } | ForEach-Object {
+  $link = Join-Path $dst $_.Name
+  if (Test-Path $link) { "skip: $($_.Name) (already there)" }
+  else { New-Item -ItemType Junction -Path $link -Target $_.FullName | Out-Null }
+}
+```
+
+On Windows, skills and hooks that run `.sh` scripts need Git Bash or WSL, and the lint
+command is `py bin\lint-skills.py`. The Desktop app does not see a `~/.claude` that lives
+inside WSL.
+
+**Then open a new session**: skills are indexed when a session starts. Type `/` to see them
+(in Desktop also **+ → Slash commands**). Twelve skills, `grill-me` among them, run only when
+you type `/<name>`; the rest Claude also loads by itself when your request matches their
+description. (The **Slack** skills need a little extra per-machine wiring; see
+[SETUP.md](SETUP.md).)
+
+**Updating:** `git -C "$HOME/Code/agent-skills" pull` (the same line works in Bash and
+PowerShell). The links follow the repo, but a skill added upstream needs the loop above
+re-run.
 
 ### 2. Find which skills you need to adapt
 
@@ -48,6 +84,9 @@ claude "Read ADAPTATION.md, then review each adaptation point against my setup. 
 what I actually use (Slack? Obsidian? ARC/T3 on zeus? my home directory?), then give me
 an exact, file-and-line checklist of what I must change — and mark the rest N/A."
 ```
+
+Without the `claude` CLI on your PATH (a Desktop-only or VS Code-only install), open a new
+session in the `agent-skills` folder and send the quoted prompt there instead.
 
 Work through the list it produces. Re-run `python3 bin/lint-skills.py` after edits to make
 sure you didn't break a skill.
