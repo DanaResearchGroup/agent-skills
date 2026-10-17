@@ -38,6 +38,17 @@ worth checking; skip it when the ground is already firm.
   write one or name the artifact review that makes correctness visible — and if you catch
   yourself inventing a verifier to fill the field, say so out loud. That invention is the
   failure this skill exists to catch.
+  Write the check as a ```` ```verify ```` block (inside `## Verifier`) and `contract verify`
+  runs it with `bash -e` at the worktree root, then records the real exit code and output tail in
+  Evidence. `contract close` then requires the last run to be a PASS at the current HEAD on a
+  clean tree, so commit before you verify. A block may call other gates (`crap --diff`,
+  `mutation-test --diff`); `contract verify --json` prints the result for a PM to record.
+
+  ````
+  ```verify
+  bash contract/test/ci.sh
+  ```
+  ````
 - **Non-goals** — answer every category in [landmines](reference/landmines.md), or mark it
   N/A. Free text decays into boilerplate; the checklist names the real landmines.
 - **Gates** — what needs explicit approval before execution: pushes, merges, deletions, schema
