@@ -108,6 +108,13 @@ slug: <slug>   updated: <YYYY.MM.DD HH.MM.SS>
 - <none | what + unblock condition>
 ```
 
+**Pin the done-check as executable.** If the repo is contract-gated (`contract status` names an
+active contract), write the feature's "done and verified" command into that contract's
+`## Verifier` as a ```` ```verify ```` block, e.g. `bash test/ci.sh`. A prose Verifier cannot be
+executed: `contract verify` refuses with "no ```verify block", and the run falls back to judging
+its own output. Write the block now, before any code. That way the check is fixed before the
+work exists to fit it. With no contract, skip this; Step 2's Verify runs the tests directly.
+
 ## Step 2 — Development loop (repeat per milestone until done)
 
 ### Prime Codex once (first `spar` round of the run)
@@ -159,7 +166,11 @@ For each milestone, in order:
    Codex resumes the same persistent session each round, so it sees the whole arc.
    Treat Codex's P1/serious findings as must-fix: fix them before moving on. Record the
    round (the spar skill persists Q/A under `~/agents/adversarial/<slug>/`).
-3. **Verify.** Run the tests/build. Do not advance on red. Fix, re-verify.
+3. **Verify.** Run this milestone's tests/build. Do not advance on red. Fix, re-verify. With a
+   ```verify block in the contract, the last milestone also runs `contract verify`, and its
+   exit code is the verdict, not your reading of the output. The block is the whole feature's
+   done-check, so an earlier milestone can fail it only because later work is unbuilt; it
+   does not gate those. It runs on a dirty tree, so no commit is needed first.
 4. **Record.** Update `$DEV/progress.md` (tick the milestone, update Done/Decisions/Next).
    If continuous-checkpoint or git is in use, commit the logical unit.
 5. **Checkpoint beat, then continue.** Before spawning the next phase's work, run the
@@ -328,7 +339,9 @@ mid-run is fully recoverable — keep `progress.md` current at every checkpoint 
 ## Step 4 — Stop conditions
 
 - All milestones done and verification green → set progress.md `status: done`, write a
-  final handoff, summarize what shipped, and stop.
+  final handoff, summarize what shipped, and stop. Under a contract, "green" means: commit,
+  then `contract verify` PASS at that clean HEAD, then `contract close`. `close` refuses a stale,
+  dirty or failed run, so a refusal means you are not done.
 - User decision required — Codex voted `ESCALATE: yes`, or it falls in the unilateral
   carve-out (irreversible/destructive, or user-only info) per "Decision points" → write
   handoff, ask via AskUserQuestion, stop.
