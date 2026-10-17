@@ -1,0 +1,310 @@
+#!/usr/bin/env python3
+"""Map a Python repo's (or one package's) internal imports, report module depth, and check rules.
+
+Writes `<out>/arch-map.mmd` (package graph, Mermaid), `<out>/arch-map.html` (self-contained
+drill-down viewer), and `<out>/arch-map.json`. With `--rules FILE` it also checks forbidden edges
+and new package cycles: exit 0 clean, 1 on a violation, 2 on bad input.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import fnmatch
+import json
+import sys
+import tomllib
+from collections import Counter, defaultdict
+from pathlib import Path
+
+DEFAULT_EXCLUDES = ("*_test.py", "test_*.py", "*/tests/*", "*/test/*", "*/testing/*", "conftest.py")
+HERE = Path(__file__).resolve().parent
+
+
+class InputError(Exception):
+    """Bad input: exit 2."""
+
+
+def excluded(rel: str, patterns) -> bool:
+    """A pattern without '/' matches the file name; one with '/' matches the path (with a leading '/')."""
+    name = rel.rsplit("/", 1)[-1]
+    return any(fnmatch.fnmatch("/" + rel, pat) or fnmatch.fnmatch(rel, pat) if "/" in pat
+               else fnmatch.fnmatch(name, pat) for pat in patterns)
+
+
+def discover(root: Path, top: str, patterns) -> dict[str, Path]:
+    """Dotted module name -> file, for every source module under the top-level package `top`."""
+    base = root / top.replace(".", "/")
+    if not base.is_dir():
+        raise InputError(f"{base} is not a package directory under {root}")
+    mods = {}
+    for path in sorted(base.rglob("*.py")):
+        rel = path.relative_to(root).as_posix()
+        if excluded(rel, patterns) or any(part.startswith(".") for part in path.parts):
+            continue
+        parts = list(path.relative_to(root).with_suffix("").parts)
+        if parts[-1] == "__init__":
+            parts.pop()
+        mods[".".join(parts)] = path
+    return mods
+
+
+def parse(path: Path) -> ast.AST:
+    try:
+        return ast.parse(path.read_text(errors="replace"), filename=str(path))
+    except SyntaxError as exc:
+        raise InputError(f"cannot parse {path}: {exc}") from exc
+
+
+def reexports(mods: dict[str, Path]) -> dict[str, str]:
+    """`pkg.Name` -> defining module, for names a package's __init__ imports from its own submodules,
+    so `from pkg import Name` counts against the module that defines Name, not the __init__."""
+    out = {}
+    for name, path in mods.items():
+        if path.name != "__init__.py":
+            continue
+        for node in parse(path).body:
+            if isinstance(node, ast.ImportFrom):
+                base = resolve_base(name, name, node)
+                if base in mods and base != name:
+                    # `from .sub import child` may name a submodule rather than an attribute of sub
+                    out.update({f"{name}.{a.asname or a.name}": f"{base}.{a.name}" if f"{base}.{a.name}" in mods
+                                else base for a in node.names})
+    return out
+
+
+def resolve_base(name: str, package: str, node: ast.ImportFrom) -> str:
+    base = node.module or ""
+    if node.level:
+        anchor = package.split(".")
+        anchor = anchor[: len(anchor) - (node.level - 1)]
+        base = ".".join(anchor + ([base] if base else []))
+    return base
+
+
+def imports(name: str, path: Path, mods: dict[str, Path], aliases: dict[str, str] | None = None) -> set[str]:
+    """Internal modules `name` imports, resolved to the longest known module prefix."""
+    tree = parse(path)
+    aliases = aliases or {}
+    package = name if path.name == "__init__.py" else name.rpartition(".")[0]
+    found = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            targets = [a.name for a in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            base = resolve_base(name, package, node)
+            # one target per imported name: a submodule, a re-exported name's home, or the module itself
+            targets = [aliases.get(f"{base}.{a.name}", f"{base}.{a.name}") for a in node.names]
+        else:
+            continue
+        for target in targets:
+            while target and target not in mods:
+                target = target.rpartition(".")[0]
+            if target and target != name:
+                found.add(target)
+    return found
+
+
+def group_of(module: str, top: str, depth: int) -> str:
+    """The package a module is drawn under: `top` plus `depth` more components."""
+    keep = len(top.split(".")) + depth
+    return ".".join(module.split(".")[:keep])
+
+
+def cycles(edges: set[tuple[str, str]]) -> list[list[str]]:
+    """Strongly connected components with more than one node (Tarjan, iterative)."""
+    graph = defaultdict(set)
+    for a, b in edges:
+        graph[a].add(b)
+        graph.setdefault(b, set())
+    index, low, on_stack, stack, out = {}, {}, set(), [], []
+    counter = 0
+    for start in sorted(graph):
+        if start in index:
+            continue
+        work = [(start, iter(sorted(graph[start])))]
+        index[start] = low[start] = counter
+        counter += 1
+        stack.append(start)
+        on_stack.add(start)
+        while work:
+            node, children = work[-1]
+            for child in children:
+                if child not in index:
+                    index[child] = low[child] = counter
+                    counter += 1
+                    stack.append(child)
+                    on_stack.add(child)
+                    work.append((child, iter(sorted(graph[child]))))
+                    break
+                if child in on_stack:
+                    low[node] = min(low[node], index[child])
+            else:
+                work.pop()
+                if work:
+                    low[work[-1][0]] = min(low[work[-1][0]], low[node])
+                if low[node] == index[node]:
+                    comp = []
+                    while True:
+                        member = stack.pop()
+                        on_stack.discard(member)
+                        comp.append(member)
+                        if member == node:
+                            break
+                    if len(comp) > 1:
+                        out.append(sorted(comp))
+    return sorted(out)
+
+
+def depth_report(mods: dict[str, Path], edges: set[tuple[str, str]]) -> list[dict]:
+    """Per module: public interface size, lines, fan-in/out, and thin pass-through functions."""
+    fan_in = Counter(b for _, b in edges)
+    fan_out = Counter(a for a, _ in edges)
+    rows = []
+    for name, path in mods.items():
+        source = path.read_text(errors="replace")
+        tree = parse(path)
+        public = [n.name for n in tree.body
+                  if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and not n.name.startswith("_")]
+        rows.append({"module": name, "public": len(public), "lines": source.count("\n") + 1,
+                     "fan_in": fan_in[name], "fan_out": fan_out[name],
+                     "pass_through": pass_throughs(tree)})
+    return sorted(rows, key=lambda r: (-r["fan_in"], r["module"]))
+
+
+def pass_throughs(tree: ast.AST) -> list[str]:
+    """Functions whose whole body forwards their own parameters to one other call, unchanged.
+
+    `super().__init__(...)` is inheritance plumbing, not a shallow module, and is skipped."""
+    found = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) or len(node.body) != 1:
+            continue
+        stmt = node.body[0]
+        call = stmt.value if isinstance(stmt, (ast.Return, ast.Expr)) else None
+        if not isinstance(call, ast.Call):
+            continue
+        func = call.func
+        if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Call) \
+                and isinstance(func.value.func, ast.Name) and func.value.func.id == "super":
+            continue
+        params = {a.arg for a in node.args.args + node.args.kwonlyargs} - {"self", "cls"}
+        passed = {a.id for a in call.args if isinstance(a, ast.Name)}
+        passed |= {k.value.id for k in call.keywords if isinstance(k.value, ast.Name)}
+        if params and params == passed:
+            found.append(node.name)
+    return found
+
+
+def mermaid(groups: list[str], gedges: set[tuple[str, str]], cyc: list[list[str]]) -> str:
+    ids = {g: f"n{i}" for i, g in enumerate(groups)}
+    in_cycle = {g for comp in cyc for g in comp}
+    lines = ["graph LR"]
+    lines += [f'  {ids[g]}["{g}"]' for g in groups]
+    for i, (a, b) in enumerate(sorted(gedges)):
+        lines.append(f"  {ids[a]} --> {ids[b]}")
+    if in_cycle:
+        lines.append("  classDef cycle stroke:#c0392b,stroke-width:3px")
+        lines.append("  class " + ",".join(ids[g] for g in sorted(in_cycle)) + " cycle")
+    return "\n".join(lines) + "\n"
+
+
+def check_rules(rules_path: Path, gedges: set[tuple[str, str]], cyc: list[list[str]],
+                medges: set[tuple[str, str]]) -> list[str]:
+    try:
+        rules = tomllib.loads(rules_path.read_text())
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise InputError(f"cannot read rules {rules_path}: {exc}") from exc
+    violations = []
+    for rule in rules.get("forbid", []):
+        src, sep, dst = (part.strip() for part in rule.partition("->"))
+        if not sep or not src or not dst:
+            raise InputError(f"forbid rule {rule!r} is not 'A -> B'")
+        for a, b in sorted(medges):
+            if fnmatch.fnmatch(a, src) or fnmatch.fnmatch(a, src + ".*"):
+                if fnmatch.fnmatch(b, dst) or fnmatch.fnmatch(b, dst + ".*"):
+                    violations.append(f"forbidden edge {a} -> {b} (rule: {rule})")
+    mode = rules.get("cycles", "allow")
+    if mode not in ("allow", "none", "no-new"):
+        raise InputError(f"cycles = {mode!r}; expected 'allow', 'none' or 'no-new'")
+    if mode != "allow":
+        known = [set(c) for c in rules.get("known_cycles", [])] if mode == "no-new" else []
+        for comp in cyc:
+            if not any(set(comp) <= k for k in known):
+                violations.append(f"package cycle: {' <-> '.join(comp)}")
+    return violations
+
+
+def html(payload: dict) -> str:
+    template = (HERE.parent / "viewer.html").read_text()
+    # `<` as \u003c: a string holding `</script>` must not close the tag it is embedded in
+    return template.replace("/*__DATA__*/null", json.dumps(payload).replace("<", "\\u003c"))
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(prog="arch-map", description=__doc__.splitlines()[0])
+    ap.add_argument("package", help="dotted package to map, e.g. `arc` or `arc.molecule` (resolved from --root)")
+    ap.add_argument("--root", type=Path, default=Path.cwd(), help="directory the top-level package lives in")
+    ap.add_argument("--depth", type=int, default=1, help="package levels below PACKAGE to group modules by")
+    ap.add_argument("--out", type=Path, help="write arch-map.{mmd,html,json} here")
+    ap.add_argument("--rules", type=Path, help="arch-rules.toml to check (exit 1 on violation)")
+    ap.add_argument("--exclude", action="append", metavar="GLOB",
+                    help=f"skip matching files (repeatable; default: {' '.join(DEFAULT_EXCLUDES)})")
+    ap.add_argument("--top", type=int, default=10, help="rows of the depth report to print")
+    args = ap.parse_args(argv)
+
+    root = args.root.resolve()
+    if (root / "__init__.py").exists():
+        print(f"arch-map: --root {root} is itself inside a package, so absolute imports would not resolve; "
+              f"pass the directory above the top-level package and a dotted name (e.g. --root .. pkg.sub)",
+              file=sys.stderr)
+        return 2
+    patterns = args.exclude or DEFAULT_EXCLUDES
+    try:
+        # resolve names from the top-level package so absolute imports inside a subpackage still match
+        top_level = args.package.split(".")[0]
+        everything = discover(root, top_level, patterns)
+        prefix = args.package
+        mods = {m: p for m, p in everything.items() if m == prefix or m.startswith(prefix + ".")}
+        if not mods:
+            raise InputError(f"no source modules under {args.package}")
+        aliases = reexports(everything)
+        medges = {(m, t) for m, p in mods.items() for t in imports(m, p, everything, aliases) if t in mods}
+        # the package's own __init__ usually re-exports everything; it would put every package in one cycle
+        hub = prefix
+        groups = sorted({group_of(m, prefix, args.depth) for m in mods})
+        gedges = {(group_of(a, prefix, args.depth), group_of(b, prefix, args.depth)) for a, b in medges
+                  if hub not in (a, b) and group_of(a, prefix, args.depth) != group_of(b, prefix, args.depth)}
+        cyc = cycles(gedges)
+        depth = depth_report(mods, medges)
+        violations = check_rules(args.rules, gedges, cyc, medges) if args.rules else []
+    except InputError as exc:
+        print(f"arch-map: {exc}", file=sys.stderr)
+        return 2
+
+    if args.out:
+        args.out.mkdir(parents=True, exist_ok=True)
+        payload = {"package": prefix, "groups": groups, "group_edges": sorted(gedges),
+                   "module_edges": sorted(medges), "modules": sorted(mods), "cycles": cyc, "depth": depth,
+                   "violations": violations}
+        (args.out / "arch-map.mmd").write_text(mermaid(groups, gedges, cyc))
+        (args.out / "arch-map.json").write_text(json.dumps(payload, indent=1))
+        (args.out / "arch-map.html").write_text(html(payload))
+
+    print(f"{len(mods)} modules, {len(medges)} imports; {len(groups)} groups, {len(gedges)} group edges"
+          f" (the {hub} __init__ hub left out)")
+    for comp in cyc:
+        print(f"cycle ({len(comp)}): {' <-> '.join(comp)}")
+    print(f"{'module':48} {'public':>6} {'lines':>6} {'in':>4} {'out':>4}  pass-through")
+    for row in depth[: args.top]:
+        thin = ", ".join(row["pass_through"])
+        print(f"{row['module']:48} {row['public']:6} {row['lines']:6} {row['fan_in']:4} {row['fan_out']:4}  {thin}")
+    for v in violations:
+        print(f"FAIL {v}")
+    if args.out:
+        print(f"wrote {args.out / 'arch-map.html'}")
+    return 1 if violations else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
