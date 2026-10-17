@@ -1,0 +1,256 @@
+#!/usr/bin/env python3
+"""Mutation-test the lines a git diff touched, with cosmic-ray, and gate on surviving mutants.
+
+Run it with the Python of the environment under test (cosmic-ray must be importable there).
+Exit 0 when every mutant was killed, 1 when any survived, 2 when the gate cannot judge:
+bad input, a red baseline, a compiled module shadowing its source, too many mutants, or a
+mutant run that crashed rather than passed or failed.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fnmatch
+import hashlib
+import importlib.machinery
+import json
+import os
+import re
+import shlex
+import signal
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+DEFAULT_EXCLUDES = ("*_test.py", "test_*.py", "*/tests/*", "*/test/*", "conftest.py")
+INSTALL_HINT = "pip install 'cosmic-ray>=8.7,<9' into the environment the tests run in"
+
+
+class InputError(Exception):
+    """The gate cannot judge: exit 2."""
+
+
+def git(root: Path, *args: str) -> subprocess.CompletedProcess:
+    # quotePath pinned on so unquote() sees only ASCII, whatever the user's config says
+    return subprocess.run(["git", "-c", "core.quotePath=true", "-C", str(root), *args],
+                          capture_output=True, text=True)
+
+
+def unquote(path: str) -> str:
+    """Undo git's C-style quoting of a path with non-ASCII or control characters."""
+    if not (path.startswith('"') and path.endswith('"')):
+        return path
+    return path[1:-1].encode("ascii").decode("unicode_escape").encode("latin-1").decode("utf-8")
+
+
+def changed_lines(root: Path, base: str) -> dict[str, set[int] | None]:
+    """New-side line numbers each .py file changed since `base`; None means the whole file
+    (untracked files, which `git diff` cannot see)."""
+    # prefixes pinned, external drivers and textconv off: config such as diff.mnemonicPrefix
+    # would otherwise rename `b/` and every changed file would silently match nothing
+    proc = git(root, "diff", "--relative", "-U0", "--no-color", "--no-ext-diff", "--no-textconv",
+               "--src-prefix=a/", "--dst-prefix=b/", "--diff-filter=AMR", base, "--", "*.py")
+    if proc.returncode != 0:
+        raise InputError(f"git diff against {base!r} failed: {proc.stderr.strip()}")
+    changed: dict[str, set[int] | None] = {}
+    current = None
+    for line in proc.stdout.splitlines():
+        if line.startswith("+++ "):
+            path = unquote(line[4:].rstrip("\t"))  # git appends a tab to names containing spaces
+            current = None if path == "/dev/null" else path[2:] if path.startswith("b/") else path
+            if current:
+                changed.setdefault(current, set())
+        elif current and (m := re.match(r"@@ -\S+ \+(\d+)(?:,(\d+))? @@", line)):
+            start, count = int(m.group(1)), int(m.group(2) or 1)
+            # a pure deletion (count 0) sits between lines `start` and `start + 1`; mark both, so a
+            # deletion at the top of a file (`+0,0`) still leaves the line after it in scope
+            changed[current].update(range(start, start + count) if count else {start, start + 1} - {0})
+    untracked = git(root, "ls-files", "-oz", "--exclude-standard", "--", "*.py")
+    changed.update(dict.fromkeys(filter(None, untracked.stdout.split("\0"))))
+    return changed
+
+
+def excluded(rel: str, patterns) -> bool:
+    """A pattern without '/' matches the file name; one with '/' matches the path (with a leading '/')."""
+    name = rel.rsplit("/", 1)[-1]
+    return any(fnmatch.fnmatch("/" + rel, pat) or fnmatch.fnmatch(rel, pat) if "/" in pat
+               else fnmatch.fnmatch(name, pat) for pat in patterns)
+
+
+def shadowing_extensions(root: Path, rel: str) -> list[str]:
+    """Compiled modules that Python would import instead of `rel` (e.g. Cython-built `x.cpython-314-…so`)."""
+    src = root / rel
+    stem = src.name[: -len(".py")]
+    return sorted(p.name for suffix in importlib.machinery.EXTENSION_SUFFIXES
+                  for p in src.parent.glob(stem + suffix))
+
+
+def select_targets(root: Path, base: str | None, paths: list[str], patterns) -> dict[str, set[int] | None]:
+    if base:
+        targets = changed_lines(root, base)
+    elif paths:
+        targets = {}
+        for p in paths:
+            full = root / p
+            files = [full] if full.is_file() else sorted(full.rglob("*.py"))
+            targets.update({f.relative_to(root).as_posix(): None for f in files})
+    else:
+        raise InputError("give --diff BASE, or paths to mutate in full")
+    if base and paths:
+        prefixes = [Path(p).as_posix().rstrip("/") for p in paths]
+        targets = {r: t for r, t in targets.items()
+                   if any(p == "." or r == p or r.startswith(p + "/") for p in prefixes)}
+    return {r: t for r, t in targets.items()
+            if r.endswith(".py") and not excluded(r, patterns) and (root / r).is_file()}
+
+
+def wrap(command: str) -> str:
+    # cosmic-ray shlex-splits the command and runs it without a shell; give it one
+    return "bash -c " + shlex.quote(command)
+
+
+def terminate(signum, frame):
+    raise SystemExit(128 + signum)
+
+
+def main(argv=None) -> int:
+    # Python's default SIGTERM/SIGHUP exit skips `finally`, which would leave a mutant in the source;
+    # as SystemExit they unwind through restore() like any other exit
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, terminate)
+    ap = argparse.ArgumentParser(prog="mutation-test", description=__doc__.splitlines()[0])
+    ap.add_argument("--test-command", required=True,
+                    help="shell command that runs the tests covering the targets; must exit 0 unmutated")
+    ap.add_argument("--diff", metavar="BASE", help="mutate only lines changed since this git revision")
+    ap.add_argument("--root", type=Path, help="repo root (default: the git toplevel of the cwd)")
+    ap.add_argument("--timeout", type=float, default=120.0, help="seconds per test run before the mutant counts as killed")
+    ap.add_argument("--max-mutants", type=int, default=200, help="refuse runs larger than this (exit 2)")
+    ap.add_argument("--exclude", action="append", metavar="GLOB",
+                    help=f"also skip matching files (repeatable); test files are always skipped: {' '.join(DEFAULT_EXCLUDES)}")
+    ap.add_argument("--json", action="store_true", help="print the result as JSON")
+    ap.add_argument("paths", nargs="*", help="limit to these files or directories (relative to the root)")
+    args = ap.parse_args(argv)
+    try:
+        return run(args)
+    except InputError as exc:
+        print(f"mutation-test: {exc}", file=sys.stderr)
+        return 2
+
+
+def run(args) -> int:
+    try:
+        from cosmic_ray.commands import execute, init
+        from cosmic_ray.config import ConfigDict
+        from cosmic_ray.testing import run_tests
+        from cosmic_ray.work_db import WorkDB, use_db
+        from cosmic_ray.work_item import TestOutcome, WorkerOutcome, WorkResult
+    except ImportError as exc:
+        raise InputError(f"cosmic-ray is not importable from {sys.executable} ({exc}); {INSTALL_HINT}")
+
+    if args.root:
+        root = args.root.resolve()
+    else:
+        top = git(Path.cwd(), "rev-parse", "--show-toplevel")
+        if top.returncode != 0:
+            raise InputError("not inside a git repository; pass --root")
+        root = Path(top.stdout.strip())
+    patterns = (*DEFAULT_EXCLUDES, *(args.exclude or ()))  # added to, never replacing: a mutated test is unsound
+    targets = select_targets(root, args.diff, args.paths, patterns)
+    if not targets:
+        return report(args, [], "no Python source in scope")
+
+    shadowed = {rel: ext for rel in targets if (ext := shadowing_extensions(root, rel))}
+    if shadowed:
+        listing = "; ".join(f"{rel} (imported from {', '.join(ext)})" for rel, ext in shadowed.items())
+        raise InputError(f"compiled modules shadow their source, so mutating it changes nothing: {listing}. "
+                         "Pass the remaining paths explicitly, or test those modules uncompiled.")
+
+    os.chdir(root)  # cosmic-ray resolves module paths and runs the tests relative to the cwd
+    command = wrap(args.test_command)
+    outcome, output = run_tests(command, args.timeout)
+    if outcome != TestOutcome.SURVIVED:
+        tail = "\n".join((output or "").splitlines()[-15:])
+        raise InputError(f"baseline is red: the test command fails on unmutated code, so every mutant "
+                         f"would count as killed. Fix or --deselect the failing tests first.\n{tail}")
+
+    originals = {rel: (root / rel).read_bytes() for rel in targets}
+    with tempfile.TemporaryDirectory(prefix="mutation-test.") as tmp:
+        session = Path(tmp) / "session.sqlite"
+        config = ConfigDict({"test-command": command, "timeout": args.timeout,
+                             "distributor": ConfigDict({"name": "local"})})
+        with use_db(str(session)) as db:
+            init([Path(rel) for rel in targets], db, {})
+            skip = [item.job_id for item in db.pending_work_items
+                    if not any(in_scope(m, targets) for m in item.mutations)]
+            if skip:
+                db.set_multiple_results(skip, WorkResult(output="outside the diff",
+                                                         worker_outcome=WorkerOutcome.SKIPPED))
+            pending = len(list(db.pending_work_items))
+            if pending > args.max_mutants:
+                raise InputError(f"{pending} mutants in scope, above --max-mutants {args.max_mutants} "
+                                 "(each one is a full test run); narrow the paths or the test command")
+            try:
+                execute(db, config)
+            finally:
+                restored = restore(root, originals)
+            rows = [(item, result) for item, result in db.completed_work_items
+                    if result.worker_outcome != WorkerOutcome.SKIPPED]
+    if restored:
+        print(f"mutation-test: WARNING, restored files cosmic-ray left mutated: {', '.join(restored)}",
+              file=sys.stderr)
+    return report(args, rows, None)
+
+
+def in_scope(mutation, targets) -> bool:
+    lines = targets.get(Path(mutation.module_path).as_posix(), set())
+    return lines is None or bool(lines & set(range(mutation.start_pos[0], mutation.end_pos[0] + 1)))
+
+
+def restore(root: Path, originals: dict[str, bytes]) -> list[str]:
+    """Put back any target whose bytes differ from before the run; return the ones that did."""
+    changed = []
+    for rel, data in originals.items():
+        path = root / rel
+        if hashlib.sha256(path.read_bytes()).digest() != hashlib.sha256(data).digest():
+            path.write_bytes(data)
+            changed.append(rel)
+    return changed
+
+
+def report(args, rows, note) -> int:
+    from cosmic_ray.work_item import TestOutcome, WorkerOutcome
+    survived, killed, errors = [], 0, []
+    for item, result in rows:
+        if result.worker_outcome != WorkerOutcome.NORMAL or result.test_outcome == TestOutcome.INCOMPETENT:
+            errors.append((item, result))
+        elif result.test_outcome == TestOutcome.SURVIVED:
+            survived.append((item, result))
+        else:
+            killed += 1
+
+    def where(item):
+        m = item.mutations[0]
+        return f"{Path(m.module_path).as_posix()}:{m.start_pos[0]} {m.operator_name}"
+
+    run_count = len(rows)
+    if args.json:
+        print(json.dumps({"mutants": run_count, "killed": killed, "survived": len(survived), "errors": len(errors),
+                          "survivors": [{"where": where(i), "diff": r.diff} for i, r in survived],
+                          "error_details": [{"where": where(i), "output": (r.output or "")[-2000:]} for i, r in errors],
+                          "note": note}, indent=1))
+    else:
+        for item, result in survived:
+            print(f"SURVIVED {where(item)}\n{result.diff}")
+        for item, result in errors:
+            print(f"ERROR    {where(item)} ({result.worker_outcome})\n{(result.output or '')[-800:]}")
+        rate = f"{len(survived) / run_count:.0%}" if run_count else "n/a"
+        print(f"{run_count} mutant(s) run: {killed} killed, {len(survived)} survived ({rate}), "
+              f"{len(errors)} errored" + (f"; {note}" if note else ""))
+    if errors:
+        return 2
+    return 1 if survived else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
