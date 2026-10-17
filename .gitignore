@@ -33,6 +33,7 @@
 # Root directories that belong to this repo.
 !/.github/
 !/bin/
+!/arch-map/
 !/ask-me/
 !/autodev/
 !/code-review/

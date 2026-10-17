@@ -1,0 +1,69 @@
+<!doctype html>
+<!-- arch-map viewer: self-contained, no network. bin/arch-map replaces the DATA placeholder. -->
+<html><head><meta charset="utf-8"><title>arch-map</title>
+<style>
+ body{font:13px system-ui,sans-serif;margin:0;display:flex;height:100vh;color:#222}
+ #graph{flex:1;overflow:auto;border-right:1px solid #ddd}
+ #side{width:420px;overflow:auto;padding:12px}
+ .node rect{fill:#eef3fb;stroke:#4a6fa5;rx:4}
+ .node.cycle rect{stroke:#c0392b;stroke-width:2.5}
+ .node.sel rect{fill:#ffe9a8}
+ .node text{font-size:12px;pointer-events:none}
+ .node{cursor:pointer}
+ path.e{fill:none;stroke:#9aa7b8;stroke-width:1;marker-end:url(#a)}
+ path.e.hot{stroke:#e67e22;stroke-width:2}
+ path.e.dim{opacity:.12}
+ table{border-collapse:collapse;width:100%}td,th{padding:2px 6px;border-bottom:1px solid #eee;text-align:right}
+ td:first-child,th:first-child{text-align:left}
+ h2{font-size:15px;margin:8px 0}.bad{color:#c0392b}
+</style></head><body>
+<div id="graph"><svg id="svg"></svg></div>
+<div id="side"></div>
+<script>
+const D=/*__DATA__*/null;
+const short=g=>g===D.package?g:g.slice(D.package.length+1)||g;
+// every report string (module names, rule globs) is data: escape it before it reaches innerHTML
+const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]);
+const inCycle=new Set(D.cycles.flat());
+// layer: collapse each cycle to one node, then longest path from sources over the DAG
+const comp={};D.groups.forEach(g=>comp[g]=g);D.cycles.forEach(c=>c.forEach(g=>comp[g]=c[0]));
+const out={};D.group_edges.forEach(([a,b])=>{a=comp[a];b=comp[b];if(a!==b)(out[a]=out[a]||new Set).add(b)});
+const layer={};const visit=(n,seen=new Set())=>{if(n in layer)return layer[n];if(seen.has(n))return 0;seen.add(n);
+ let d=0;(out[n]||[]).forEach(m=>d=Math.max(d,visit(m,seen)+1));return layer[n]=d};
+D.groups.forEach(g=>visit(comp[g]));
+const cols={};D.groups.forEach(g=>{const L=layer[comp[g]];(cols[L]=cols[L]||[]).push(g)});
+const W=150,H=24,GX=46,GY=10,pos={};
+const nL=Math.max(...Object.keys(cols).map(Number))+1;
+Object.entries(cols).forEach(([L,gs])=>{gs.sort((a,b)=>comp[a].localeCompare(comp[b])||a.localeCompare(b));
+ gs.forEach((g,i)=>pos[g]={x:20+(nL-1-L)*(W+GX),y:20+i*(H+GY)})});
+const svg=document.getElementById('svg');const NS='http://www.w3.org/2000/svg';
+const maxY=Math.max(...Object.values(pos).map(p=>p.y))+H+20;
+svg.setAttribute('width',20+nL*(W+GX));svg.setAttribute('height',maxY);
+svg.innerHTML='<defs><marker id="a" viewBox="0 0 8 8" refX="8" refY="4" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0L8,4L0,8z" fill="#9aa7b8"/></marker></defs>';
+const el=(t,a,p=svg)=>{const e=document.createElementNS(NS,t);for(const k in a)e.setAttribute(k,a[k]);p.appendChild(e);return e};
+const edges=D.group_edges.map(([a,b])=>{const p=pos[a],q=pos[b];const x1=p.x+W,y1=p.y+H/2,x2=q.x,y2=q.y+H/2;
+ const back=x2<=x1;const d=back?`M${p.x},${y1} C${p.x-60},${y1} ${x2+W+60},${y2} ${x2+W},${y2}`
+  :`M${x1},${y1} C${(x1+x2)/2},${y1} ${(x1+x2)/2},${y2} ${x2},${y2}`;
+ return {a,b,e:el('path',{d,class:'e'})}});
+const nodes={};D.groups.forEach(g=>{const n=el('g',{class:'node'+(inCycle.has(g)?' cycle':''),transform:`translate(${pos[g].x},${pos[g].y})`});
+ el('rect',{width:W,height:H},n);const t=el('text',{x:6,y:17},n);t.textContent=short(g);n.onclick=()=>select(g);nodes[g]=n});
+const depth=Object.fromEntries(D.depth.map(r=>[r.module,r]));
+const inGroup=(m,g)=>m===g||m.startsWith(g+'.');
+function table(rows){return '<table><tr><th>module</th><th>public</th><th>lines</th><th>in</th><th>out</th></tr>'+
+ rows.map(r=>`<tr><td title="${esc(r.pass_through.join(', '))}">${esc(short(r.module))}${r.pass_through.length?' ⇢':''}</td><td>${esc(r.public)}</td><td>${esc(r.lines)}</td><td>${esc(r.fan_in)}</td><td>${esc(r.fan_out)}</td></tr>`).join('')+'</table>'}
+function summary(){return `<h2>${esc(D.package)}</h2><p>${D.modules.length} modules · ${D.module_edges.length} imports · ${D.groups.length} groups</p>`+
+ (D.violations.length?'<h2 class="bad">Rule violations</h2><ul>'+D.violations.map(v=>`<li class="bad">${esc(v)}</li>`).join('')+'</ul>':'')+
+ (D.cycles.length?'<h2 class="bad">Cycles</h2><ul>'+D.cycles.map(c=>`<li>${esc(c.map(short).join(' ↔ '))}</li>`).join('')+'</ul>':'<p>No package cycles.</p>')+
+ '<h2>Depth (by fan-in)</h2><p>Wide interface × high fan-in = expensive to change. ⇢ marks pass-through functions (hover).</p>'+table(D.depth.slice(0,40))}
+let sel=null;
+function select(g){if(sel)nodes[sel].classList.remove('sel');if(sel===g){sel=null;edges.forEach(x=>x.e.setAttribute('class','e'));side.innerHTML=summary();return}
+ sel=g;nodes[g].classList.add('sel');edges.forEach(x=>x.e.setAttribute('class','e '+(x.a===g||x.b===g?'hot':'dim')));
+ const mods=D.modules.filter(m=>inGroup(m,g));const ext=D.module_edges.filter(([a,b])=>inGroup(a,g)!==inGroup(b,g));
+ const outs=ext.filter(([a])=>inGroup(a,g)),ins=ext.filter(([,b])=>inGroup(b,g));
+ const li=es=>'<ul>'+es.map(([a,b])=>`<li>${esc(short(a))} → ${esc(short(b))}</li>`).join('')+'</ul>';
+ side.innerHTML=`<h2>${esc(g)}</h2><p><a href="#" id="back">← back</a></p>`+table(mods.map(m=>depth[m]).filter(Boolean))+
+  `<h2>Imports out (${outs.length})</h2>${li(outs)}<h2>Imported by (${ins.length})</h2>${li(ins)}`;
+ document.getElementById('back').addEventListener('click',e=>{e.preventDefault();select(g)})}
+const side=document.getElementById('side');side.innerHTML=summary();
+const want=decodeURIComponent(location.hash.slice(1));if(want in nodes)select(want);
+</script></body></html>
