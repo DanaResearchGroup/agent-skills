@@ -1,5 +1,6 @@
 """Tests for mutation-test/bin/mutation-test. Run via mutation-test/test/ci.sh (needs cosmic-ray)."""
 
+import fcntl
 import importlib.machinery
 import json
 import os
@@ -136,6 +137,66 @@ class Gate(unittest.TestCase):
             if proc.poll() is None:
                 proc.kill()
         self.assertEqual((self.root / "calc.py").read_bytes(), original)
+
+    def lock_path(self):
+        gitdir = subprocess.run(["git", "-C", str(self.root), "rev-parse", "--absolute-git-dir"],
+                                check=True, capture_output=True, text=True).stdout.strip()
+        return Path(gitdir) / "mutation-test.lock"
+
+    def test_concurrent_run_on_the_same_tree_is_refused(self):
+        # injection: a live run holds the tree; a second run would snapshot its mutant as the original
+        (self.root / "calc.py").write_text(CALC + UNTESTED)
+        with open(self.lock_path(), "a+") as held:
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            held.write("4242\n")
+            held.flush()
+            rc, data, err = self.run_gate("--diff", "HEAD")
+        self.assertEqual((rc, data), (2, None))
+        self.assertIn("another mutation-test run (pid 4242)", err)
+
+    def test_lock_file_left_by_a_dead_run_does_not_block(self):
+        self.lock_path().write_text("4242\n")  # file present, nobody holds the flock
+        (self.root / "calc.py").write_text(CALC + UNTESTED)
+        rc, data, err = self.run_gate("--diff", "HEAD")
+        self.assertEqual(rc, 1, err)
+
+    def test_linked_worktree_is_not_blocked_by_a_run_on_the_main_tree(self):
+        # each linked worktree has its own git dir, so the lock covers one tree, not the repository
+        (self.root / "calc.py").write_text(CALC + UNTESTED)
+        self.git("commit", "-qam", "untested")
+        other = tempfile.TemporaryDirectory()
+        self.addCleanup(other.cleanup)
+        tree = Path(other.name) / "linked"
+        self.git("worktree", "add", "-q", str(tree))
+        with open(self.lock_path(), "a+") as held:
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            proc = subprocess.run([sys.executable, str(BIN), "--root", str(tree), "--json",
+                                   "--test-command", self.test_command, "--diff", "HEAD~1"],
+                                  capture_output=True, text=True, cwd=tree)
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertNotIn("another mutation-test run", proc.stderr)
+
+    def test_planted_lock_link_outside_git_is_refused_and_its_target_kept(self):
+        # injection: outside git the lock is in the tree, so an untrusted archive can plant it as a
+        # link; following it would write the pid over the target
+        other = tempfile.TemporaryDirectory()
+        self.addCleanup(other.cleanup)
+        tree = Path(other.name) / "tree"
+        tree.mkdir()
+        for name in ("calc.py", "calc_test.py"):
+            (tree / name).write_bytes((self.root / name).read_bytes())
+        victim = Path(other.name) / "victim.txt"
+        for plant in (os.symlink, os.link):
+            with self.subTest(plant=plant.__name__):
+                victim.write_text("precious\n")
+                plant(victim, tree / ".mutation-test.lock")
+                proc = subprocess.run([sys.executable, str(BIN), "--root", str(tree), "--json",
+                                       "--test-command", self.test_command, "calc.py"],
+                                      capture_output=True, text=True, cwd=tree)
+                (tree / ".mutation-test.lock").unlink()
+                self.assertEqual(proc.returncode, 2, proc.stderr)
+                self.assertIn("lock file", proc.stderr)
+                self.assertEqual(victim.read_text(), "precious\n")
 
     def test_compiled_module_shadowing_source_is_refused(self):
         (self.root / "calc.py").write_text(CALC + UNTESTED)
