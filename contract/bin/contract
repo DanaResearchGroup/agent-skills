@@ -301,6 +301,11 @@ cmd_lint() {
     found=1
   fi
 
+  # Warn only: a note may legitimately carry a prose Verifier.
+  if [ "$(count_verify_blocks "$f")" -eq 0 ]; then
+    printf '%s: WARN: Verifier has no ```verify block; `contract verify` cannot execute it\n' "$f" >&2
+  fi
+
   return "$found"
 }
 
@@ -465,6 +470,142 @@ cmd_show() {
   cat "$CDIR/$slug.md"
 }
 
+# --- contract verify -------------------------------------------------------
+# A note's Verifier may carry fenced blocks whose opening fence is exactly
+# ```verify. `contract verify` executes them and appends the real result to the
+# note; `close` then trusts only a header line this tool wrote. "Trusted" means
+# a line at column 0, in the exact format below, OUTSIDE every fenced block —
+# and the tool writes captured output only inside a fence, every line indented
+# so that output can neither be a header nor close the fence early.
+
+# Extract the verify blocks of note $1 into dir $2 as 1.sh, 2.sh, ...; prints
+# the count. Only fences inside the ## Verifier section count; a "## " line
+# inside any fence is content, not a heading.
+extract_verify_blocks() {
+  awk -v dir="$2" '
+    BEGIN { insec = 0; fence = 0; cap = 0; n = 0 }
+    {
+      line = $0
+      if (line ~ /^```/) {
+        if (!fence) {
+          fence = 1
+          if (insec && line == "```verify") { cap = 1; n++; f = dir "/" n ".sh"; printf "" > f }
+          else cap = 0
+        } else if (line ~ /^```+[ \t]*$/) {
+          if (cap) close(f)
+          fence = 0; cap = 0
+        } else if (cap) print line > f
+        next
+      }
+      if (fence) { if (cap) print line > f; next }
+      if (line ~ /^## /) insec = (line ~ /^## Verifier[ \t]*$/)
+    }
+    END { print n }
+  ' "$1"
+}
+
+count_verify_blocks() {
+  local d n; d=$(mktemp -d "${TMPDIR:-/tmp}/contract-vb.XXXXXX") || { echo 0; return; }
+  n=$(extract_verify_blocks "$1" "$d")
+  rm -rf "$d"
+  printf '%s\n' "${n:-0}"
+}
+
+# Last trusted run record in note $1: "CONCL<TAB>short<TAB>dirty<TAB>full".
+# `full` is empty unless the header is followed by the tool's head comment.
+last_verify_record() {
+  awk '
+    BEGIN { fence = 0; pend = 0; have = 0 }
+    {
+      if ($0 ~ /^```/) {
+        if (!fence) fence = 1; else if ($0 ~ /^```+[ \t]*$/) fence = 0
+        pend = 0; next
+      }
+      if (fence) { pend = 0; next }
+      if (pend) {
+        pend = 0
+        if ($0 ~ /^<!-- verify-head [0-9a-f]+ dirty=[01] -->$/) { split($0, q, " "); full = q[3] }
+      }
+      if ($0 ~ /^### contract verify — (PASS|FAIL) — [0-9][0-9-]*T[0-9:]*Z — head [0-9a-f]+( dirty)?$/) {
+        split($0, p, " — ")
+        concl = p[2]; split(p[4], h, " "); short = h[2]; dirty = (p[4] ~ / dirty$/) ? 1 : 0
+        full = ""; have = 1; pend = 1
+      }
+    }
+    END { if (have) printf "%s\t%s\t%s\t%s\n", concl, short, dirty, full }
+  ' "$1"
+}
+
+cmd_verify() {
+  local json=0
+  case "${1:-}" in
+    --json) json=1 ;;
+    '') ;;
+    *) die "usage: contract verify [--json]" ;;
+  esac
+  require_repo
+  local slug; slug=$(active_slug)
+  [ -n "$slug" ] || die "no active contract in this worktree"
+  local note="$CDIR/$slug.md"
+  local tmp; tmp=$(mktemp -d "${TMPDIR:-/tmp}/contract-verify.XXXXXX") || die "cannot create a temp dir"
+  mkdir "$tmp/blocks"
+  local nblocks; nblocks=$(extract_verify_blocks "$note" "$tmp/blocks")
+  if [ "${nblocks:-0}" -lt 1 ]; then
+    rm -rf "$tmp"
+    die 'no ```verify block in Verifier; nothing to execute'
+  fi
+  local head_full head_short dirty=0
+  head_full=$(git -C "$WT" rev-parse HEAD 2>/dev/null) || { rm -rf "$tmp"; die "cannot resolve HEAD"; }
+  head_short=$(git -C "$WT" rev-parse --short HEAD)
+  [ -z "$(git -C "$WT" status --porcelain 2>/dev/null)" ] || dirty=1
+
+  local i label rc t0 t1 secs conclusion=PASS entry="" results="$tmp/results.tsv"
+  : > "$results"
+  for ((i = 1; i <= nblocks; i++)); do
+    label=$(sed -n '1p' "$tmp/blocks/$i.sh" | tr -d '\r' | cut -c1-200)
+    [ -n "$label" ] || label="(block $i)"
+    t0=$(date +%s.%N)
+    if [ "$json" = 1 ]; then
+      ( cd "$WT" && exec bash -e "$tmp/blocks/$i.sh" </dev/null ) 2>&1 | tee "$tmp/out.$i" >&2
+    else
+      ( cd "$WT" && exec bash -e "$tmp/blocks/$i.sh" </dev/null ) 2>&1 | tee "$tmp/out.$i"
+    fi
+    rc=${PIPESTATUS[0]}
+    t1=$(date +%s.%N)
+    secs=$(awk -v a="$t0" -v b="$t1" 'BEGIN { printf "%.1f", b - a }')
+    [ "$rc" = 0 ] || conclusion=FAIL
+    printf '%s\t%s\t%s\n' "$rc" "$secs" "$label" >> "$results"
+    entry+=$'\n'"- \`$label\` — exit $rc in ${secs}s"$'\n\n```text\n'
+    entry+=$(tail -n 40 "$tmp/out.$i" | tr -d '\000' | sed -e $'s/\x1b\\[[0-9;]*[A-Za-z]//g' -e 's/^/    /')
+    entry+=$'\n```\n'
+  done
+
+  local ts dtag=""
+  ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  [ "$dirty" = 0 ] || dtag=" dirty"
+  entry=$'\n'"### contract verify — $conclusion — $ts — head $head_short$dtag"$'\n'"<!-- verify-head $head_full dirty=$dirty -->"$'\n'"$entry"
+
+  if [ "$json" = 1 ]; then
+    python3 - "$conclusion" "$head_full" "$dirty" "$note" "$results" <<'PY'
+import json, sys
+concl, head, dirty, note, tsv = sys.argv[1:6]
+blocks = []
+for ln in open(tsv, encoding="utf-8", errors="replace"):
+    ex, secs, label = ln.rstrip("\n").split("\t", 2)
+    blocks.append({"label": label, "exit": int(ex), "seconds": float(secs)})
+print(json.dumps({"conclusion": concl, "head": head, "dirty": dirty == "1",
+                  "blocks": blocks, "note": note}))
+PY
+  fi
+  rm -rf "$tmp"
+
+  # Lock only around the append: blocks may be slow and must not hold it.
+  take_lock
+  printf '%s' "$entry" >> "$note" || die "cannot append to $note — $(legacy_hint)"
+  [ "$json" = 1 ] || printf 'contract: verify %s — appended to %s\n' "$conclusion" "$note"
+  [ "$conclusion" = PASS ]
+}
+
 cmd_close() {
   require_repo
   take_lock
@@ -477,6 +618,31 @@ cmd_close() {
   if [ -z "$evidence" ]; then
     printf 'contract: Evidence is empty in %s — run the verifier and paste its real output first\n' "$note" >&2
     exit 4
+  fi
+  # An executable Verifier is not satisfied by prose: the last trusted
+  # `contract verify` record must be a PASS at this exact HEAD on a clean tree.
+  if [ "$(count_verify_blocks "$note")" -gt 0 ]; then
+    local rec concl _short rdirty rfull cur
+    rec=$(last_verify_record "$note")
+    if [ -z "$rec" ]; then
+      printf 'contract: Verifier has a ```verify block but no `contract verify` run is recorded in %s — run it\n' "$note" >&2
+      exit 4
+    fi
+    IFS=$'\t' read -r concl _short rdirty rfull <<<"$rec"
+    cur=$(git -C "$WT" rev-parse HEAD 2>/dev/null)
+    if [ "$concl" != PASS ]; then
+      printf 'contract: the last `contract verify` run FAILED — fix it and rerun before closing\n' >&2
+      exit 4
+    elif [ -z "$rfull" ] || [ "$rfull" != "$cur" ]; then
+      printf 'contract: the last `contract verify` run is stale (HEAD moved since it ran) — rerun it\n' >&2
+      exit 4
+    elif [ "$rdirty" = 1 ]; then
+      printf 'contract: the last `contract verify` run was on a dirty tree — commit, then rerun it\n' >&2
+      exit 4
+    elif [ -n "$(git -C "$WT" status --porcelain 2>/dev/null)" ]; then
+      printf 'contract: the worktree is dirty — commit or stash, then rerun `contract verify`\n' >&2
+      exit 4
+    fi
   fi
   mkdir -p "$CDIR/closed" || die "cannot create $CDIR/closed — $(legacy_hint)"
   local archived; archived=$(archive_path "$slug")
@@ -618,12 +784,13 @@ main() {
     new)     cmd_new "$@" ;;
     show)    cmd_show ;;
     close)   cmd_close ;;
+    verify)  cmd_verify "$@" ;;
     abandon) cmd_abandon "$@" ;;
     skip)    cmd_skip "$@" ;;
     skipped) cmd_skipped "$@" ;;
     migrate) cmd_migrate ;;
     lint)    cmd_lint "$@" ;;
-    *) printf 'contract: unknown subcommand %s\n' "$sub" >&2; return 2 ;;
+    *) printf 'contract: unknown subcommand %s (status|enable|disable|new|show|close|verify|abandon|skip|skipped|migrate|lint)\n' "$sub" >&2; return 2 ;;
   esac
 }
 
