@@ -3,13 +3,14 @@
 
 Run it with the Python of the environment under test (cosmic-ray must be importable there).
 Exit 0 when every mutant was killed, 1 when any survived, 2 when the gate cannot judge:
-bad input, a red baseline, a compiled module shadowing its source, too many mutants, or a
-mutant run that crashed rather than passed or failed.
+bad input, a red baseline, a compiled module shadowing its source, too many mutants, another
+run already mutating the same tree, or a mutant run that crashed rather than passed or failed.
 """
 
 from __future__ import annotations
 
 import argparse
+import fcntl
 import fnmatch
 import hashlib
 import importlib.machinery
@@ -18,6 +19,7 @@ import os
 import re
 import shlex
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -105,6 +107,45 @@ def select_targets(root: Path, base: str | None, paths: list[str], patterns) -> 
             if r.endswith(".py") and not excluded(r, patterns) and (root / r).is_file()}
 
 
+def lock_tree(root: Path):
+    """Hold an exclusive lock on the tree for the whole run, or refuse.
+
+    cosmic-ray mutates the source in place. A second run started while the first has a mutant
+    applied snapshots that mutant as the original, and its restore writes it back after the first
+    run has cleaned up. When the mutant is one the tests do not catch, the source keeps a bug its
+    own suite cannot see. flock is released by the kernel when the process dies, so there is no
+    stale lock to clear.
+
+    Outside git the lock lives in the tree, which an untrusted archive controls: a symlink or
+    hardlink planted there would have the pid written over its target, so only a regular file
+    with one link is accepted.
+    """
+    gitdir = git(root, "rev-parse", "--absolute-git-dir")
+    path = Path(gitdir.stdout.strip()) / "mutation-test.lock" if gitdir.returncode == 0 else root / ".mutation-test.lock"
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    except OSError as exc:
+        raise InputError(f"cannot open the lock file {path} ({exc.strerror}); a symlink there is refused")
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        os.close(fd)
+        raise InputError(f"the lock file {path} is not a plain file of its own (a link or special file); "
+                         "remove it and rerun")
+    handle = os.fdopen(fd, "r+")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.seek(0)
+        holder = handle.read().strip() or "unknown"
+        handle.close()
+        raise InputError(f"another mutation-test run (pid {holder}) is mutating this tree; wait for it to "
+                         f"finish. Two at once can write a surviving mutant back into the source ({path})")
+    handle.truncate(0)
+    handle.write(f"{os.getpid()}\n")
+    handle.flush()
+    return handle
+
+
 def wrap(command: str) -> str:
     # cosmic-ray shlex-splits the command and runs it without a shell; give it one
     return "bash -c " + shlex.quote(command)
@@ -166,6 +207,7 @@ def run(args) -> int:
         raise InputError(f"compiled modules shadow their source, so mutating it changes nothing: {listing}. "
                          "Pass the remaining paths explicitly, or test those modules uncompiled.")
 
+    lock = lock_tree(root)  # noqa: F841 -- held until the process exits
     os.chdir(root)  # cosmic-ray resolves module paths and runs the tests relative to the cwd
     command = wrap(args.test_command)
     outcome, output = run_tests(command, args.timeout)

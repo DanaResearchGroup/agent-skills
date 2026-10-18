@@ -38,7 +38,7 @@ python ~/.claude/skills/mutation-test/bin/mutation-test --diff <base> \
 |---|---|
 | 0 | every mutant killed (or nothing in scope) |
 | 1 | at least one survived: each printed as `SURVIVED file:line operator` plus its diff |
-| 2 | cannot judge: red baseline, compiled module shadowing a target, more than `--max-mutants`, a mutant run that crashed, or cosmic-ray missing |
+| 2 | cannot judge: red baseline, compiled module shadowing a target, more than `--max-mutants`, a mutant run that crashed, another run already mutating the same tree, or cosmic-ray missing |
 
 Other flags: `--timeout S` per test run (a timeout counts as killed), `--max-mutants N`
 (default 200), `--json`, `--exclude GLOB` (added to the test-file exclusions, which always apply), and trailing paths to narrow the scope (or, without
@@ -88,3 +88,7 @@ free-tier one can run it.
 - Any non-zero exit of the test command counts as a kill — including an import error. The green
   baseline guards the common case; a mutant that breaks imports is still killed, which is correct.
 - A pure deletion (lines removed, none added) scopes the line just before the cut.
+- **One run per tree.** Mutants are written into the source in place, so a second run started
+  mid-run would snapshot a mutant as the original and write it back afterwards. A surviving
+  mutant left that way is a bug the suite cannot see. The second run exits 2. Agent harnesses
+  that background long commands (codex does) make this easy to hit: wait for the first run.
