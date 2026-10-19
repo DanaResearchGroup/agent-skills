@@ -130,6 +130,16 @@ still exists, and a pruned worktree takes that proof with it:
 ~/.claude/skills/spar/bin/migrate-spar-bindings.sh --apply
 ```
 
+## Model selection
+
+All Codex calls below use `~/.claude/skills/spar/bin/spar-codex.sh`. When the optional
+`~/.claude/skills/model-ladder/bin/ladder.py` resolver is installed, the helper uses the model
+and reasoning effort from `resolve review`. Set `SPAR_TIER=hard` in the calling shell (for
+example, `export SPAR_TIER=hard`) for a stronger adversarial review of work written by a
+top-tier model. The setting applies to fresh rounds, resumed rounds, and handoff summaries.
+If the resolver is absent, fails, or returns an unusable result, the helper leaves the model
+at Codex's configured default and sets reasoning effort to `high`.
+
 ## Codex Context Auto-Handoff
 
 Before composing a **substantive** round (`/spar <topic>` — NOT `reset`, `log`, or `review`),
@@ -178,7 +188,7 @@ Be specific and terse. Reference files by path; the successor can read the code 
     HTMPERR=$(mktemp "${TMPDIR:-/tmp}/spar-handoff-err-XXXXXX.txt")
     HRUN=$(mktemp "${TMPDIR:-/tmp}/spar-handoff-out-XXXXXX.txt")
     # Uses the SAME JSON-stream parser as "Invoke Codex" below.
-    (cd "$REPO_ROOT" && timeout 600 codex exec resume "$OLD_SID" "$HANDOFF_PROMPT" --skip-git-repo-check -c 'sandbox_mode="read-only"' -c 'model_reasoning_effort="high"' --json < /dev/null 2>"$HTMPERR") \
+    (cd "$REPO_ROOT" && timeout 600 ~/.claude/skills/spar/bin/spar-codex.sh resume "$OLD_SID" "$HANDOFF_PROMPT" --skip-git-repo-check -c 'sandbox_mode="read-only"' --json < /dev/null 2>"$HTMPERR") \
       | PYTHONUNBUFFERED=1 "$PYTHON_CMD" -u -c '<same parser as Invoke Codex>' | tee "$HRUN"
     HEXIT=${PIPESTATUS[0]}
     sed '/^SESSION_ID:/d' "$HRUN" > "$HANDOFF_FILE.tmp"
@@ -278,7 +288,7 @@ For the first round (this path also runs immediately after an auto-handoff rotat
 and predecessor-handoff block prepended, per **Codex Context Auto-Handoff** above):
 
 ```bash
-timeout 600 codex exec "$PROMPT" -C "$REPO_ROOT" --skip-git-repo-check -s read-only -c 'model_reasoning_effort="high"' --enable web_search_cached --json < /dev/null 2>"$TMPERR" \
+timeout 600 ~/.claude/skills/spar/bin/spar-codex.sh "$PROMPT" -C "$REPO_ROOT" --skip-git-repo-check -s read-only --enable web_search_cached --json < /dev/null 2>"$TMPERR" \
   | PYTHONUNBUFFERED=1 "$PYTHON_CMD" -u -c '
 import json, sys
 turn_completed = 0
@@ -333,7 +343,7 @@ For later rounds:
 
 ```bash
 SESSION_ID=$(cat "$STORE/.session-id")
-(cd "$REPO_ROOT" && timeout 600 codex exec resume "$SESSION_ID" "$PROMPT" --skip-git-repo-check -c 'sandbox_mode="read-only"' -c 'model_reasoning_effort="high"' --enable web_search_cached --json < /dev/null 2>"$TMPERR") \
+(cd "$REPO_ROOT" && timeout 600 ~/.claude/skills/spar/bin/spar-codex.sh resume "$SESSION_ID" "$PROMPT" --skip-git-repo-check -c 'sandbox_mode="read-only"' --enable web_search_cached --json < /dev/null 2>"$TMPERR") \
   | PYTHONUNBUFFERED=1 "$PYTHON_CMD" -u -c '<same parser as above>' | tee "$RUN_OUT"
 CODEX_EXIT=${PIPESTATUS[0]}
 if [ "$CODEX_EXIT" != 0 ]; then
