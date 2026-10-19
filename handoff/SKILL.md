@@ -8,11 +8,13 @@ Write or load a handoff document so a fresh agent can continue the work after co
 
 Explicit invocation is runtime-specific: Claude Code uses `/handoff`; Codex uses `$handoff`.
 
-Save handoffs into `$HOME/agents/handoffs/` - not the current workspace and not the OS temp
+`AUTODEV_HOME` defaults to `~/agents`; every `agents` path below honors it.
+
+Save handoffs into `${AUTODEV_HOME:-$HOME/agents}/handoffs/` - not the current workspace and not the OS temp
 directory. Create the directory if it does not already exist. Name new files:
 `$(date +"%Y.%m.%d %H.%M.%S") handoff-<short-kebab-topic>.md`.
 
-Files in `$HOME/agents/handoffs/` older than one month are auto-pruned by an external monthly
+Files in `${AUTODEV_HOME:-$HOME/agents}/handoffs/` older than one month are auto-pruned by an external monthly
 cron job. If the cron still targets `$HOME/handoffs/`, update it outside this skill.
 
 ## Load
@@ -20,15 +22,17 @@ cron job. If the cron still targets `$HOME/handoffs/`, update it outside this sk
 If the user asks `/handoff load` (Claude Code) or `$handoff load` (Codex), resolve this session's
 identity exactly as the writer does: `${CLAUDE_CODE_SESSION_ID}` for Claude Code, or
 `${CODEX_SESSION_ID:-${CODEX_THREAD_ID:-}}` for Codex. Read
-`$HOME/agents/handoffs/.latest.<resolved-session-id>`, then read and present that handoff document.
+`${AUTODEV_HOME:-$HOME/agents}/handoffs/.latest.<resolved-session-id>`, then read and present that handoff document.
 Do not infer a Codex identity from a scratchpad path.
 
-If that pointer is missing, do NOT silently fall back to `$HOME/agents/handoffs/.latest` or to
+If that pointer is missing, do NOT silently fall back to `${AUTODEV_HOME:-$HOME/agents}/handoffs/.latest` or to
 "the newest file in the directory". Both are machine-wide and last-writer-wins: on a box with
 several concurrent sessions they usually name somebody else's mission. Instead, list the newest
 timestamped handoffs and ask the user which one to load.
 
 ## Required sections
+
+The first line under the document title is `Context at handoff: <n>%` (the `$pct` from the Write Workflow's first step, or `unknown`).
 
 Every handoff MUST contain these sections, in this order. Do not drop any of them even for a "small" handoff — scale each to the work, but cover all.
 
@@ -47,17 +51,29 @@ Every handoff MUST contain these sections, in this order. Do not drop any of the
 
 ## Write Workflow
 
+First, before anything else, print the context % to the user. This is the first visible output
+of the handoff turn, and it runs for manual and watcher-triggered handoffs alike. Resolve the
+session id as elsewhere in this file and read the reading the statusline (Claude Code) or Stop hook (Codex) wrote; never estimate it:
+
+```bash
+sid="${CLAUDE_CODE_SESSION_ID:-${CODEX_SESSION_ID:-${CODEX_THREAD_ID:-}}}"
+pct=$(sed -n 's/^pct=\([0-9.]*\).*/\1/p' "${AUTODEV_HOME:-$HOME/agents}/state/$sid.ctx" 2>/dev/null)
+[ -n "$sid" ] && [ -n "$pct" ] && echo "Context at ${pct}% — writing handoff." || echo "Context: unknown (no .ctx reading)"
+```
+
+Show that line to the user as text, then continue. Keep `$pct` (or "unknown") for the document header.
+
 Before writing, migrate old handoffs once if needed. Preserve the `~/agents/` timestamp naming
 convention by prefixing each migrated file with its original modification time:
 
 ```bash
-mkdir -p "$HOME/agents/handoffs"
+mkdir -p "${AUTODEV_HOME:-$HOME/agents}/handoffs"
 for f in "$HOME"/handoffs/*.md; do
   [ -e "$f" ] || continue
   epoch=$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f")
   ts=$(date -d "@$epoch" +"%Y.%m.%d %H.%M.%S" 2>/dev/null || date -r "$epoch" +"%Y.%m.%d %H.%M.%S")
   base=$(basename "$f")
-  mv "$f" "$HOME/agents/handoffs/$ts $base"
+  mv "$f" "${AUTODEV_HOME:-$HOME/agents}/handoffs/$ts $base"
 done
 ```
 
@@ -76,8 +92,8 @@ hf="<full handoff path>"
 # ("what handed off most recently on this box"), and it is NOT what your session
 # reloads from — with several sessions running concurrently, whoever writes last
 # wins and everyone else would resume the wrong mission.
-tmp="$HOME/agents/handoffs/.latest.tmp"
-printf '%s\n' "$hf" > "$tmp" && mv "$tmp" "$HOME/agents/handoffs/.latest"
+tmp="${AUTODEV_HOME:-$HOME/agents}/handoffs/.latest.tmp"
+printf '%s\n' "$hf" > "$tmp" && mv "$tmp" "${AUTODEV_HOME:-$HOME/agents}/handoffs/.latest"
 
 # This is the one that matters. --handoff records the PER-SESSION reload pointer
 # (.latest.<sid>) naming the file you just wrote, which is the only thing the
@@ -96,7 +112,7 @@ done
 ```
 
 **ALWAYS print the handoff's absolute path to the user — every time, no exceptions.** The full
-expanded path exactly as `$hf` holds it: not `~/agents/handoffs/…`, not a bare filename, not "the
+expanded path exactly as `$hf` holds it: not `${AUTODEV_HOME:-$HOME/agents}/handoffs/…`, not a bare filename, not "the
 handoff file". The user has to open, move, or hand that file to another session, and a path they
 must reconstruct is a path they cannot click. This holds when the write was routine, when a tool
 call already showed the filename, and when nothing else in the turn is worth saying.
@@ -107,9 +123,9 @@ when autodev is not installed. Running it is therefore not proof that anything w
 
 ```bash
 sid="${CLAUDE_CODE_SESSION_ID:-${CODEX_SESSION_ID:-${CODEX_THREAD_ID:-}}}"
-ls -la "$HOME/agents/state/$sid".{compact-request,handoff-request} 2>/dev/null
-ls -la "$HOME/agents/handoffs/.latest.$sid" 2>/dev/null   # the reload pointer
-cat "$HOME/agents/state/$sid.ctx" 2>/dev/null             # authoritative pct — never guess it
+ls -la "${AUTODEV_HOME:-$HOME/agents}/state/$sid".{compact-request,handoff-request} 2>/dev/null
+ls -la "${AUTODEV_HOME:-$HOME/agents}/handoffs/.latest.$sid" 2>/dev/null   # the reload pointer
+cat "${AUTODEV_HOME:-$HOME/agents}/state/$sid.ctx" 2>/dev/null             # authoritative pct — never guess it
 ```
 
 Resolve as follows:
@@ -147,9 +163,9 @@ Handoff written: <absolute path — the full expanded $hf, always, no exceptions
   the authority. If the required state is absent, run /compact yourself now.
 
 Reload contract: after compaction, the next agent turn is handed THIS session's handoff to read,
-via the SessionStart hook reading ~/agents/handoffs/.latest.<resolved-session-id> (using
+via the SessionStart hook reading ${AUTODEV_HOME:-$HOME/agents}/handoffs/.latest.<resolved-session-id> (using
 CLAUDE_CODE_SESSION_ID, or CODEX_SESSION_ID with CODEX_THREAD_ID as its fallback). If that pointer
-is missing the reload fails closed on purpose — it will never hand you the shared ~/agents/handoffs/.latest,
+is missing the reload fails closed on purpose — it will never hand you the shared ${AUTODEV_HOME:-$HOME/agents}/handoffs/.latest,
 because that file is machine-wide and would resume another session's mission.
 ```
 
