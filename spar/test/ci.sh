@@ -14,6 +14,8 @@ SKILL_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 BINDING="$SKILL_DIR/bin/spar-binding.sh"
 MIGRATE="$SKILL_DIR/bin/migrate-spar-bindings.sh"
 
+bash "$SKILL_DIR/test/test-model.sh" || exit $?
+
 PASS=0; FAIL=0
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/spar-binding-test-XXXXXX")
 trap 'chmod -R u+w "$WORK" 2>/dev/null; rm -rf "$WORK"' EXIT
