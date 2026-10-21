@@ -47,6 +47,7 @@ case "${1:-} ${2:-}" in
       [ -f "$H/read-fail" ] && exit 1
       n=$(( $(cat "$H/reads" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$H/reads"
       if [ -f "$H/later.txt" ] && [ "$n" -ge "$(cat "$H/later-from")" ]; then
+        [ -f "$H/new-req" ] && { : > "$(cat "$H/new-req")"; rm -f "$H/new-req"; }
         cat "$H/later.txt"; exit 0
       fi
       [ -f "$H/screen.txt" ] || exit 1
@@ -81,6 +82,7 @@ STUB
   chmod +x "$SB/fakebin/herdr" "$SB/fakebin/tmux"
   export PATH="$SB/fakebin:$ORIG_PATH" MUX_HERDR="$SB/fakebin/herdr"
   session_new "$SID" 15 "w1:p7G"
+  handoff_pointer "$SID"
   printf '%s\n' "$SID" > "$SB/herdr/owner"
   arm
 }
@@ -203,6 +205,18 @@ assert_contains "and logged as a deferral at the send" "$(LOG auto-handoff)" "DE
 assert_file "the consumed request is re-filed" "$STATE/$SID.compact-request"
 age=$(( $(date +%s) - $(date -r "$STATE/$SID.compact-request" +%s) ))
 assert_eq "with its original age" "$([ "$age" -ge 590 ] && echo old || echo "fresh (${age}s)")" old
+sandbox_rm
+
+# A DEFER re-file must not clobber a request the session filed in the meantime.
+setup; screen idle-prompt
+cp "$FX/single-select.txt" "$SB/herdr/later.txt"; echo 5 > "$SB/herdr/later-from"
+printf '%s\n' "$STATE/$SID.compact-request" > "$SB/herdr/new-req"
+: > "$STATE/$SID.compact-request"
+touch -d "@$(( $(date +%s) - 600 ))" "$STATE/$SID.compact-request"
+bash "$BIN/auto-handoff-watch.sh" "$SID" >/dev/null 2>&1
+age=$(( $(date +%s) - $(date -r "$STATE/$SID.compact-request" +%s) ))
+assert_eq "a request filed during the deferral survives the re-file (not reset to the old mtime)" "$([ "$age" -lt 300 ] && echo newer || echo "clobbered (${age}s)")" newer
+assert_eq "and no re-file temp is left behind" "$(ls "$STATE" | grep -c 'compact-request\.' )" 0
 sandbox_rm
 
 # Re-running never escalates: the fifth deferral types exactly as much as the first.

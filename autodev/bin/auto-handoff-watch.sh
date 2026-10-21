@@ -32,6 +32,10 @@ mkdir -p "$STATE" "$LOGDIR" 2>/dev/null
 # mux_busy/mux_send_line/mux_session_name. Absent => watcher safely no-ops.
 _HERE="$(cd "$(dirname "$0")" && pwd)"
 [ -f "$_HERE/mux-lib.sh" ] && . "$_HERE/mux-lib.sh"
+[ -f "$_HERE/request-lib.sh" ] && . "$_HERE/request-lib.sh"
+# Never let a missing lib make every request look stale: fall back to "exists".
+command -v request_valid >/dev/null 2>&1 || request_valid(){ [ -f "${5:-$1/$3.$4}" ]; }
+command -v remove_stale_request >/dev/null 2>&1 || remove_stale_request(){ return 1; }
 
 THRESHOLD=35        # act only when used_percentage > THRESHOLD
 # Opportunistic "compact while the cache is already cold" trigger. Compaction
@@ -58,7 +62,7 @@ WAIT_IDLE=${AUTODEV_WAIT_IDLE:-420}      # max seconds to wait for the /handoff 
 WAIT_COMPACT=${AUTODEV_WAIT_COMPACT:-300} # max seconds to wait for compaction to complete
 COOLDOWN=900        # suppress re-trigger after a cycle (success OR abort)
 HEARTBEAT_EVERY=600 # emit at most one HEARTBEAT log line per this many seconds
-REQUEST_MAX_AGE=3600 # a .handoff-request / .compact-request older than this is stale -> ignored + removed
+# (requests never expire by age — see request-lib.sh for when one is stale)
 
 log(){ printf '%s [%s] %s\n' "$(date +'%Y.%m.%d %H.%M.%S')" "$sid" "$*" >> "$LOG"; }
 
@@ -130,24 +134,18 @@ req="$STATE/$sid.handoff-request"
 creq="$STATE/$sid.compact-request"
 reason=""
 compact_only=0
-if [ -f "$req" ]; then
-  req_age=$(( $(date +%s) - $(date -r "$req" +%s 2>/dev/null || echo 0) ))
-  if [ "$req_age" -le "$REQUEST_MAX_AGE" ]; then
-    reason=requested
-  else
-    log "SKIP stale handoff-request (age ${req_age}s > ${REQUEST_MAX_AGE}s) — removed (pct=$pct)"
-    rm -f "$req" 2>/dev/null
-  fi
+if request_valid "$STATE" "$AUTODEV_HOME/handoffs" "$sid" handoff-request; then
+  reason=requested
+elif remove_stale_request "$STATE" "$AUTODEV_HOME/handoffs" "$sid" handoff-request; then
+  log "SKIP stale handoff-request (a compaction is newer than it) — removed (pct=$pct)"
 fi
 # compact-request is honored only when no full handoff-request is pending (a
 # handoff-request means "write a fresh handoff too", which supersedes it).
-if [ -z "$reason" ] && [ -f "$creq" ]; then
-  creq_age=$(( $(date +%s) - $(date -r "$creq" +%s 2>/dev/null || echo 0) ))
-  if [ "$creq_age" -le "$REQUEST_MAX_AGE" ]; then
+if [ -z "$reason" ]; then
+  if request_valid "$STATE" "$AUTODEV_HOME/handoffs" "$sid" compact-request; then
     reason=compact-requested; compact_only=1
-  else
-    log "SKIP stale compact-request (age ${creq_age}s > ${REQUEST_MAX_AGE}s) — removed (pct=$pct)"
-    rm -f "$creq" 2>/dev/null
+  elif remove_stale_request "$STATE" "$AUTODEV_HOME/handoffs" "$sid" compact-request; then
+    log "SKIP stale compact-request (its handoff is missing or predates the last compaction) — removed (pct=$pct)"
   fi
 fi
 if [ -z "$reason" ]; then
@@ -245,8 +243,15 @@ wait_turn_done(){ # $1 = since epoch, $2 = timeout: idle marker newer AND pane i
 landed=0
 defer_awaiting(){ # $1 = where
   if [ "$landed" = 0 ] && [ -n "${consumed:-}" ]; then
-    : > "$consumed" 2>/dev/null && touch -d "@$consumed_mtime" "$consumed" 2>/dev/null
+    # Atomic, and never over a request the session filed in the meantime (that one
+    # is newer and supersedes the one we consumed).
+    if [ ! -e "$consumed" ]; then
+      rtmp="$consumed.refile.$$"
+      { : > "$rtmp" && touch -d "@$consumed_mtime" "$rtmp" && mv -n "$rtmp" "$consumed"; } 2>/dev/null
+      rm -f "$rtmp" 2>/dev/null
+    fi
   fi
+  : > "$STATE/$sid.deferred" 2>/dev/null   # the sweeper pages on a long-pending, only-deferred request
   log "DEFER awaiting-human ($1): pane shows an open question/permission prompt pct=$pct — retry next sweep"
   exit 0
 }
@@ -274,6 +279,7 @@ if [ "$DRY" = 0 ] && mux_awaiting_human; then defer_awaiting "pre-send"; fi
 # --- Pre-send idle gate: never inject into a busy session (it would queue). ---
 if [ "$DRY" = 0 ] && pane_busy; then
   if ! wait_pane_idle "$PRECHECK"; then
+    : > "$STATE/$sid.deferred" 2>/dev/null
     log "DEFER busy pane (agents/turn/queued input) pct=$pct — retry next idle turn"
     exit 0    # no cooldown: a genuine idle Stop will retry cleanly
   fi
@@ -294,6 +300,7 @@ if [ "$reason" = compact-requested ] && [ ! -f "$creq" ]; then
   log "ABORT compact-request withdrawn before trigger (pct=$pct)"; exit 0
 fi
 
+rm -f "$STATE/$sid.deferred" 2>/dev/null   # committed to the cycle: no longer merely deferring
 log "TRIGGER ($reason) pct=$pct thr=$THRESHOLD pane=$pane dry=$DRY"
 # Consume an explicit request NOW that we're committed to the cycle — before any
 # send. A post-send abort (/handoff or /compact may already have landed) must NOT
@@ -302,11 +309,11 @@ log "TRIGGER ($reason) pct=$pct thr=$THRESHOLD pane=$pane dry=$DRY"
 # so a request dropped DURING a threshold cycle survives to be honored next idle.
 consumed=""
 if [ "$reason" = requested ]; then
-  consumed="$req"; consumed_mtime=$(date -r "$req" +%s 2>/dev/null || date +%s)
+  consumed="$req"; consumed_mtime=$(date -r "$req" +%s.%N 2>/dev/null || date +%s)
   rm -f "$req" 2>/dev/null
   [ -f "$req" ] && log "WARN could not remove handoff-request $req — may re-fire after cooldown"
 elif [ "$reason" = compact-requested ]; then
-  consumed="$creq"; consumed_mtime=$(date -r "$creq" +%s 2>/dev/null || date +%s)
+  consumed="$creq"; consumed_mtime=$(date -r "$creq" +%s.%N 2>/dev/null || date +%s)
   rm -f "$creq" 2>/dev/null
   [ -f "$creq" ] && log "WARN could not remove compact-request $creq — may re-fire after cooldown"
 fi

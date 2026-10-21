@@ -283,8 +283,8 @@ bash "$AUTODEV_BIN/request-handoff.sh"   # drops this session's handoff-request 
 This writes `~/agents/state/<sid>.handoff-request`, a second trigger path that makes the
 watcher run the normal handoff → `/compact` → reload on its **next idle Stop even below
 35%**. It bypasses ONLY the threshold — every other safety gate (idle, pane-live,
-pane-ownership, cooldown, cycle-lock) still applies, and the marker has a TTL so a forgotten
-request cannot fire much later. After raising it, update `progress.md` and **end the turn** —
+pane-ownership, cooldown, cycle-lock) still applies. A request never expires by age; it is dropped
+only once satisfied (a compaction newer than it). After raising it, update `progress.md` and **end the turn** —
 do not open the heavy phase, and do **not** invoke the handoff skill yourself: the watcher runs its own
 handoff → `/compact` → reload on the next idle Stop, so a manual handoff here would just
 duplicate it. Changed your mind before the watcher acts? `request-handoff.sh --cancel` removes
@@ -365,6 +365,15 @@ docs. The scripts are self-locating and store runtime data under **`AUTODEV_HOME
   the new hooks with `/hooks` in a new Codex session.
 - `bin/cc-statusline.sh` — writes live context % + tmux pane to `$AUTODEV_HOME/state/<sid>.*`
   and renders the automation badge.
+- `bin/cc-handoff-gate.sh` — PreToolUse hook: while this session's compact/handoff request is pending,
+  denies every tool call except the ones that finish the handoff (writes under `handoffs/`,
+  `request-handoff.sh`, reading this session's state files, the handoff skill's verify/pointer
+  commands), telling the model to end its turn. The 3rd denial of one request returns
+  `{"continue":false}`, which stops Claude even under `/goal`. Bypass: `AUTODEV_NO_HANDOFF_GATE=1`,
+  `touch $AUTODEV_HOME/state/<sid>.no-handoff-gate` (one session) or `state/disable-handoff-gate`
+  (all). Fails open on any error. Claude Code only — Codex hooks differ and are not gated.
+  The sweeper pages (`notify-send`, else a `PAGE` log line) once per request that has been pending
+  30 min while the watcher only deferred.
 - `bin/cc-stop-hook.sh` — at each turn end, marks idle and launches both watchers (`$HERE/…`).
 - `bin/codex-stop-hook.sh` — records Codex's effective active-context percentage and launches
   the handoff watcher at each turn end.

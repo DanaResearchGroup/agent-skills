@@ -34,6 +34,10 @@ mkdir -p "$STATE" "$LOGDIR" 2>/dev/null
 
 _HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [ -f "$_HERE/mux-lib.sh" ] && . "$_HERE/mux-lib.sh"
+[ -f "$_HERE/request-lib.sh" ] && . "$_HERE/request-lib.sh"
+# Never let a missing lib make every request look stale: fall back to "exists".
+command -v request_valid >/dev/null 2>&1 || request_valid(){ [ -f "${5:-$1/$3.$4}" ]; }
+command -v remove_stale_request >/dev/null 2>&1 || remove_stale_request(){ return 1; }
 WATCH="$_HERE/auto-handoff-watch.sh"
 [ -x "$WATCH" ] || exit 0
 command -v mux_init >/dev/null 2>&1 || exit 0
@@ -42,7 +46,9 @@ command -v mux_init >/dev/null 2>&1 || exit 0
 # of these is re-checked authoritatively by the watcher itself.
 THRESHOLD=35
 COOLDOWN=900
-REQUEST_MAX_AGE=3600
+# A request is never expired by age (see request-lib.sh). A request pending this
+# long with the watcher only ever DEFERring is stuck, and the user is paged once.
+PAGE_AFTER=1800
 # Opportunistic "compact while the cache is already cold" trigger — see
 # auto-handoff-watch.sh for the full rationale. Compacting once the cache has
 # already expired turns an already-owed full-context prefix rewrite into a
@@ -67,6 +73,45 @@ now=$(date +%s)
 mtime(){ date -r "$1" +%s 2>/dev/null || echo 0; }
 fresh(){ [ -f "$1" ] && [ "$(( now - $(mtime "$1") ))" -le "$2" ]; }
 
+# Page once for <sid>'s <kind> request. Serialised per session: two sweeps can
+# overlap (timer tick while a slow one runs), and both would otherwise read
+# "not paged yet". The identity is re-read under the lock.
+page_stuck(){
+  local sid=$1 kind=$2 rf key age
+  rf="$STATE/$sid.$kind"
+  # Without flock (or with AUTODEV_NO_FLOCK=1) two overlapping sweeps could still
+  # both page; sequential sweeps are deduped by .paged either way.
+  if [ -n "${AUTODEV_NO_FLOCK:-}" ] || ! command -v flock >/dev/null 2>&1; then
+    _page_locked "$sid" "$kind"; return
+  fi
+  (
+    flock -n 9 || exit 0
+    _page_locked "$sid" "$kind"
+  ) 9>"$STATE/$sid.page.lock"
+}
+_page_locked(){
+  local sid=$1 kind=$2 rf key age msg
+  rf="$STATE/$sid.$kind"
+  [ -f "$rf" ] || return 0
+  key="$kind:$(date -r "$rf" +%s%N 2>/dev/null)"
+  [ "$(cat "$STATE/$sid.paged" 2>/dev/null)" = "$key" ] && return 0
+  age=$(( (now - $(mtime "$rf")) / 60 ))
+  msg="autodev: $kind for session $sid pending $age min and the watcher keeps deferring (busy pane or open prompt) — compact it by hand"
+  # Record BEFORE paging, and refuse to page if the record cannot be kept: an
+  # unrecorded page repeats on every sweep.
+  if ! printf '%s\n' "$key" > "$STATE/$sid.paged" 2>/dev/null; then
+    log "$sid" "PAGE-SKIP cannot record $STATE/$sid.paged — not paging (would repeat every sweep): $msg"
+    return 0
+  fi
+  log "$sid" "PAGE $msg"
+  # A timer-run sweeper has no session bus in its environment; point at the user's.
+  [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] && [ -S "/run/user/$(id -u)/bus" ] &&
+    export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u)/bus"
+  local -a runner=(); command -v timeout >/dev/null 2>&1 && runner=(timeout "${AUTODEV_PAGE_TIMEOUT:-10}")
+  "${runner[@]}" "${AUTODEV_PAGE_CMD:-notify-send}" "autodev: handoff stuck" "$msg" >/dev/null 2>&1 ||
+    log "$sid" "PAGE notify failed — the PAGE line above is the only record; handled once, not retried"
+}
+
 shopt -s nullglob
 seen=" "
 for pf in "$STATE"/*.herdr-pane "$STATE"/*.tmux-pane; do
@@ -76,6 +121,14 @@ for pf in "$STATE"/*.herdr-pane "$STATE"/*.tmux-pane; do
   # A session registered under both multiplexers appears twice.
   case "$seen" in *" $sid "*) continue ;; esac
   seen="$seen$sid "
+
+  # A request is stale when satisfied (see request-lib.sh), never by age. Cleaned
+  # before the pane checks so a dead session's leftovers go too.
+  for kind in handoff-request compact-request; do
+    if [ -f "$STATE/$sid.$kind" ] && remove_stale_request "$STATE" "$AUTODEV_HOME/handoffs" "$sid" "$kind"; then
+      log "$sid" "SKIP stale $kind (handoff missing or predates the last compaction) — removed"
+    fi
+  done
 
   # Phoenix owns sessions that are waiting out a usage limit; typing at them
   # would only queue input behind a blocked prompt.
@@ -107,9 +160,9 @@ for pf in "$STATE"/*.herdr-pane "$STATE"/*.tmux-pane; do
 
   # --- is there anything to do? ---------------------------------------------
   reason=""
-  if fresh "$STATE/$sid.handoff-request" "$REQUEST_MAX_AGE"; then
+  if [ -f "$STATE/$sid.handoff-request" ]; then
     reason="pending handoff-request"
-  elif fresh "$STATE/$sid.compact-request" "$REQUEST_MAX_AGE"; then
+  elif [ -f "$STATE/$sid.compact-request" ]; then
     reason="pending compact-request"
   else
     ctxf="$STATE/$sid.ctx"
@@ -138,6 +191,17 @@ for pf in "$STATE"/*.herdr-pane "$STATE"/*.tmux-pane; do
       continue
     fi
   fi
+
+  # --- stuck request: pending >= PAGE_AFTER and the watcher has only DEFERred ----
+  # Page once per request. Its identity is its mtime in ns (a re-filed request has
+  # a new one; the watcher's DEFER re-file restores the original exactly). The
+  # DEFER must be newer than the request — an older one says nothing about it.
+  for kind in handoff-request compact-request; do
+    rf="$STATE/$sid.$kind"
+    [ -f "$rf" ] && [ "$STATE/$sid.deferred" -nt "$rf" ] || continue
+    [ "$(( now - $(mtime "$rf") ))" -ge "$PAGE_AFTER" ] || continue
+    page_stuck "$sid" "$kind"
+  done
 
   # --- the pane must be live AND still ours ---------------------------------
   # mux_pane_live only proves the pane exists; herdr recycles short pane ids, so
