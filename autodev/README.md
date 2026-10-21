@@ -30,6 +30,8 @@ autodev/
     install.sh                 # wire Claude Code or Codex hooks and the sweeper
     mux-lib.sh                 # multiplexer abstraction (herdr preferred, tmux fallback)
     cc-statusline.sh           # statusLine: writes context % + herdr/tmux pane/tab; renders the badge
+    cc-handoff-gate.sh         # PreToolUse hook: no new work while a handoff request is pending (see SKILL.md)
+    request-lib.sh             # when a request is stale (satisfied, never by age); shared by watch + sweep
     cc-stop-hook.sh            # Stop hook: marks idle, launches the watchers (via $HERE)
     codex-stop-hook.sh         # Stop hook: effective Codex context % + handoff watcher
     cache-warm-watch.sh        # prompt-cache TTL → countdown in the tab label (`--clear` strips it)
@@ -49,6 +51,9 @@ autodev/
     lib.sh                     # harness: throwaway AUTODEV_HOME, copied bin/, stubbed multiplexer
     test-mission-bleed.sh      # a session may only ever be pointed at its OWN handoff
     test-parked-session.sh     # the sweeper re-arms a session the Stop hook can no longer reach
+    test-handoff-gate.sh       # PreToolUse gate: deny/allow-list, continue:false escalation, bypass, fail-open
+    test-request-expiry.sh     # requests never expire by age; stale only when satisfied
+    test-stuck-page.sh         # one page per request pending 30 min with only DEFERs
     test-abort-recovery.sh     # aborts are counted, retried, then surfaced as STUCK
     test-install-sweeper.sh    # the generated systemd unit (incl. the KillMode=process guard)
     test-cache-warmth.sh       # the cache badge: countdown in the tab, deadline in the status line

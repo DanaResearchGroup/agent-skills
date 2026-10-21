@@ -120,4 +120,66 @@ assert_contains "falls back to cron when systemd is absent" "$(cat "$SB/calls.lo
 assert_contains "cron line invokes the sweeper" "$(cat "$SB/install.out")" "cron"
 sandbox_rm
 
+echo "== the PreToolUse handoff gate is installed into the (fixture) settings =="
+
+setup_install
+printf '{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"/other/hook.sh"}]}]}}\n' > "$SB/settings.json"
+run_install
+run_install
+gate_n=$(jq --arg g "$BIN/cc-handoff-gate.sh" '[.hooks.PreToolUse[]?.hooks[]? | select(.command==$g)] | length' "$SB/settings.json")
+assert_eq "install adds the gate once, idempotently" "$gate_n" 1
+other_n=$(jq '[.hooks.PreToolUse[]?.hooks[]? | select(.command=="/other/hook.sh")] | length' "$SB/settings.json")
+assert_eq "install preserves other PreToolUse hooks" "$other_n" 1
+sandbox_rm
+
+echo "== install.sh vs unusual existing settings =="
+
+gate_count() { jq --arg g "$BIN/cc-handoff-gate.sh" '[.hooks.PreToolUse[]?.hooks[]? | select(.command==$g)] | length' "$SB/settings.json"; }
+
+# Other matchers survive.
+setup_install
+printf '{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"/a.sh"}]},{"matcher":"Edit|Write","hooks":[{"type":"command","command":"/b.sh"}]}]}}\n' > "$SB/settings.json"
+run_install
+assert_eq "PreToolUse with several matchers: both kept, gate added once" "$(jq '.hooks.PreToolUse | length' "$SB/settings.json")" 3
+sandbox_rm
+
+# The same command under a different matcher, and sharing an entry with another hook.
+setup_install
+printf '{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"%s/cc-handoff-gate.sh"},{"type":"command","command":"/keep.sh"}]}]}}\n' "$BIN" > "$SB/settings.json"
+run_install
+assert_eq "gate under another matcher is not duplicated" "$(gate_count)" 1
+assert_eq "a hook sharing the entry with the gate is NOT deleted" "$(jq '[.hooks.PreToolUse[]?.hooks[]? | select(.command=="/keep.sh")] | length' "$SB/settings.json")" 1
+sandbox_rm
+
+# Same protection for the Stop hook install had before.
+setup_install
+printf '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"%s/cc-stop-hook.sh"},{"type":"command","command":"/keep-stop.sh"}]}]}}\n' "$BIN" > "$SB/settings.json"
+run_install
+assert_eq "a hook sharing an entry with the Stop hook is NOT deleted" "$(jq '[.hooks.Stop[]?.hooks[]? | select(.command=="/keep-stop.sh")] | length' "$SB/settings.json")" 1
+sandbox_rm
+
+# hooks.PreToolUse as a single object (not an array) is wrapped, not crashed on.
+setup_install
+printf '{"hooks":{"PreToolUse":{"matcher":"Bash","hooks":[{"type":"command","command":"/solo.sh"}]}}}\n' > "$SB/settings.json"
+run_install
+assert_eq "object-valued PreToolUse: gate installed" "$(gate_count)" 1
+assert_eq "object-valued PreToolUse: the original hook is kept" "$(jq '[.hooks.PreToolUse[]?.hooks[]? | select(.command=="/solo.sh")] | length' "$SB/settings.json")" 1
+sandbox_rm
+
+# A settings file install cannot safely edit is left byte-for-byte alone and install fails loudly.
+setup_install
+printf '{"hooks":{"PreToolUse":"oops"}}\n' > "$SB/settings.json"; cp "$SB/settings.json" "$SB/settings.orig"
+run_install; rc=$?
+assert_eq "a string-valued PreToolUse is left untouched" "$(cmp -s "$SB/settings.json" "$SB/settings.orig" && echo same || echo changed)" same
+assert_eq "and install exits non-zero rather than clobbering it" "$([ "$rc" -ne 0 ] && echo nonzero || echo zero)" nonzero
+sandbox_rm
+
+# Re-install is a fixed point.
+setup_install
+printf '{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"/a.sh"}]}]}}\n' > "$SB/settings.json"
+run_install; cp "$SB/settings.json" "$SB/once.json"
+run_install
+assert_eq "second install changes nothing" "$(cmp -s "$SB/settings.json" "$SB/once.json" && echo same || echo changed)" same
+sandbox_rm
+
 finish

@@ -46,6 +46,14 @@ session_new() { # $1 = sid, $2 = pct, $3 = pane id
   printf '%s\n' "$1" > "$STATE/.paneowner-herdr-$(printf '%s' "$3" | tr ':%' '__')"
 }
 
+# A handoff file plus the per-session reload pointer naming it — what makes a
+# compact-request valid (see bin/request-lib.sh).
+handoff_pointer() { # $1 = sid
+  local hf="$AUTODEV_HOME/handoffs/2026.01.01 00.00.00 handoff-fixture-$1.md"
+  printf 'fixture\n' > "$hf"
+  printf '%s\n' "$hf" > "$AUTODEV_HOME/handoffs/.latest.$1"
+}
+
 # Give a session a tab with a starting label. The label lives in a file the mux
 # stub reads and writes, so a test can inspect it, rename it behind the watcher's
 # back, or delete it to model the tab being closed.

@@ -28,7 +28,7 @@ esac
 : "${AUTODEV_HOME:=$HOME/agents}"
 
 command -v jq >/dev/null 2>&1 || { echo "error: jq is required" >&2; exit 1; }
-for f in cc-statusline.sh cc-stop-hook.sh codex-stop-hook.sh cc-sessionstart-compact.sh sessionstart-compact.sh auto-handoff-watch.sh auto-handoff-sweep.sh session-resume-watch.sh request-handoff.sh cache-warm-watch.sh; do
+for f in cc-statusline.sh cc-stop-hook.sh codex-stop-hook.sh cc-sessionstart-compact.sh sessionstart-compact.sh auto-handoff-watch.sh auto-handoff-sweep.sh session-resume-watch.sh request-handoff.sh cache-warm-watch.sh cc-handoff-gate.sh request-lib.sh; do
   [ -f "$HERE/$f" ] || { echo "error: missing $HERE/$f" >&2; exit 1; }
   chmod +x "$HERE/$f"
 done
@@ -57,20 +57,28 @@ else
   SL="$HERE/cc-statusline.sh"
   STOP="$HERE/cc-stop-hook.sh"
   SC="$HERE/cc-sessionstart-compact.sh"
+  GATE="$HERE/cc-handoff-gate.sh"
   mkdir -p "$(dirname "$SETTINGS")"
   [ -f "$SETTINGS" ] || echo '{}' > "$SETTINGS"
   cp "$SETTINGS" "$SETTINGS.bak.autodev.$(date +%s)"
+  # addhook(event; entry; cmd): drop OUR command from every existing entry for the
+  # event (keeping entries' other hooks and matchers; dropping an entry only when
+  # ours was all it held), then append our entry. A single-object event value is
+  # wrapped; anything else aborts with settings untouched.
   jq \
-    --arg sl "$SL" --arg stop "$STOP" --arg sc "$SC" '
+    --arg sl "$SL" --arg stop "$STOP" --arg sc "$SC" --arg gate "$GATE" '
+    def addhook($ev; $entry; $cmd):
+      .hooks[$ev] = (
+        ((.hooks[$ev] // []) | if type=="array" then . elif type=="object" then [.] else error("hooks.\($ev) is not an array or object") end)
+        | map(.hooks = [(.hooks // [])[] | select(.command != $cmd)])
+        | map(select((.hooks | length) > 0))
+        | . + [$entry]);
     .statusLine = {type:"command", command:$sl}
-    | .hooks = (.hooks // {})
-    | .hooks.Stop = (((.hooks.Stop // [])
-          | map(select((any(.hooks[]?; .command==$stop)) | not)))
-          + [{hooks:[{type:"command", command:$stop}]}])
-    | .hooks.SessionStart = (((.hooks.SessionStart // [])
-          | map(select((any(.hooks[]?; .command==$sc)) | not)))
-          + [{matcher:"compact", hooks:[{type:"command", command:$sc}]}])
-  ' "$SETTINGS" > "$SETTINGS.tmp"
+    | .hooks = ((.hooks // {}) | if type=="object" then . else error("hooks is not an object") end)
+    | addhook("Stop"; {hooks:[{type:"command", command:$stop}]}; $stop)
+    | addhook("PreToolUse"; {hooks:[{type:"command", command:$gate}]}; $gate)
+    | addhook("SessionStart"; {matcher:"compact", hooks:[{type:"command", command:$sc}]}; $sc)
+  ' "$SETTINGS" > "$SETTINGS.tmp" || { rm -f "$SETTINGS.tmp"; echo "error: could not merge hooks into $SETTINGS (left unchanged)" >&2; exit 1; }
   mv "$SETTINGS.tmp" "$SETTINGS"
 fi
 
@@ -134,6 +142,7 @@ if [ "$RUNTIME" = codex ]; then
 else
   echo "  statusLine        -> $SL"
   echo "  Stop hook         -> $STOP"
+  echo "  PreToolUse gate   -> $GATE   (denies new work while a handoff request is pending)"
   echo "  SessionStart(compact) -> $SC"
 fi
 echo "  sweeper (level trigger) -> $sweep_installed"
@@ -149,5 +158,6 @@ echo "Default is DRY-RUN (logs only, never touches your pane). To go live:"
 echo "  touch \"$AUTODEV_HOME/state/auto-handoff.armed\"     # arm (badge -> 🔴 ARMED)"
 echo "  touch \"$AUTODEV_HOME/state/disable-auto-compact\"   # global kill switch (badge -> ⛔)"
 echo "  touch \"$AUTODEV_HOME/state/disable-auto-resume\"    # Phoenix off only"
+echo "  touch \"$AUTODEV_HOME/state/disable-handoff-gate\"  # PreToolUse gate off (per session: <sid>.no-handoff-gate; env AUTODEV_NO_HANDOFF_GATE=1)"
 echo "  touch \"$AUTODEV_HOME/state/no-usage-credits\"       # Phoenix: skip paid credits, wait for reset"
 echo "Logs: $AUTODEV_HOME/logs/{auto-handoff,auto-resume}.log"

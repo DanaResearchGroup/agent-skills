@@ -43,6 +43,7 @@ sandbox_rm
 # A voluntary request below the threshold must also survive having no edges.
 setup
 session_new "$SID" 12 "w1:p1"
+handoff_pointer "$SID"
 export MUX_LIVE_PANES="w1:p1" MUX_BUSY=0
 : > "$STATE/$SID.compact-request"
 sweep
