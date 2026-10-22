@@ -190,26 +190,32 @@ mux_awaiting_human(){
   printf '%s\n' "$out" | mux_text_awaiting_human
 }
 
-# 0 = pane is BUSY (typed input would queue, or would answer a dialog), 1 = safe
-# to send. A pane awaiting the human is busy: every watcher's retry loop then
-# waits it out exactly as it waits out a running turn. Under herdr use native
-# agent_status; fall back to the text scrape when state is unknown.
-mux_busy(){
+# 0 = the pane is running a turn (typed input would queue). Not the same as
+# busy: a pane parked at a menu is busy but not working. Under herdr use native
+# agent_status; fall back to the text scrape when state is unknown or under tmux.
+mux_working(){
   local st
-  mux_awaiting_human && return 0
   case "$MUX" in
     herdr)
       st=$(mux_status)
       case "$st" in
-        working|blocked)   return 0 ;;                       # running a turn, or parked at a
-                                                             # question/permission menu => busy:
-                                                             # an injected Enter would answer it
-        idle|done)         return 1 ;;                       # at the input prompt => safe
+        working)           return 0 ;;
+        blocked|idle|done) return 1 ;;
         *) mux_capture | tail -15 | grep -Eq "$MUX_BUSY_RE" ;; # unknown => scrape
       esac ;;
     tmux)  tmux capture-pane -t "$PANE" -p 2>/dev/null | tail -15 | grep -Eq "$MUX_BUSY_RE" ;;
     *) return 1 ;;
   esac
+}
+
+# 0 = pane is BUSY (typed input would queue, or would answer a dialog), 1 = safe
+# to send. A pane awaiting the human is busy: every watcher's retry loop then
+# waits it out exactly as it waits out a running turn. herdr `blocked` (parked at
+# a question/permission menu) is busy too: an injected Enter would answer it.
+mux_busy(){
+  mux_awaiting_human && return 0
+  [ "$MUX" = herdr ] && [ "$(mux_status)" = blocked ] && return 0
+  mux_working
 }
 
 # A stable human label to re-assert after compaction (the tmux session name).

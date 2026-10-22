@@ -374,6 +374,11 @@ docs. The scripts are self-locating and store runtime data under **`AUTODEV_HOME
   (all). Fails open on any error. Claude Code only — Codex hooks differ and are not gated.
   The sweeper pages (`notify-send`, else a `PAGE` log line) once per request that has been pending
   30 min while the watcher only deferred.
+  It also files the `handoff-request` itself (`request-handoff.sh --if-absent`, logged
+  `REQUEST raised (threshold, busy Nm)`) when a session is over the threshold and its pane has
+  worked continuously for 20 min (`AUTODEV_BUSY_MINUTES`), so a session stuck in one long turn is
+  stopped without having to file its own. The sweep keeps `<sid>.busy-since` for this; an idle
+  pane, an open menu/prompt, a recorded Stop, or a >10 min observation gap resets it.
 - `bin/cc-stop-hook.sh` — at each turn end, marks idle and launches both watchers (`$HERE/…`).
 - `bin/codex-stop-hook.sh` — records Codex's effective active-context percentage and launches
   the handoff watcher at each turn end.

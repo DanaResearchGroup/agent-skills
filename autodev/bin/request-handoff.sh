@@ -28,6 +28,14 @@
 #                    per-session reload pointer .latest.<sid>. Always pass it.
 #     --cancel       remove a pending request for the current session (pairs with
 #                    --compact-only to cancel a compact-request)
+#     --reason <t>   label for the log line: "REQUEST raised (<t>)" in place of
+#                    "(voluntary <kind>)". Log text only.
+#     --if-absent    create the marker only if no handoff-request exists and no
+#                    compact-request exists before the write; otherwise leave the
+#                    session's request untouched and log "REQUEST skipped". If a
+#                    compact-request appears after the atomic link, leave both:
+#                    the handoff-request supersedes it. Used by the sweep's
+#                    threshold path. Not valid with --compact-only/--cancel.
 #     sid            operate on an explicit session id instead of auto-resolving
 #                    (order-independent with flags; mainly for testing/scripts)
 #
@@ -46,7 +54,7 @@ _HERE="$(cd "$(dirname "$0")" && pwd)"
 # without it we fall back to the host agent's session-id environment.
 [ -f "$_HERE/mux-lib.sh" ] && . "$_HERE/mux-lib.sh"
 
-usage(){ echo "usage: $(basename "$0") [sid] [--cancel] [--compact-only] [--handoff <path>]" >&2; exit 2; }
+usage(){ echo "usage: $(basename "$0") [sid] [--cancel] [--compact-only] [--handoff <path>] [--reason <text>] [--if-absent]" >&2; exit 2; }
 
 # --- parse args (a lone non-flag token is an explicit sid) ---
 # --compact-only raises a *compact-request* instead of a handoff-request: the
@@ -61,19 +69,32 @@ COMPACT_ONLY=0
 SID_ARG=""
 HANDOFF=""
 want_handoff=0
+REASON=""
+want_reason=0
+IF_ABSENT=0
 for a in "$@"; do
   if [ "$want_handoff" = 1 ]; then HANDOFF="$a"; want_handoff=0; continue; fi
+  if [ "$want_reason" = 1 ]; then REASON="$a"; want_reason=0; continue; fi
   case "$a" in
     --cancel) CANCEL=1 ;;
     --compact-only) COMPACT_ONLY=1 ;;
     --handoff) want_handoff=1 ;;
     --handoff=*) HANDOFF="${a#--handoff=}" ;;
+    --reason) want_reason=1 ;;
+    --reason=*) REASON="${a#--reason=}" ;;
+    --if-absent) IF_ABSENT=1 ;;
     -h|--help) usage ;;
     -*) echo "unknown option: $a" >&2; usage ;;
     *) [ -n "$SID_ARG" ] && { echo "too many arguments" >&2; usage; }; SID_ARG="$a" ;;
   esac
 done
 [ "$want_handoff" = 1 ] && { echo "--handoff requires a path" >&2; usage; }
+[ "$want_reason" = 1 ] && { echo "--reason requires a text" >&2; usage; }
+if [ "$IF_ABSENT" = 1 ] && { [ "$COMPACT_ONLY" = 1 ] || [ "$CANCEL" = 1 ]; }; then
+  echo "--if-absent applies only to raising a handoff-request" >&2; usage
+fi
+# The reason lands in a shared log: same charset discipline as the sid.
+case "$REASON" in *[!A-Za-z0-9\ ,._:=-]*) echo "refusing unsafe --reason" >&2; exit 2 ;; esac
 
 # --- resolve this session's sid ---
 # Priority: explicit arg > host session env > reverse pane-owner file.
@@ -234,8 +255,34 @@ warn=""
 # its target, and (b) set a clean, current mtime for the watcher's TTL. The marker
 # body stays empty — mtime is the whole contract.
 tmp="$req.tmp.$$"
-: > "$tmp" 2>/dev/null && mv -f "$tmp" "$req" 2>/dev/null || {
-  rm -f "$tmp" 2>/dev/null; echo "failed to write $req" >&2; exit 2; }
+if [ "$IF_ABSENT" = 1 ]; then
+  # Atomic create-if-absent: `ln` fails when the target exists, so a marker the
+  # session files at any moment before this line is never replaced (an mv would
+  # swap in a new inode and mtime; the mtime is the request's identity to
+  # page_stuck). A compact-request is checked before the link. If one appears
+  # after our link, leave both markers: the watcher treats a handoff-request as
+  # superseding a compact-request, and unlinking our marker after an inode check
+  # would race with a session replacing it via tmp+mv.
+  skip(){ rm -f "$tmp" 2>/dev/null; log "REQUEST skipped (session filed its own)"
+          echo "session already filed its own request for $sid — nothing raised"; exit 0; }
+  [ -e "$STATE/$sid.compact-request" ] && skip
+  : > "$tmp" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; echo "failed to write $req" >&2; exit 2; }
+  if ! ln "$tmp" "$req" 2>/dev/null; then
+    if [ -e "$req" ] || [ -L "$req" ]; then
+      skip
+    fi
+    rm -f "$tmp" 2>/dev/null
+    echo "failed to write $req" >&2
+    exit 2
+  fi
+  if [ -e "$STATE/$sid.compact-request" ]; then
+    log "REQUEST raised alongside a session compact-request (handoff-request supersedes)"
+  fi
+  rm -f "$tmp" 2>/dev/null
+else
+  : > "$tmp" 2>/dev/null && mv -f "$tmp" "$req" 2>/dev/null || {
+    rm -f "$tmp" 2>/dev/null; echo "failed to write $req" >&2; exit 2; }
+fi
 
 # The authoritative pointer was already recorded above, before the deferral. All
 # that is left is the legacy fallback for an older handoff skill that does not
@@ -254,7 +301,7 @@ if [ "$COMPACT_ONLY" = 1 ] && [ -z "$HANDOFF" ]; then
   fi
 fi
 
-log "REQUEST raised (voluntary $kind${warn:+; ${warn%; }})"
+log "REQUEST raised (${REASON:-voluntary $kind}${warn:+; ${warn%; }})"
 act="hand off"; [ "$COMPACT_ONLY" = 1 ] && act="compact and reload"
 if [ -n "$warn" ]; then
   echo "$kind raised for $sid, but it will NOT fire yet — ${warn%; }" >&2

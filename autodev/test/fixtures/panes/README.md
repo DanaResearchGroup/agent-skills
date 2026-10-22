@@ -14,6 +14,7 @@ must flag every file here except the two `idle-*` ones.
 | `idle-prompt.txt` | plain idle prompt with the status line | real capture |
 | `multi-select.txt` | AskUserQuestion multi-select (`[ ]`/`[✔]` rows, Submit row) | assembled |
 | `other-row.txt` | single-select with the cursor on the free-text "Other" row, text typed | assembled |
+| `rate-limit-menu.txt` | usage-limit menu ("What do you want to do?" with Stop-and-wait / extra usage rows) | assembled |
 | `idle-after-answer.txt` | idle prompt whose transcript quotes a dialog footer higher up | assembled |
 
 The real captures come from herdr's saved scrollback (`~/.config/herdr/session-history.json`).

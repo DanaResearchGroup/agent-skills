@@ -63,6 +63,23 @@ CACHE_TTL=300
 # stuck (the status line surfaces it) rather than typing /compact at a wedged
 # pane every few minutes forever.
 MAX_ABORTS=5
+# The threshold alone must stop a busy session: the gate keys on a request file
+# and the watcher only types into an idle pane, so a session that crosses
+# THRESHOLD inside one long turn and never files its own request would run on
+# until the turn ends. Past BUSY_MIN minutes of continuous work the sweep files
+# the request for it. Anything but a positive integer falls back to the default
+# (never to "off" or "immediately").
+positive_integer_or_default(){
+  local value=$1 fallback=$2
+  case "$value" in ''|*[!0-9]*) printf '%s\n' "$fallback"; return ;; esac
+  while [ "${value#0}" != "$value" ]; do value=${value#0}; done
+  if [ -z "$value" ] || [ "${#value}" -gt 9 ]; then value=$fallback; fi
+  printf '%s\n' "$value"
+}
+BUSY_MIN=$(positive_integer_or_default "${AUTODEV_BUSY_MINUTES:-20}" 20)
+# Continuity: the sweep is the only observer, so two observations further apart
+# than this (a skipped sweep, a stopped timer) do not prove the pane stayed busy.
+BUSY_GAP=$(positive_integer_or_default "${AUTODEV_BUSY_GAP:-600}" 600)
 
 log(){ printf '%s [%s] %s\n' "$(date +'%Y.%m.%d %H.%M.%S')" "$1" "$2" >> "$LOG"; }
 
@@ -106,7 +123,7 @@ _page_locked(){
   log "$sid" "PAGE $msg"
   # A timer-run sweeper has no session bus in its environment; point at the user's.
   [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] && [ -S "/run/user/$(id -u)/bus" ] &&
-    export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u)/bus"
+    DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u)/bus" && export DBUS_SESSION_BUS_ADDRESS
   local -a runner=(); command -v timeout >/dev/null 2>&1 && runner=(timeout "${AUTODEV_PAGE_TIMEOUT:-10}")
   "${runner[@]}" "${AUTODEV_PAGE_CMD:-notify-send}" "autodev: handoff stuck" "$msg" >/dev/null 2>&1 ||
     log "$sid" "PAGE notify failed — the PAGE line above is the only record; handled once, not retried"
@@ -132,7 +149,11 @@ for pf in "$STATE"/*.herdr-pane "$STATE"/*.tmux-pane; do
 
   # Phoenix owns sessions that are waiting out a usage limit; typing at them
   # would only queue input behind a blocked prompt.
-  [ -f "$STATE/$sid.limit-wait" ] && continue
+  if [ -f "$STATE/$sid.limit-wait" ]; then
+    # The pane is waiting on a usage-limit reset, not continuously working.
+    rm -f "$STATE/$sid.busy-since" 2>/dev/null
+    continue
+  fi
 
   # A cycle genuinely in flight must not be piled onto.
   lock="$STATE/$sid.cycle.lock"
@@ -141,8 +162,22 @@ for pf in "$STATE"/*.herdr-pane "$STATE"/*.tmux-pane; do
     [ -n "$lpid" ] && kill -0 "$lpid" 2>/dev/null && continue
   fi
 
-  # A cycle that just ran (either outcome) gets left alone for the cooldown.
-  fresh "$STATE/$sid.cooldown" "$COOLDOWN" && continue
+  # Dry-run threshold previews need a fresh busy observation every sweep. The
+  # real watcher completes a dry cycle and stamps cooldown, but that cooldown
+  # is longer than BUSY_GAP and would keep resetting the preview clock. Bypass
+  # it only for an unarmed, over-threshold session with no pending request.
+  dry_preview=0
+  if [ -f "$STATE/$sid.cooldown" ] && [ ! -f "$STATE/auto-handoff.armed" ] \
+     && [ ! -f "$STATE/$sid.handoff-request" ] && [ ! -f "$STATE/$sid.compact-request" ] \
+     && [ -f "$STATE/$sid.ctx" ]; then
+    cooldown_pct=$(sed -n 's/^pct=\([0-9.]*\).*/\1/p' "$STATE/$sid.ctx")
+    if [ -n "$cooldown_pct" ] && awk "BEGIN{exit !($cooldown_pct > $THRESHOLD)}"; then
+      dry_preview=1
+    fi
+  fi
+  if fresh "$STATE/$sid.cooldown" "$COOLDOWN" && [ "$dry_preview" = 0 ]; then
+    continue
+  fi
 
   # A session whose cycles keep aborting is wedged, not slow. Stop driving it and
   # make it VISIBLE — a wedged session whose pane still reads healthy is the
@@ -159,25 +194,37 @@ for pf in "$STATE"/*.herdr-pane "$STATE"/*.tmux-pane; do
   fi
 
   # --- is there anything to do? ---------------------------------------------
-  reason=""
+  reason=""; thr=0
   if [ -f "$STATE/$sid.handoff-request" ]; then
     reason="pending handoff-request"
+    rm -f "$STATE/$sid.busy-since" 2>/dev/null
   elif [ -f "$STATE/$sid.compact-request" ]; then
     reason="pending compact-request"
+    rm -f "$STATE/$sid.busy-since" 2>/dev/null
   else
     ctxf="$STATE/$sid.ctx"
-    [ -f "$ctxf" ] || continue
+    [ -f "$ctxf" ] || { rm -f "$STATE/$sid.busy-since" 2>/dev/null; continue; }
     pct=$(sed -n 's/^pct=\([0-9.]*\).*/\1/p' "$ctxf")
-    [ -n "$pct" ] || continue
+    [ -n "$pct" ] || { rm -f "$STATE/$sid.busy-since" 2>/dev/null; continue; }
     if awk "BEGIN{exit !($pct > $THRESHOLD)}"; then
-      reason="pct=$pct > $THRESHOLD"
-    elif [ ! -f "$STATE/disable-cold-cache-compact" ] \
+      reason="pct=$pct > $THRESHOLD"; thr=1
+    else
+      # The busy clock only measures stretches that qualify for the threshold
+      # path; time below threshold cannot contribute to a later stretch.
+      rm -f "$STATE/$sid.busy-since" 2>/dev/null
+    fi
+    if [ "$thr" = 0 ] && [ ! -f "$STATE/disable-cold-cache-compact" ] \
          && awk "BEGIN{exit !($pct > $COLD_MIN)}" \
          && [ -f "$STATE/$sid.idle" ] \
          && [ "$(( now - $(cat "$STATE/$sid.idle" 2>/dev/null || echo "$now") ))" -ge "$CACHE_TTL" ]; then
       reason="pct=$pct > $COLD_MIN, idle >= ${CACHE_TTL}s (cold-cache)"
-    else
+    elif [ "$thr" = 0 ] && [ -z "$reason" ]; then
       continue
+    fi
+    # Re-confirm the exception after selecting the trigger: if a request arrived
+    # during the cooldown pre-check, this is no longer a dry threshold preview.
+    if [ "$thr" != 1 ] || [ -f "$STATE/auto-handoff.armed" ]; then
+      dry_preview=0
     fi
     # Guard against re-compacting an idle session forever: once a cycle has
     # COMPLETED, only fire again if the session has actually done something
@@ -187,7 +234,8 @@ for pf in "$STATE"/*.herdr-pane "$STATE"/*.tmux-pane; do
     # sitting above COLD_MIN and idle would get compacted every COOLDOWN
     # period forever.
     if [ "$aborts" -eq 0 ] && [ -f "$STATE/$sid.cooldown" ] &&
-       [ "$(mtime "$ctxf")" -le "$(mtime "$STATE/$sid.cooldown")" ]; then
+       [ "$(mtime "$ctxf")" -le "$(mtime "$STATE/$sid.cooldown")" ] &&
+       [ "$dry_preview" = 0 ]; then
       continue
     fi
   fi
@@ -207,10 +255,57 @@ for pf in "$STATE"/*.herdr-pane "$STATE"/*.tmux-pane; do
   # mux_pane_live only proves the pane exists; herdr recycles short pane ids, so
   # a live pane may now host a DIFFERENT session. Driving it would type /compact
   # into somebody else's work.
-  mux_init "$sid" || continue
-  mux_pane_live || continue
+  if ! mux_init "$sid"; then
+    [ "$thr" = 1 ] && rm -f "$STATE/$sid.busy-since" 2>/dev/null
+    continue
+  fi
+  if ! mux_pane_live; then
+    [ "$thr" = 1 ] && rm -f "$STATE/$sid.busy-since" 2>/dev/null
+    continue
+  fi
   owner=$(mux_pane_owner)
-  [ -n "$owner" ] && [ "$owner" != "$sid" ] && continue
+  if [ -n "$owner" ] && [ "$owner" != "$sid" ]; then
+    [ "$thr" = 1 ] && rm -f "$STATE/$sid.busy-since" 2>/dev/null
+    continue
+  fi
+
+  # --- over threshold and working: raise the request the session never filed --
+  # Only on the plain threshold path: a pending request (either kind) never gets
+  # here with thr=1, and limit-wait, cooldown, cycle-lock and stuck sessions were
+  # already skipped above. The clock <sid>.busy-since is "<start> <last>": start
+  # of the stretch as first SEEN (a lower bound, so it can only delay a request),
+  # last = latest observation. It resets whenever the pane is not working
+  # (idle, or parked at a menu/prompt for the human), a Stop was recorded after
+  # it began, or the observations have a gap.
+  if [ "$thr" = 1 ]; then
+    bsf="$STATE/$sid.busy-since"
+    if mux_awaiting_human || ! mux_working; then
+      rm -f "$bsf" 2>/dev/null
+    else
+      bs=0; bl=0
+      [ -f "$bsf" ] && read -r bs bl < "$bsf" 2>/dev/null
+      case "$bs$bl" in ''|*[!0-9]*) bs=0; bl=0 ;; esac
+      idle_at=0; [ -f "$STATE/$sid.idle" ] && idle_at=$(cat "$STATE/$sid.idle" 2>/dev/null)
+      case "$idle_at" in ''|*[!0-9]*) idle_at=0 ;; esac
+      if [ "$bs" -eq 0 ] || [ "$idle_at" -gt "$bs" ] || [ "$(( now - bl ))" -gt "$BUSY_GAP" ]; then
+        bs=$now
+      fi
+      printf '%s %s\n' "$bs" "$now" > "$bsf.tmp.$$" 2>/dev/null && mv -f "$bsf.tmp.$$" "$bsf" 2>/dev/null
+      busy_min=$(( (now - bs) / 60 ))
+      if [ "$busy_min" -ge "$BUSY_MIN" ] \
+         && [ ! -f "$STATE/$sid.handoff-request" ] && [ ! -f "$STATE/$sid.compact-request" ]; then
+        if [ ! -f "$STATE/auto-handoff.armed" ]; then
+          log "$sid" "REQUEST would raise (threshold, busy ${busy_min}m) [dry-run]"
+        # --if-absent: the session may file its own between the check above and
+        # the write; the writer creates atomically and leaves its marker alone.
+        elif "$_HERE/request-handoff.sh" "$sid" --if-absent --reason "threshold, busy ${busy_min}m" >/dev/null 2>&1; then
+          rm -f "$bsf" 2>/dev/null
+        else
+          log "$sid" "REQUEST threshold writer failed (busy ${busy_min}m) — retry next sweep"
+        fi
+      fi
+    fi
+  fi
 
   log "$sid" "SWEEP re-arming watcher ($reason, aborts=$aborts)"
   setsid "$WATCH" "$sid" </dev/null >/dev/null 2>&1 &
