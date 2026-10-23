@@ -115,7 +115,8 @@ done
 expanded path exactly as `$hf` holds it: not `${AUTODEV_HOME:-$HOME/agents}/handoffs/…`, not a bare filename, not "the
 handoff file". The user has to open, move, or hand that file to another session, and a path they
 must reconstruct is a path they cannot click. This holds when the write was routine, when a tool
-call already showed the filename, and when nothing else in the turn is worth saying.
+call already showed the filename, and when nothing else in the turn is worth saying. Print the
+context % alongside it using the same `$pct` reading from the first step, never a fresh estimate.
 
 **Then VERIFY the trigger exists — do not assume the script filed one.** `request-handoff.sh`
 legitimately declines to file when the watcher is already mid-cycle, and it is a silent no-op
@@ -152,6 +153,7 @@ Then emit this explicit instruction block:
 
 ```text
 Handoff written: <absolute path — the full expanded $hf, always, no exceptions>
+Context at handoff: <pct>% (or "unknown" when no .ctx reading exists)
 .latest updated, compact-request filed.
 
 • End the turn only when the marker and this session's registered pane were verified above. The
