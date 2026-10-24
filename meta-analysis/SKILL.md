@@ -13,12 +13,55 @@ analyses how the conversation got there.
 Name the documents this analysis will point at instead of duplicate (design doc, roadmap, decision
 log, evidence base). Every section below cites them by path rather than restating their content.
 
-**Output.** Write to `docs/meta-analysis/<slug>.md`, `<slug>` naming the conversation or campaign.
-If that file already exists, this is a re-run, not a new analysis: update it in place (§9) so two
-runs converge on one document instead of spawning rivals.
+Name the cast before anything else: every participant — the human, the authoring agent and its
+model, internal adversaries, external reviewers, worker agents — with the **model and access tier**
+behind it (for example "external reviewer: the strongest model the user could reach, relayed by
+hand"). Without the model names the yield scoreboard (§3) cannot tell "a harsh reviewer" from "a
+different model family". If identities are disclosed late, add them and say they were.
 
-**Done when** every numbered section below has content, or an explicit `N/A — <why>`, and the
-ledger (§2) and predictions (§8) reflect this run.
+**Output.** One analysis produces these files, sharing one `<slug>` that names the conversation or
+campaign:
+
+| File | Content |
+|---|---|
+| `<slug> summary.md` | the short, human-readable version (§0) |
+| `<slug>.md` | the formal analysis, §§1–9 |
+| `<slug> trajectory.json` | the chart data (§1) |
+| `<slug> trajectory.png` | the static chart, for the summary and the PDF |
+| `<slug>.pdf` | summary plus formal analysis as appendix, highlights kept (§10) |
+| `<slug>.html` | the same, self-contained, with the interactive chart (§10) |
+
+**Where.** Ask the user for the designated folder before writing anything, and wait for the
+answer. Offer a dated subfolder, `<YYYY.MM.DD> <Slug>/`, inside the folder they name, and match
+that folder's own file-naming convention in place of the `<slug>` names above. Inside a repo,
+offer `docs/meta-analysis/` as the default. If the files already exist there, this is a re-run,
+not a new analysis: update them in place (§9) so two runs converge on one document instead of
+spawning rivals.
+
+**Done when** the user named the folder, §0 and every numbered section below have content, or an
+explicit `N/A — <why>`, the ledger (§2) and predictions (§8) reflect this run, and both renderings
+(§10) were built and looked at.
+
+## 0. The short version, first
+
+Write `<slug> summary.md` for a reader who will read one page. It is the front of the PDF and
+HTML, with the formal analysis behind it as an appendix. In order:
+
+1. **Key findings**, three to five, each a bold lead-in and two or three plain sentences. Mark the
+   one or two that should change how the next session runs as `==…==`; the renderers highlight
+   them. If the user named the findings to highlight, use theirs.
+2. **The chart** (§1), with one paragraph on how to read it, stating that the Y axis is judged.
+3. **The cast** table (above).
+4. **The initial prompt and the first question or goal, quoted verbatim.** They are the baseline
+   every later turn is measured against; a paraphrase drifts toward what the work became.
+5. **Phases**, five to seven, each with clock times, what happened, and where the question stood
+   at its end. People navigate by phase; the ledger (§2) is for counting.
+6. **The question-evolution table**: after each inflection that changed it, the question's (or
+   goal's) wording in short form and a judged depth score. The formal sections track what changed
+   the trajectory; this table shows what the trajectory changed.
+
+Done when a reader of this page alone can say where the work started, where it ended, and which
+two things mattered most.
 
 ## 1. Timeline from artefact evidence
 
@@ -33,8 +76,20 @@ and prefer the commit/tracker record whenever one exists. Compute the headline y
 you're at it: how much of the final corpus's durable content came from what fraction of the
 elapsed time or word count.
 
+**The trajectory chart.** Build `<slug> trajectory.json` from the timeline: one event per
+interaction (user turn, adversarial round, external review round, returned compute result), in
+order, each with its time, source, a judged depth-and-novelty score for the live question (0–10),
+a short label, a one-sentence hover detail, and `key: true` on the turning points. Add markers for
+compactions and long breaks. Render the static chart with
+[`bin/trajectory.py`](bin/trajectory.py) (needs matplotlib); the JSON schema is in its docstring.
+Use the reference categorical palette from the `dataviz` skill, one fixed hue and marker shape per
+source, and run its validator. The score is a judgment: say so on the axis and in the summary,
+and keep it consistent rather than precise. What the chart shows that tables do not is the shape:
+early kills, the plateau where the question froze, and whether later gains came from reframing or
+from evidence.
+
 Done when the timeline is built from at least one mtime-independent source, or the mtime-reliance
-check is stated explicitly.
+check is stated explicitly, and the chart JSON covers every interaction in the timeline.
 
 ## 2. Ledger of inflection points
 
@@ -121,6 +176,25 @@ This document is not a tombstone. New inflection points get a ledger row (§2) a
 numbered subsection. Use the append template in [`append-template.md`](append-template.md).
 
 Done when the ledger and §8 are current as of this run and no earlier section was left stale.
+
+## 10. Render the report
+
+```bash
+B=<this skill's directory>/bin
+python3 $B/trajectory.py "<slug> trajectory.json" "<slug> trajectory.png"
+python3 $B/md2pdf.py "<slug>.pdf" "<slug> summary.md" "<slug>.md"
+python3 $B/report_html.py "<slug>.html" "<slug> summary.md" "<slug>.md" --chart "<slug> trajectory.json"
+```
+
+`md2pdf.py` needs xelatex (fontspec, soul, tcolorbox, xltabular) and the DejaVu fonts;
+`report_html.py` needs only the standard library and writes one self-contained page whose chart
+shows each event's detail on hover or keyboard focus, with a data table under it. Both read the
+same Markdown subset ([`bin/mdlite.py`](bin/mdlite.py)): a paragraph that is wholly `==…==`
+becomes a highlighted box, a shorter `==span==` or a list item an inline highlight. Open both
+outputs and look at them: check that the highlights landed on the intended sentences, no table
+overflows, and the chart labels do not collide.
+
+Done when both files exist, open, and carry the highlights.
 
 ## Judgement throughout
 
