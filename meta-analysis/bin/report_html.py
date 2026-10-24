@@ -77,8 +77,12 @@ def render(md_path, chart_json, appendix):
                 mime = mimetypes.guess_type(p.name)[0] or "image/png"
                 data = base64.b64encode(p.read_bytes()).decode()
                 out.append(f'<figure><img alt="{html.escape(b[1])}" src="data:{mime};base64,{data}"></figure>')
+            else:
+                print(f"warning: image not found, alt text used: {p}", file=sys.stderr)
+                out.append(f'<figure class="missing-image">[{html.escape(b[1] or p.name)}]</figure>')
         elif b[0] == "quote":
-            out.append(f"<blockquote>{para(b[1], 'span')}</blockquote>")
+            text = html.escape(b[1], quote=False).replace("\n", "<br>\n")
+            out.append(f"<blockquote><span>{text}</span></blockquote>")
         elif b[0] == "code":
             out.append(f"<pre><code>{html.escape(b[1])}</code></pre>")
     close()
@@ -121,26 +125,26 @@ const W=960,H=430,L=58,R=16,T=34,B=46,ev=D.events,n=ev.length;
 const x=i=>L+(i+0.5)*(W-L-R)/n, y=v=>T+(1-v/10.2)*(H-T-B);
 const shapes={o:'<circle r="5.5"/>',s:'<rect x="-5" y="-5" width="10" height="10"/>',D:'<rect x="-5" y="-5" width="10" height="10" transform="rotate(45)"/>','^':'<path d="M0,-6.5L6,4.5L-6,4.5Z"/>'};
 let s=`<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(D.title)}"><defs>`;
-for(const [k,v] of Object.entries(D.sources))s+=`<g id="m-${k}" fill="${v.color}" stroke="var(--bg)" stroke-width="2">${shapes[v.marker]||shapes.o}</g>`;
+for(const [k,v] of Object.entries(D.sources))s+=`<g id="m-${esc(k)}" fill="${esc(v.color)}" stroke="var(--bg)" stroke-width="2">${shapes[v.marker]||shapes.o}</g>`;
 s+=`</defs><text x="${L}" y="18" font-size="15" font-family="system-ui,sans-serif" fill="var(--ink)">${esc(D.title)}</text>`;
 for(let v=0;v<=10;v+=2)s+=`<line x1="${L}" x2="${W-R}" y1="${y(v)}" y2="${y(v)}" stroke="var(--grid)"/><text x="${L-8}" y="${y(v)+4}" text-anchor="end" font-size="11" fill="var(--muted)" font-family="system-ui">${v}</text>`;
 for(const m of D.markers||[]){const xm=(x(m.after-1)+x(m.after))/2,dash=m.style==='dashed';
  s+=`<line x1="${xm}" x2="${xm}" y1="${T}" y2="${H-B}" stroke="var(--muted)" stroke-dasharray="${dash?'4 4':'1 3'}"/><text x="${xm+4}" y="${dash?T+10:H-B-6}" font-size="10" fill="var(--muted)" font-family="system-ui">${esc(m.label)}</text>`;}
-let p='';ev.forEach((e,i)=>{p+=(i?`H${x(i)}V${y(e.depth)}`:`M${x(0)},${y(e.depth)}`)});p+=`H${x(n-1)+8}`;
+let p='';ev.forEach((e,i)=>{const depth=Number(e.depth);p+=(i?`H${x(i)}V${y(depth)}`:`M${x(0)},${y(depth)}`)});p+=`H${x(n-1)+8}`;
 s+=`<path d="${p}" fill="none" stroke="var(--line)" stroke-width="2"/>`;
-let k=0;ev.forEach((e,i)=>{s+=`<text x="${x(i)}" y="${H-B+16}" text-anchor="middle" font-size="10" fill="var(--muted)" font-family="system-ui">${i+1}</text>`;
- if(e.key){s+=`<text x="${x(i)}" y="${y(e.depth)-11}" text-anchor="middle" font-size="11" font-weight="700" fill="var(--ink)" font-family="system-ui">${String.fromCharCode(65+k++)}</text>`;}
- s+=`<g class="pt" tabindex="0" data-i="${i}" transform="translate(${x(i)},${y(e.depth)})"><circle r="12" fill="transparent"/><use href="#m-${e.source}"/></g>`;});
+let k=0;ev.forEach((e,i)=>{const depth=Number(e.depth),source=esc(e.source);s+=`<text x="${x(i)}" y="${H-B+16}" text-anchor="middle" font-size="10" fill="var(--muted)" font-family="system-ui">${i+1}</text>`;
+ if(e.key){s+=`<text x="${x(i)}" y="${y(depth)-11}" text-anchor="middle" font-size="11" font-weight="700" fill="var(--ink)" font-family="system-ui">${String.fromCharCode(65+k++)}</text>`;}
+ s+=`<g class="pt" tabindex="0" data-i="${i}" transform="translate(${x(i)},${y(depth)})"><circle r="12" fill="transparent"/><use href="#m-${source}"/></g>`;});
 s+=`<text x="${(L+W-R)/2}" y="${H-6}" text-anchor="middle" font-size="12" fill="var(--muted)" font-family="system-ui">Interaction (chronological) — hover or tab to a point for details</text>`;
 s+=`<text transform="translate(16,${(T+H-B)/2}) rotate(-90)" text-anchor="middle" font-size="12" fill="var(--muted)" font-family="system-ui">${esc((D.y_label||'Depth (judged, 0–10)').replace(/\n/g,' '))}</text></svg>`;
-let lg='<div class="legend">';for(const [k2,v] of Object.entries(D.sources))lg+=`<span><svg width="14" height="14" viewBox="-8 -8 16 16"><use href="#m-${k2}"/></svg>${esc(v.name)}</span>`;lg+='</div>';
+let lg='<div class="legend">';for(const [k2,v] of Object.entries(D.sources))lg+=`<span><svg width="14" height="14" viewBox="-8 -8 16 16"><use href="#m-${esc(k2)}"/></svg>${esc(v.name)}</span>`;lg+='</div>';
 let ky='<div class="keys">';let kk=0;ev.forEach((e,i)=>{if(e.key)ky+=`<div><b>${String.fromCharCode(65+kk++)}</b> [${i+1}] ${esc(e.label)}</div>`});ky+='</div>';
 let tb='<details><summary>Data table</summary><div class="tw"><table><thead><tr><th>#</th><th>Time</th><th>Source</th><th>Depth</th><th>Event</th><th>Detail</th></tr></thead><tbody>';
-ev.forEach((e,i)=>tb+=`<tr><td>${i+1}</td><td>${esc(e.time)}</td><td>${esc(D.sources[e.source].name)}</td><td>${e.depth}</td><td>${esc(e.label)}</td><td>${esc(e.detail||'')}</td></tr>`);
+ev.forEach((e,i)=>tb+=`<tr><td>${i+1}</td><td>${esc(e.time)}</td><td>${esc(D.sources[e.source].name)}</td><td>${Number(e.depth)}</td><td>${esc(e.label)}</td><td>${esc(e.detail||'')}</td></tr>`);
 fig.innerHTML=s+lg+ky+tb+'</tbody></table></div></details>';
 const tip=document.createElement('div');tip.id='tip';document.body.appendChild(tip);
 function show(g,cx,cy){const e=ev[+g.dataset.i],src=D.sources[e.source];
- tip.innerHTML=`<div class="h"><svg width="12" height="12" viewBox="-8 -8 16 16"><use href="#m-${e.source}"/></svg>#${+g.dataset.i+1} · ${esc(e.label)}</div><div class="m">${esc(e.time)} · ${esc(src.name)} · depth ${e.depth}</div>${e.detail?`<div>${esc(e.detail)}</div>`:''}`;
+ tip.innerHTML=`<div class="h"><svg width="12" height="12" viewBox="-8 -8 16 16"><use href="#m-${esc(e.source)}"/></svg>#${+g.dataset.i+1} · ${esc(e.label)}</div><div class="m">${esc(e.time)} · ${esc(src.name)} · depth ${Number(e.depth)}</div>${e.detail?`<div>${esc(e.detail)}</div>`:''}`;
  tip.style.display='block';const r=tip.getBoundingClientRect();let lx=cx+14,ly=cy+14;
  if(lx+r.width>innerWidth-8)lx=cx-r.width-14;if(ly+r.height>innerHeight-8)ly=cy-r.height-14;tip.style.left=lx+'px';tip.style.top=ly+'px';}
 fig.querySelectorAll('.pt').forEach(g=>{g.addEventListener('mousemove',ev2=>show(g,ev2.clientX,ev2.clientY));

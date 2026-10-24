@@ -16,13 +16,14 @@ LaTeX log, if xelatex fails.
 """
 import argparse
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from mdlite import inline_tex, is_highlight, parse  # noqa: E402
+from mdlite import escape_tex, inline_tex, is_highlight, parse  # noqa: E402
 
 ENV = {"ul": "itemize", "ol": "enumerate"}
 
@@ -52,8 +53,9 @@ def table(rows):
     return "\n".join(out)
 
 
-def convert(md_path, appendix):
+def convert(md_path, appendix, image_dir=None):
     base, out, stack = md_path.parent, [], []
+    image_index = 0
 
     def close(depth=0):
         while len(stack) > depth:
@@ -86,12 +88,37 @@ def convert(md_path, appendix):
                 print(f"warning: image not found, alt text used: {target}", file=sys.stderr)
                 out.append(r"\begin{center}\emph{[" + inline_tex(b[1] or target.name) + r"]}\end{center}")
                 continue
+            if image_dir is not None:
+                suffix = target.suffix.lower()
+                if not re.fullmatch(r"\.[A-Za-z0-9]+", suffix):
+                    print(f"warning: unsafe image path, alt text used: {target}", file=sys.stderr)
+                    out.append(r"\begin{center}\emph{[" + inline_tex(b[1] or target.name) + r"]}\end{center}")
+                    continue
+                image_dir.mkdir(parents=True, exist_ok=True)
+                filename = f"image-{image_index}{suffix}"
+                image_index += 1
+                try:
+                    shutil.copyfile(target, image_dir / filename)
+                except OSError as exc:
+                    print(f"warning: image could not be copied, alt text used: {target}: {exc}",
+                          file=sys.stderr)
+                    out.append(r"\begin{center}\emph{[" + inline_tex(b[1] or target.name) + r"]}\end{center}")
+                    continue
+                image_path = f"{image_dir.name}/{filename}"
+            else:
+                if any(char in str(target) for char in "%#{}\\"):
+                    print(f"warning: unsafe image path, alt text used: {target}", file=sys.stderr)
+                    out.append(r"\begin{center}\emph{[" + inline_tex(b[1] or target.name) + r"]}\end{center}")
+                    continue
+                image_path = str(target)
             out.append(r"\begin{center}\includegraphics[width=\linewidth,height=0.55\textheight,"
-                       r"keepaspectratio]{\detokenize{" + str(target) + r"}}\end{center}")
+                       r"keepaspectratio]{\detokenize{" + image_path + r"}}\end{center}")
         elif b[0] == "quote":
-            out.append(r"\begin{quote}\itshape " + para(b[1]) + r"\end{quote}")
+            out.append(r"\begin{quote}\itshape " + escape_tex(b[1]).replace("\n", r"\\") + r"\end{quote}")
         elif b[0] == "code":
-            out.append("\\begin{verbatim}\n" + b[1] + "\n\\end{verbatim}")
+            lines = [r"\texttt{" + escape_tex(line).replace(" ", r"\ ") + "}"
+                     for line in b[1].split("\n")]
+            out.append(r"\begin{quote}" + r"\\ ".join(lines) + r"\end{quote}")
     close()
     return "\n".join(out)
 
@@ -121,8 +148,9 @@ def main():
     if not shutil.which("xelatex"):
         sys.exit("md2pdf: xelatex not found")
     srcs = [pathlib.Path(s).resolve() for s in a.sources]
-    body = "\n\n".join(convert(p, appendix=k > 0) for k, p in enumerate(srcs))
     with tempfile.TemporaryDirectory() as tmp:
+        body = "\n\n".join(convert(p, appendix=k > 0, image_dir=pathlib.Path(tmp) / f"assets-{k}")
+                           for k, p in enumerate(srcs))
         tex = pathlib.Path(tmp) / "report.tex"
         tex.write_text(PREAMBLE + body + "\n\\end{document}\n", encoding="utf-8")
         for _ in range(2):
