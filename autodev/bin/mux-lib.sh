@@ -14,6 +14,7 @@
 # The driver calls `mux_init "<sid>"` once, which sets two globals:
 #     MUX  = herdr | tmux | ""     ("" => no registered pane; caller should skip)
 #     PANE = backend pane id       (herdr "w1:p1", tmux "%3")
+#     MUX_SESSION = owning session id
 # and then runs every pane operation through the mux_* helpers below.
 #
 # This file only defines constants + functions. Sourcing it runs nothing and
@@ -95,7 +96,7 @@ mux_register(){ # $1 = sid
 # Returns 0 when a registration exists, 1 when none (caller should exit).
 mux_init(){ # $1 = sid
   local sid="$1" v
-  MUX=""; PANE=""; TAB=""
+  MUX=""; PANE=""; TAB=""; MUX_SESSION="$sid"
   [ -s "$STATE/$sid.herdr-tab" ] && TAB=$(cat "$STATE/$sid.herdr-tab" 2>/dev/null)
   if [ -s "$STATE/$sid.herdr-pane" ]; then
     v=$(cat "$STATE/$sid.herdr-pane" 2>/dev/null)
@@ -182,11 +183,79 @@ mux_text_awaiting_human(){
 # herdr's own detector reports these dialogs as `blocked` (its claude manifest,
 # rule live_blocked_form), which is trusted as a positive but never as a
 # negative — `idle` is still checked against the screen.
+mux_live_prompt_footer(){
+  local screen tail
+  screen=$(cat)
+  tail=$(printf '%s\n' "$screen" | awk 'NF' | tail -n 8)
+  [ -n "$tail" ] || return 1
+  printf '%s\n' "$tail" | awk '
+    function rule(s, count) {
+      count=gsub(/─/, "", s)
+      gsub(/[[:space:]]/, "", s)
+      return count >= 3 && length(s) == 0
+    }
+    function mode_line(s) {
+      return tolower(s) ~ /auto mode|shortcut|shift.*tab|for agents/
+    }
+    function right_notice(s, indent, body) {
+      if (match(s, /^[[:space:]]+/) != 1) return 0
+      indent=RLENGTH
+      if (indent < 24) return 0
+      body=substr(s, indent + 1)
+      return body ~ /^✔ Update installed · Restart to apply$/ ||
+             body ~ /^new task[?] \/clear to save [0-9]+([.][0-9]+)?k tokens$/
+    }
+    {
+      row[++n]=$0
+      if ($0 ~ /^[[:space:]]*❯([[:space:]]|$)/) prompt=n
+    }
+    END {
+      mode=n
+      if (right_notice(row[n])) mode=n-1
+      if (mode < 1 || !mode_line(row[mode]) || !prompt || prompt < 2 || prompt + 1 >= mode) exit 1
+      if (!rule(row[prompt-1]) || !rule(row[prompt+1])) exit 1
+    }'
+}
+
+# Remove the verified live prompt footer by structure: the lower rule beneath
+# the standalone prompt glyph and every live footer row after it. This keeps
+# notice rows from pushing an open menu's own footer out of the matcher window.
+mux_visible_dialog_text(){
+  awk '
+    function rule(s, count) {
+      count=gsub(/─/, "", s)
+      gsub(/[[:space:]]/, "", s)
+      return count >= 3 && length(s) == 0
+    }
+    { if (NF) row[++n]=$0 }
+    END {
+      for (i=n-1; i>=2; i--) {
+        if (row[i] ~ /^[[:space:]]*❯([[:space:]]|$)/ &&
+            rule(row[i-1]) && i+1 <= n && rule(row[i+1])) {
+          for (j=1; j<=i; j++) print row[j]
+          exit 0
+        }
+      }
+      exit 1
+    }'
+}
+
 mux_awaiting_human(){
-  local out
+  local out visible dialog
   [ "$MUX" = herdr ] && [ "$(mux_status)" = blocked ] && return 0
   out=$(mux_read_screen) || return 0
-  [ -n "$(printf '%s' "$out" | tr -d '[:space:]')" ] || return 0
+  if [ -z "$(printf '%s' "$out" | tr -d '[:space:]')" ]; then
+    # A post-compaction recent-unwrapped read can briefly contain only blank
+    # rows. The visible source follows scroll position, so trust it only when
+    # its bottom still proves this is the live prompt and status footer.
+    [ "$MUX" = herdr ] || return 0
+    visible=$("$MUX_HERDR" pane read "$PANE" --source visible 2>/dev/null) || return 0
+    [ -n "$(printf '%s' "$visible" | tr -d '[:space:]')" ] || return 0
+    printf '%s\n' "$visible" | mux_live_prompt_footer || return 0
+    dialog=$(printf '%s\n' "$visible" | mux_visible_dialog_text) || return 0
+    printf '%s\n' "$dialog" | mux_text_awaiting_human
+    return $?
+  fi
   printf '%s\n' "$out" | mux_text_awaiting_human
 }
 
@@ -257,13 +326,24 @@ mux_tab_rename(){ # $1 = label
 
 # --- sending: every keystroke into a pane goes through here -----------------
 # Each sender below refuses, returning MUX_REFUSED (3) and typing nothing, while
-# mux_awaiting_human holds. The check sits here, at the keystroke, rather than
+# mux_awaiting_human holds or the tmux session has a staged-input lock. The check
+# sits here, at the keystroke, rather than
 # only in mux_busy, because this is the one place no caller can route around:
 # a future sender that forgets mux_busy still cannot answer a question, and the
 # check runs as late as possible, after any wait the caller did. Callers log the
 # refusal as `DEFER awaiting-human` and retry later exactly as for a busy pane;
 # nothing escalates a refusal into a send.
 MUX_REFUSED=3
+_mux_refuse_staged_attempt(){
+  [ "$MUX" = tmux ] || return 1
+  [ "${MUX_ATTEMPT_SEND:-0}" = 1 ] && return 1
+  local sid=${MUX_SESSION:-}
+  [ -n "$sid" ] || sid=$(mux_pane_owner)
+  [ -n "$sid" ] || return 1
+  [ -f "$STATE/$sid.reload-attempt" ] || return 1
+  printf 'mux: refusing tmux input for session %s: staged-input lock is active\n' "$sid" >&2
+  return 0
+}
 _mux_refuse_if_awaiting(){
   mux_awaiting_human || return 0
   printf 'mux: refused: pane %s is awaiting the human (open question or prompt)\n' "$PANE" >&2
@@ -275,9 +355,15 @@ _mux_refuse_if_awaiting(){
 # literal text and immediately before Enter. A dialog can open between the two
 # commands; in that race, leave the text staged and refuse the decisive key.
 mux_send_line(){ # $1 = text
+  # tmux stages the literal before the final guard. Callers persisting a retry
+  # must be able to distinguish a refusal before staging from one that may have
+  # left text in the input line.
+  MUX_LINE_STAGED=0
+  _mux_refuse_staged_attempt && return "$MUX_REFUSED"
   _mux_refuse_if_awaiting || return "$MUX_REFUSED"
   case "$MUX" in
-    tmux)  tmux send-keys -t "$PANE" -l "$1" || return 1
+    tmux)  MUX_LINE_STAGED=1
+           tmux send-keys -t "$PANE" -l "$1" || return 1
            _mux_refuse_if_awaiting || return "$MUX_REFUSED"
            tmux send-keys -t "$PANE" Enter ;;
     herdr) "$MUX_HERDR" pane run "$PANE" "$1" >/dev/null 2>&1 ;;
@@ -289,6 +375,7 @@ mux_send_line(){ # $1 = text
 # Guarded too: in a select menu the typed characters are keystrokes, and a digit
 # picks an option.
 mux_stage_text(){ # $1 = text
+  _mux_refuse_staged_attempt && return "$MUX_REFUSED"
   _mux_refuse_if_awaiting || return "$MUX_REFUSED"
   case "$MUX" in
     tmux)  tmux send-keys -t "$PANE" -l "$1" ;;
@@ -303,6 +390,7 @@ mux_stage_text(){ # $1 = text
 #                 /compact confirmation, the dialog /usage-credits opens on a
 #                 limit-stopped session), where no human question can be open.
 mux_send_key(){ # [--own-prompt] $1 = key
+  _mux_refuse_staged_attempt && return "$MUX_REFUSED"
   if [ "${1:-}" = --own-prompt ]; then shift
   else _mux_refuse_if_awaiting || return "$MUX_REFUSED"; fi
   case "$MUX" in

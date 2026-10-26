@@ -1,0 +1,9 @@
+│ Choose an option
+❯ 1. Continue
+  2. Stop
+
+Enter to select · Tab/Arrow keys to navigate · Esc to cancel
+────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────
+⏵⏵ auto mode on (shift+tab to cycle) · ← for agents

@@ -66,6 +66,18 @@ HEARTBEAT_EVERY=600 # emit at most one HEARTBEAT log line per this many seconds
 
 log(){ printf '%s [%s] %s\n' "$(date +'%Y.%m.%d %H.%M.%S')" "$sid" "$*" >> "$LOG"; }
 
+prepare_reload_line(){
+  local ptr="$AUTODEV_HOME/handoffs/.latest.$sid" hf=""
+  [ -f "$ptr" ] && hf=$(cat "$ptr" 2>/dev/null)
+  if [ -n "$hf" ] && { [ "$DRY" = 1 ] || [ -f "$hf" ]; }; then
+    pending_reload_line="Read the handoff at \"$hf\" and continue execution from where it leaves off."
+    reload_has_handoff=1
+  else
+    pending_reload_line="A compaction just occurred, but no handoff is registered for THIS session. Do not read another session's handoff from $AUTODEV_HOME/handoffs — re-orient from this session's own transcript and continue, or ask the user."
+    reload_has_handoff=0
+  fi
+}
+
 # Abandon this cycle. Stamps the cooldown and bumps the consecutive-abort
 # counter that auto-handoff-sweep.sh reads to tell "retry it" from "this session
 # is wedged — stop typing at it and flag it". Cleared on a completed cycle.
@@ -92,11 +104,41 @@ if [ -f "$STATE/$sid.limit-wait" ]; then log "SKIP session-limit resume pending"
 DRY=1
 [ -f "$STATE/auto-handoff.armed" ] && DRY=0
 
+reload_marker="$STATE/$sid.reload-pending"
+reload_attempt="$STATE/$sid.reload-attempt"
+reload_retry=0
+reload_superseded=0
+if [ -f "$reload_marker" ]; then
+  if ! command -v reload_marker_retire_reason >/dev/null 2>&1; then
+    log "SKIP reload-pending: request-lib retirement check unavailable"
+    exit 0
+  fi
+  retired=$(reload_marker_retire_reason "$STATE" "$AUTODEV_HOME/handoffs" "$sid" "$reload_marker" || true)
+  case "$retired" in
+    new-handoff-request)
+      rm -f "$reload_marker" 2>/dev/null
+      log "DROP reload-pending: a newer handoff request superseded it"
+      ;;
+    new-handoff|completed-turn)
+      rm -f "$reload_marker" 2>/dev/null
+      reload_superseded=1
+      log "DROP reload-pending: superseded by $retired"
+      ;;
+    *) reload_retry=1 ;;
+  esac
+fi
+
 # --- read context % written by the statusline ---
 ctxf="$STATE/$sid.ctx"
-[ -f "$ctxf" ] || exit 0
-pct=$(sed -n 's/^pct=\([0-9.]*\).*/\1/p' "$ctxf")
-[ -n "$pct" ] || exit 0
+if [ "$reload_retry" = 1 ]; then
+  pct="unknown"
+  [ -f "$ctxf" ] && pct=$(sed -n 's/^pct=\([0-9.]*\).*/\1/p' "$ctxf")
+  [ -n "$pct" ] || pct="unknown"
+else
+  [ -f "$ctxf" ] || exit 0
+  pct=$(sed -n 's/^pct=\([0-9.]*\).*/\1/p' "$ctxf")
+  [ -n "$pct" ] || exit 0
+fi
 
 # A missing runtime tag means a pre-upgrade Claude Code session. Codex writes
 # its tag from the Stop hook and uses the host's explicit `$skill` syntax.
@@ -121,7 +163,7 @@ if [ $(( hb_now - hb_last )) -ge "$HEARTBEAT_EVERY" ]; then
   printf '%s\n' "$hb_now" > "$hbf" 2>/dev/null
 fi
 
-# --- trigger gate: over threshold OR an explicit handoff/compact request ---
+# --- trigger gate: pending reload OR over threshold / explicit request ---
 # A quiesced session that knows its NEXT phase is heavy can drop
 # $STATE/$sid.handoff-request to hand off at THIS clean boundary even below
 # threshold (e.g. holding at a phase boundary at 22%). A session that has ALREADY
@@ -134,7 +176,9 @@ req="$STATE/$sid.handoff-request"
 creq="$STATE/$sid.compact-request"
 reason=""
 compact_only=0
-if request_valid "$STATE" "$AUTODEV_HOME/handoffs" "$sid" handoff-request; then
+if [ "$reload_retry" = 1 ]; then
+  reason="pending reload"
+elif request_valid "$STATE" "$AUTODEV_HOME/handoffs" "$sid" handoff-request; then
   reason=requested
 elif remove_stale_request "$STATE" "$AUTODEV_HOME/handoffs" "$sid" handoff-request; then
   log "SKIP stale handoff-request (a compaction is newer than it) — removed (pct=$pct)"
@@ -161,7 +205,7 @@ fi
 
 # --- cooldown gate ---
 cdf="$STATE/$sid.cooldown"
-if [ -f "$cdf" ]; then
+if [ "$reload_retry" != 1 ] && [ -f "$cdf" ]; then
   last=$(cat "$cdf" 2>/dev/null || echo 0); now=$(date +%s)
   if [ $(( now - last )) -lt "$COOLDOWN" ]; then
     log "SKIP cooldown active (pct=$pct)"; exit 0
@@ -184,6 +228,10 @@ fi
 owner=$(mux_pane_owner)
 if [ -n "$owner" ] && [ "$owner" != "$sid" ]; then
   log "SKIP pane $pane reused by session $owner (not ours) — cleared stale binding (pct=$pct)"
+  if [ -f "$reload_marker" ] || [ -f "$reload_attempt" ]; then
+    rm -f "$reload_marker" "$reload_attempt" 2>/dev/null
+    log "DROP reload-pending: pane is now owned by session $owner"
+  fi
   rm -f "$STATE/$sid.$MUX-pane" 2>/dev/null
   exit 0
 fi
@@ -211,6 +259,39 @@ if ! mkdir "$lock" 2>/dev/null; then
 fi
 printf '%s\n' "$$" > "$lock/pid" 2>/dev/null
 trap 'rm -rf "$lock" 2>/dev/null || true' EXIT
+
+# A staged tmux literal locks every send for this session, even if a newer
+# request superseded the reload marker. Only a completed turn that is strictly
+# newer than the attempt proves the input was consumed and releases the lock.
+clear_reload_attempt_if_consumed(){
+  [ "$MUX" = tmux ] || return 0
+  [ -f "$reload_attempt" ] && [ -f "$STATE/$sid.idle" ] || return 0
+  if [ "$STATE/$sid.idle" -nt "$reload_attempt" ]; then
+    rm -f "$reload_attempt" 2>/dev/null
+    log "CLEAR tmux staged-input lock: newer idle turn consumed prior input"
+  fi
+}
+refile_consumed_request(){
+  [ "$landed" = 0 ] && [ -n "${consumed:-}" ] || return 0
+  # Never overwrite a request filed in the meantime; that one is newer.
+  if [ ! -e "$consumed" ]; then
+    rtmp="$consumed.refile.$$"
+    { : > "$rtmp" && touch -d "@$consumed_mtime" "$rtmp" && mv -n "$rtmp" "$consumed"; } 2>/dev/null
+    rm -f "$rtmp" 2>/dev/null
+  fi
+}
+defer_staged_input(){ # $1 = action blocked by a prior possibly staged literal
+  refile_consumed_request
+  : > "$STATE/$sid.deferred" 2>/dev/null
+  log "DEFER $1: tmux staged-input lock is active; refusing every send until a newer idle turn or pane-owner change"
+  exit 0
+}
+clear_reload_attempt_if_consumed
+if [ -f "$reload_attempt" ]; then
+  log "DEFER tmux staged-input lock: inspect the pane; no session sends are allowed"
+  exit 0
+fi
+if [ "$reload_superseded" = 1 ]; then exit 0; fi
 
 # --- idle helpers (pre-send safety gate; avoids queuing into a busy agent) ---
 pane_busy(){ mux_busy; }  # 0 = busy (herdr agent_status, or tmux visible-pane scrape)
@@ -241,33 +322,147 @@ wait_turn_done(){ # $1 = since epoch, $2 = timeout: idle marker newer AND pane i
 # request marker consumed at TRIGGER (with its original age), so the refusal
 # costs a retry, not the request.
 landed=0
+post_compaction=0
+pending_reload_line=""
+save_reload_pending(){
+  local tmp="$reload_marker.tmp.$$"
+  [ -n "$pending_reload_line" ] || return 1
+  printf '%s\n' "$pending_reload_line" > "$tmp" 2>/dev/null &&
+    mv -f "$tmp" "$reload_marker" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+}
+save_reload_attempt(){ # $1 = attempting|staged; atomically persist ambiguous send state
+  local value=$1 tmp="$reload_attempt.tmp.$$"
+  printf '%s\n' "$value" > "$tmp" 2>/dev/null &&
+    mv -f "$tmp" "$reload_attempt" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+}
 defer_awaiting(){ # $1 = where
-  if [ "$landed" = 0 ] && [ -n "${consumed:-}" ]; then
-    # Atomic, and never over a request the session filed in the meantime (that one
-    # is newer and supersedes the one we consumed).
-    if [ ! -e "$consumed" ]; then
-      rtmp="$consumed.refile.$$"
-      { : > "$rtmp" && touch -d "@$consumed_mtime" "$rtmp" && mv -n "$rtmp" "$consumed"; } 2>/dev/null
-      rm -f "$rtmp" 2>/dev/null
+  if [ "$post_compaction" = 1 ]; then
+    if save_reload_pending; then
+      log "RELOAD-PENDING saved after $1"
+    else
+      log "ERROR could not save reload-pending after $1"
     fi
   fi
+  refile_consumed_request
   : > "$STATE/$sid.deferred" 2>/dev/null   # the sweeper pages on a long-pending, only-deferred request
   log "DEFER awaiting-human ($1): pane shows an open question/permission prompt pct=$pct — retry next sweep"
   exit 0
 }
 
 send(){ # send one literal line + Enter to the registered pane (via herdr/tmux)
-  local text="$1" rc
+  local text="$1" rc track_reload=0 track_tmux=0
   if [ "$DRY" = 1 ]; then
     log "DRY would send: [$text]"
   else
+    # This runs under the cycle lock. Repeat the staged-input check here so a
+    # watcher that passed the pre-lock observation cannot append after another
+    # watcher staged a literal in the intervening window.
+    clear_reload_attempt_if_consumed
+    [ "$MUX" != tmux ] || [ ! -f "$reload_attempt" ] || defer_staged_input "send [$text] refused"
+    if [ "$post_compaction" = 1 ]; then
+      if ! save_reload_pending; then
+        abort_cycle "could not persist reload before post-compaction send"
+      fi
+      track_reload=1
+    fi
+    if [ "$MUX" = tmux ]; then
+      if ! save_reload_attempt attempting; then
+        abort_cycle "could not persist tmux send state"
+      fi
+      track_tmux=1
+      MUX_ATTEMPT_SEND=1
+    fi
     mux_send_line "$text" 2>>"$LOG"; rc=$?
+    MUX_ATTEMPT_SEND=0
+    if [ "$track_tmux" = 1 ]; then
+      if [ "$rc" = 0 ]; then
+        rm -f "$reload_attempt" 2>/dev/null
+        [ "$track_reload" = 0 ] || rm -f "$reload_marker" 2>/dev/null
+      elif [ "${MUX_LINE_STAGED:-0}" = 1 ]; then
+        save_reload_attempt staged || log "ERROR could not update tmux reload-send state; retaining attempting state"
+        log "TMUX input may contain staged text; every session send is locked pending inspection"
+      else
+        rm -f "$reload_attempt" 2>/dev/null
+        log "TMUX send returned without staging; input lock cleared"
+      fi
+    elif [ "$track_reload" = 1 ] && [ "$rc" = 0 ]; then
+      rm -f "$reload_marker" 2>/dev/null
+    fi
     [ "$rc" = "${MUX_REFUSED:-3}" ] && defer_awaiting "refused [$text]"
     [ "$rc" = 0 ] || abort_cycle "send failed for [$text]"
     landed=1
     log "SENT: [$text]"
   fi
 }
+
+# The sweep re-arms this watcher for a refused reload. Retry under the same
+# cycle lock and pane-owner check as a normal cycle, and through mux_send_line's
+# last-moment human-input guard. Do not queue behind an active turn: once it
+# completes, its newer .idle marker retires this stale reload instead.
+if [ "$reload_retry" = 1 ]; then
+  retired=$(reload_marker_retire_reason "$STATE" "$AUTODEV_HOME/handoffs" "$sid" "$reload_marker" || true)
+  case "$retired" in
+    new-handoff-request)
+      rm -f "$reload_marker" 2>/dev/null
+      log "DROP reload-pending: a newer handoff request superseded it"
+      exit 0
+      ;;
+    new-handoff|completed-turn)
+      rm -f "$reload_marker" 2>/dev/null
+      log "DROP reload-pending: superseded by $retired"
+      exit 0
+      ;;
+  esac
+  [ -f "$reload_marker" ] || exit 0
+  stored_reload_line=$(cat "$reload_marker" 2>/dev/null) || stored_reload_line=""
+  prepare_reload_line
+  case "$stored_reload_line" in *$'\n'*) log "DEFER reload-pending: malformed marker has multiple lines"; exit 0 ;; esac
+  if [ -z "$stored_reload_line" ] || [ "$stored_reload_line" != "$pending_reload_line" ]; then
+    log "DEFER reload-pending: malformed or superseded payload; retaining it"
+    exit 0
+  fi
+  if [ "$DRY" = 1 ]; then
+    log "DRY would retry reload-pending"
+    exit 0
+  fi
+  if pane_busy; then
+    log "DEFER reload-pending: pane is busy or awaiting the human"
+    exit 0
+  fi
+  clear_reload_attempt_if_consumed
+  if [ -f "$reload_attempt" ]; then
+    defer_staged_input "reload retry refused"
+  fi
+  if [ "$MUX" = tmux ] && ! save_reload_attempt attempting; then
+    log "DEFER reload-pending: could not persist tmux send state; marker retained"
+    exit 0
+  fi
+  [ "$MUX" != tmux ] || MUX_ATTEMPT_SEND=1
+  mux_send_line "$pending_reload_line" 2>>"$LOG"; rc=$?
+  MUX_ATTEMPT_SEND=0
+  if [ "$MUX" = tmux ]; then
+    if [ "$rc" = 0 ]; then
+      rm -f "$reload_marker" "$reload_attempt" 2>/dev/null
+    elif [ "${MUX_LINE_STAGED:-0}" = 1 ]; then
+      save_reload_attempt staged || log "ERROR could not update tmux reload-send state; retaining attempting state"
+      log "DEFER reload-pending: prior tmux send may have left text staged; inspect the pane before retrying"
+    else
+      rm -f "$reload_attempt" 2>/dev/null
+      log "DEFER reload-pending: tmux send returned without staging; retry is safe"
+    fi
+  fi
+  if [ "$rc" = 0 ]; then
+    rm -f "$reload_marker" "$reload_attempt" 2>/dev/null
+    date +%s > "$cdf" 2>/dev/null
+    rm -f "$STATE/$sid.abort-count" "$STATE/$sid.stuck" 2>/dev/null
+    log "RELOAD retry sent"
+  elif [ "$rc" = "${MUX_REFUSED:-3}" ]; then
+    log "DEFER awaiting-human (reload retry); marker retained"
+  else
+    log "DEFER reload retry send failed rc=$rc; marker retained"
+  fi
+  exit 0
+fi
 
 sleep "$SETTLE"
 
@@ -417,7 +612,11 @@ if [ "$DRY" = 0 ]; then
   fi
 fi
 
-# 3) re-assert the session name (compaction can reset the display title), then continue
+# 3) re-assert the session name (compaction can reset the display title), then continue.
+# Prepare the reload before any post-compaction send so a refusal of /rename also
+# leaves the required reload durable. Refresh again after rename before sending.
+prepare_reload_line
+post_compaction=1
 [ "$DRY" = 0 ] && wait_pane_idle 60
 if [ -n "$SESSION_NAME" ]; then
   send "/rename $SESSION_NAME"
@@ -432,13 +631,12 @@ fi
 # someone else's mission while its pane still reads perfectly healthy, silently
 # ending whatever it was actually monitoring. A missing pointer must therefore
 # fail closed: no handoff is strictly better than another session's handoff.
-ptr="$AUTODEV_HOME/handoffs/.latest.$sid"
-hf=""; [ -f "$ptr" ] && hf=$(cat "$ptr" 2>/dev/null)
-if [ -n "$hf" ] && { [ "$DRY" = 1 ] || [ -f "$hf" ]; }; then
-  send "Read the handoff at \"$hf\" and continue execution from where it leaves off."
+prepare_reload_line
+if [ "$reload_has_handoff" = 1 ]; then
+  send "$pending_reload_line"
 else
   log "WARN reloaded with no per-session pointer (.latest.$sid) — sent the fail-closed prompt"
-  send "A compaction just occurred, but no handoff is registered for THIS session. Do not read another session's handoff from $AUTODEV_HOME/handoffs — re-orient from this session's own transcript and continue, or ask the user."
+  send "$pending_reload_line"
 fi
 
 # 4) stamp cooldown and finish. (An explicit request was already consumed at
