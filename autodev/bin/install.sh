@@ -28,7 +28,7 @@ esac
 : "${AUTODEV_HOME:=$HOME/agents}"
 
 command -v jq >/dev/null 2>&1 || { echo "error: jq is required" >&2; exit 1; }
-for f in cc-statusline.sh cc-stop-hook.sh codex-stop-hook.sh cc-sessionstart-compact.sh sessionstart-compact.sh auto-handoff-watch.sh auto-handoff-sweep.sh session-resume-watch.sh request-handoff.sh cache-warm-watch.sh cc-handoff-gate.sh request-lib.sh; do
+for f in cc-statusline.sh cc-stop-hook.sh codex-stop-hook.sh cc-sessionstart-compact.sh sessionstart-compact.sh auto-handoff-watch.sh auto-handoff-sweep.sh session-resume-watch.sh request-handoff.sh cache-warm-watch.sh cc-handoff-gate.sh request-lib.sh lock-lib.sh; do
   [ -f "$HERE/$f" ] || { echo "error: missing $HERE/$f" >&2; exit 1; }
   chmod +x "$HERE/$f"
 done

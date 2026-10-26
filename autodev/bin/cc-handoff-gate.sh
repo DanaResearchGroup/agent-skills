@@ -34,6 +34,8 @@ command -v realpath >/dev/null 2>&1 || exit 0
 : "${AUTODEV_HOME:=$HOME/agents}"
 STATE="$AUTODEV_HOME/state"
 HANDOFFS="$AUTODEV_HOME/handoffs"
+_HERE="$(cd "$(dirname "$0")" && pwd)"
+[ -f "$_HERE/lock-lib.sh" ] && . "$_HERE/lock-lib.sh" || exit 0
 
 sid=$(printf '%s' "$input" | jq -r '.session_id // empty' 2>/dev/null) || exit 0
 case "$sid" in ""|*[!A-Za-z0-9._-]*) exit 0 ;; esac
@@ -63,8 +65,12 @@ done
 # The watcher is driving this session's cycle right now (it holds the cycle lock
 # with a live pid): /handoff must be free to run its own steps, and a request
 # marker may legitimately still exist (a compact-request filed mid-cycle).
-lpid=$(cat "$STATE/$sid.cycle.lock/pid" 2>/dev/null)
-[ -n "$lpid" ] && kill -0 "$lpid" 2>/dev/null && exit 0
+lock="$STATE/$sid.cycle.lock"
+if autodev_lock_path_present "$lock"; then
+  autodev_lock_read_owner "$lock"
+  lpid=$lock_owner_pid
+  [ -n "$lpid" ] && kill -0 "$lpid" 2>/dev/null && exit 0
+fi
 
 tool=$(printf '%s' "$input" | jq -r '.tool_name // empty' 2>/dev/null) || exit 0
 [ -n "$tool" ] || exit 0

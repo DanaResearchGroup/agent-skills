@@ -50,6 +50,7 @@ LOGDIR="$AUTODEV_HOME/logs"
 LOG="$LOGDIR/auto-handoff.log"
 
 _HERE="$(cd "$(dirname "$0")" && pwd)"
+[ -f "$_HERE/lock-lib.sh" ] && . "$_HERE/lock-lib.sh"
 # mux-lib gives mux_owner_file() for the reverse pane->owner lookup. Optional:
 # without it we fall back to the host agent's session-id environment.
 [ -f "$_HERE/mux-lib.sh" ] && . "$_HERE/mux-lib.sh"
@@ -224,8 +225,9 @@ fi
 # prevents the double compact.
 if [ "$COMPACT_ONLY" = 1 ]; then
   lock="$STATE/$sid.cycle.lock"
-  if [ -d "$lock" ]; then
-    lpid=$(cat "$lock/pid" 2>/dev/null || true)
+  if command -v autodev_lock_path_present >/dev/null 2>&1 && autodev_lock_path_present "$lock"; then
+    autodev_lock_read_owner "$lock"
+    lpid=$lock_owner_pid
     if [ -n "$lpid" ] && kill -0 "$lpid" 2>/dev/null; then
       log "COMPACT-REQUEST deferred — watcher cycle in progress (pid $lpid)"
       echo "auto-handoff watcher is already mid-cycle for $sid — it will compact; no marker filed"

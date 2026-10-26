@@ -137,14 +137,26 @@ run_strict_token_case() {
   echo "== only canonical absolute owner tokens parse as PIDs =="
   setup
   . "$BIN/lock-lib.sh"
+  assert_eq "canonical PID ceiling is accepted" \
+    "$(autodev_lock_pid_is_canonical 4194304 && echo accepted || echo rejected)" accepted
+  assert_eq "PID above the canonical ceiling is rejected" \
+    "$(autodev_lock_pid_is_canonical 4194305 >/dev/null 2>&1 && echo accepted || echo rejected)" rejected
+  assert_eq "leading-zero PID is rejected" \
+    "$(autodev_lock_pid_is_canonical 0123 >/dev/null 2>&1 && echo accepted || echo rejected)" rejected
+  assert_eq "oversized PID is rejected" \
+    "$(autodev_lock_pid_is_canonical 99999999999999999999 >/dev/null 2>&1 && echo accepted || echo rejected)" rejected
   assert_eq "canonical owner token parses" \
-    "$(autodev_lock_parse_token /dev/null/autodev-lock-owner/12345)" 12345
+    "$(autodev_lock_parse_token /dev/null/autodev-lock-owner/4194304)" 4194304
   assert_eq "relative numeric target is rejected" \
     "$(autodev_lock_parse_token 12345 >/dev/null 2>&1 && echo accepted || echo rejected)" rejected
   assert_eq "owner token suffix is rejected" \
-    "$(autodev_lock_parse_token /dev/null/autodev-lock-owner/12345x >/dev/null 2>&1 && echo accepted || echo rejected)" rejected
+    "$(autodev_lock_parse_token /dev/null/autodev-lock-owner/4194304x >/dev/null 2>&1 && echo accepted || echo rejected)" rejected
   assert_eq "noncanonical leading-zero PID is rejected" \
-    "$(autodev_lock_parse_token /dev/null/autodev-lock-owner/012345 >/dev/null 2>&1 && echo accepted || echo rejected)" rejected
+    "$(autodev_lock_parse_token /dev/null/autodev-lock-owner/0123 >/dev/null 2>&1 && echo accepted || echo rejected)" rejected
+  assert_eq "oversized token PID is rejected" \
+    "$(autodev_lock_parse_token /dev/null/autodev-lock-owner/99999999999999999999 >/dev/null 2>&1 && echo accepted || echo rejected)" rejected
+  assert_eq "above-ceiling token PID is rejected" \
+    "$(autodev_lock_parse_token /dev/null/autodev-lock-owner/4194305 >/dev/null 2>&1 && echo accepted || echo rejected)" rejected
   sandbox_rm
 }
 

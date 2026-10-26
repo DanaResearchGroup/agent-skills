@@ -7,16 +7,18 @@
 
 AUTODEV_LOCK_OWNER_PREFIX=/dev/null/autodev-lock-owner/
 
-autodev_lock_pid_is_positive_numeric(){
+autodev_lock_pid_is_canonical(){
   case "$1" in
-    ''|*[!0-9]*) return 1 ;;
-    *[1-9]*) return 0 ;;
-    *) return 1 ;;
+    ''|0*|*[!0-9]*) return 1 ;;
   esac
+  # PID values are at most seven decimal digits under the shared Linux/BSD
+  # ceiling, so reject oversized input before asking test(1) to compare it.
+  [ "${#1}" -le 7 ] || return 1
+  [ "$1" -le 4194304 ] 2>/dev/null
 }
 
 autodev_lock_token(){ # $1 = positive decimal PID
-  autodev_lock_pid_is_positive_numeric "$1" || return 1
+  autodev_lock_pid_is_canonical "$1" || return 1
   printf '%s%s\n' "$AUTODEV_LOCK_OWNER_PREFIX" "$1"
 }
 
@@ -26,7 +28,7 @@ autodev_lock_parse_token(){ # $1 = exact symlink target; prints PID on success
     *) return 1 ;;
   esac
   local pid=${1#"$AUTODEV_LOCK_OWNER_PREFIX"}
-  case "$pid" in ''|0*|*[!0-9]*) return 1 ;; esac
+  autodev_lock_pid_is_canonical "$pid" || return 1
   printf '%s\n' "$pid"
 }
 
@@ -97,7 +99,7 @@ autodev_lock_read_owner(){ # sets lock_owner_value, lock_owner_pid, lock_owner_r
         return 0
       }
       lock_owner_value=$raw
-      autodev_lock_pid_is_positive_numeric "$raw" && lock_owner_pid=$raw
+      autodev_lock_pid_is_canonical "$raw" && lock_owner_pid=$raw
     elif [ -e "$lock_path/pid" ]; then
       lock_owner_readable=0
     fi
