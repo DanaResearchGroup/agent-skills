@@ -90,6 +90,38 @@ now=$(date +%s)
 mtime(){ date -r "$1" +%s 2>/dev/null || echo 0; }
 fresh(){ [ -f "$1" ] && [ "$(( now - $(mtime "$1") ))" -le "$2" ]; }
 
+# Take the per-session cycle lock only when its directory does not already
+# exist. The watcher owns stale-lock reclamation; a sweep never removes a lock.
+cycle_lock_take(){ # $1 = lock directory
+  local lock_path=$1
+  if mkdir "$lock_path" 2>/dev/null; then
+    if ! printf '%s\n' "$$" > "$lock_path/pid" 2>/dev/null; then
+      return 1
+    fi
+    return 0
+  fi
+  return 1
+}
+
+cycle_lock_release(){ # $1 = lock directory; release only our recorded lock
+  local lock_path=$1
+  [ "$(cat "$lock_path/pid" 2>/dev/null || true)" = "$$" ] || return 1
+  rm -rf "$lock_path" 2>/dev/null
+}
+
+cycle_lock_block_reason(){ # $1 = lock directory
+  local lpid
+  [ -d "$1" ] || { printf 'could not create lock'; return; }
+  lpid=$(cat "$1/pid" 2>/dev/null || true)
+  if [ -n "$lpid" ] && kill -0 "$lpid" 2>/dev/null; then
+    printf 'held by live pid %s' "$lpid"
+  elif [ -n "$lpid" ]; then
+    printf 'present with stale pid %s' "$lpid"
+  else
+    printf 'present without pid file'
+  fi
+}
+
 # Page once for <sid>'s <kind> request. Serialised per session: two sweeps can
 # overlap (timer tick while a slow one runs), and both would otherwise read
 # "not paged yet". The identity is re-read under the lock.
@@ -151,11 +183,20 @@ for pf in "$STATE"/*.herdr-pane "$STATE"/*.tmux-pane; do
   seen="$seen$sid "
   reload_marker="$STATE/$sid.reload-pending"
   reload_attempt="$STATE/$sid.reload-attempt"
+  lock="$STATE/$sid.cycle.lock"
   reload_retired_exit=0
   if [ -f "$reload_attempt" ] && [ -f "$STATE/$sid.idle" ] &&
      [ "$STATE/$sid.idle" -nt "$reload_attempt" ]; then
-    rm -f "$reload_attempt" 2>/dev/null
-    log "$sid" "CLEAR tmux staged-input lock: newer idle turn consumed prior input"
+    if cycle_lock_take "$lock"; then
+      if [ -f "$reload_attempt" ] && [ -f "$STATE/$sid.idle" ] &&
+         [ "$STATE/$sid.idle" -nt "$reload_attempt" ]; then
+        rm -f "$reload_attempt" 2>/dev/null
+        log "$sid" "CLEAR tmux staged-input lock: newer idle turn consumed prior input"
+      fi
+      cycle_lock_release "$lock" || log "$sid" "ERROR could not release cycle lock after reload cleanup"
+    else
+      log "$sid" "SKIP reload cleanup: cycle lock $(cycle_lock_block_reason "$lock")"
+    fi
   fi
 
   # A request is stale when satisfied (see request-lib.sh), never by age. Cleaned
@@ -174,33 +215,41 @@ for pf in "$STATE"/*.herdr-pane "$STATE"/*.tmux-pane; do
     continue
   fi
 
-  # A cycle genuinely in flight must not be piled onto.
-  lock="$STATE/$sid.cycle.lock"
-  if [ -d "$lock" ]; then
-    lpid=$(cat "$lock/pid" 2>/dev/null || true)
-    [ -n "$lpid" ] && kill -0 "$lpid" 2>/dev/null && continue
-  fi
-
   # A reload is independent of context percentage and may outlive cooldown.
   # Retire it before paging/retrying if the session moved on or wrote a newer
   # handoff; the watcher repeats this check under the cycle lock.
   reload_pending=0
   if [ -f "$reload_marker" ]; then
-    retired=""
-    command -v reload_marker_retire_reason >/dev/null 2>&1 &&
-      retired=$(reload_marker_retire_reason "$STATE" "$AUTODEV_HOME/handoffs" "$sid" "$reload_marker" || true)
-    case "$retired" in
-      new-handoff-request)
-        rm -f "$reload_marker" 2>/dev/null
-        log "$sid" "DROP reload-pending: a newer handoff request superseded it"
-        ;;
-      new-handoff|completed-turn)
-        rm -f "$reload_marker" 2>/dev/null
-        log "$sid" "DROP reload-pending: superseded by $retired"
-        reload_retired_exit=1
-        ;;
-      *) reload_pending=1 ;;
-    esac
+    if cycle_lock_take "$lock"; then
+      if [ -f "$reload_marker" ]; then
+        retired=""
+        command -v reload_marker_retire_reason >/dev/null 2>&1 &&
+          retired=$(reload_marker_retire_reason "$STATE" "$AUTODEV_HOME/handoffs" "$sid" "$reload_marker" || true)
+        case "$retired" in
+          new-handoff-request)
+            rm -f "$reload_marker" 2>/dev/null
+            log "$sid" "DROP reload-pending: a newer handoff request superseded it"
+            ;;
+          new-handoff|completed-turn)
+            rm -f "$reload_marker" 2>/dev/null
+            log "$sid" "DROP reload-pending: superseded by $retired"
+            reload_retired_exit=1
+            ;;
+          *) reload_pending=1 ;;
+        esac
+      fi
+      cycle_lock_release "$lock" || log "$sid" "ERROR could not release cycle lock after reload cleanup"
+    else
+      reload_pending=1
+      log "$sid" "SKIP reload cleanup: cycle lock $(cycle_lock_block_reason "$lock")"
+    fi
+  fi
+
+  # A cycle genuinely in flight must not be piled onto. Reload cleanup above
+  # took and released its own lock before this check.
+  if [ -d "$lock" ]; then
+    lpid=$(cat "$lock/pid" 2>/dev/null || true)
+    [ -n "$lpid" ] && kill -0 "$lpid" 2>/dev/null && continue
   fi
   # Dry-run threshold previews need a fresh busy observation every sweep. The
   # real watcher completes a dry cycle and stamps cooldown, but that cooldown
@@ -313,8 +362,17 @@ for pf in "$STATE"/*.herdr-pane "$STATE"/*.tmux-pane; do
   owner=$(mux_pane_owner)
   if [ -n "$owner" ] && [ "$owner" != "$sid" ]; then
     if [ "$reload_pending" = 1 ] || [ -f "$reload_attempt" ]; then
-      rm -f "$reload_marker" "$reload_attempt" 2>/dev/null
-      log "$sid" "DROP reload-pending: pane is now owned by session $owner"
+      if cycle_lock_take "$lock"; then
+        owner_now=$(mux_pane_owner)
+        if [ -n "$owner_now" ] && [ "$owner_now" != "$sid" ] &&
+           { [ "$reload_pending" = 1 ] || [ -f "$reload_attempt" ]; }; then
+          rm -f "$reload_marker" "$reload_attempt" 2>/dev/null
+          log "$sid" "DROP reload-pending: pane is now owned by session $owner_now"
+        fi
+        cycle_lock_release "$lock" || log "$sid" "ERROR could not release cycle lock after reload cleanup"
+      else
+        log "$sid" "SKIP reload cleanup: cycle lock $(cycle_lock_block_reason "$lock")"
+      fi
     fi
     [ "$thr" = 1 ] && rm -f "$STATE/$sid.busy-since" 2>/dev/null
     continue

@@ -36,13 +36,28 @@ setup() {
   mkdir -p "$SB/herdr" "$SB/fakebin"
   : > "$SB/typed.log"
   printf 'idle\n' > "$SB/herdr/status"
+  printf '0\n' > "$SB/herdr/offset-from-bottom"
+  : > "$SB/herdr/get-count"
   cat > "$SB/fakebin/herdr" <<'STUB'
 #!/usr/bin/env bash
 H="$SB/herdr"
 case "${1:-} ${2:-}" in
   "pane get")
-      printf '{"result":{"pane_id":"%s","agent_status":"%s","agent_session":{"value":"%s"}}}\n' \
-        "$3" "$(cat "$H/status")" "$(cat "$H/owner" 2>/dev/null)" ;;
+      [ -f "$H/get-fail" ] && exit 1
+      [ -f "$H/get-raw.json" ] && { cat "$H/get-raw.json"; exit 0; }
+      offset=$(cat "$H/offset-from-bottom" 2>/dev/null || echo 0)
+      if [ -f "$H/offset-sequence" ]; then
+        n=$(( $(cat "$H/get-count" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$H/get-count"
+        offset=$(sed -n "${n}p" "$H/offset-sequence")
+        [ -n "$offset" ] || offset=$(tail -n 1 "$H/offset-sequence")
+      fi
+      if [ "$offset" = missing ]; then
+        printf '{"id":"cli:pane:get","result":{"pane":{"pane_id":"%s","agent_status":"%s","agent_session":{"value":"%s"},"scroll":{"max_offset_from_bottom":0,"viewport_rows":128}},"type":"pane_info"}}\n' \
+          "$3" "$(cat "$H/status")" "$(cat "$H/owner" 2>/dev/null)"
+      else
+        printf '{"id":"cli:pane:get","result":{"pane":{"pane_id":"%s","agent_status":"%s","agent_session":{"value":"%s"},"scroll":{"max_offset_from_bottom":0,"offset_from_bottom":%s,"viewport_rows":128}},"type":"pane_info"}}\n' \
+          "$3" "$(cat "$H/status")" "$(cat "$H/owner" 2>/dev/null)" "$offset"
+      fi ;;
   "pane read")
       [ -f "$H/read-fail" ] && exit 1
       n=$(( $(cat "$H/reads" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$H/reads"
@@ -171,7 +186,54 @@ echo "== post-compaction blank recent read: trust only a live visible footer =="
 setup
 cp "$FX/post-compact-recent.txt" "$SB/herdr/recent.txt"
 cp "$FX/post-compact-visible-idle.txt" "$SB/herdr/visible.txt"
-assert_eq "blank recent + live idle prompt/footer is not awaiting" "$(mux mux_awaiting_human)" 1
+assert_eq "blank recent + live footer at integer offset 0 is not awaiting" "$(mux mux_awaiting_human)" 1
+sandbox_rm
+
+for offset in 1 0.0 '"0"' null true; do
+  setup
+  cp "$FX/post-compact-recent.txt" "$SB/herdr/recent.txt"
+  cp "$FX/post-compact-visible-idle.txt" "$SB/herdr/visible.txt"
+  printf '%s\n' "$offset" > "$SB/herdr/offset-from-bottom"
+  assert_eq "blank recent + visible footer with offset $offset stays awaiting" \
+    "$(mux mux_awaiting_human)" 0
+  sandbox_rm
+done
+
+setup
+cp "$FX/post-compact-recent.txt" "$SB/herdr/recent.txt"
+cp "$FX/post-compact-visible-idle.txt" "$SB/herdr/visible.txt"
+printf '0\n1\n0\n' > "$SB/herdr/offset-sequence"
+assert_eq "visible read bracket: offset moves from scrolled to bottom" \
+  "$(mux mux_awaiting_human)" 0
+sandbox_rm
+
+setup
+cp "$FX/post-compact-recent.txt" "$SB/herdr/recent.txt"
+cp "$FX/post-compact-visible-idle.txt" "$SB/herdr/visible.txt"
+printf '0\n0\n1\n' > "$SB/herdr/offset-sequence"
+assert_eq "visible read bracket: offset moves from bottom to scrolled" \
+  "$(mux mux_awaiting_human)" 0
+sandbox_rm
+
+setup
+cp "$FX/post-compact-recent.txt" "$SB/herdr/recent.txt"
+cp "$FX/post-compact-visible-idle.txt" "$SB/herdr/visible.txt"
+printf 'missing\n' > "$SB/herdr/offset-from-bottom"
+assert_eq "blank recent + missing scroll offset stays awaiting" "$(mux mux_awaiting_human)" 0
+sandbox_rm
+
+setup
+cp "$FX/post-compact-recent.txt" "$SB/herdr/recent.txt"
+cp "$FX/post-compact-visible-idle.txt" "$SB/herdr/visible.txt"
+printf '{not json\n' > "$SB/herdr/get-raw.json"
+assert_eq "blank recent + malformed pane JSON stays awaiting" "$(mux mux_awaiting_human)" 0
+sandbox_rm
+
+setup
+cp "$FX/post-compact-recent.txt" "$SB/herdr/recent.txt"
+cp "$FX/post-compact-visible-idle.txt" "$SB/herdr/visible.txt"
+: > "$SB/herdr/get-fail"
+assert_eq "blank recent + pane get error stays awaiting" "$(mux mux_awaiting_human)" 0
 sandbox_rm
 
 setup

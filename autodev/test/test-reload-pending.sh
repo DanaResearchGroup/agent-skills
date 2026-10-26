@@ -23,7 +23,15 @@ setup() {
 H="$SB/herdr"
 case "${1:-} ${2:-}" in
   "pane get")
-      printf '{"result":{"pane_id":"%s","agent_status":"%s","agent_session":{"value":"%s"}}}\n' \
+      if [ -f "$SB/inject-cycle-lock-on-owner" ]; then
+        n=$(( $(cat "$H/get-count" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$H/get-count"
+        if [ "$n" -eq 2 ]; then
+          /bin/mkdir -p "$STATE/$SID.cycle.lock"
+          cat "$SB/cycle-holder.pid" > "$STATE/$SID.cycle.lock/pid"
+          rm -f "$SB/inject-cycle-lock-on-owner"
+        fi
+      fi
+      printf '{"id":"cli:pane:get","result":{"pane":{"pane_id":"%s","agent_status":"%s","agent_session":{"value":"%s"},"scroll":{"max_offset_from_bottom":0,"offset_from_bottom":0,"viewport_rows":128}},"type":"pane_info"}}\n' \
         "$3" "$(cat "$H/status")" "$(cat "$H/owner")" ;;
   "pane read")
       source=recent-unwrapped
@@ -194,6 +202,74 @@ sweep
 assert_no_file "a reused pane retires the old marker" "$STATE/$SID.reload-pending"
 assert_contains "the sweeper logs the new owner" "$(LOG)" "pane is now owned by session $OTHER"
 no_reload_typed "a pane owned by another session is never sent the old reload"
+sandbox_rm
+
+# A live watcher cycle protects both reload files; after it releases the lock,
+# the same newer-idle/completed-turn conditions clean them up as before.
+setup
+seed_reload
+printf 'staged\n' > "$STATE/$SID.reload-attempt"
+touch -d '20 minutes ago' "$STATE/$SID.reload-attempt"
+touch -d "@$(( $(date +%s) + 2 ))" "$STATE/$SID.idle"
+mkdir -p "$STATE/$SID.cycle.lock"
+printf '%s\n' "$$" > "$STATE/$SID.cycle.lock/pid"
+sweep
+assert_file "live cycle lock preserves reload-pending" "$STATE/$SID.reload-pending"
+assert_file "live cycle lock preserves reload-attempt" "$STATE/$SID.reload-attempt"
+assert_eq "live cycle lock leaves attempt content untouched" \
+  "$(cat "$STATE/$SID.reload-attempt")" staged
+rm -rf "$STATE/$SID.cycle.lock"
+sweep
+assert_no_file "released lock allows newer idle to clear attempt" "$STATE/$SID.reload-attempt"
+assert_no_file "released lock allows completed turn to retire marker" "$STATE/$SID.reload-pending"
+assert_no_file "non-contended sweep releases its cycle lock" "$STATE/$SID.cycle.lock"
+sandbox_rm
+
+# A stale lock belongs to the watcher to reclaim. The sweeper must skip every
+# reload cleanup and leave that lock directory and pid file untouched.
+setup
+seed_reload
+printf 'staged\n' > "$STATE/$SID.reload-attempt"
+touch -d '20 minutes ago' "$STATE/$SID.reload-attempt"
+touch -d "@$(( $(date +%s) + 2 ))" "$STATE/$SID.idle"
+mkdir -p "$STATE/$SID.cycle.lock"
+printf '999999999\n' > "$STATE/$SID.cycle.lock/pid"
+lock_inode=$(stat -c %i "$STATE/$SID.cycle.lock")
+lock_pid_inode=$(stat -c %i "$STATE/$SID.cycle.lock/pid")
+lock_pid=$(cat "$STATE/$SID.cycle.lock/pid")
+sweep
+assert_file "stale cycle lock preserves reload-pending" "$STATE/$SID.reload-pending"
+assert_file "stale cycle lock preserves reload-attempt" "$STATE/$SID.reload-attempt"
+assert_eq "stale cycle lock leaves attempt content untouched" \
+  "$(cat "$STATE/$SID.reload-attempt")" staged
+assert_eq "sweeper leaves stale cycle lock inode untouched" \
+  "$(stat -c %i "$STATE/$SID.cycle.lock")" "$lock_inode"
+assert_eq "sweeper leaves stale cycle lock pid untouched" \
+  "$(cat "$STATE/$SID.cycle.lock/pid")" "$lock_pid"
+assert_eq "sweeper leaves stale cycle lock pid file inode untouched" \
+  "$(stat -c %i "$STATE/$SID.cycle.lock/pid")" "$lock_pid_inode"
+assert_contains "sweeper logs stale lock cleanup skip" "$(LOG)" \
+  "SKIP reload cleanup: cycle lock present with stale pid $lock_pid"
+sandbox_rm
+
+# Model a watcher taking the lock after the sweep's initial lock check but
+# before pane-owner cleanup. The cleanup must defer, then run after release.
+setup
+seed_reload
+printf 'staged\n' > "$STATE/$SID.reload-attempt"
+printf '%s\n' "$OTHER" > "$SB/herdr/owner"
+printf 'pct=40 ts=%s\n' "$(date +%s)" > "$STATE/$SID.ctx"
+printf '%s\n' "$$" > "$SB/cycle-holder.pid"
+: > "$SB/inject-cycle-lock-on-owner"
+sweep
+assert_file "owner-change race preserves reload-pending" "$STATE/$SID.reload-pending"
+assert_file "owner-change race preserves reload-attempt" "$STATE/$SID.reload-attempt"
+assert_contains "owner-change race logs skipped cleanup" "$(LOG)" "SKIP reload cleanup: cycle lock held by live pid $$"
+rm -rf "$STATE/$SID.cycle.lock"
+sweep
+assert_no_file "released owner-change lock allows marker cleanup" "$STATE/$SID.reload-pending"
+assert_no_file "released owner-change lock allows attempt cleanup" "$STATE/$SID.reload-attempt"
+assert_no_file "owner-change sweep releases its cycle lock" "$STATE/$SID.cycle.lock"
 sandbox_rm
 
 # A malformed marker is retained for visibility but never typed into a pane.
