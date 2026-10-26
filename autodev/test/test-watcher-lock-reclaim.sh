@@ -42,6 +42,33 @@ if [ "$rc" -eq 0 ] && [ "${1:-}" = "${LOCK_PATH:-}.reclaim" ] && [ "${PAUSE_MUTE
 fi
 exit "$rc"
 STUB
+  cat > "$SB/fakebin/ln" <<'STUB'
+#!/usr/bin/env bash
+dest=${!#}
+if [ "$dest" = "${LOCK_PATH:-}" ] && [ "${INJECT_LEGACY_DIR_BEFORE_LN:-}" = 1 ] &&
+   [ ! -e "$SB/injected-legacy-dir" ]; then
+  /bin/mkdir "$dest"
+  printf '%s\n' "$INJECT_LEGACY_PID" > "$dest/pid"
+  : > "$SB/injected-legacy-dir"
+fi
+if [ "$dest" = "${LOCK_PATH:-}" ] && [ -n "${INJECT_DIRECTORY_LINK_TARGET:-}" ] &&
+   [ ! -e "$SB/injected-directory-symlink" ]; then
+  /bin/ln -s "$INJECT_DIRECTORY_LINK_TARGET" "$dest"
+  : > "$SB/injected-directory-symlink"
+fi
+/bin/ln "$@"
+rc=$?
+dest=${!#}
+if [ "$rc" -eq 0 ] && [ "$dest" = "${LOCK_PATH:-}" ] && [ "${PAUSE_LOCK_MKDIR:-}" = 1 ]; then
+  : > "$SB/mkdir-lock-paused"
+  while [ ! -e "$SB/release-mkdir-lock" ]; do /bin/sleep 0.02; done
+fi
+if [ "$rc" -eq 0 ] && [ "$dest" = "${LOCK_PATH:-}.reclaim" ] && [ "${PAUSE_MUTEX_MKDIR:-}" = 1 ]; then
+  : > "$SB/mkdir-mutex-paused"
+  while [ ! -e "$SB/release-mkdir-mutex" ]; do /bin/sleep 0.02; done
+fi
+exit "$rc"
+STUB
   cat > "$SB/fakebin/sleep" <<'STUB'
 #!/usr/bin/env bash
 if [ "${SLEEP_GATE:-}" = 1 ] && [ "${1:-}" = "${AUTODEV_SETTLE:-}" ]; then
@@ -68,6 +95,74 @@ run_watch() {
   bash "$BIN/auto-handoff-watch.sh" "$SID" >/dev/null 2>&1
 }
 
+run_watch_with_kill_probe() { # $1 = raw symlink target that must not reach kill -0
+  BIN="$BIN" SID="$SID" KILL_PROBE_PID="$1" KILL_PROBE_LOG="$SB/kill-zero-probe.log" \
+    bash -c '
+      kill(){
+        if [ "${1:-}" = -0 ] && [ "${2:-}" = "$KILL_PROBE_PID" ]; then
+          printf '%s\n' "$2" >> "$KILL_PROBE_LOG"
+        fi
+        builtin kill "$@"
+      }
+      export -f kill
+      exec bash "$BIN/auto-handoff-watch.sh" "$SID" >/dev/null 2>&1
+    '
+}
+
+lock_owner_for_test() { # $1 = symlink lock or legacy directory
+  if [ -L "$1" ]; then
+    target=$(readlink "$1" 2>/dev/null || true)
+    printf '%s' "${target##*/}"
+  elif [ -d "$1" ] && [ ! -L "$1" ]; then
+    cat "$1/pid" 2>/dev/null || true
+  fi
+}
+
+stub_foreground_setsid() {
+  cat > "$SB/fakebin/setsid" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$$" > "$SB/setsid-pid"
+"$@"
+rc=$?
+: > "$SB/setsid-finished"
+exit "$rc"
+STUB
+  chmod +x "$SB/fakebin/setsid"
+}
+
+wait_for_process_exit() { # $1 = PID recorded by the fake setsid launcher
+  local pid=$1 ticks=200 state args
+  while [ "$ticks" -gt 0 ]; do
+    state=$(ps -p "$pid" -o stat= 2>/dev/null || true)
+    case "$state" in ''|Z*) return 0 ;; esac
+    /bin/sleep 0.01
+    ticks=$((ticks - 1))
+  done
+
+  # A failed assertion must still leave no test child writing into SB. Only
+  # signal the exact fake setsid process recorded by this test, then bound the
+  # reap wait so a broken child cannot hang the suite forever.
+  args=$(ps -p "$pid" -o args= 2>/dev/null || true)
+  case "$args" in *"$SB/fakebin/setsid"*) ;; *) return 1 ;; esac
+  kill -TERM "$pid" 2>/dev/null || true
+  ticks=200
+  while [ "$ticks" -gt 0 ]; do
+    state=$(ps -p "$pid" -o stat= 2>/dev/null || true)
+    case "$state" in ''|Z*) return 1 ;; esac
+    /bin/sleep 0.01
+    ticks=$((ticks - 1))
+  done
+  kill -KILL "$pid" 2>/dev/null || true
+  ticks=200
+  while [ "$ticks" -gt 0 ]; do
+    state=$(ps -p "$pid" -o stat= 2>/dev/null || true)
+    case "$state" in ''|Z*) return 1 ;; esac
+    /bin/sleep 0.01
+    ticks=$((ticks - 1))
+  done
+  return 1
+}
+
 trigger_count() {
   local count
   count=$(grep -c "\[$SID\] TRIGGER" "$AUTODEV_HOME/logs/auto-handoff.log" 2>/dev/null || true)
@@ -76,8 +171,8 @@ trigger_count() {
 
 assert_dir() { [ -d "$2" ] && _pass "$1" || _fail "$1" "missing directory: $2"; }
 assert_absent() { [ ! -e "$2" ] && [ ! -L "$2" ] && _pass "$1" || _fail "$1" "path still exists: $2"; }
-age_directory_old() { python3 -c 'import os, sys, time; os.utime(sys.argv[1], (time.time() - 3600,) * 2)' "$1"; }
-set_mtime_offset() { python3 -c 'import os, sys, time; t=time.time()+float(sys.argv[2]); os.utime(sys.argv[1], (t, t))' "$1" "$2"; }
+age_directory_old() { python3 -c 'import os, sys, time; t=time.time()-3600; os.utime(sys.argv[1], (t, t), follow_symlinks=False)' "$1"; }
+set_mtime_offset() { python3 -c 'import os, sys, time; t=time.time()+float(sys.argv[2]); os.utime(sys.argv[1], (t, t), follow_symlinks=False)' "$1" "$2"; }
 stub_unreadable_pid_cat() {
   cat > "$SB/fakebin/cat" <<'STUB'
 #!/usr/bin/env bash
@@ -98,6 +193,7 @@ STUB
   chmod +x "$SB/fakebin/cat"
 }
 stub_pause_cycle_pid_read() {
+  REAL_READLINK=$(command -v readlink); export REAL_READLINK
   cat > "$SB/fakebin/cat" <<'STUB'
 #!/usr/bin/env bash
 if [ "${PAUSE_FIRST_CYCLE_PID_READ:-}" = 1 ] \
@@ -111,12 +207,25 @@ fi
 exec /bin/cat "$@"
 STUB
   chmod +x "$SB/fakebin/cat"
+  cat > "$SB/fakebin/readlink" <<'STUB'
+#!/usr/bin/env bash
+"${REAL_READLINK:-/usr/bin/readlink}" "$@"
+rc=$?
+if [ "${PAUSE_FIRST_CYCLE_PID_READ:-}" = 1 ] \
+    && [ "${1:-}" = "${PAUSE_PID_READ_TARGET:-${LOCK_PATH:-__no_match__}}" ] \
+    && [ ! -e "$SB/cycle-pid-read-paused" ]; then
+  : > "$SB/cycle-pid-read-paused"
+  while [ ! -e "$SB/release-cycle-pid-read" ]; do /bin/sleep 0.02; done
+fi
+exit "$rc"
+STUB
+  chmod +x "$SB/fakebin/readlink"
 }
 
 echo "== uncontended dead-PID lock is reclaimed and released =="
 setup
 mkdir "$LOCK"
-printf '99999999\n' > "$LOCK/pid"
+printf '4194304\n' > "$LOCK/pid"
 run_watch
 assert_eq "stale PID lock permits one cycle" "$(trigger_count)" "1"
 assert_absent "cycle exit releases the owned lock" "$LOCK"
@@ -126,7 +235,7 @@ sandbox_rm
 echo "== two reclaimers serialize on the mutex =="
 setup
 mkdir "$LOCK"
-printf '99999999\n' > "$LOCK/pid"
+printf '4194304\n' > "$LOCK/pid"
 LOCK_PATH="$LOCK" PAUSE_RECLAIM_RM=1 SLEEP_GATE=1 AUTODEV_SETTLE=1 PATH="$SB/fakebin:$PATH" \
   bash "$BIN/auto-handoff-watch.sh" "$SID" >"$SB/a.out" 2>&1 &
 watcher_a=$!
@@ -137,7 +246,7 @@ wait "$watcher_b"
 assert_eq "second contender cannot run alongside mutex holder" "$(trigger_count)" "0"
 assert_eq "old lock remains present during serialized reclaim" "$(test -d "$LOCK" && echo yes)" "yes"
 : > "$SB/release-reclaim-rm"
-assert_eq "first reclaimer reaches its cycle after acquiring lock" "$(wait_file "$SB/settle-paused" && cat "$LOCK/pid")" "$watcher_a"
+assert_eq "first reclaimer reaches its cycle after acquiring lock" "$(wait_file "$SB/settle-paused" && lock_owner_for_test "$LOCK")" "$watcher_a"
 assert_absent "mutex is released before cycle work" "$LOCK.reclaim"
 : > "$SB/release-settle"
 wait "$watcher_a"
@@ -148,8 +257,8 @@ sandbox_rm
 echo "== crashed reclaimer mutex is recovered after its grace period =="
 setup
 mkdir "$LOCK" "$LOCK.reclaim"
-printf '99999999\n' > "$LOCK/pid"
-printf '99999999\n' > "$LOCK.reclaim/pid"
+printf '4194304\n' > "$LOCK/pid"
+printf '4194304\n' > "$LOCK.reclaim/pid"
 age_directory_old "$LOCK.reclaim"
 run_watch
 assert_eq "dead stale mutex allows recovery and one cycle" "$(trigger_count)" "1"
@@ -161,6 +270,7 @@ setup
 mkdir "$LOCK" "$LOCK.reclaim"
 printf '99999999\n' > "$LOCK/pid"
 printf 'garbage\n' > "$LOCK.reclaim/pid"
+age_directory_old "$LOCK"
 age_directory_old "$LOCK.reclaim"
 run_watch
 assert_eq "old malformed-PID mutex permits recovery and one cycle" "$(trigger_count)" "1"
@@ -173,13 +283,13 @@ setup
 sleep 300 &
 live_reclaimer=$!
 mkdir "$LOCK" "$LOCK.reclaim"
-printf '99999999\n' > "$LOCK/pid"
+printf '4194304\n' > "$LOCK/pid"
 printf '%s\n' "$live_reclaimer" > "$LOCK.reclaim/pid"
 age_directory_old "$LOCK.reclaim"
 run_watch
 assert_eq "aged live mutex prevents cycle acquisition" "$(trigger_count)" "0"
 assert_eq "live mutex PID remains intact" "$(cat "$LOCK.reclaim/pid")" "$live_reclaimer"
-assert_eq "stale cycle lock remains untouched" "$(cat "$LOCK/pid")" "99999999"
+assert_eq "stale cycle lock remains untouched" "$(cat "$LOCK/pid")" "4194304"
 kill "$live_reclaimer" 2>/dev/null || true
 wait "$live_reclaimer" 2>/dev/null || true
 sandbox_rm
@@ -190,6 +300,66 @@ mkdir "$LOCK"
 run_watch
 assert_eq "fresh legacy lock skips the cycle" "$(trigger_count)" "0"
 assert_dir "fresh legacy lock remains in place" "$LOCK"
+sandbox_rm
+
+echo "== an ln destination directory is not mistaken for lock ownership =="
+setup
+sleep 300 &
+live_directory_owner=$!
+mkdir "$LOCK"
+printf '%s\n' "$live_directory_owner" > "$LOCK/pid"
+run_watch
+assert_eq "live legacy directory owner prevents a cycle" "$(trigger_count)" "0"
+assert_eq "ln fall-through leaves no stray child in the legacy lock" \
+  "$(find "$LOCK" -mindepth 1 -maxdepth 1 ! -name pid -print)" ""
+assert_eq "legacy directory PID remains unchanged" "$(cat "$LOCK/pid")" "$live_directory_owner"
+kill "$live_directory_owner" 2>/dev/null || true
+wait "$live_directory_owner" 2>/dev/null || true
+sandbox_rm
+
+setup
+sleep 300 &
+injected_directory_owner=$!
+LOCK_PATH="$LOCK" INJECT_LEGACY_DIR_BEFORE_LN=1 INJECT_LEGACY_PID="$injected_directory_owner" \
+  PATH="$SB/fakebin:$PATH" run_watch
+assert_eq "concurrent legacy directory creation defeats ln ownership" "$(trigger_count)" "0"
+assert_eq "failed ln fall-through cleans only its own child link" \
+  "$(find "$LOCK" -mindepth 1 -maxdepth 1 ! -name pid -print)" ""
+assert_eq "concurrent legacy owner remains unchanged" "$(cat "$LOCK/pid")" "$injected_directory_owner"
+kill "$injected_directory_owner" 2>/dev/null || true
+wait "$injected_directory_owner" 2>/dev/null || true
+sandbox_rm
+
+setup
+sleep 300 &
+symlink_directory_owner=$!
+mkdir "$SB/legacy-lock-target"
+printf '%s\n' "$symlink_directory_owner" > "$SB/legacy-lock-target/pid"
+/bin/ln -s "$SB/legacy-lock-target" "$LOCK"
+run_watch
+assert_eq "symlink-to-directory collision cannot authorize a cycle" "$(trigger_count)" "0"
+assert_eq "ln fall-through through a directory symlink leaves no stray child" \
+  "$(find "$SB/legacy-lock-target" -mindepth 1 -maxdepth 1 ! -name pid -print)" ""
+assert_eq "directory symlink target PID remains unchanged" \
+  "$(cat "$SB/legacy-lock-target/pid")" "$symlink_directory_owner"
+kill "$symlink_directory_owner" 2>/dev/null || true
+wait "$symlink_directory_owner" 2>/dev/null || true
+sandbox_rm
+
+setup
+sleep 300 &
+injected_symlink_directory_owner=$!
+mkdir "$SB/injected-directory-target"
+printf '%s\n' "$injected_symlink_directory_owner" > "$SB/injected-directory-target/pid"
+LOCK_PATH="$LOCK" INJECT_DIRECTORY_LINK_TARGET="$SB/injected-directory-target" \
+  PATH="$SB/fakebin:$PATH" run_watch
+assert_eq "concurrent directory symlink defeats ln ownership" "$(trigger_count)" "0"
+assert_eq "failed ln through directory symlink leaves no child link" \
+  "$(find "$SB/injected-directory-target" -mindepth 1 -maxdepth 1 ! -name pid -print)" ""
+assert_eq "symlink target directory owner remains unchanged" \
+  "$(cat "$SB/injected-directory-target/pid")" "$injected_symlink_directory_owner"
+kill "$injected_symlink_directory_owner" 2>/dev/null || true
+wait "$injected_symlink_directory_owner" 2>/dev/null || true
 sandbox_rm
 
 echo "== unusable PID values follow the legacy age threshold =="
@@ -258,6 +428,103 @@ kill "$live_holder" 2>/dev/null || true
 wait "$live_holder" 2>/dev/null || true
 sandbox_rm
 
+run_malformed_symlink_owner_case() { # $1 = label; $2 = owner-target suffix format
+  local label=$1 target_format=$2 live_holder target
+  setup
+  sleep 300 &
+  live_holder=$!
+  case "$target_format" in
+    bare) target=$live_holder ;;
+    leading-zero) target="0$live_holder" ;;
+    leading-zero-token) target="/dev/null/autodev-lock-owner/0$live_holder" ;;
+    *) _fail "harness: malformed symlink target case" "unknown format: $target_format"; return ;;
+  esac
+  /bin/ln -s "$target" "$LOCK"
+
+  run_watch_with_kill_probe "$target"
+  assert_eq "$label is honored while fresh" "$(trigger_count)" "0"
+  assert_eq "$label remains a symlink while fresh" "$(test -L "$LOCK" && echo yes)" yes
+  assert_eq "$label raw numeric target never reaches kill -0" \
+    "$(test ! -e "$SB/kill-zero-probe.log" && echo no-call)" no-call
+
+  age_directory_old "$LOCK"
+  run_watch_with_kill_probe "$target"
+  assert_eq "$label is reclaimed after the existing age threshold" "$(trigger_count)" "1"
+  assert_absent "$label lock is removed by the new owner" "$LOCK"
+  assert_eq "$label raw numeric target never reaches kill -0 when stale" \
+    "$(test ! -e "$SB/kill-zero-probe.log" && echo no-call)" no-call
+  kill "$live_holder" 2>/dev/null || true
+  wait "$live_holder" 2>/dev/null || true
+  sandbox_rm
+}
+
+echo "== malformed numeric symlink owners follow only the age rule =="
+run_malformed_symlink_owner_case "bare numeric symlink target" bare
+run_malformed_symlink_owner_case "leading-zero numeric symlink target" leading-zero
+run_malformed_symlink_owner_case "leading-zero symlink token" leading-zero-token
+
+run_malformed_pid_age_case() { # $1 = lock kind; $2 = malformed decimal PID
+  local kind=$1 raw_pid=$2 lock_path probe_value label
+  setup
+  label="$kind owner $raw_pid"
+  lock_path=$LOCK
+  case "$kind" in
+    symlink)
+      probe_value="/dev/null/autodev-lock-owner/$raw_pid"
+      /bin/ln -s "$probe_value" "$LOCK"
+      ;;
+    legacy)
+      probe_value=$raw_pid
+      mkdir "$LOCK"
+      printf '%s\n' "$raw_pid" > "$LOCK/pid"
+      ;;
+    mutex)
+      # A canonical dead cycle owner forces the watcher to inspect this
+      # malformed reclaim-mutex owner. Keep the cycle lock old enough too.
+      /bin/ln -s /dev/null/autodev-lock-owner/4194304 "$LOCK"
+      age_directory_old "$LOCK"
+      lock_path="$LOCK.reclaim"
+      probe_value=$raw_pid
+      mkdir "$lock_path"
+      printf '%s\n' "$raw_pid" > "$lock_path/pid"
+      ;;
+    mutex-symlink)
+      /bin/ln -s /dev/null/autodev-lock-owner/4194304 "$LOCK"
+      age_directory_old "$LOCK"
+      lock_path="$LOCK.reclaim"
+      probe_value="/dev/null/autodev-lock-owner/$raw_pid"
+      /bin/ln -s "$probe_value" "$lock_path"
+      ;;
+    *) _fail "harness: malformed owner age case" "unknown lock kind: $kind"; return ;;
+  esac
+
+  run_watch_with_kill_probe "$probe_value"
+  assert_eq "$label is honored while fresh" "$(trigger_count)" 0
+  assert_eq "$label remains present while fresh" \
+    "$(test -e "$lock_path" || test -L "$lock_path"; echo $?)" 0
+  assert_eq "$label never reaches kill -0 while fresh" \
+    "$(test ! -e "$SB/kill-zero-probe.log" && echo no-call)" no-call
+
+  age_directory_old "$lock_path"
+  run_watch_with_kill_probe "$probe_value"
+  assert_eq "$label is reclaimed after its age threshold" "$(trigger_count)" 1
+  assert_absent "$label lock path is removed after reclaim" "$lock_path"
+  if [ "$kind" = mutex ]; then
+    assert_absent "$label's cycle lock is reclaimed too" "$LOCK"
+  fi
+  assert_eq "$label never reaches kill -0 after aging" \
+    "$(test ! -e "$SB/kill-zero-probe.log" && echo no-call)" no-call
+  sandbox_rm
+}
+
+echo "== noncanonical numeric owners follow the age rule in every lock format =="
+for malformed_pid in 0123 99999999999999999999 4194305; do
+  run_malformed_pid_age_case symlink "$malformed_pid"
+  run_malformed_pid_age_case legacy "$malformed_pid"
+  run_malformed_pid_age_case mutex "$malformed_pid"
+  run_malformed_pid_age_case mutex-symlink "$malformed_pid"
+done
+
 echo "== unreadable PID locks age out but fresh locks are honored =="
 setup
 mkdir "$LOCK"
@@ -290,32 +557,32 @@ assert_eq "fresh unreadable-PID lock skips the cycle" "$(trigger_count)" "0"
 assert_dir "fresh unreadable-PID lock remains" "$LOCK"
 sandbox_rm
 
-echo "== PID readback rejects a lock renamed away after mkdir =="
+echo "== owner verification rejects a lock renamed away after publication =="
 setup
 LOCK_PATH="$LOCK" PAUSE_LOCK_MKDIR=1 PATH="$SB/fakebin:$PATH" \
   bash "$BIN/auto-handoff-watch.sh" "$SID" >"$SB/watch.out" 2>&1 &
 watcher=$!
-assert_eq "watcher pauses after mkdir" "$(wait_file "$SB/mkdir-lock-paused" && echo yes)" "yes"
+assert_eq "watcher pauses after atomic publication" "$(wait_file "$SB/mkdir-lock-paused" && echo yes)" "yes"
 /bin/mv "$LOCK" "$SB/moved-lock"
 : > "$SB/release-mkdir-lock"
 wait "$watcher"
 assert_eq "renamed-away lock cannot authorize a cycle" "$(trigger_count)" "0"
-assert_contains "missing PID readback is logged" "$(cat "$AUTODEV_HOME/logs/auto-handoff.log")" "SKIP cycle lock ownership changed after mkdir"
+assert_contains "renamed-away publication cannot authorize a cycle" "$(cat "$AUTODEV_HOME/logs/auto-handoff.log")" "SKIP cycle lock ownership changed after atomic publication"
 sandbox_rm
 
-echo "== reclaim mutex readback rejects a renamed-away mutex =="
+echo "== reclaim mutex owner verification rejects a renamed-away mutex =="
 setup
 mkdir "$LOCK"
-printf '99999999\n' > "$LOCK/pid"
+printf '4194304\n' > "$LOCK/pid"
 LOCK_PATH="$LOCK" PAUSE_MUTEX_MKDIR=1 PATH="$SB/fakebin:$PATH" \
   bash "$BIN/auto-handoff-watch.sh" "$SID" >"$SB/watch.out" 2>&1 &
 watcher=$!
-assert_eq "watcher pauses after mutex mkdir" "$(wait_file "$SB/mkdir-mutex-paused" && echo yes)" "yes"
+assert_eq "watcher pauses after mutex atomic publication" "$(wait_file "$SB/mkdir-mutex-paused" && echo yes)" "yes"
 /bin/mv "$LOCK.reclaim" "$SB/moved-reclaim-mutex"
 : > "$SB/release-mkdir-mutex"
 wait "$watcher"
 assert_eq "unverified mutex cannot reclaim the cycle lock" "$(trigger_count)" "0"
-assert_eq "stale cycle lock remains intact" "$(cat "$LOCK/pid")" "99999999"
+assert_eq "stale cycle lock remains intact" "$(cat "$LOCK/pid")" "4194304"
 assert_absent "renamed-away mutex path is not recreated" "$LOCK.reclaim"
 assert_contains "mutex readback failure is logged" "$(cat "$AUTODEV_HOME/logs/auto-handoff.log")" "SKIP reclaim mutex ownership could not be verified"
 sandbox_rm
@@ -343,7 +610,7 @@ setup
 LOCK_PATH="$LOCK" SLEEP_GATE=1 AUTODEV_SETTLE=1 PATH="$SB/fakebin:$PATH" \
   bash "$BIN/auto-handoff-watch.sh" "$SID" >"$SB/old-owner.out" 2>&1 &
 old_owner=$!
-assert_eq "old owner pauses in its cycle" "$(wait_file "$SB/settle-paused" && cat "$LOCK/pid")" "$old_owner"
+assert_eq "old owner pauses in its cycle" "$(wait_file "$SB/settle-paused" && lock_owner_for_test "$LOCK")" "$old_owner"
 stub_pause_cycle_pid_read
 LOCK_PATH="$LOCK" PAUSE_FIRST_CYCLE_PID_READ=1 PATH="$SB/fakebin:$PATH" \
   bash "$BIN/auto-handoff-watch.sh" "$SID" >"$SB/reclaimer.out" 2>&1 &
@@ -360,12 +627,12 @@ LOCK_PATH="$LOCK" SLEEP_GATE=1 AUTODEV_SETTLE=1 PATH="$SB/fakebin:$PATH" \
   bash "$BIN/auto-handoff-watch.sh" "$SID" >"$SB/new-owner.out" 2>&1 &
 new_owner=$!
 assert_eq "fast-path watcher acquires replacement lock" \
-  "$(wait_file "$SB/settle-paused" && cat "$LOCK/pid")" "$new_owner"
+  "$(wait_file "$SB/settle-paused" && lock_owner_for_test "$LOCK")" "$new_owner"
 : > "$SB/release-cycle-pid-read"
 wait "$reclaimer"
 assert_eq "reclaimer skips changed dead-holder snapshot" \
   "$(grep -c 'SKIP cycle lock changed during stale recheck' "$AUTODEV_HOME/logs/auto-handoff.log")" "1"
-assert_eq "replacement lock remains owned by fast-path watcher" "$(cat "$LOCK/pid")" "$new_owner"
+assert_eq "replacement lock remains owned by fast-path watcher" "$(lock_owner_for_test "$LOCK")" "$new_owner"
 assert_eq "reclaimer adds no overlapping cycle" "$(trigger_count)" "1"
 : > "$SB/release-settle"
 wait "$new_owner"
@@ -376,7 +643,7 @@ sandbox_rm
 echo "== stale mutex recovery preserves a replacement mutex owner =="
 setup
 mkdir "$LOCK"
-printf '99999999\n' > "$LOCK/pid"
+printf '4194304\n' > "$LOCK/pid"
 (
   while [ ! -e "$SB/release-old-mutex-owner" ]; do /bin/sleep 0.02; done
   /bin/rm -rf "$LOCK.reclaim"
@@ -399,13 +666,13 @@ LOCK_PATH="$LOCK" PAUSE_MUTEX_MKDIR=1 PATH="$SB/fakebin:$PATH" \
   bash "$BIN/auto-handoff-watch.sh" "$SID" >"$SB/new-mutex-owner.out" 2>&1 &
 new_mutex_owner=$!
 assert_eq "fast-path reclaimer creates replacement mutex" \
-  "$(wait_file "$SB/mkdir-mutex-paused" && test -d "$LOCK.reclaim" && echo yes)" "yes"
-age_directory_old "$LOCK.reclaim"
+  "$(wait_file "$SB/mkdir-mutex-paused" && test -L "$LOCK.reclaim" && lock_owner_for_test "$LOCK.reclaim")" "$new_mutex_owner"
+set_mtime_offset "$LOCK.reclaim" -3600
 : > "$SB/release-cycle-pid-read"
 wait "$stale_mutex_reclaimer"
 assert_eq "stale recovery skips the changed mutex owner" "$(trigger_count)" "0"
 assert_eq "replacement mutex still blocks other reclaimers" \
-  "$(test -d "$LOCK.reclaim" && test ! -e "$LOCK.reclaim/pid" && echo yes)" "yes"
+  "$(test -L "$LOCK.reclaim" && lock_owner_for_test "$LOCK.reclaim")" "$new_mutex_owner"
 : > "$SB/release-mkdir-mutex"
 wait "$new_mutex_owner"
 assert_eq "replacement mutex owner runs one cycle" "$(trigger_count)" "1"
@@ -416,7 +683,7 @@ sandbox_rm
 echo "== sweeper sees the lock throughout a stale reclaim =="
 setup
 mkdir "$LOCK"
-printf '99999999\n' > "$LOCK/pid"
+printf '4194304\n' > "$LOCK/pid"
 LOCK_PATH="$LOCK" PAUSE_RECLAIM_RM=1 PAUSE_LOCK_MKDIR=1 SLEEP_GATE=1 AUTODEV_SETTLE=1 \
   PATH="$SB/fakebin:$PATH" bash "$BIN/auto-handoff-watch.sh" "$SID" >"$SB/watch.out" 2>&1 &
 watcher=$!
@@ -431,13 +698,13 @@ bash "$BIN/auto-handoff-sweep.sh" >"$SB/sweep-old.out" 2>&1
 assert_file "sweeper preserves attempt during reclaim" "$STATE/$SID.reload-attempt"
 assert_file "sweeper preserves pending marker during reclaim" "$STATE/$SID.reload-pending"
 : > "$SB/release-reclaim-rm"
-assert_eq "new lock exists before its PID is written" "$(wait_file "$SB/mkdir-lock-paused" && test -d "$LOCK" && echo yes)" "yes"
+assert_eq "new owner is visible at atomic lock creation" "$(wait_file "$SB/mkdir-lock-paused" && test -L "$LOCK" && lock_owner_for_test "$LOCK")" "$watcher"
 bash "$BIN/auto-handoff-sweep.sh" >"$SB/sweep-new.out" 2>&1
 assert_file "sweeper preserves attempt while new owner acquires" "$STATE/$SID.reload-attempt"
 assert_file "sweeper preserves pending marker while new owner acquires" "$STATE/$SID.reload-pending"
 rm -f "$STATE/$SID.reload-attempt" "$STATE/$SID.reload-pending"
 : > "$SB/release-mkdir-lock"
-assert_eq "watcher enters cycle with verified lock" "$(wait_file "$SB/settle-paused" && cat "$LOCK/pid")" "$watcher"
+assert_eq "watcher enters cycle with verified lock" "$(wait_file "$SB/settle-paused" && lock_owner_for_test "$LOCK")" "$watcher"
 printf 'staged\n' > "$STATE/$SID.reload-attempt"
 set_mtime_offset "$STATE/$SID.reload-attempt" -1200
 : > "$STATE/$SID.idle"
@@ -451,6 +718,47 @@ assert_contains "sweeper reports the held lock" "$(cat "$AUTODEV_HOME/logs/auto-
 rm -f "$STATE/$SID.reload-attempt" "$STATE/$SID.reload-pending"
 : > "$SB/release-settle"
 wait "$watcher"
+sandbox_rm
+
+echo "== watcher honors a cycle lock atomically published by the sweeper =="
+setup
+printf 'staged\n' > "$STATE/$SID.reload-attempt"
+set_mtime_offset "$STATE/$SID.reload-attempt" -1200
+: > "$STATE/$SID.idle"
+set_mtime_offset "$STATE/$SID.idle" 2
+export MUX_BUSY=1
+stub_foreground_setsid
+LOCK_PATH="$LOCK" PAUSE_LOCK_MKDIR=1 PATH="$SB/fakebin:$PATH" \
+  bash "$BIN/auto-handoff-sweep.sh" >"$SB/sweep-owner.out" 2>&1 &
+sweeper=$!
+assert_eq "sweeper pauses after atomic cycle-lock publication" \
+  "$(wait_file "$SB/mkdir-lock-paused" && test -L "$LOCK" && lock_owner_for_test "$LOCK")" "$sweeper"
+bash "$BIN/auto-handoff-watch.sh" "$SID" >"$SB/watch-contender.out" 2>&1
+assert_eq "watcher does not run beside the live sweeper" "$(trigger_count)" "0"
+assert_file "sweeper owner keeps staged-input state protected" "$STATE/$SID.reload-attempt"
+: > "$SB/release-mkdir-lock"
+wait "$sweeper"
+assert_eq "sweeper's re-armed watcher completed before cleanup" \
+  "$(wait_file "$SB/setsid-finished" && echo yes)" yes
+setsid_pid=$(cat "$SB/setsid-pid")
+assert_eq "foreground setsid launcher exited before cleanup" \
+  "$(wait_for_process_exit "$setsid_pid" && echo yes)" yes
+assert_absent "sweeper releases its cycle lock" "$LOCK"
+assert_absent "sweeper clears the consumed staged-input marker" "$STATE/$SID.reload-attempt"
+sandbox_rm
+
+echo "== sweeper stays out while a live symlink cycle lock is held =="
+setup
+sleep 300 &
+sweep_lock_owner=$!
+/bin/ln -s "/dev/null/autodev-lock-owner/$sweep_lock_owner" "$LOCK"
+bash "$BIN/auto-handoff-sweep.sh" >"$SB/sweep-live-symlink.out" 2>&1
+rearmed=$(grep -c 'SWEEP re-arming watcher' "$AUTODEV_HOME/logs/auto-handoff.log" 2>/dev/null || true)
+assert_eq "sweeper does not re-arm a live symlink-locked session" \
+  "${rearmed:-0}" 0
+assert_eq "live symlink cycle lock remains in place" "$(test -L "$LOCK" && echo yes)" yes
+kill "$sweep_lock_owner" 2>/dev/null || true
+wait "$sweep_lock_owner" 2>/dev/null || true
 sandbox_rm
 
 finish

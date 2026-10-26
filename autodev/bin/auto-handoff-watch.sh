@@ -31,6 +31,7 @@ mkdir -p "$STATE" "$LOGDIR" 2>/dev/null
 # Multiplexer abstraction (herdr | tmux). Provides mux_init/mux_pane_live/
 # mux_busy/mux_send_line/mux_session_name. Absent => watcher safely no-ops.
 _HERE="$(cd "$(dirname "$0")" && pwd)"
+[ -f "$_HERE/lock-lib.sh" ] && . "$_HERE/lock-lib.sh" || exit 0
 [ -f "$_HERE/mux-lib.sh" ] && . "$_HERE/mux-lib.sh"
 [ -f "$_HERE/request-lib.sh" ] && . "$_HERE/request-lib.sh"
 # Never let a missing lib make every request look stale: fall back to "exists".
@@ -238,7 +239,7 @@ fi
 # Stable label to re-assert after compaction (tmux session name; empty under herdr).
 SESSION_NAME=$(mux_session_name)
 
-# --- cycle lock (atomic mkdir; blocks recursion + concurrent cycles) ---
+# --- cycle lock (atomic owner-bearing symlink; blocks recursion + concurrent cycles) ---
 # A stale lock is removed only while holding a separate reclaim mutex, so a live
 # cycle lock always remains visible to other watchers and the sweeper.
 lock="$STATE/$sid.cycle.lock"
@@ -246,53 +247,30 @@ reclaim_mutex="$lock.reclaim"
 lock_stale_after=$(( WAIT_IDLE + WAIT_COMPACT ))
 reclaim_mutex_stale_after=60
 
-lock_pid_is_positive_numeric(){
-  case "$1" in
-    ''|*[!0-9]*) return 1 ;;
-    *[1-9]*) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
 lock_directory_mtime(){ # $1 = lock directory; print mtime in epoch seconds
   local mtime
-  mtime=$(date -r "$1" +%s 2>/dev/null) || return 1
+  mtime=$(stat -c '%Y' "$1" 2>/dev/null) \
+    || mtime=$(stat -f '%m' "$1" 2>/dev/null) || return 1
   case "$mtime" in ''|*[!0-9]*) return 1 ;; esac
   printf '%s\n' "$mtime"
 }
 
-lock_stat_signature(){ # $1 = GNU format, $2 = BSD format, $3 = path
-  local signature
-  signature=$(stat -c "$1" "$3" 2>/dev/null) \
-    || signature=$(stat -f "$2" "$3" 2>/dev/null) || return 1
-  printf '%s\n' "$signature"
+lock_directory_signature(){ # $1 = lock path; lstat identity, type, size, and mtime
+  autodev_lock_object_signature "$1"
 }
 
-lock_directory_signature(){ # $1 = lock directory; identify it and its mtime portably
-  local identity mtime
-  identity=$(lock_stat_signature '%d:%i' '%d:%i' "$1") || return 1
-  mtime=$(lock_directory_mtime "$1") || return 1
-  printf '%s:%s\n' "$identity" "$mtime"
-}
-
-lock_pid_file_signature(){ # $1 = pid file; identify its current content-bearing file
-  local identity mtime
-  if [ ! -e "$1" ] && [ ! -L "$1" ]; then
-    printf 'missing\n'
-    return 0
-  fi
-  identity=$(lock_stat_signature '%d:%i:%s' '%d:%i:%z' "$1") || return 1
-  mtime=$(date -r "$1" +%s 2>/dev/null) || return 1
-  printf '%s:%s\n' "$identity" "$mtime"
+lock_pid_file_signature(){ # $1 = lock path; snapshot its owner representation without following links
+  autodev_lock_owner_signature "$1"
 }
 
 lock_snapshot_matches(){ # path, pid, readable, directory signature, pid-file signature
   local path=$1 expected_pid=$2 expected_readable=$3 expected_dir_sig=$4 expected_pid_sig=$5
   local current_dir_sig current_pid_sig
-  [ -d "$path" ] || return 1
+  autodev_lock_path_present "$path" || return 1
+  if [ -L "$path" ]; then :; else [ -d "$path" ] || return 1; fi
   current_dir_sig=$(lock_directory_signature "$path") || return 1
   [ "$current_dir_sig" = "$expected_dir_sig" ] || return 1
-  current_pid_sig=$(lock_pid_file_signature "$path/pid") || return 1
+  current_pid_sig=$(lock_pid_file_signature "$path") || return 1
   [ "$current_pid_sig" = "$expected_pid_sig" ] || return 1
   read_lock_pid "$path"
   [ "$lock_pid_readable" = "$expected_readable" ] && [ "$lock_pid" = "$expected_pid" ]
@@ -306,47 +284,52 @@ lock_directory_age(){ # $1 = lock directory, optional $2 = snapshotted mtime
   printf '%s\n' "$(( now - mtime ))"
 }
 
-read_lock_pid(){ # sets lock_pid and lock_pid_readable for $1
-  lock_pid=""
-  lock_pid_readable=1
-  if [ -e "$1/pid" ]; then
-    lock_pid=$(cat "$1/pid" 2>/dev/null) || lock_pid_readable=0
+read_lock_pid(){ # sets lock_pid and lock_pid_readable for a symlink or legacy directory
+  autodev_lock_read_owner "$1"
+  lock_pid_readable=$lock_owner_readable
+  if [ "$lock_owner_kind" = symlink ]; then
+    lock_pid=$lock_owner_pid
+  else
+    lock_pid=$lock_owner_value
   fi
 }
 
-write_and_verify_pid(){ # $1 = lock directory
-  printf '%s\n' "$$" > "$1/pid" 2>/dev/null || return 1
-  lock_pid=$(cat "$1/pid" 2>/dev/null) || return 1
-  [ "$lock_pid" = "$$" ]
+publish_and_verify_lock(){ # publish and verify the owner-bearing symlink at $1
+  local rc
+  autodev_lock_publish "$1" "$$"; rc=$?
+  [ "$rc" -eq 0 ] || return "$rc"
+  if [ ! -L "$1" ] || [ "$(readlink "$1" 2>/dev/null || true)" != "$(autodev_lock_token "$$")" ]; then
+    return 2
+  fi
+  return 0
 }
 
 release_reclaim_mutex(){
   [ "${reclaim_mutex_owned:-0}" = 1 ] || return 0
-  if [ "$(cat "$reclaim_mutex/pid" 2>/dev/null || true)" = "$$" ]; then
-    rm -rf "$reclaim_mutex" 2>/dev/null || true
-  fi
+  autodev_lock_release_owned "$reclaim_mutex" "$$" || true
   reclaim_mutex_owned=0
 }
 
 release_cycle_lock(){
-  if [ "$(cat "$lock/pid" 2>/dev/null || true)" = "$$" ]; then
-    rm -rf "$lock" 2>/dev/null || true
-  fi
+  autodev_lock_release_owned "$lock" "$$" || true
 }
 
 take_reclaim_mutex(){
-  local mutex_pid mutex_pid_readable mutex_dir_sig mutex_pid_sig mutex_age
-  if mkdir "$reclaim_mutex" 2>/dev/null; then
+  local mutex_pid mutex_pid_readable mutex_dir_sig mutex_pid_sig mutex_age rc
+  publish_and_verify_lock "$reclaim_mutex"; rc=$?
+  if [ "$rc" -eq 0 ]; then
     return 0
   fi
-  [ -d "$reclaim_mutex" ] || return 1
+  [ "$rc" -eq 2 ] && return 2
+  autodev_lock_path_present "$reclaim_mutex" || return 1
+  if [ -L "$reclaim_mutex" ]; then :; else [ -d "$reclaim_mutex" ] || return 1; fi
 
   read_lock_pid "$reclaim_mutex"
   mutex_pid=$lock_pid
   mutex_pid_readable=$lock_pid_readable
   mutex_dir_sig=$(lock_directory_signature "$reclaim_mutex") || return 1
-  mutex_pid_sig=$(lock_pid_file_signature "$reclaim_mutex/pid") || return 1
-  if [ "$mutex_pid_readable" = 1 ] && lock_pid_is_positive_numeric "$mutex_pid"; then
+  mutex_pid_sig=$(lock_pid_file_signature "$reclaim_mutex") || return 1
+  if [ "$mutex_pid_readable" = 1 ] && autodev_lock_pid_is_canonical "$mutex_pid"; then
     if kill -0 "$mutex_pid" 2>/dev/null; then
       return 1
     fi
@@ -363,28 +346,41 @@ take_reclaim_mutex(){
   # Concurrent stale-mutex recovery can race while removing/recreating the mutex.
   # That second-order window requires a prior reclaimer crash to leave it stale;
   # normal reclaim takes milliseconds, so the mutex is otherwise live and protected.
-  rm -rf "$reclaim_mutex" 2>/dev/null || return 1
-  mkdir "$reclaim_mutex" 2>/dev/null
+  if [ -L "$reclaim_mutex" ]; then
+    rm -f "$reclaim_mutex" 2>/dev/null || return 1
+  else
+    rm -rf "$reclaim_mutex" 2>/dev/null || return 1
+  fi
+  publish_and_verify_lock "$reclaim_mutex"
 }
 
-if mkdir "$lock" 2>/dev/null; then
-  if ! write_and_verify_pid "$lock"; then
-    log "SKIP cycle lock ownership changed after mkdir (pct=$pct)"; exit 0
-  fi
+publish_and_verify_lock "$lock"
+lock_publish_rc=$?
+if [ "$lock_publish_rc" -eq 0 ]; then
+  :
 else
-  if ! take_reclaim_mutex; then
-    log "SKIP cycle already in progress or reclaim mutex held (pct=$pct)"; exit 0
+  if [ "$lock_publish_rc" -eq 2 ]; then
+    log "SKIP cycle lock ownership changed after atomic publication (pct=$pct)"; exit 0
   fi
-  if ! write_and_verify_pid "$reclaim_mutex"; then
-    log "SKIP reclaim mutex ownership could not be verified (pct=$pct)"; exit 0
+  take_reclaim_mutex
+  mutex_acquire_rc=$?
+  if [ "$mutex_acquire_rc" -ne 0 ]; then
+    if [ "$mutex_acquire_rc" -eq 2 ]; then
+      log "SKIP reclaim mutex ownership could not be verified (pct=$pct)"
+    else
+      log "SKIP cycle already in progress or reclaim mutex held (pct=$pct)"
+    fi
+    exit 0
   fi
   reclaim_mutex_owned=1
   trap 'release_reclaim_mutex' EXIT
 
   stale_lock=0
-  if [ -e "$lock" ] || [ -L "$lock" ]; then
-    if [ ! -d "$lock" ]; then
-      log "SKIP cycle lock path is not a directory (pct=$pct)"; exit 0
+  if autodev_lock_path_present "$lock"; then
+    if [ -L "$lock" ]; then :; else
+      if [ ! -d "$lock" ]; then
+        log "SKIP cycle lock path is not a legacy directory (pct=$pct)"; exit 0
+      fi
     fi
     read_lock_pid "$lock"
     lpid=$lock_pid
@@ -392,10 +388,10 @@ else
     lock_dir_sig=$(lock_directory_signature "$lock") || {
       log "SKIP cycle lock identity unavailable (pct=$pct)"; exit 0;
     }
-    lock_pid_sig=$(lock_pid_file_signature "$lock/pid") || {
+    lock_pid_sig=$(lock_pid_file_signature "$lock") || {
       log "SKIP cycle lock PID identity unavailable (pct=$pct)"; exit 0;
     }
-    if [ "$lpid_readable" = 1 ] && lock_pid_is_positive_numeric "$lpid"; then
+    if [ "$lpid_readable" = 1 ] && autodev_lock_pid_is_canonical "$lpid"; then
       if kill -0 "$lpid" 2>/dev/null; then
         log "SKIP cycle already in progress (pid $lpid, pct=$pct)"; exit 0
       fi
@@ -426,23 +422,33 @@ else
     if [ "$stale_lock" = 1 ]; then
       lock_holder=$lpid
       if [ "$lpid_readable" != 1 ]; then lock_holder=unreadable
-      elif ! lock_pid_is_positive_numeric "$lpid"; then lock_holder=none
+      elif ! autodev_lock_pid_is_canonical "$lpid"; then lock_holder=none
       fi
       log "reclaim stale cycle lock (holder $lock_holder, age ${lock_age:-unknown}, pct=$pct)"
       # The mutex is the sole authority to remove a rechecked stale cycle lock.
-      rm -rf "$lock" 2>/dev/null || {
-        log "SKIP cycle lock reclaim failed (pct=$pct)"; exit 0;
-      }
+      if [ -L "$lock" ]; then
+        rm -f "$lock" 2>/dev/null || {
+          log "SKIP cycle lock reclaim failed (pct=$pct)"; exit 0;
+        }
+      else
+        rm -rf "$lock" 2>/dev/null || {
+          log "SKIP cycle lock reclaim failed (pct=$pct)"; exit 0;
+        }
+      fi
     fi
   fi
 
-  # A fast-path watcher or the sweeper may win after removal; only mkdir's
-  # winner proceeds, and PID readback below confirms the path still belongs to us.
-  if ! mkdir "$lock" 2>/dev/null; then
-    log "SKIP cycle lock race after reclaim (pct=$pct)"; exit 0
-  fi
-  if ! write_and_verify_pid "$lock"; then
-    log "SKIP cycle lock ownership changed after reclaim (pct=$pct)"; exit 0
+  # A fast-path watcher or the sweeper may win after removal; only ln's winner
+  # proceeds, and owner readback below confirms the path still belongs to us.
+  publish_and_verify_lock "$lock"
+  lock_publish_rc=$?
+  if [ "$lock_publish_rc" -ne 0 ]; then
+    if [ "$lock_publish_rc" -eq 2 ]; then
+      log "SKIP cycle lock ownership changed after reclaim (pct=$pct)"
+    else
+      log "SKIP cycle lock race after reclaim (pct=$pct)"
+    fi
+    exit 0
   fi
   release_reclaim_mutex
   trap - EXIT

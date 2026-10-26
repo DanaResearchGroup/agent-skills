@@ -33,6 +33,7 @@ LOG="$LOGDIR/auto-handoff.log"
 mkdir -p "$STATE" "$LOGDIR" 2>/dev/null
 
 _HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+[ -f "$_HERE/lock-lib.sh" ] && . "$_HERE/lock-lib.sh" || exit 0
 [ -f "$_HERE/mux-lib.sh" ] && . "$_HERE/mux-lib.sh"
 [ -f "$_HERE/request-lib.sh" ] && . "$_HERE/request-lib.sh"
 # Never let a missing lib make every request look stale: fall back to "exists".
@@ -92,31 +93,23 @@ fresh(){ [ -f "$1" ] && [ "$(( now - $(mtime "$1") ))" -le "$2" ]; }
 
 # Take the per-session cycle lock only when its directory does not already
 # exist. The watcher owns stale-lock reclamation; a sweep never removes a lock.
-cycle_lock_take(){ # $1 = lock directory
-  local lock_path=$1
-  if mkdir "$lock_path" 2>/dev/null; then
-    if ! printf '%s\n' "$$" > "$lock_path/pid" 2>/dev/null; then
-      return 1
-    fi
-    return 0
-  fi
-  return 1
+cycle_lock_take(){ # $1 = cycle lock path
+  autodev_lock_publish "$1" "$$"
 }
 
-cycle_lock_release(){ # $1 = lock directory; release only our recorded lock
-  local lock_path=$1
-  [ "$(cat "$lock_path/pid" 2>/dev/null || true)" = "$$" ] || return 1
-  rm -rf "$lock_path" 2>/dev/null
+cycle_lock_release(){ # $1 = cycle lock path; release only our recorded lock
+  autodev_lock_release_owned "$1" "$$"
 }
 
-cycle_lock_block_reason(){ # $1 = lock directory
+cycle_lock_block_reason(){ # $1 = cycle lock path
   local lpid
-  [ -d "$1" ] || { printf 'could not create lock'; return; }
-  lpid=$(cat "$1/pid" 2>/dev/null || true)
+  autodev_lock_path_present "$1" || { printf 'could not create lock'; return; }
+  autodev_lock_read_owner "$1"
+  lpid=$lock_owner_pid
   if [ -n "$lpid" ] && kill -0 "$lpid" 2>/dev/null; then
     printf 'held by live pid %s' "$lpid"
-  elif [ -n "$lpid" ]; then
-    printf 'present with stale pid %s' "$lpid"
+  elif [ -n "$lock_owner_value" ]; then
+    printf 'present with stale pid %s' "$lock_owner_value"
   else
     printf 'present without pid file'
   fi
@@ -247,8 +240,9 @@ for pf in "$STATE"/*.herdr-pane "$STATE"/*.tmux-pane; do
 
   # A cycle genuinely in flight must not be piled onto. Reload cleanup above
   # took and released its own lock before this check.
-  if [ -d "$lock" ]; then
-    lpid=$(cat "$lock/pid" 2>/dev/null || true)
+  if autodev_lock_path_present "$lock"; then
+    autodev_lock_read_owner "$lock"
+    lpid=$lock_owner_pid
     [ -n "$lpid" ] && kill -0 "$lpid" 2>/dev/null && continue
   fi
   # Dry-run threshold previews need a fresh busy observation every sweep. The

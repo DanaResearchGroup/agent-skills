@@ -76,8 +76,7 @@ sandbox_rm
 # check, which turns a dead pid into a loud harness failure instead.
 hold_cycle_lock() { # $1 = sid; sets $lockpid
   sleep 300 & lockpid=$!
-  mkdir -p "$STATE/$1.cycle.lock"
-  printf '%s\n' "$lockpid" > "$STATE/$1.cycle.lock/pid"
+  /bin/ln -s "/dev/null/autodev-lock-owner/$lockpid" "$STATE/$1.cycle.lock"
   kill -0 "$lockpid" 2>/dev/null ||
     _fail "harness: cycle-lock pid died before the test ran" "the deferral was never exercised"
 }
