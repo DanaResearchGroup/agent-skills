@@ -1,0 +1,4 @@
+● Earlier conversation
+
+The pane is scrolled up in recent history. The live prompt and mode footer
+are below this viewport.

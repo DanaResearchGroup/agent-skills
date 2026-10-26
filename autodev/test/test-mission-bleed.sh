@@ -31,11 +31,13 @@ hook_ctx() { # $1 = sid -> the additionalContext the SessionStart hook injects
 # Answer the watcher's /compact by writing the completion marker CC's
 # SessionStart hook would normally write.
 compaction_responder() { # $1 = sid
+  local sid=$1 drop_pointer=${2:-}
   (
     for _ in $(seq 1 200); do
       if grep -qxF '/compact' "$SB/sent.log" 2>/dev/null; then
+        [ "$drop_pointer" = --drop-pointer ] && rm -f "$AUTODEV_HOME/handoffs/.latest.$sid"
         sleep 1
-        printf '%s\n' "$(date +%s)" > "$STATE/$1.compacted"
+        printf '%s\n' "$(date +%s)" > "$STATE/$sid.compacted"
         exit 0
       fi
       sleep 0.5
@@ -132,8 +134,10 @@ arm
 session_new "$S2" 45 "w1:p1"
 export MUX_LIVE_PANES="w1:p1" MUX_BUSY=0
 printf '%s\n' "$H1" > "$AUTODEV_HOME/handoffs/.latest"
+: > "$AUTODEV_HOME/handoffs/.latest.$S2"
+printf '%s\n' "$H2" > "$AUTODEV_HOME/handoffs/.latest.$S2"
 : > "$STATE/$S2.compact-request"
-compaction_responder "$S2"
+compaction_responder "$S2" --drop-pointer
 bash "$BIN/auto-handoff-watch.sh" "$S2" >/dev/null 2>&1
 sent=$(cat "$SB/sent.log")
 assert_not_contains "watcher: no pointer => never sends a foreign handoff path" "$sent" "$H1"

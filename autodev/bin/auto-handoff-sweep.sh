@@ -107,13 +107,24 @@ page_stuck(){
   ) 9>"$STATE/$sid.page.lock"
 }
 _page_locked(){
-  local sid=$1 kind=$2 rf key age msg
-  rf="$STATE/$sid.$kind"
+  local sid=$1 kind=$2 rf key age msg pending=""
+  if [ "$kind" = reload-attempt ]; then rf="$STATE/$sid.reload-attempt"
+  else rf="$STATE/$sid.$kind"; fi
   [ -f "$rf" ] || return 0
   key="$kind:$(date -r "$rf" +%s%N 2>/dev/null)"
   [ "$(cat "$STATE/$sid.paged" 2>/dev/null)" = "$key" ] && return 0
   age=$(( (now - $(mtime "$rf")) / 60 ))
-  msg="autodev: $kind for session $sid pending $age min and the watcher keeps deferring (busy pane or open prompt) — compact it by hand"
+  if [ -f "$STATE/$sid.reload-attempt" ]; then
+    [ -f "$STATE/$sid.reload-pending" ] && pending="reload retry"
+    [ -f "$STATE/$sid.handoff-request" ] && pending="${pending:+$pending, }handoff-request"
+    [ -f "$STATE/$sid.compact-request" ] && pending="${pending:+$pending, }compact-request"
+    if [ -n "$pending" ]; then pending=" Pending work also waiting: $pending."; fi
+    msg="autodev: tmux input for session $sid may contain staged text after $age min; inspect the pane before submitting anything.$pending"
+  elif [ "$kind" = reload-pending ]; then
+    msg="autodev: reload for session $sid pending $age min and the watcher keeps deferring (busy pane or open prompt) — continue it by hand"
+  else
+    msg="autodev: $kind for session $sid pending $age min and the watcher keeps deferring (busy pane or open prompt) — compact it by hand"
+  fi
   # Record BEFORE paging, and refuse to page if the record cannot be kept: an
   # unrecorded page repeats on every sweep.
   if ! printf '%s\n' "$key" > "$STATE/$sid.paged" 2>/dev/null; then
@@ -138,6 +149,14 @@ for pf in "$STATE"/*.herdr-pane "$STATE"/*.tmux-pane; do
   # A session registered under both multiplexers appears twice.
   case "$seen" in *" $sid "*) continue ;; esac
   seen="$seen$sid "
+  reload_marker="$STATE/$sid.reload-pending"
+  reload_attempt="$STATE/$sid.reload-attempt"
+  reload_retired_exit=0
+  if [ -f "$reload_attempt" ] && [ -f "$STATE/$sid.idle" ] &&
+     [ "$STATE/$sid.idle" -nt "$reload_attempt" ]; then
+    rm -f "$reload_attempt" 2>/dev/null
+    log "$sid" "CLEAR tmux staged-input lock: newer idle turn consumed prior input"
+  fi
 
   # A request is stale when satisfied (see request-lib.sh), never by age. Cleaned
   # before the pane checks so a dead session's leftovers go too.
@@ -162,6 +181,27 @@ for pf in "$STATE"/*.herdr-pane "$STATE"/*.tmux-pane; do
     [ -n "$lpid" ] && kill -0 "$lpid" 2>/dev/null && continue
   fi
 
+  # A reload is independent of context percentage and may outlive cooldown.
+  # Retire it before paging/retrying if the session moved on or wrote a newer
+  # handoff; the watcher repeats this check under the cycle lock.
+  reload_pending=0
+  if [ -f "$reload_marker" ]; then
+    retired=""
+    command -v reload_marker_retire_reason >/dev/null 2>&1 &&
+      retired=$(reload_marker_retire_reason "$STATE" "$AUTODEV_HOME/handoffs" "$sid" "$reload_marker" || true)
+    case "$retired" in
+      new-handoff-request)
+        rm -f "$reload_marker" 2>/dev/null
+        log "$sid" "DROP reload-pending: a newer handoff request superseded it"
+        ;;
+      new-handoff|completed-turn)
+        rm -f "$reload_marker" 2>/dev/null
+        log "$sid" "DROP reload-pending: superseded by $retired"
+        reload_retired_exit=1
+        ;;
+      *) reload_pending=1 ;;
+    esac
+  fi
   # Dry-run threshold previews need a fresh busy observation every sweep. The
   # real watcher completes a dry cycle and stamps cooldown, but that cooldown
   # is longer than BUSY_GAP and would keep resetting the preview clock. Bypass
@@ -175,7 +215,8 @@ for pf in "$STATE"/*.herdr-pane "$STATE"/*.tmux-pane; do
       dry_preview=1
     fi
   fi
-  if fresh "$STATE/$sid.cooldown" "$COOLDOWN" && [ "$dry_preview" = 0 ]; then
+  if fresh "$STATE/$sid.cooldown" "$COOLDOWN" && [ "$dry_preview" = 0 ] &&
+     [ "$reload_pending" = 0 ] && [ ! -f "$reload_attempt" ]; then
     continue
   fi
 
@@ -185,7 +226,8 @@ for pf in "$STATE"/*.herdr-pane "$STATE"/*.tmux-pane; do
   aborts=0
   [ -f "$STATE/$sid.abort-count" ] && aborts=$(cat "$STATE/$sid.abort-count" 2>/dev/null || echo 0)
   case "$aborts" in ''|*[!0-9]*) aborts=0 ;; esac
-  if [ "$aborts" -ge "$MAX_ABORTS" ]; then
+  if [ "$aborts" -ge "$MAX_ABORTS" ] && [ "$reload_pending" = 0 ] &&
+     [ ! -f "$reload_attempt" ]; then
     if [ ! -f "$STATE/$sid.stuck" ]; then
       printf 'aborted %s consecutive auto-handoff cycles\n' "$aborts" > "$STATE/$sid.stuck"
       log "$sid" "STUCK after $aborts consecutive aborted cycles — no longer auto-retrying (status line flags it)"
@@ -195,7 +237,11 @@ for pf in "$STATE"/*.herdr-pane "$STATE"/*.tmux-pane; do
 
   # --- is there anything to do? ---------------------------------------------
   reason=""; thr=0
-  if [ -f "$STATE/$sid.handoff-request" ]; then
+  if [ -f "$reload_attempt" ]; then
+    reason="staged tmux input"
+  elif [ "$reload_pending" = 1 ]; then
+    reason="pending reload"
+  elif [ -f "$STATE/$sid.handoff-request" ]; then
     reason="pending handoff-request"
     rm -f "$STATE/$sid.busy-since" 2>/dev/null
   elif [ -f "$STATE/$sid.compact-request" ]; then
@@ -245,6 +291,7 @@ for pf in "$STATE"/*.herdr-pane "$STATE"/*.tmux-pane; do
   # a new one; the watcher's DEFER re-file restores the original exactly). The
   # DEFER must be newer than the request — an older one says nothing about it.
   for kind in handoff-request compact-request; do
+    [ -f "$reload_attempt" ] && continue
     rf="$STATE/$sid.$kind"
     [ -f "$rf" ] && [ "$STATE/$sid.deferred" -nt "$rf" ] || continue
     [ "$(( now - $(mtime "$rf") ))" -ge "$PAGE_AFTER" ] || continue
@@ -265,8 +312,25 @@ for pf in "$STATE"/*.herdr-pane "$STATE"/*.tmux-pane; do
   fi
   owner=$(mux_pane_owner)
   if [ -n "$owner" ] && [ "$owner" != "$sid" ]; then
+    if [ "$reload_pending" = 1 ] || [ -f "$reload_attempt" ]; then
+      rm -f "$reload_marker" "$reload_attempt" 2>/dev/null
+      log "$sid" "DROP reload-pending: pane is now owned by session $owner"
+    fi
     [ "$thr" = 1 ] && rm -f "$STATE/$sid.busy-since" 2>/dev/null
     continue
+  fi
+
+  if [ -f "$reload_attempt" ]; then
+    if [ "$(( now - $(mtime "$reload_attempt") ))" -ge "$PAGE_AFTER" ]; then
+      if [ -f "$reload_marker" ]; then page_stuck "$sid" reload-pending
+      else page_stuck "$sid" reload-attempt; fi
+    fi
+    log "$sid" "DEFER tmux staged-input lock: refusing all session sends until a newer idle turn or pane-owner change"
+    continue
+  fi
+  [ "$reload_retired_exit" = 1 ] && continue
+  if [ "$reload_pending" = 1 ] && [ "$(( now - $(mtime "$reload_marker") ))" -ge "$PAGE_AFTER" ]; then
+    page_stuck "$sid" reload-pending
   fi
 
   # --- over threshold and working: raise the request the session never filed --

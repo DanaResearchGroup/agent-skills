@@ -1,0 +1,10 @@
+  - Round-trip test: the arrays survive the JSON round trip; pre-existing keys unchanged.
+  - Merge is yours — I committed on the branch and stopped.
+
+✻ Cogitated for 53m 7s · done Tuesday 6:17 AM
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   🔴 AUTO-HANDOFF: ARMED   Opus 4.8 184.0k (18.0%) cache⌛06:22:33
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents

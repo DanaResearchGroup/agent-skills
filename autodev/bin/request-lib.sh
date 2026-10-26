@@ -50,3 +50,23 @@ remove_stale_request() { # same args as request_valid
   rm -f "$claim" 2>/dev/null
   return 0
 }
+
+# A refused post-compaction reload is obsolete once its session has completed
+# another turn or filed/written a newer handoff. Shared by the watcher and the
+# sweeper so they agree on when a durable retry is superseded.
+reload_marker_retire_reason() { # $1 = state, $2 = handoffs, $3 = sid, $4 = marker
+  local state=$1 handoffs=$2 sid=$3 marker=$4
+  if [ -f "$state/$sid.handoff-request" ] && [ "$state/$sid.handoff-request" -nt "$marker" ]; then
+    printf 'new-handoff-request\n'
+    return 0
+  fi
+  if [ -f "$handoffs/.latest.$sid" ] && [ "$handoffs/.latest.$sid" -nt "$marker" ]; then
+    printf 'new-handoff\n'
+    return 0
+  fi
+  if [ -f "$state/$sid.idle" ] && [ "$state/$sid.idle" -nt "$marker" ]; then
+    printf 'completed-turn\n'
+    return 0
+  fi
+  return 1
+}

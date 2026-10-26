@@ -28,7 +28,7 @@ export AUTODEV_SETTLE=0 AUTODEV_POLL=1 AUTODEV_PRECHECK=2 \
        AUTODEV_WAIT_IDLE=2 AUTODEV_WAIT_COMPACT=2
 
 # --- fake herdr --------------------------------------------------------------
-# $SB/herdr/screen.txt  what `pane read` returns (absent or read-fail => exit 1)
+# $SB/herdr/{screen,recent,visible}.txt  pane-read sources (absent => screen.txt)
 # $SB/herdr/status      agent_status for `pane get` (default idle)
 # $SB/typed.log         every pane run / send-text / send-keys, one per line
 setup() {
@@ -50,8 +50,18 @@ case "${1:-} ${2:-}" in
         [ -f "$H/new-req" ] && { : > "$(cat "$H/new-req")"; rm -f "$H/new-req"; }
         cat "$H/later.txt"; exit 0
       fi
-      [ -f "$H/screen.txt" ] || exit 1
-      cat "$H/screen.txt" ;;
+      source=recent-unwrapped
+      while [ "$#" -gt 0 ]; do
+        if [ "$1" = --source ] && [ "$#" -ge 2 ]; then source=$2; shift 2; else shift; fi
+      done
+      case "$source" in
+        visible) file="$H/visible.txt" ;;
+        recent) file="$H/recent-scrollback.txt" ;;
+        *) file="$H/recent.txt" ;;
+      esac
+      [ -f "$file" ] || file="$H/screen.txt"
+      [ -f "$file" ] || exit 1
+      cat "$file" ;;
   "pane run")
       [ -f "$H/run-fail" ] && exit 1
       printf 'RUN %s\n' "$4" >> "$SB/typed.log" ;;
@@ -73,7 +83,13 @@ case "${1:-}" in
       [ -f "$H/screen.txt" ] || exit 1
       cat "$H/screen.txt" ;;
   send-keys)
-      if [ "${4:-}" = -l ]; then printf 'TEXT %s\n' "$5" >> "$SB/typed.log"
+      if [ "${4:-}" = -l ]; then
+        printf '%s' "$5" >> "$SB/tmux-input.txt"
+        printf 'TEXT %s\n' "$5" >> "$SB/typed.log"
+      elif [ "${4:-}" = Enter ]; then
+        printf 'SUBMIT %s\n' "$(cat "$SB/tmux-input.txt" 2>/dev/null)" >> "$SB/tmux-submits.log"
+        : > "$SB/tmux-input.txt"
+        printf 'KEY %s\n' "$4" >> "$SB/typed.log"
       else printf 'KEY %s\n' "$4" >> "$SB/typed.log"
       fi ;;
   *) echo "fake tmux: unhandled [$*]" >&2; exit 64 ;;
@@ -98,6 +114,12 @@ LOG() { cat "$AUTODEV_HOME/logs/$1.log" 2>/dev/null; }
 # shellcheck disable=SC2034  # MUX/PANE are read by the sourced library
 mux() { ( . "$BIN/mux-lib.sh"; MUX=herdr PANE=w1:p7G; "$@" >/dev/null 2>&1; echo $? ); }
 mux_tmux() { ( . "$BIN/mux-lib.sh"; MUX=tmux PANE=%7; "$@" >/dev/null 2>&1; echo $? ); }
+mux_tmux_state() {
+  ( . "$BIN/mux-lib.sh"; MUX=tmux PANE=%7
+    mux_send_line "$1" >/dev/null 2>&1; rc=$?
+    printf '%s:%s\n' "$rc" "${MUX_LINE_STAGED:-0}"
+  )
+}
 
 MENUS="single-select multi-select multi-question preview other-row review-answers"
 
@@ -145,6 +167,55 @@ setup; printf '  \n\n' > "$SB/herdr/screen.txt"
 assert_eq "a blank read is awaiting, not clear" "$(mux mux_awaiting_human)" 0
 sandbox_rm
 
+echo "== post-compaction blank recent read: trust only a live visible footer =="
+setup
+cp "$FX/post-compact-recent.txt" "$SB/herdr/recent.txt"
+cp "$FX/post-compact-visible-idle.txt" "$SB/herdr/visible.txt"
+assert_eq "blank recent + live idle prompt/footer is not awaiting" "$(mux mux_awaiting_human)" 1
+sandbox_rm
+
+setup
+cp "$FX/post-compact-recent.txt" "$SB/herdr/recent.txt"
+cp "$FX/post-compact-visible-idle-update-notice.txt" "$SB/herdr/visible.txt"
+assert_eq "blank recent + live footer + update notice is not awaiting" "$(mux mux_awaiting_human)" 1
+sandbox_rm
+
+setup
+cp "$FX/post-compact-recent.txt" "$SB/herdr/recent.txt"
+cp "$FX/post-compact-visible-idle-new-task-notice.txt" "$SB/herdr/visible.txt"
+assert_eq "blank recent + live footer + new-task notice is not awaiting" "$(mux mux_awaiting_human)" 1
+sandbox_rm
+
+setup
+cp "$FX/post-compact-recent.txt" "$SB/herdr/recent.txt"
+cp "$FX/post-compact-visible-idle-arbitrary-row.txt" "$SB/herdr/visible.txt"
+assert_eq "blank recent + arbitrary trailing row stays awaiting" "$(mux mux_awaiting_human)" 0
+sandbox_rm
+
+setup
+cp "$FX/post-compact-recent.txt" "$SB/herdr/recent.txt"
+cp "$FX/post-compact-visible-idle-two-notices.txt" "$SB/herdr/visible.txt"
+assert_eq "blank recent + two trailing notices stays awaiting" "$(mux mux_awaiting_human)" 0
+sandbox_rm
+
+setup
+cp "$FX/post-compact-recent.txt" "$SB/herdr/recent.txt"
+cp "$FX/post-compact-visible-scrolled.txt" "$SB/herdr/visible.txt"
+assert_eq "blank recent + scrolled-up visible text without live footer stays awaiting" "$(mux mux_awaiting_human)" 0
+sandbox_rm
+
+setup
+cp "$FX/post-compact-recent.txt" "$SB/herdr/recent.txt"
+cp "$FX/post-compact-visible-menu.txt" "$SB/herdr/visible.txt"
+assert_eq "blank recent + live footer under an open menu is awaiting" "$(mux mux_awaiting_human)" 0
+sandbox_rm
+
+setup
+cp "$FX/post-compact-recent.txt" "$SB/herdr/recent.txt"
+cp "$FX/post-compact-visible-menu-notice.txt" "$SB/herdr/visible.txt"
+assert_eq "blank recent + open menu + new-task notice is awaiting" "$(mux mux_awaiting_human)" 0
+sandbox_rm
+
 echo "== the chokepoint: every send helper refuses on an open question =="
 setup; screen preview
 assert_eq "mux_send_line refuses with MUX_REFUSED" "$(mux mux_send_line /handoff)" 3
@@ -162,6 +233,23 @@ setup; screen idle-prompt
 cp "$FX/single-select.txt" "$SB/herdr/later.txt"; echo 2 > "$SB/herdr/later-from"
 assert_eq "tmux re-checks a dialog that opens before Enter" "$(mux_tmux mux_send_line /compact)" 3
 assert_eq "the literal text is staged but Enter is withheld" "$(typed)" "TEXT /compact"
+sandbox_rm
+
+# A refused tmux send can leave its literal in the input line. Calling the same
+# sender again appends another copy before Enter; the reload retry must detect
+# and quarantine this state rather than call mux_send_line again.
+setup; screen idle-prompt
+cp "$FX/single-select.txt" "$SB/herdr/later.txt"; echo 2 > "$SB/herdr/later-from"
+reload_text='Read the handoff at "fixture.md" and continue execution from where it leaves off.'
+assert_eq "tmux reload send is refused after staging" \
+  "$(mux_tmux_state "$reload_text")" "3:1"
+assert_eq "the first tmux reload attempt remains in the input line" \
+  "$(cat "$SB/tmux-input.txt")" "$reload_text"
+rm -f "$SB/herdr/later.txt"
+assert_eq "an unguarded tmux retry would submit successfully" \
+  "$(mux_tmux mux_send_line "$reload_text")" 0
+assert_eq "tmux retry appends onto the previously staged reload" \
+  "$(cat "$SB/tmux-submits.log")" "SUBMIT $reload_text$reload_text"
 sandbox_rm
 
 echo "== auto-handoff-watch.sh: /compact must not answer the question =="
