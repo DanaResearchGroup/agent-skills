@@ -185,9 +185,8 @@ sandbox_rm
 echo "== a gate that could deny forever =="
 # The watcher is driving the cycle (/handoff must be free to run its own steps).
 setup; pending
-mkdir -p "$STATE/$SID.cycle.lock"
 sleep 30 & lp=$!
-printf '%s\n' "$lp" > "$STATE/$SID.cycle.lock/pid"
+/bin/ln -s "/dev/null/autodev-lock-owner/$lp" "$STATE/$SID.cycle.lock"
 out=$(gate Bash '{"command":"make test"}')
 assert_eq "live watcher cycle lock -> the gate stands down" "$out" ""
 kill "$lp" 2>/dev/null; wait "$lp" 2>/dev/null

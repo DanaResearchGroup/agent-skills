@@ -130,7 +130,17 @@ for arg in "$@"; do
 done
 exec /bin/mkdir "$@"
 STUB
-  chmod +x "$SB/fakebin/mkdir"
+  cat > "$SB/fakebin/ln" <<'STUB'
+#!/usr/bin/env bash
+for arg in "$@"; do
+  if [ "$arg" = "$STATE/$SID.cycle.lock" ] && [ -f "$SB/attempt-before-lock" ]; then
+    printf 'staged\n' > "$STATE/$SID.reload-attempt"
+    rm -f "$SB/attempt-before-lock"
+  fi
+done
+exec /bin/ln "$@"
+STUB
+  chmod +x "$SB/fakebin/mkdir" "$SB/fakebin/ln"
 }
 
 sweep() { bash "$BIN/auto-handoff-sweep.sh" >"$SB/sweep.out" 2>&1; }
@@ -222,7 +232,7 @@ rm -rf "$STATE/$SID.cycle.lock"
 sweep
 assert_no_file "released lock allows newer idle to clear attempt" "$STATE/$SID.reload-attempt"
 assert_no_file "released lock allows completed turn to retire marker" "$STATE/$SID.reload-pending"
-assert_no_file "non-contended sweep releases its cycle lock" "$STATE/$SID.cycle.lock"
+assert_lock_absent "non-contended sweep releases its cycle lock" "$STATE/$SID.cycle.lock"
 sandbox_rm
 
 # A stale lock belongs to the watcher to reclaim. The sweeper must skip every
@@ -269,7 +279,7 @@ rm -rf "$STATE/$SID.cycle.lock"
 sweep
 assert_no_file "released owner-change lock allows marker cleanup" "$STATE/$SID.reload-pending"
 assert_no_file "released owner-change lock allows attempt cleanup" "$STATE/$SID.reload-attempt"
-assert_no_file "owner-change sweep releases its cycle lock" "$STATE/$SID.cycle.lock"
+assert_lock_absent "owner-change sweep releases its cycle lock" "$STATE/$SID.cycle.lock"
 sandbox_rm
 
 # A malformed marker is retained for visibility but never typed into a pane.

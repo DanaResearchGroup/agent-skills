@@ -142,6 +142,7 @@ assert_line_start() { printf '%s\n' "$2" | grep -qF -- "$3" && printf '%s\n' "$2
 
 assert_file()         { [ -f "$2" ] && _pass "$1" || _fail "$1" "missing file: $2"; }
 assert_no_file()      { [ -f "$2" ] && _fail "$1" "file should not exist: $2" || _pass "$1"; }
+assert_lock_absent()  { [ ! -e "$2" ] && [ ! -L "$2" ] && _pass "$1" || _fail "$1" "lock path still exists: $2"; }
 
 # An unknown command is a HARNESS failure, not a silence: a test that calls a
 # helper this lib never defined prints "command not found" to stderr, and its
