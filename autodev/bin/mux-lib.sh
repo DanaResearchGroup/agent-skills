@@ -240,6 +240,22 @@ mux_visible_dialog_text(){
     }'
 }
 
+mux_herdr_visible_at_bottom(){
+  local info
+  info=$("$MUX_HERDR" pane get "$PANE" 2>/dev/null) || return 1
+  printf '%s\n' "$info" | python3 -c '
+import json
+import sys
+
+try:
+    offset = json.load(sys.stdin)["result"]["pane"]["scroll"]["offset_from_bottom"]
+except (json.JSONDecodeError, KeyError, TypeError):
+    sys.exit(1)
+
+sys.exit(0 if type(offset) is int and offset == 0 else 1)
+' >/dev/null 2>&1
+}
+
 mux_awaiting_human(){
   local out visible dialog
   [ "$MUX" = herdr ] && [ "$(mux_status)" = blocked ] && return 0
@@ -249,7 +265,9 @@ mux_awaiting_human(){
     # rows. The visible source follows scroll position, so trust it only when
     # its bottom still proves this is the live prompt and status footer.
     [ "$MUX" = herdr ] || return 0
+    mux_herdr_visible_at_bottom || return 0
     visible=$("$MUX_HERDR" pane read "$PANE" --source visible 2>/dev/null) || return 0
+    mux_herdr_visible_at_bottom || return 0
     [ -n "$(printf '%s' "$visible" | tr -d '[:space:]')" ] || return 0
     printf '%s\n' "$visible" | mux_live_prompt_footer || return 0
     dialog=$(printf '%s\n' "$visible" | mux_visible_dialog_text) || return 0
