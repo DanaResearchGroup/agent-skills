@@ -53,6 +53,8 @@ if [ -n "$sid" ] && [ -f "$lw" ]; then
   badge="\033[1;5;97;45m ⏳ AUTO-RESUME @ ${lw_h:-reset} \033[0m"  # bold + blink, white on magenta
 elif [ -f "$STATE/disable-auto-compact" ]; then
   badge="\033[1;97;100m ⛔ AUTO-HANDOFF: OFF \033[0m"        # bold white on grey
+elif [ -n "$sid" ] && [ -f "$STATE/$sid.unreachable" ]; then
+  badge="\033[1;5;97;101m ⚠ AUTO-HANDOFF: UNREACHABLE \033[0m"
 elif [ -n "$sid" ] && [ -f "$STATE/$sid.stuck" ]; then
   # auto-handoff-sweep.sh gave up after repeated aborted cycles. Without this the
   # pane keeps showing a healthy ARMED badge while nothing will ever hand off

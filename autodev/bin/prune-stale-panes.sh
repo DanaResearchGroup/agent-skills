@@ -36,6 +36,7 @@ for f in "$STATE"/*.herdr-pane "$STATE"/*.tmux-pane; do
     echo "PRUNE (pane gone)  $base -> $PANE"
     [ "$APPLY" = 1 ] && rm -f "$f"; removed=$((removed+1)); continue
   fi
+  MUX_SESSION="$sid"
   owner="$(mux_pane_owner)"
   if [ -n "$owner" ] && [ "$owner" != "$sid" ]; then
     echo "PRUNE (reused)     $base -> $PANE now owned by $owner"

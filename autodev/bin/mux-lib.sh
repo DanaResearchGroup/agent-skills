@@ -55,14 +55,11 @@ MUX_AWAIT_YESNO_RE='^[[:space:]]*(❯[[:space:]]*)?[0-9]+\.[[:space:]]+(Yes|No)(
 : "${STATE:=$AUTODEV_HOME/state}"
 
 # --- registration side (runs in CC's env, from the hooks) --------------------
-# Record this session's backend pane id(s). Cheap by design: reads env vars only,
-# no subprocess to herdr/tmux, so it is safe on every statusline render. Writes
-# atomically. Records both files when a session is nested in both multiplexers.
 # Reverse pane->owner mapping file for a (mux, pane-id) pair. The pane id is
 # sanitized (':' and '%' -> '_') so it is a safe flat filename. This is the
-# tmux-side (and herdr fallback) source of truth for "who currently owns this
-# pane" — the last session to render a statusline in the pane wins, and a dead
-# session never renders again, so it never reclaims a recycled pane id.
+# tmux-side source of truth: the last rendered session wins. For herdr, the
+# reverse file is combined with the current label and ctx freshness; registration
+# replaces an obsolete owner only after validating that evidence.
 mux_owner_file(){ # $1 = mux, $2 = paneid
   printf '%s/.paneowner-%s-%s' "$STATE" "$1" "$(printf '%s' "$2" | tr ':%' '__')"
 }
@@ -70,14 +67,12 @@ mux_owner_file(){ # $1 = mux, $2 = paneid
 mux_register(){ # $1 = sid
   local sid="$1" f o
   [ -n "$sid" ] || return 0
+  case "$sid" in *[!A-Za-z0-9._-]*|.|..) return 0 ;; esac
   if [ "${HERDR_ENV:-}" = "1" ] && [ -n "${HERDR_PANE_ID:-}" ]; then
-    f="$STATE/$sid.herdr-pane"
-    printf '%s\n' "$HERDR_PANE_ID" > "$f.tmp" 2>/dev/null && mv "$f.tmp" "$f" 2>/dev/null
-    o=$(mux_owner_file herdr "$HERDR_PANE_ID")
-    printf '%s\n' "$sid" > "$o.tmp" 2>/dev/null && mv "$o.tmp" "$o" 2>/dev/null
+    _mux_register_herdr "$sid"
   fi
   # The TAB owning this pane, for the label badges (cache-warm-watch.sh). herdr
-  # exports it alongside the pane id, so this stays env-only and subprocess-free.
+  # exports it alongside the pane id; the tab registration remains env-only.
   if [ "${HERDR_ENV:-}" = "1" ] && [ -n "${HERDR_TAB_ID:-}" ]; then
     f="$STATE/$sid.herdr-tab"
     printf '%s\n' "$HERDR_TAB_ID" > "$f.tmp" 2>/dev/null && mv "$f.tmp" "$f" 2>/dev/null
@@ -88,6 +83,66 @@ mux_register(){ # $1 = sid
     o=$(mux_owner_file tmux "$TMUX_PANE")
     printf '%s\n' "$sid" > "$o.tmp" 2>/dev/null && mv "$o.tmp" "$o" 2>/dev/null
   fi
+}
+
+# Most statusline renders only read this stamp and the cached binding. Slow
+# validation runs on a changed env/binding pair, an unreachable flag, or expiry.
+# Cache BOTH ids so a permanently stale inherited env does not defeat the throttle.
+_mux_register_herdr(){ # $1 sid
+  local sid=$1 f="$STATE/$1.herdr-pane" stamp="$STATE/$1.herdr-register-check"
+  local cached="" checked=0 checked_env="" checked_pane="" now
+  if [ ! -s "$f" ]; then
+    # Never replace a concurrent resolver's result during initial publication.
+    printf '%s\n' "$HERDR_PANE_ID" > "$f.tmp.$$" 2>/dev/null &&
+      ln "$f.tmp.$$" "$f" 2>/dev/null
+    rm -f "$f.tmp.$$" 2>/dev/null
+  fi
+  [ -s "$f" ] && cached=$(cat "$f" 2>/dev/null)
+  [ -f "$stamp" ] && read -r checked checked_env checked_pane < "$stamp"
+  case "$checked" in ''|*[!0-9]*) checked=0 ;; esac
+  now=$(date +%s)
+  if [ -n "$cached" ] && [ ! -f "$STATE/$sid.unreachable" ] &&
+     [ "$checked_env" = "$HERDR_PANE_ID" ] && [ "$checked_pane" = "$cached" ] &&
+     [ "$(( now - checked ))" -ge 0 ] && [ "$(( now - checked ))" -lt 60 ]; then
+    return 0
+  fi
+
+  # A background worker can carry the spawning pane's id indefinitely. Prefer
+  # the resolved binding, trying the env only when that binding cannot be used.
+  if ! mux_session_reachable "$sid" && [ "$PANE" != "$HERDR_PANE_ID" ]; then
+    MUX=herdr; MUX_SESSION=$sid; PANE=$HERDR_PANE_ID
+    if mux_pane_live && [ "$(mux_pane_owner)" = "$sid" ]; then
+      printf '%s\n' "$PANE" > "$f.tmp.$$" 2>/dev/null && mv "$f.tmp.$$" "$f" 2>/dev/null
+    fi
+  fi
+  if mux_session_reachable "$sid"; then
+    if ! _mux_claim_herdr "$sid"; then
+      mux_session_reachable "$sid" || true
+      return 0
+    fi
+    # Recheck after the claim; a competing statusline can update its ctx while
+    # waiting for the per-pane claim lock. Failed checks retain the visible flag.
+    mux_session_reachable "$sid" || return 0
+    printf '%s %s %s\n' "$now" "$HERDR_PANE_ID" "$PANE" > "$stamp.tmp.$$" 2>/dev/null &&
+      mv "$stamp.tmp.$$" "$stamp" 2>/dev/null
+  fi
+  return 0
+}
+
+# Re-evaluate under the per-pane lock, then atomically REPLACE the reverse file.
+# A dead former owner must not reserve a recycled pane forever. flock releases
+# automatically on exit, so an interrupted registration leaves no stuck lock.
+_mux_claim_herdr(){ # $1 sid; uses the resolved MUX/PANE
+  (
+    local sid=$1 o
+    o=$(mux_owner_file herdr "$PANE")
+    command -v flock >/dev/null 2>&1 || return 1
+    exec 9>"$o.lock" || return 1
+    flock -n 9 || return 1
+    [ "$(mux_pane_owner)" = "$sid" ] || return 1
+    printf '%s\n' "$sid" > "$o.tmp.$$" 2>/dev/null &&
+      mv "$o.tmp.$$" "$o" 2>/dev/null
+  )
 }
 
 # --- driver side (runs detached in the watchers) -----------------------------
@@ -118,23 +173,105 @@ mux_pane_live(){
   esac
 }
 
-# Session uuid the pane is CURRENTLY bound to (0 args; uses MUX/PANE from
-# mux_init). herdr recycles short pane ids (w1:pY, w1:pC...) when tabs/sessions
-# close, so a live pane may now host a DIFFERENT session than the one that first
-# registered it — mux_pane_live only proves the pane exists, not that it is still
-# ours. This resolves the true current owner so callers can refuse to drive a
-# recycled pane. herdr: authoritative live query (falls back to the reverse-owner
-# file). tmux: the reverse-owner file. Prints the sid, or nothing if unknown.
+_mux_ctx_fresher(){ # $1 possible live owner, $2 our session
+  [ -f "$STATE/$1.ctx" ] &&
+    { [ ! -f "$STATE/$2.ctx" ] || [ "$STATE/$1.ctx" -nt "$STATE/$2.ctx" ]; }
+}
+
+# Effective owner, shared by every watcher ownership gate. A stale herdr
+# agent_session label alone cannot establish that a pane has been recycled.
+# A reverse owner yields to our current label when its ctx is missing or not
+# newer than ours. A fresher other ctx still proves live ownership and refuses.
+# Unknown herdr ownership prints nothing; driving requires positive ownership.
 mux_pane_owner(){
-  local o v
-  if [ "$MUX" = "herdr" ]; then
-    v=$("$MUX_HERDR" pane get "$PANE" 2>/dev/null \
-          | grep -o '"agent_session":{[^}]*}' \
-          | grep -o '"value":"[^"]*"' | head -1 | cut -d'"' -f4)
-    if [ -n "$v" ]; then printf '%s\n' "$v"; return 0; fi
-  fi
+  local o registered="" hint="" ours="${MUX_SESSION:-}"
   o=$(mux_owner_file "$MUX" "$PANE")
-  [ -s "$o" ] && cat "$o" 2>/dev/null
+  [ -s "$o" ] && registered=$(cat "$o" 2>/dev/null)
+  if [ "$MUX" != herdr ]; then
+    [ -n "$registered" ] && printf '%s\n' "$registered"
+    return 0
+  fi
+  hint=$("$MUX_HERDR" pane get "$PANE" 2>/dev/null \
+    | jq -r '(.result.pane // .result).agent_session.value // empty' 2>/dev/null)
+  # Treat labels/reverse files as ids, never as paths supplied by the backend.
+  case "$hint" in *[!A-Za-z0-9._-]*|.|..) hint="" ;; esac
+  case "$registered" in *[!A-Za-z0-9._-]*|.|..) registered="" ;; esac
+  if [ -n "$registered" ] && [ "$registered" != "$ours" ] &&
+     { [ "$hint" != "$ours" ] || _mux_ctx_fresher "$registered" "$ours"; }; then
+    printf '%s\n' "$registered"
+  elif [ -n "$hint" ] && [ "$hint" != "$ours" ] &&
+       _mux_ctx_fresher "$hint" "$ours"; then
+    printf '%s\n' "$hint"
+  elif [ -n "$ours" ] && { [ "$hint" = "$ours" ] ||
+       { [ "$registered" = "$ours" ] && [ -f "$STATE/$ours.ctx" ]; }; }; then
+    printf '%s\n' "$ours"
+  fi
+}
+
+# One flag and log entry per unreachable episode, even across overlapping
+# evaluations. Keep the binding: a temporary refusal must not destroy retries.
+mux_mark_unreachable(){ # $1 sid, $2 reason
+  local sid=$1 reason=$2
+  case "$sid" in ""|*[!A-Za-z0-9._-]*|.|..) return 1 ;; esac
+  if (set -C; printf '%s\n' "$reason" > "$STATE/$sid.unreachable") 2>/dev/null; then
+    mkdir -p "$AUTODEV_HOME/logs" 2>/dev/null
+    printf '%s [%s] UNREACHABLE %s\n' "$(date +'%Y.%m.%d %H.%M.%S')" "$sid" "$reason" \
+      >> "$AUTODEV_HOME/logs/auto-handoff.log"
+  fi
+  return 1
+}
+
+# A pane id may have been renumbered. Resolve only a unique exact session label,
+# then validate current ownership before publishing it. No pid/tty heuristic:
+# a daemon-hosted background conversation may have no attached pane at all.
+mux_resolve_herdr(){
+  local found old=$PANE
+  found=$("$MUX_HERDR" pane list 2>/dev/null | jq -er --arg sid "$MUX_SESSION" '
+    [.result.panes[]? | select(.agent_session.value == $sid) | .pane_id]
+    | select(length == 1) | .[0] | select(type == "string" and length > 0)' 2>/dev/null) || return 1
+  PANE=$found
+  if ! mux_pane_live || [ "$(mux_pane_owner)" != "$MUX_SESSION" ]; then
+    PANE=$old
+    return 1
+  fi
+  printf '%s\n' "$PANE" > "$STATE/$MUX_SESSION.herdr-pane.tmp.$$" &&
+    mv "$STATE/$MUX_SESSION.herdr-pane.tmp.$$" "$STATE/$MUX_SESSION.herdr-pane"
+}
+
+# Positive reachability gate for herdr; tmux retains its prior unknown-owner
+# behavior. Re-run at the send boundary as well as before taking cycle locks.
+mux_session_reachable(){ # $1 sid
+  local sid=$1 owner
+  MUX_OWNER=""
+  mux_init "$sid" || {
+    mux_mark_unreachable "$sid" 'no pane registered'
+    return 1
+  }
+  if ! mux_pane_live; then
+    if [ "$MUX" != herdr ] || ! mux_resolve_herdr; then
+      mux_mark_unreachable "$sid" "registered pane $PANE is not live; no unique session match"
+      return 1
+    fi
+  fi
+  owner=$(mux_pane_owner)
+  MUX_OWNER=$owner
+  if { [ -n "$owner" ] && [ "$owner" != "$sid" ]; } ||
+     { [ "$MUX" = herdr ] && [ "$owner" != "$sid" ]; }; then
+    mux_mark_unreachable "$sid" "pane $PANE ownership refused (owner: ${owner:-unproved})"
+    return 1
+  fi
+  rm -f "$STATE/$sid.unreachable" 2>/dev/null
+  return 0
+}
+
+# Check the SAME pane immediately before a herdr keystroke. Resolving a new
+# pane mid-cycle could send the tail of an old cycle into another attachment.
+_mux_refuse_unowned(){
+  [ "$MUX" = herdr ] && [ -n "${MUX_SESSION:-}" ] || return 0
+  if ! mux_pane_live || [ "$(mux_pane_owner)" != "$MUX_SESSION" ]; then
+    mux_mark_unreachable "$MUX_SESSION" "pane $PANE lost live ownership before send"
+    return 1
+  fi
 }
 
 # herdr agent state for the pane: prints idle|working|blocked|done|unknown.
@@ -363,6 +500,7 @@ _mux_refuse_staged_attempt(){
   return 0
 }
 _mux_refuse_if_awaiting(){
+  _mux_refuse_unowned || return 1
   mux_awaiting_human || return 0
   printf 'mux: refused: pane %s is awaiting the human (open question or prompt)\n' "$PANE" >&2
   return 1
@@ -384,7 +522,8 @@ mux_send_line(){ # $1 = text
            tmux send-keys -t "$PANE" -l "$1" || return 1
            _mux_refuse_if_awaiting || return "$MUX_REFUSED"
            tmux send-keys -t "$PANE" Enter ;;
-    herdr) "$MUX_HERDR" pane run "$PANE" "$1" >/dev/null 2>&1 ;;
+    herdr) _mux_refuse_unowned || return "$MUX_REFUSED"
+           "$MUX_HERDR" pane run "$PANE" "$1" >/dev/null 2>&1 ;;
     *) return 1 ;;
   esac
 }
@@ -397,7 +536,8 @@ mux_stage_text(){ # $1 = text
   _mux_refuse_if_awaiting || return "$MUX_REFUSED"
   case "$MUX" in
     tmux)  tmux send-keys -t "$PANE" -l "$1" ;;
-    herdr) "$MUX_HERDR" pane send-text "$PANE" "$1" >/dev/null 2>&1 ;;
+    herdr) _mux_refuse_unowned || return "$MUX_REFUSED"
+           "$MUX_HERDR" pane send-text "$PANE" "$1" >/dev/null 2>&1 ;;
     *) return 1 ;;
   esac
 }
@@ -409,11 +549,14 @@ mux_stage_text(){ # $1 = text
 #                 limit-stopped session), where no human question can be open.
 mux_send_key(){ # [--own-prompt] $1 = key
   _mux_refuse_staged_attempt && return "$MUX_REFUSED"
-  if [ "${1:-}" = --own-prompt ]; then shift
+  if [ "${1:-}" = --own-prompt ]; then
+    _mux_refuse_unowned || return "$MUX_REFUSED"
+    shift
   else _mux_refuse_if_awaiting || return "$MUX_REFUSED"; fi
   case "$MUX" in
     tmux)  tmux send-keys -t "$PANE" "$1" ;;
-    herdr) "$MUX_HERDR" pane send-keys "$PANE" "$1" >/dev/null 2>&1 ;;
+    herdr) _mux_refuse_unowned || return "$MUX_REFUSED"
+           "$MUX_HERDR" pane send-keys "$PANE" "$1" >/dev/null 2>&1 ;;
     *) return 1 ;;
   esac
 }

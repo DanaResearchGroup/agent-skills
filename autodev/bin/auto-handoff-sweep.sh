@@ -349,6 +349,11 @@ for pf in "$STATE"/*.herdr-pane "$STATE"/*.tmux-pane; do
     [ "$thr" = 1 ] && rm -f "$STATE/$sid.busy-since" 2>/dev/null
     continue
   fi
+  if [ "$MUX" = herdr ] && ! mux_session_reachable "$sid" &&
+     { [ -z "${MUX_OWNER:-}" ] || [ "$MUX_OWNER" = "$sid" ]; }; then
+    [ "$thr" = 1 ] && rm -f "$STATE/$sid.busy-since" 2>/dev/null
+    continue
+  fi
   if ! mux_pane_live; then
     [ "$thr" = 1 ] && rm -f "$STATE/$sid.busy-since" 2>/dev/null
     continue
