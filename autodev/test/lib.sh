@@ -105,6 +105,11 @@ mux_tab_rename(){
 }
 mux_pane_live(){ case " ${MUX_LIVE_PANES:-} " in *" $PANE "*) return 0;; *) return 1;; esac; }
 mux_pane_owner(){ local o; o=$(mux_owner_file "$MUX" "$PANE"); [ -s "$o" ] && cat "$o"; }
+mux_mark_unreachable(){ return 1; }
+mux_session_reachable(){
+  mux_init "$1" && mux_pane_live || return 1
+  return 0
+}
 mux_status(){ [ "${MUX_BUSY:-0}" = 1 ] && echo working || echo idle; }
 mux_capture(){ printf '%s' "${MUX_CAPTURE_TEXT:-}"; }
 MUX_REFUSED=3

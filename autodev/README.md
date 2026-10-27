@@ -8,6 +8,9 @@ keeps such a run alive across the two things that normally kill it:
   handoff → `/compact` → `/rename` → "read the handoff and continue" by sending keys to the
   session's pane (herdr or tmux). A session can also **voluntarily** request this below the
   threshold via `request-handoff.sh` (see below) — e.g. to hand off *before* opening a heavy phase.
+  Claude background sessions without a reachable, owned pane use an in-session Stop-hook
+  fallback; see [handoff reachability](reference/handoff-reach.md) for ownership, recovery,
+  and the one-shot human `/compact` notice after a request is filed.
 - **Phoenix** (session-limit auto-resume) — on a usage/session-limit stop, runs
   `/usage-credits` or waits until past the stated reset time, then sends `continue`.
 - **PM-nudger** — in a multi-pane campaign, notices when the PM session has gone quiet *and* its

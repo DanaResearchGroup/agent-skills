@@ -208,6 +208,7 @@ sandbox_rm
 setup
 seed_reload
 printf '%s\n' "$OTHER" > "$SB/herdr/owner"
+printf '%s\n' "$OTHER" > "$STATE/.paneowner-herdr-w1_p7G"
 sweep
 assert_no_file "a reused pane retires the old marker" "$STATE/$SID.reload-pending"
 assert_contains "the sweeper logs the new owner" "$(LOG)" "pane is now owned by session $OTHER"
@@ -268,6 +269,7 @@ setup
 seed_reload
 printf 'staged\n' > "$STATE/$SID.reload-attempt"
 printf '%s\n' "$OTHER" > "$SB/herdr/owner"
+printf '%s\n' "$OTHER" > "$STATE/.paneowner-herdr-w1_p7G"
 printf 'pct=40 ts=%s\n' "$(date +%s)" > "$STATE/$SID.ctx"
 printf '%s\n' "$$" > "$SB/cycle-holder.pid"
 : > "$SB/inject-cycle-lock-on-owner"

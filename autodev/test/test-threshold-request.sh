@@ -116,9 +116,13 @@ chmod +x "$BIN/auto-handoff-watch.sh"
 export AUTODEV_SETTLE=0 AUTODEV_POLL=0.01
 sweep
 for i in $(seq 1 100); do
-  [ "$(LOG | grep -c 'CYCLE COMPLETE' || true)" -ge 1 ] && break
+  # Completion is logged before the EXIT trap releases the cycle lock. The
+  # next sweep must observe the finished process, not that earlier log line.
+  if [ "$(LOG | grep -c 'CYCLE COMPLETE' || true)" -ge 1 ] &&
+     [ ! -e "$STATE/$SID.cycle.lock" ] && [ ! -L "$STATE/$SID.cycle.lock" ]; then break; fi
   sleep 0.02
 done
+assert_lock_absent "dry-run cycle released its lock before the next sweep" "$STATE/$SID.cycle.lock"
 assert_eq "first dry-run pass logs a preview" "$(would_raise)" 1
 assert_file "real dry-run watcher stamps cooldown" "$STATE/$SID.cooldown"
 assert_no_file "real dry-run watcher files no request" "$REQ"
@@ -282,8 +286,10 @@ sandbox_rm
 
 setup; clock 1500
 printf 'another-session\n' > "$SB/herdr/owner"
+printf 'another-session\n' > "$STATE/.paneowner-herdr-w1_p1"
 sweep
 assert_no_file "reassigned pane: clock deleted" "$CLOCK"
+printf '%s\n' "$SID" > "$STATE/.paneowner-herdr-w1_p1"
 printf '%s\n' "$SID" > "$SB/herdr/owner"
 sweep
 assert_no_file "reassigned pane returning: no request" "$REQ"

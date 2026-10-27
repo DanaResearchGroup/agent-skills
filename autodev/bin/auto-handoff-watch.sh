@@ -140,6 +140,14 @@ else
   pct=$(sed -n 's/^pct=\([0-9.]*\).*/\1/p' "$ctxf")
   [ -n "$pct" ] || exit 0
 fi
+if [ "$pct" != unknown ] && awk "BEGIN{exit !($pct < $THRESHOLD)}" &&
+   autodev_lock_publish "$STATE/$sid.cycle.lock" "$$"; then
+  current_pct=$(sed -n 's/^pct=\([0-9.]*\).*/\1/p' "$ctxf" 2>/dev/null)
+  if [ -n "$current_pct" ] && awk "BEGIN{exit !($current_pct < $THRESHOLD)}"; then
+    rm -f "$STATE/$sid.busy-deferrals" 2>/dev/null
+  fi
+  autodev_lock_release_owned "$STATE/$sid.cycle.lock" "$$" || true
+fi
 
 # A missing runtime tag means a pre-upgrade Claude Code session. Codex writes
 # its tag from the Stop hook and uses the host's explicit `$skill` syntax.
@@ -215,7 +223,12 @@ fi
 
 # --- pane registration gate (herdr preferred, tmux fallback) ---
 if ! command -v mux_init >/dev/null 2>&1 || ! mux_init "$sid"; then
-  log "SKIP no pane registered (pct=$pct)"; exit 0
+  mux_mark_unreachable "$sid" "no pane registered (pct=$pct)"
+  exit 0
+fi
+if [ "$MUX" = herdr ]; then
+  if ! mux_session_reachable "$sid" &&
+     { [ -z "${MUX_OWNER:-}" ] || [ "$MUX_OWNER" = "$sid" ]; }; then exit 0; fi
 fi
 pane="$PANE"
 if ! mux_pane_live; then
@@ -228,6 +241,26 @@ fi
 # Refuse, and self-heal by dropping our stale pane binding.
 owner=$(mux_pane_owner)
 if [ -n "$owner" ] && [ "$owner" != "$sid" ]; then
+  if [ "$MUX" = herdr ]; then
+    # A genuine owner change can retire retry state, but only under the cycle
+    # lock and after repeating the evidence check. Unproved ownership retains it.
+    reused_lock="$STATE/$sid.cycle.lock"
+    if autodev_lock_publish "$reused_lock" "$$"; then
+      # Registration may have recovered onto another pane while we waited.
+      mux_init "$sid" || true
+      owner_now=$(mux_pane_owner)
+      if [ -n "$owner_now" ] && [ "$owner_now" != "$sid" ]; then
+        if [ -f "$reload_marker" ] || [ -f "$reload_attempt" ]; then
+          rm -f "$reload_marker" "$reload_attempt" 2>/dev/null
+          log "DROP reload-pending: pane is now owned by session $owner_now"
+        fi
+      fi
+      autodev_lock_release_owned "$reused_lock" "$$" || true
+    else
+      log "SKIP reload cleanup: cycle lock held"
+    fi
+    exit 0
+  fi
   log "SKIP pane $pane reused by session $owner (not ours) — cleared stale binding (pct=$pct)"
   if [ -f "$reload_marker" ] || [ -f "$reload_attempt" ]; then
     rm -f "$reload_marker" "$reload_attempt" 2>/dev/null
@@ -456,6 +489,12 @@ fi
 
 trap 'release_cycle_lock' EXIT
 
+# Ownership can change while we wait for the lock. Never drive a pre-lock snapshot.
+if [ "$MUX" = herdr ]; then
+  mux_session_reachable "$sid" || exit 0
+  pane="$PANE"
+fi
+
 # A staged tmux literal locks every send for this session, even if a newer
 # request superseded the reload marker. Only a completed turn that is strictly
 # newer than the attempt proves the input was consumed and releases the lock.
@@ -671,6 +710,13 @@ if [ "$DRY" = 0 ] && mux_awaiting_human; then defer_awaiting "pre-send"; fi
 if [ "$DRY" = 0 ] && pane_busy; then
   if ! wait_pane_idle "$PRECHECK"; then
     : > "$STATE/$sid.deferred" 2>/dev/null
+    # Serialized by the cycle lock. Three consecutive failed idle windows hand
+    # control back to the session's Stop hook instead of waiting forever.
+    busy_n=$(cat "$STATE/$sid.busy-deferrals" 2>/dev/null || echo 0)
+    [ "$STATE/$sid.compacted" -nt "$STATE/$sid.busy-deferrals" ] && busy_n=0
+    case "$busy_n" in ''|*[!0-9]*) busy_n=0 ;; esac
+    busy_n=$(( busy_n < 3 ? busy_n + 1 : 3 ))
+    printf '%s\n' "$busy_n" > "$STATE/$sid.busy-deferrals"
     log "DEFER busy pane (agents/turn/queued input) pct=$pct — retry next idle turn"
     exit 0    # no cooldown: a genuine idle Stop will retry cleanly
   fi
@@ -691,6 +737,7 @@ if [ "$reason" = compact-requested ] && [ ! -f "$creq" ]; then
   log "ABORT compact-request withdrawn before trigger (pct=$pct)"; exit 0
 fi
 
+rm -f "$STATE/$sid.busy-deferrals" 2>/dev/null
 rm -f "$STATE/$sid.deferred" 2>/dev/null   # committed to the cycle: no longer merely deferring
 log "TRIGGER ($reason) pct=$pct thr=$THRESHOLD pane=$pane dry=$DRY"
 # Consume an explicit request NOW that we're committed to the cycle — before any
