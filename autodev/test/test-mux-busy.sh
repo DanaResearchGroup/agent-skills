@@ -18,7 +18,10 @@ busy_for() ( # $1 = herdr agent_status; prints busy|safe from the real mux_busy
   MUX=herdr STUB_STATUS="$1"
   . "$(dirname "$0")/../bin/mux-lib.sh"
   mux_status(){ printf '%s\n' "$STUB_STATUS"; }
-  mux_read_screen(){ cat "$SKILL_DIR/test/fixtures/panes/idle-prompt.txt"; }
+  mux_read_screen(){
+    printf -v "$2" '%s' "$(cat "$SKILL_DIR/test/fixtures/panes/idle-prompt.txt")"
+    MUX_SCREEN_SOURCE=recent-unwrapped
+  }
   mux_busy && echo busy || echo safe
 )
 

@@ -65,6 +65,7 @@ case "${1:-} ${2:-}" in
         [ -f "$H/new-req" ] && { : > "$(cat "$H/new-req")"; rm -f "$H/new-req"; }
         cat "$H/later.txt"; exit 0
       fi
+      [ -f "$H/recent-fail" ] && [ "$5" = recent-unwrapped ] && { printf 'partial stale output'; exit 1; }
       source=recent-unwrapped
       while [ "$#" -gt 0 ]; do
         if [ "$1" = --source ] && [ "$#" -ge 2 ]; then source=$2; shift 2; else shift; fi
@@ -187,6 +188,22 @@ setup
 cp "$FX/post-compact-recent.txt" "$SB/herdr/recent.txt"
 cp "$FX/post-compact-visible-idle.txt" "$SB/herdr/visible.txt"
 assert_eq "blank recent + live footer at integer offset 0 is not awaiting" "$(mux mux_awaiting_human)" 1
+sandbox_rm
+
+for fx in post-compact-visible-idle post-compact-visible-menu; do
+  setup
+  : > "$SB/herdr/recent-fail"
+  cp "$FX/$fx.txt" "$SB/herdr/visible.txt"
+  expected=0
+  [ "$fx" = post-compact-visible-idle ] && expected=1
+  assert_eq "failed recent + $fx uses visible" "$(mux mux_awaiting_human)" "$expected"
+  sandbox_rm
+done
+
+setup
+: > "$SB/herdr/recent.txt"
+printf '  \n\t\n' > "$SB/herdr/visible.txt"
+assert_eq "both recent and visible blank stay awaiting" "$(mux mux_awaiting_human)" 0
 sandbox_rm
 
 for offset in 1 0.0 '"0"' null true; do

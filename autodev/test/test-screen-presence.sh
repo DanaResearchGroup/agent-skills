@@ -18,8 +18,21 @@ case "$1 $2" in
   'pane get')
     owner=sess-a
     [ -f "$SB/new-owner" ] && owner=sess-b
-    printf '{"result":{"pane":{"agent_session":{"value":"%s"},"agent_status":"idle"}}}\n' "$owner" ;;
+    offset=0
+    [ -f "$SB/scroll-offset" ] && offset=$(cat "$SB/scroll-offset")
+    printf '{"result":{"pane":{"agent_session":{"value":"%s"},"agent_status":"idle","scroll":{"offset_from_bottom":%s}}}}\n' "$owner" "$offset" ;;
   'pane read')
+    if [ "$5" = visible ]; then
+      [ -f "$SB/read-fails" ] && exit 1
+      if [ -f "$SB/blank-reads" ] && [ "$(cat "$SB/read-count")" -le "$(cat "$SB/blank-reads")" ]; then
+        exit 0
+      fi
+      if [ -f "$SB/visible" ]; then cat "$SB/visible"; else cat "$SB/screen"; fi
+      exit 0
+    fi
+    [ -f "$SB/recent-fails" ] && { printf 'partial stale output'; exit 1; }
+    [ -f "$SB/recent-empty" ] && exit 0
+    [ -f "$SB/recent-blank" ] && { printf '  \n\t\n'; exit 0; }
     if [ "$7" = 5 ]; then
       n=0
       [ -f "$SB/read-count" ] && n=$(cat "$SB/read-count")
@@ -185,6 +198,57 @@ rm -f "$STATE/sess-a.fallback-cooldown"
 assert_eq 'recovered screen makes Stop silent even without cooldown' "$(stop)" ''
 assert_no_file 'recovered Stop consumes no fallback cooldown' "$STATE/sess-a.fallback-cooldown"
 sandbox_rm
+
+# After compaction, visible is the only usable source. Test the actual guard
+# directly so neither a dialog precheck nor a fake send can hide its result.
+for recent in empty blank fails; do
+  setup
+  touch "$SB/recent-$recent"
+  sed 's/AUTO-HANDOFF: ARMED/AUTO-HANDOFF: ARMED ⟨cc:sess-a⟩/' \
+    "$SKILL_DIR/test/fixtures/panes/post-compact-visible-idle.txt" > "$SB/visible"
+  mux_awaiting_human; rc=$?
+  assert_eq "$recent recent: visible idle screen is not awaiting" "$rc" 1
+  mux_send_line reload > "$SB/send.out" 2>&1; rc=$?
+  assert_eq "$recent recent: visible idle owner permits reload" "$rc" 0
+  assert_eq "$recent recent: fake records exactly the reload" "$(cat "$SB/typed")" 'pane run w1:pX reload'
+  : > "$SB/typed"
+  _mux_refuse_unowned; rc=$?
+  assert_eq "$recent recent: visible owner tag passes" "$rc" 0
+  assert_contains "$recent recent: visible text was requested" "$(cat "$SB/calls")" 'pane read w1:pX --source visible --format text'
+  printf '1\n' > "$SB/scroll-offset"
+  _mux_refuse_unowned; rc=$?
+  assert_eq "$recent recent: scrolled owner tag refuses" "$rc" 1
+  assert_file "$recent recent: scrolled viewport records refusal" "$STATE/sess-a.unreachable"
+  mux_send_key --own-prompt Escape > "$SB/send.out" 2>&1; rc=$?
+  assert_eq "$recent recent: scrolled owner tag refuses own-prompt key" "$rc" 3
+  assert_eq "$recent recent: scrolled viewport gets no key" "$(cat "$SB/typed")" ''
+  printf '0\n' > "$SB/scroll-offset"
+  _mux_refuse_unowned; rc=$?
+  assert_eq "$recent recent: bottom owner tag passes after scrolling back" "$rc" 0
+  assert_no_file "$recent recent: bottom recovery clears refusal" "$STATE/sess-a.unreachable"
+  mux_send_key --own-prompt Escape > "$SB/send.out" 2>&1; rc=$?
+  assert_eq "$recent recent: bottom owner tag permits own-prompt key" "$rc" 0
+  assert_eq "$recent recent: bottom viewport gets exactly one key" "$(cat "$SB/typed")" 'pane send-keys w1:pX Escape'
+  : > "$SB/typed"
+  cp "$SKILL_DIR/test/fixtures/panes/session-b-status.txt" "$SB/visible"
+  _mux_refuse_unowned; rc=$?
+  assert_eq "$recent recent: visible foreign tag refuses" "$rc" 1
+  assert_file "$recent recent: refusal is recorded" "$STATE/sess-a.unreachable"
+  # The split is inside the tag, not just between the tag and nearby text.
+  printf '❯\n────────────\n AUTO-HANDOFF: ARMED ⟨cc:ses\ns-a⟩ Claude\n auto mode on\n' > "$SB/visible"
+  _mux_refuse_unowned; rc=$?
+  assert_eq "$recent recent: wrapped visible owner tag recovers" "$rc" 0
+  assert_no_file "$recent recent: recovery clears refusal" "$STATE/sess-a.unreachable"
+  cat "$SKILL_DIR/test/fixtures/panes/session-a-status.txt" > "$SB/visible"
+  printf 'one\ntwo\nthree\nfour\nfive\n' >> "$SB/visible"
+  _mux_refuse_unowned; rc=$?
+  assert_eq "$recent recent: old viewport tag outside bottom five refuses" "$rc" 1
+  : > "$SB/visible"
+  _mux_refuse_unowned; rc=$?
+  assert_eq "$recent recent: blank visible refuses" "$rc" 1
+  assert_eq "$recent recent: guard tests send no input" "$(cat "$SB/typed")" ''
+  sandbox_rm
+done
 
 for runtime in codex unknown; do
   setup
