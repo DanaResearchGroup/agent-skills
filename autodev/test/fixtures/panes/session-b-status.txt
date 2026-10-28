@@ -1,0 +1,5 @@
+❯
+──────────────────────────────────────────────────────
+ 🔴 AUTO-HANDOFF: ARMED  ⟨cc:sess-b⟩  Claude 30k (30.0%)
+ ⏵⏵ auto mode on (shift+tab to cycle)
+

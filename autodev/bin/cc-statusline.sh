@@ -2,7 +2,7 @@
 # Claude Code status line + context-signal writer for the auto-handoff watcher.
 # Reads the statusline JSON on stdin, writes the live context % and tmux pane to
 # ~/agents/state/<session>.{ctx,tmux-pane}, then prints the user's status line
-# (output preserved byte-for-byte from the original inline statusLine command).
+# with a stable session tag for send-boundary screen verification.
 input=$(cat)
 : "${AUTODEV_HOME:=$HOME/agents}"; export AUTODEV_HOME
 STATE="$AUTODEV_HOME/state"
@@ -153,6 +153,11 @@ fi
 cache_seg=""
 command -v cc_cache_seg >/dev/null 2>&1 && cache_seg=$(cc_cache_seg "$tpath")
 
+session_tag=""
+if [ -n "$sid" ] && command -v mux_session_tag >/dev/null 2>&1; then
+  session_tag=" $(mux_session_tag "$sid")"
+fi
+
 if [ -n "$pct" ]; then
   pct_fmt=$(printf '%s' "$pct" | awk '{printf "%.1f", $1}')
   if command -v cc_ctx_color >/dev/null 2>&1; then
@@ -162,9 +167,9 @@ if [ -n "$pct" ]; then
   else
     color="\033[31m"
   fi
-  printf "%b%b  %s %s %b(%s%%)\033[0m%b%b%b%b" "$badge" "$ad_badge" "$model" "$tok_fmt" "$color" "$pct_fmt" "$cache_seg" "$loc" "$spar_badge" "$pq_badge"
+  printf "%b%s%b  %s %s %b(%s%%)\033[0m%b%b%b%b" "$badge" "$session_tag" "$ad_badge" "$model" "$tok_fmt" "$color" "$pct_fmt" "$cache_seg" "$loc" "$spar_badge" "$pq_badge"
 else
-  printf "%b%b  %s %s%b%b%b%b" "$badge" "$ad_badge" "$model" "$tok_fmt" "$cache_seg" "$loc" "$spar_badge" "$pq_badge"
+  printf "%b%s%b  %s %s%b%b%b%b" "$badge" "$session_tag" "$ad_badge" "$model" "$tok_fmt" "$cache_seg" "$loc" "$spar_badge" "$pq_badge"
 fi
 
 # ---- optional context-window bar (second row) ----

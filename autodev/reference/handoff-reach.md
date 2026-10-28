@@ -13,19 +13,25 @@ The implementation follows this order:
 1. Compare herdr's session label with reverse-owner registration and context
    freshness. When herdr labels the pane as ours, a former reverse owner with
    missing or no newer context is stale; registration atomically replaces it.
-   A fresher context for the other session still proves live ownership and is
+   A fresher context for the other session is treated as ownership evidence and is
    refused. A different label alone does not prove reuse. Unknown ownership
    permits no herdr input. All watcher gates share `mux_pane_owner`.
 2. If a registered pane is gone, accept a unique exact session match from
    `pane list`, then verify its live ownership. Keep that binding across later
    renders carrying a stale environment id. An unlabelled attachment or no
    attachment remains unreachable, rather than guessing from a working directory.
-3. Record `<sid>.unreachable` and its reason once per episode. Show
-   `AUTO-HANDOFF: UNREACHABLE`; clear it after verified recovery. Refusal of
-   unknown ownership retains pending retry state.
+3. Immediately before each herdr send for a `claude` runtime, require the
+   session's status-line tag in a five-line `recent-unwrapped` text read.
+   Labels and timestamps cannot establish screen presence. Record
+   `<sid>.unreachable` and its reason once per episode, showing
+   `AUTO-HANDOFF: UNREACHABLE`. Metadata-only reachability and registration
+   checks preserve screen refusals; a successful send-boundary screen check
+   clears them. Refusal retains the pane binding and pending retry state.
 4. At 35% or above, the Claude Stop hook is the primary route when driving is
    impossible: ask the session to run `/handoff` and file its own compact-only
-   request. For an owned but continuously busy pane, use this fallback after
+   request. A persisted screen-presence refusal triggers this fallback even
+   when metadata remains reachable for watcher retries. For an owned but
+   continuously busy pane, use this fallback after
    three consecutive failed idle windows. Ordinary fallback notices have a
    900-second cooldown. Arming, the kill switch, and active cycle locks apply.
 5. Once an unsatisfied handoff/compact request is filed, the fallback reason is exactly
@@ -90,6 +96,47 @@ not a live API/daemon experiment. It supports using the documented
 `{"decision":"block","reason":...}` route; an additionalContext route is not
 needed for that runner. The cooldown and once-per-marker guards are tested
 separately with the real hook and fake herdr, including active goal continuations.
+
+## Screen-presence probe (2026-10-28)
+
+Standalone read-only `herdr pane list` and
+`herdr pane read <pane> --source recent-unwrapped --lines 5 --format text`
+calls succeeded with sandbox escalation. Two Claude Code panes, one idle and
+one working, both included the status line in those bottom five lines. Both
+also included the prompt separator and mode footer; the working pane included
+an update notice. Two Codex panes showed `Ask Codex to do anything`, followed
+by model, reasoning level, directory, context usage, task title, shortcuts and
+warning counts. Neither showed a session id or equivalent stable marker.
+Only these bottom regions were sampled; the probe did not drive any pane.
+
+Before this change, `cc-statusline.sh` printed the handoff state badge,
+optional AUTODEV badge, model, input token count, context percentage, and
+optional cache, location, spar-context and deferred-question segments. An
+optional context bar occupied a second row. It printed no session identity.
+It now prints `⟨cc:ab12cd34⟩` after the handoff badge, using the first eight
+session-id characters. The fixed `⟨cc:…⟩` wrapper distinguishes the tag from
+ordinary prose and bare ids; it is an accidental-misrouting guard, not an
+authentication token. The renderer and sender share `mux_session_tag`.
+
+The screen check runs only in `_mux_refuse_unowned`, including the final
+check after any dialog read and the own-prompt key path. To tolerate a
+post-compaction redraw, it tries up to five reads, waiting one second between
+attempts (`AUTODEV_POLL` overrides that delay). Ownership is rechecked after
+each wait, and recovery after a wait also rechecks for an open human dialog.
+Empty, unreadable or tagless screens produce one final refusal after the
+bound. A tag outside the bottom five lines does not
+qualify. Status-line registration never reads the screen. Codex and unknown
+runtimes retain the metadata-based behavior because the probe found no stable
+visible session marker for them; tmux behavior is unchanged. Existing Claude
+sessions need a status-line refresh with the tagged renderer before watcher
+sends can pass. The short tag can collide for ids sharing eight characters,
+and separate read/send socket calls cannot make attachment changes atomic.
+
+`bash autodev/test/test-screen-presence.sh` uses synthetic status-line fixtures
+and a fake herdr to exercise every send method, stale metadata, successful
+recovery, persistent refusal across renders, unreadable/empty screens, old
+scrollback tags, a screen switch after the dialog check, and Codex/unknown
+runtime compatibility. No real pane receives input.
 
 ## Separate updater issue
 

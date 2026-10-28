@@ -54,6 +54,9 @@ MUX_AWAIT_YESNO_RE='^[[:space:]]*(❯[[:space:]]*)?[0-9]+\.[[:space:]]+(Yes|No)(
 : "${AUTODEV_HOME:=$HOME/agents}"
 : "${STATE:=$AUTODEV_HOME/state}"
 
+# Shared by the Claude status line and the send-boundary presence check.
+mux_session_tag(){ printf '⟨cc:%s⟩' "${1:0:8}"; }
+
 # --- registration side (runs in CC's env, from the hooks) --------------------
 # Reverse pane->owner mapping file for a (mux, pane-id) pair. The pane id is
 # sanitized (':' and '%' -> '_') so it is a safe flat filename. This is the
@@ -260,18 +263,54 @@ mux_session_reachable(){ # $1 sid
     mux_mark_unreachable "$sid" "pane $PANE ownership refused (owner: ${owner:-unproved})"
     return 1
   fi
-  rm -f "$STATE/$sid.unreachable" 2>/dev/null
+  # Labels/mtimes cannot clear a screen refusal. Only a later send-boundary
+  # screen check can confirm recovery; registration must not read the screen.
+  if [ "$MUX" != herdr ] || [ "$(cat "$STATE/$sid.runtime" 2>/dev/null)" != claude ] ||
+     ! grep -q '^screen presence unproved:' "$STATE/$sid.unreachable" 2>/dev/null; then
+    rm -f "$STATE/$sid.unreachable" 2>/dev/null
+  fi
   return 0
 }
 
 # Check the SAME pane immediately before a herdr keystroke. Resolving a new
 # pane mid-cycle could send the tail of an old cycle into another attachment.
 _mux_refuse_unowned(){
+  local screen tag attempt present=0
   [ "$MUX" = herdr ] && [ -n "${MUX_SESSION:-}" ] || return 0
   if ! mux_pane_live || [ "$(mux_pane_owner)" != "$MUX_SESSION" ]; then
     mux_mark_unreachable "$MUX_SESSION" "pane $PANE lost live ownership before send"
     return 1
   fi
+  if [ "$(cat "$STATE/$MUX_SESSION.runtime" 2>/dev/null)" = claude ]; then
+    tag=$(mux_session_tag "$MUX_SESSION")
+    # Compaction can leave the bottom region blank during a redraw. Keep this
+    # bounded and at the send boundary; recheck ownership after every wait.
+    for attempt in 1 2 3 4 5; do
+      if [ "$attempt" -gt 1 ]; then
+        sleep "${AUTODEV_POLL:-1}"
+        if ! mux_pane_live || [ "$(mux_pane_owner)" != "$MUX_SESSION" ]; then
+          mux_mark_unreachable "$MUX_SESSION" "pane $PANE lost live ownership before send"
+          return 1
+        fi
+      fi
+      if screen=$("$MUX_HERDR" pane read "$PANE" --source recent-unwrapped --lines 5 --format text 2>/dev/null) &&
+         [[ "$screen" == *"$tag"* ]]; then
+        present=1
+        break
+      fi
+    done
+    if [ "$present" != 1 ]; then
+      mux_mark_unreachable "$MUX_SESSION" "screen presence unproved: pane $PANE lacks $tag before send"
+      return 1
+    fi
+    if grep -q '^screen presence unproved:' "$STATE/$MUX_SESSION.unreachable" 2>/dev/null; then
+      rm -f "$STATE/$MUX_SESSION.unreachable" 2>/dev/null
+    fi
+    # A dialog may have opened while we waited, including on an own-prompt
+    # send whose original permission to bypass that check is now stale.
+    if [ "$attempt" -gt 1 ] && mux_awaiting_human; then return 1; fi
+  fi
+  return 0
 }
 
 # herdr agent state for the pane: prints idle|working|blocked|done|unknown.

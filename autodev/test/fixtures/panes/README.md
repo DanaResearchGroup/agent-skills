@@ -1,8 +1,9 @@
 # Pane-screen fixtures
 
-Bottom-of-pane text for `test-awaiting-human.sh` and `test-pm-nudge.sh`, as
-`herdr pane read` returns it. `mux_text_awaiting_human` (in `bin/mux-lib.sh`)
-must flag every file here except the two `idle-*` ones.
+Bottom-of-pane text for the mux tests, as `herdr pane read` returns it.
+`test-awaiting-human.sh` and `test-pm-nudge.sh` distinguish open dialogs from
+idle prompts; `test-screen-presence.sh` checks the session tags on synthetic
+status lines.
 
 | File | State | Source |
 |---|---|---|
@@ -16,6 +17,7 @@ must flag every file here except the two `idle-*` ones.
 | `other-row.txt` | single-select with the cursor on the free-text "Other" row, text typed | assembled |
 | `rate-limit-menu.txt` | usage-limit menu ("What do you want to do?" with Stop-and-wait / extra usage rows) | assembled |
 | `idle-after-answer.txt` | idle prompt whose transcript quotes a dialog footer higher up | assembled |
+| `session-a-status.txt`, `session-b-status.txt` | idle prompts with distinct session tags | synthetic |
 
 The real captures come from herdr's saved scrollback (`~/.config/herdr/session-history.json`).
 This repo is public, so the question and option wording was replaced with neutral text. The chrome

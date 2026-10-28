@@ -49,6 +49,11 @@ stop_fallback() (
     return 1
   }
   mux_session_reachable "$sid" || failed=1
+  # Metadata stays reachable so the watcher can retry its screen check. A
+  # persisted screen refusal still needs the in-session handoff fallback.
+  if grep -q '^screen presence unproved:' "$STATE/$sid.unreachable" 2>/dev/null; then
+    failed=1
+  fi
   if [ -f "$STATE/$sid.busy-deferrals" ] &&
      ! [ "$STATE/$sid.compacted" -nt "$STATE/$sid.busy-deferrals" ]; then
     busy_n=$(cat "$STATE/$sid.busy-deferrals" 2>/dev/null)
