@@ -293,8 +293,9 @@ _mux_refuse_unowned(){
           return 1
         fi
       fi
-      if screen=$("$MUX_HERDR" pane read "$PANE" --source recent-unwrapped --lines 5 --format text 2>/dev/null) &&
-         [[ "$screen" == *"$tag"* ]]; then
+      if mux_read_screen 5 screen &&
+         { [ "$MUX_SCREEN_SOURCE" != visible ] || [ "$MUX_SCREEN_AT_BOTTOM" = 1 ]; } &&
+         [[ "$(printf '%s\n' "$screen" | awk 'NF' | tail -n 5 | tr -d '\n')" == *"$tag"* ]]; then
         present=1
         break
       fi
@@ -332,14 +333,31 @@ mux_capture(){
   esac
 }
 
-# Print the pane's recent text with soft-wrapped lines joined, so a footer never
-# splits across rows. Non-zero when the pane cannot be read.
-mux_read_screen(){
+# Print recent unwrapped text, falling back to the possibly wrapped viewport.
+# Optional $2 names a caller variable, avoiding a subshell when it also needs
+# MUX_SCREEN_SOURCE and MUX_SCREEN_AT_BOTTOM for the visible-screen safeguards.
+# Non-zero when neither source can be read; blank output still means fail safe.
+mux_read_screen(){ # $1 = recent line limit (default 80), $2 = output variable
+  local text at_bottom=0
+  MUX_SCREEN_SOURCE=recent-unwrapped
+  MUX_SCREEN_AT_BOTTOM=0
   case "$MUX" in
-    herdr) "$MUX_HERDR" pane read "$PANE" --source recent-unwrapped --lines 80 2>/dev/null ;;
-    tmux)  tmux capture-pane -J -p -t "$PANE" 2>/dev/null ;;
+    herdr)
+      if ! text=$("$MUX_HERDR" pane read "$PANE" --source recent-unwrapped --lines "${1:-80}" --format text 2>/dev/null) ||
+         [ -z "$(printf '%s' "$text" | tr -d '[:space:]')" ]; then
+        MUX_SCREEN_SOURCE=visible
+        # Bracket the viewport read so both dialog and presence checks can
+        # reject visible text when it is not confirmed at the live bottom.
+        mux_herdr_visible_at_bottom && at_bottom=1
+        text=$("$MUX_HERDR" pane read "$PANE" --source visible --format text 2>/dev/null) || return 1
+        if [ "$at_bottom" = 1 ] && mux_herdr_visible_at_bottom; then
+          MUX_SCREEN_AT_BOTTOM=1
+        fi
+      fi ;;
+    tmux) text=$(tmux capture-pane -J -p -t "$PANE" 2>/dev/null) || return 1 ;;
     *) return 1 ;;
   esac
+  if [ -n "${2:-}" ]; then printf -v "$2" '%s' "$text"; else printf '%s\n' "$text"; fi
 }
 
 # 0 = the pane text on stdin ends in a dialog waiting on the human. Pure: reads
@@ -433,20 +451,14 @@ sys.exit(0 if type(offset) is int and offset == 0 else 1)
 }
 
 mux_awaiting_human(){
-  local out visible dialog
+  local out dialog
   [ "$MUX" = herdr ] && [ "$(mux_status)" = blocked ] && return 0
-  out=$(mux_read_screen) || return 0
-  if [ -z "$(printf '%s' "$out" | tr -d '[:space:]')" ]; then
-    # A post-compaction recent-unwrapped read can briefly contain only blank
-    # rows. The visible source follows scroll position, so trust it only when
-    # its bottom still proves this is the live prompt and status footer.
-    [ "$MUX" = herdr ] || return 0
-    mux_herdr_visible_at_bottom || return 0
-    visible=$("$MUX_HERDR" pane read "$PANE" --source visible 2>/dev/null) || return 0
-    mux_herdr_visible_at_bottom || return 0
-    [ -n "$(printf '%s' "$visible" | tr -d '[:space:]')" ] || return 0
-    printf '%s\n' "$visible" | mux_live_prompt_footer || return 0
-    dialog=$(printf '%s\n' "$visible" | mux_visible_dialog_text) || return 0
+  mux_read_screen 80 out || return 0
+  [ -n "$(printf '%s' "$out" | tr -d '[:space:]')" ] || return 0
+  if [ "$MUX" = herdr ] && [ "$MUX_SCREEN_SOURCE" = visible ]; then
+    [ "$MUX_SCREEN_AT_BOTTOM" = 1 ] || return 0
+    printf '%s\n' "$out" | mux_live_prompt_footer || return 0
+    dialog=$(printf '%s\n' "$out" | mux_visible_dialog_text) || return 0
     printf '%s\n' "$dialog" | mux_text_awaiting_human
     return $?
   fi
