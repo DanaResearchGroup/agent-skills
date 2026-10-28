@@ -13,7 +13,9 @@
 # The first two denials of one request return deny + reason; from the third on
 # the hook returns {"continue":false,...}, which stops Claude outright.
 #
-# Allow-list (minimal): writes under handoffs/, request-handoff.sh, reading this
+# During the watcher's live handoff phase, all tools except delegated work and
+# background Bash can finish the handoff. Otherwise the allow-list is minimal:
+# writes under handoffs/, request-handoff.sh, reading this
 # session's own state files / the handoffs dir, and the exact read-only and
 # pointer-writing shapes the handoff skill runs after filing.
 #
@@ -57,20 +59,28 @@ for k in compact-request handoff-request; do
   m=$(date -r "$f" +%s%N 2>/dev/null) || exit 0
   [ "$m" -gt "$req_key" ] && req_key=$m
 done
-[ "$req_key" -gt 0 ] || exit 0
-
 # The watcher can only act on a session with a registered pane.
 [ -e "$STATE/$sid.herdr-pane" ] || [ -e "$STATE/$sid.tmux-pane" ] || exit 0
 
-# The watcher is driving this session's cycle right now (it holds the cycle lock
-# with a live pid): /handoff must be free to run its own steps, and a request
-# marker may legitimately still exist (a compact-request filed mid-cycle).
+# Housekeeping also takes the cycle lock. Only a phase marker naming its live
+# owner proves the watcher has entered /handoff, before the session files a
+# request. An abandoned marker cannot engage the gate on its own.
+cycle_live=0
 lock="$STATE/$sid.cycle.lock"
 if autodev_lock_path_present "$lock"; then
   autodev_lock_read_owner "$lock"
   lpid=$lock_owner_pid
-  [ -n "$lpid" ] && kill -0 "$lpid" 2>/dev/null && exit 0
+  phase_pid=$(cat "$STATE/$sid.cycle-handoff" 2>/dev/null) || phase_pid=
+  if [ -n "$lpid" ] && [ "$phase_pid" = "$lpid" ] && kill -0 "$lpid" 2>/dev/null; then
+    cycle_live=1
+    if [ "$req_key" = 0 ]; then
+      # Stable across hook calls, distinct when a later cycle replaces the lock.
+      cycle_key=$(autodev_lock_object_signature "$lock") || exit 0
+      req_key="cycle:$lpid:$cycle_key"
+    fi
+  fi
 fi
+[ "$req_key" != 0 ] || exit 0
 
 tool=$(printf '%s' "$input" | jq -r '.tool_name // empty' 2>/dev/null) || exit 0
 [ -n "$tool" ] || exit 0
@@ -215,6 +225,20 @@ bash_ok() {
 
 allowed() {
   local p
+  # Probe: test/test-handoff-gate.sh already uses Agent/Task in synthetic
+  # PreToolUse fixtures; slack-ask/SKILL.md documents Bash run_in_background.
+  # No captured payload/docs here confirm launch vs resume names, SendMessage,
+  # or the background flag's exact nesting. Deny those names conservatively and
+  # check tool_input.run_in_background, matching the hook's tool_input envelope.
+  case "$tool" in
+    Agent|Task|SendMessage) return 1 ;;
+    Bash)
+      p=$(printf '%s' "$input" | jq -r '.tool_input.run_in_background == true' 2>/dev/null) || exit 0
+      [ "$p" = true ] && return 1 ;;
+  esac
+  # The full handoff workflow includes git commits, recording state, and shell
+  # setup/migration commands. Only delegated/background work is gated mid-cycle.
+  [ "$cycle_live" = 1 ] && return 0
   case "$tool" in
     Write|Edit|MultiEdit|NotebookEdit)
       p=$(printf '%s' "$input" | jq -r '.tool_input.file_path // .tool_input.notebook_path // empty' 2>/dev/null) || exit 0
