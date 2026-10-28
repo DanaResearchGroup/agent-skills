@@ -129,7 +129,7 @@ out=$(gate NotebookEdit "$(jq -nc --arg p "$H/n.ipynb" '{notebook_path:$p}')")
 assert_eq "NotebookEdit under handoffs/ is allowed" "$out" ""
 out=$(gate NotebookEdit "$(jq -nc --arg p "$SB/n.ipynb" '{notebook_path:$p}')")
 assert_eq "NotebookEdit elsewhere is denied" "$(decision "$out")" deny
-for t in mcp__slack__post Task Agent TodoWrite WebFetch WebSearch ExitPlanMode; do
+for t in mcp__slack__post Task Agent SendMessage TodoWrite WebFetch WebSearch ExitPlanMode; do
   out=$(gate "$t" '{}')
   assert_eq "$t is denied" "$(decision "$out")" deny
 done
@@ -182,16 +182,118 @@ assert_eq "a new request within the same second resets the counter" "$(decision 
 unset KEEP_COUNT
 sandbox_rm
 
-echo "== a gate that could deny forever =="
-# The watcher is driving the cycle (/handoff must be free to run its own steps).
+# Use this test process as the live owner; it cannot expire during assertions.
+cycle_live() {
+  /bin/ln -s "/dev/null/autodev-lock-owner/$$" "$STATE/$SID.cycle.lock"
+  printf '%s\n' "$$" > "$STATE/$SID.cycle-handoff"
+}
+
+echo "== housekeeping and stale phase markers do not engage the gate =="
+setup; cycle_live
+rm -f "$STATE/$SID.cycle-handoff"
+for t in Agent Task SendMessage Bash; do
+  out=$(gate "$t" '{"command":"make test","run_in_background":true}')
+  assert_eq "housekeeping lock without a phase: $t allowed" "$out" ""
+done
+# A different live PID is no more authoritative than a missing marker.
+sleep 30 & other_pid=$!
+printf '%s\n' "$other_pid" > "$STATE/$SID.cycle-handoff"
+out=$(gate Agent '{}')
+assert_eq "phase PID mismatches live lock owner -> Agent allowed" "$out" ""
+kill "$other_pid" 2>/dev/null; wait "$other_pid" 2>/dev/null
+out=$(gate Agent '{}')
+assert_eq "dead phase PID mismatches live lock owner -> Agent allowed" "$out" ""
+rm -f "$STATE/$SID.cycle.lock"
+/bin/ln -s "/dev/null/autodev-lock-owner/$other_pid" "$STATE/$SID.cycle.lock"
+out=$(gate Agent '{}')
+assert_eq "matching phase and lock PID is dead -> Agent allowed" "$out" ""
+rm -f "$STATE/$SID.cycle.lock"
+out=$(gate Agent '{}')
+assert_eq "orphan phase without a lock -> Agent allowed" "$out" ""
+# A pending request remains sufficient regardless of the housekeeping phase.
+/bin/ln -s "/dev/null/autodev-lock-owner/$$" "$STATE/$SID.cycle.lock"
+pending
+out=$(gate Agent '{}')
+assert_eq "pending request still denies Agent during housekeeping" "$(decision "$out")" deny
+sandbox_rm
+
+echo "== live cycle blocks delegated/background work, with either request =="
+for request in compact-request handoff-request; do
+  setup; : > "$STATE/$SID.$request"; cycle_live
+  for t in Agent Task SendMessage; do
+    out=$(gate "$t" '{"resume":"existing-agent"}')
+    assert_eq "$request: live cycle denies $t resume" "$(decision "$out")" deny
+    assert_eq "$request: live cycle explains how to yield" "$(reason "$out")" "$REASON"
+  done
+  # Even an otherwise allowed handoff command must not escape in the background.
+  cmd="bash /x/autodev/bin/request-handoff.sh --compact-only --handoff '$H/h.md'"
+  out=$(gate Bash "$(jq -nc --arg c "$cmd" '{command:$c,run_in_background:true}')")
+  assert_eq "$request: live cycle denies background handoff Bash" "$(decision "$out")" deny
+  out=$(gate Bash "$(jq -nc --arg c "$cmd" '{command:$c,run_in_background:false}')")
+  assert_eq "$request: foreground handoff Bash is allowed" "$out" ""
+  out=$(gate Write "$(jq -nc --arg p "$H/h.md" '{file_path:$p,content:"handoff"}')")
+  assert_eq "$request: handoff Write is allowed" "$out" ""
+  out=$(bash_gate 'git add handoff.md && git commit -m "save handoff"')
+  assert_eq "$request: live cycle allows foreground git add/commit" "$out" ""
+  out=$(gate Skill '{"skill":"handoff"}')
+  assert_eq "$request: live cycle allows other non-delegating tools" "$out" ""
+  # The counter applies equally to all ways of starting delegated work.
+  export KEEP_COUNT=1
+  rm -f "$STATE/$SID.gate-denials"
+  o1=$(gate Agent '{}'); o2=$(gate SendMessage '{}')
+  o3=$(gate Bash "$(jq -nc --arg c "$cmd" '{command:$c,run_in_background:true}')")
+  assert_eq "$request: first cycle denial" "$(decision "$o1")" deny
+  assert_eq "$request: second cycle denial" "$(decision "$o2")" deny
+  assert_eq "$request: third cycle denial stops the turn" "$o3" "$STOP"
+  unset KEEP_COUNT
+  sandbox_rm
+done
+
+echo "== live cycle without a request still gates new work =="
+setup; cycle_live
+for t in Agent Task SendMessage; do
+  out=$(gate "$t" '{}')
+  assert_eq "no request: live cycle denies $t launch" "$(decision "$out")" deny
+done
+out=$(gate Bash '{"command":"cat /dev/null","run_in_background":true}')
+assert_eq "no request: background Bash is denied" "$(decision "$out")" deny
+for t in Read Write Edit; do
+  out=$(gate "$t" "$(jq -nc --arg p "$SB/project/file.md" '{file_path:$p}')")
+  assert_eq "no request: live cycle allows handoff preparation via $t" "$out" ""
+done
+out=$(bash_gate 'bash /x/autodev/bin/request-handoff.sh --compact-only')
+assert_eq "no request: live cycle allows filing the handoff request" "$out" ""
+out=$(bash_gate 'git commit -m "save handoff"')
+assert_eq "no request: live cycle allows git commit" "$out" ""
+out=$(bash_gate 'make test')
+assert_eq "no request: live cycle allows arbitrary foreground Bash" "$out" ""
+out=$(gate Skill '{"skill":"handoff"}')
+assert_eq "no request: live cycle allows other non-delegating tools" "$out" ""
+export KEEP_COUNT=1
+rm -f "$STATE/$SID.gate-denials"
+o1=$(gate Agent '{}'); o2=$(gate Agent '{}'); o3=$(gate Agent '{}')
+assert_eq "no request: first cycle denial" "$(decision "$o1")" deny
+assert_eq "no request: second cycle denial" "$(decision "$o2")" deny
+assert_eq "no request: third cycle denial stops the turn" "$o3" "$STOP"
+# A replacement cycle must not inherit an exhausted counter from the last one.
+rm -f "$STATE/$SID.cycle.lock"
+mkdir "$STATE/$SID.cycle.lock"
+printf '%s\n' "$$" > "$STATE/$SID.cycle.lock/pid"
+out=$(gate Agent '{}')
+assert_eq "replacement legacy cycle resets cycle-only denials" "$(decision "$out")" deny
+unset KEEP_COUNT
+rm -rf "$STATE/$SID.cycle.lock"
+out=$(gate Agent '{}')
+assert_eq "cycle released with no request -> normal tools allowed again" "$out" ""
+sandbox_rm
+
+echo "== only a live owner gives the handoff preparation exemption =="
 setup; pending
 sleep 30 & lp=$!
-/bin/ln -s "/dev/null/autodev-lock-owner/$lp" "$STATE/$SID.cycle.lock"
-out=$(gate Bash '{"command":"make test"}')
-assert_eq "live watcher cycle lock -> the gate stands down" "$out" ""
 kill "$lp" 2>/dev/null; wait "$lp" 2>/dev/null
-out=$(gate Bash '{"command":"make test"}')
-assert_eq "dead cycle lock -> the gate is engaged again" "$(decision "$out")" deny
+/bin/ln -s "/dev/null/autodev-lock-owner/$lp" "$STATE/$SID.cycle.lock"
+out=$(gate Write "$(jq -nc --arg p "$SB/project/file.md" '{file_path:$p}')")
+assert_eq "dead cycle lock -> normal pending-request restrictions" "$(decision "$out")" deny
 sandbox_rm
 
 # Environments that cannot evaluate the allow-list fail OPEN, never closed.
@@ -257,10 +359,88 @@ assert_eq "garbage stdin fails open (no output)" "$out" ""
 assert_eq "garbage stdin fails open (exit 0)" "$rc" 0
 sandbox_rm
 
+echo "== live cycle preserves bypasses and missing-pane fail-open =="
+for request in none compact-request; do
+  setup; cycle_live
+  [ "$request" = none ] || pending
+  for mode in env session global no-pane; do
+    case "$mode" in
+      env) export AUTODEV_NO_HANDOFF_GATE=1 ;;
+      session) : > "$STATE/$SID.no-handoff-gate" ;;
+      global) : > "$STATE/disable-handoff-gate" ;;
+      no-pane) rm -f "$STATE/$SID.herdr-pane" ;;
+    esac
+    for t in Agent Task SendMessage Bash; do
+      out=$(gate "$t" '{"command":"make test","run_in_background":true}')
+      assert_eq "$request / $mode: $t allowed" "$out" ""
+    done
+    unset AUTODEV_NO_HANDOFF_GATE
+    rm -f "$STATE/$SID.no-handoff-gate" "$STATE/disable-handoff-gate"
+  done
+  sandbox_rm
+done
+
+echo "== pending request without a cycle still denies background Bash =="
+setup; pending
+out=$(gate Bash "$(jq -nc --arg c "cat $STATE/$SID.ctx" '{command:$c,run_in_background:true}')")
+assert_eq "allow-listed Bash cannot run in background with a pending request" "$(decision "$out")" deny
+sandbox_rm
+
 echo "== handoff-request also engages the gate =="
 setup; : > "$STATE/$SID.handoff-request"
 out=$(gate Bash '{"command":"make test"}')
 assert_eq "handoff-request denies" "$(decision "$out")" deny
 sandbox_rm
+
+echo "== watcher publishes the phase before handoff and clears it on release =="
+for mode in complete abort replaced; do
+  setup; stub_mux; arm
+  handoff_pointer "$SID"
+  export MUX_LIVE_PANES="w1:p1" MUX_BUSY=0 PHASE_TEST_MODE="$mode"
+  # Observe at the actual send boundary, then simulate the session responses.
+  # Returning an error exercises release on ABORT without waiting for a timeout.
+  cat >> "$BIN/mux-lib.sh" <<'STUB'
+mux_send_line(){
+  printf '%s\n' "$1" >> "$SB/sent.log"
+  case "$1" in
+    /handoff)
+      printf '%s\n' "$$" > "$SB/watcher-pid"
+      cat "$STATE/$sid.cycle-handoff" > "$SB/phase-at-handoff" 2>/dev/null
+      autodev_lock_read_owner "$STATE/$sid.cycle.lock"
+      printf '%s\n' "$lock_owner_pid" > "$SB/owner-at-handoff"
+      jq -nc --arg s "$sid" '{session_id:$s,tool_name:"Agent",tool_input:{}}' |
+        bash "$_HERE/cc-handoff-gate.sh" > "$SB/gate-at-handoff"
+      case "$PHASE_TEST_MODE" in
+        abort) return 1 ;;
+        replaced) printf '%s\n' replacement-owner > "$STATE/$sid.cycle-handoff"; return 1 ;;
+      esac
+      printf '%s\n' "$(( $(date +%s) + 1 ))" > "$STATE/$sid.idle" ;;
+    /compact)
+      printf '%s\n' "$(( $(date +%s) + 1 ))" > "$STATE/$sid.compacted" ;;
+  esac
+  return 0
+}
+STUB
+  AUTODEV_SETTLE=0 AUTODEV_WAIT_IDLE=5 AUTODEV_WAIT_COMPACT=5 \
+    bash "$BIN/auto-handoff-watch.sh" "$SID" > "$SB/watcher.stdout" 2> "$SB/watcher.stderr"
+  assert_file "$mode: watcher reached the handoff send" "$SB/watcher-pid"
+  pid=$(cat "$SB/watcher-pid" 2>/dev/null)
+  assert_eq "$mode: phase is published before the send" "$(cat "$SB/phase-at-handoff" 2>/dev/null)" "$pid"
+  assert_eq "$mode: phase matches the lock owner" "$(cat "$SB/owner-at-handoff" 2>/dev/null)" "$pid"
+  assert_eq "$mode: Agent denied during actual handoff" "$(decision "$(cat "$SB/gate-at-handoff" 2>/dev/null)")" deny
+  assert_lock_absent "$mode: watcher released its lock" "$STATE/$SID.cycle.lock"
+  if [ "$mode" = replaced ]; then
+    assert_eq "cleanup preserves a replacement's phase" "$(cat "$STATE/$SID.cycle-handoff" 2>/dev/null)" replacement-owner
+  else
+    assert_no_file "$mode: watcher cleared its phase" "$STATE/$SID.cycle-handoff"
+  fi
+  if [ "$mode" = complete ]; then
+    assert_contains "cycle completed after the handoff" "$(cat "$AUTODEV_HOME/logs/auto-handoff.log")" 'CYCLE COMPLETE'
+  else
+    assert_contains "$mode: abort path was exercised" "$(cat "$AUTODEV_HOME/logs/auto-handoff.log")" 'ABORT send failed'
+  fi
+  unset PHASE_TEST_MODE
+  sandbox_rm
+done
 
 finish
