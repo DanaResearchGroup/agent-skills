@@ -276,6 +276,7 @@ SESSION_NAME=$(mux_session_name)
 # A stale lock is removed only while holding a separate reclaim mutex, so a live
 # cycle lock always remains visible to other watchers and the sweeper.
 lock="$STATE/$sid.cycle.lock"
+handoff_phase="$STATE/$sid.cycle-handoff"
 reclaim_mutex="$lock.reclaim"
 lock_stale_after=$(( WAIT_IDLE + WAIT_COMPACT ))
 reclaim_mutex_stale_after=60
@@ -344,6 +345,13 @@ release_reclaim_mutex(){
 }
 
 release_cycle_lock(){
+  # Clear our phase while we still exclude successors. A stale owner must never
+  # remove a marker belonging to the watcher that replaced it.
+  autodev_lock_read_owner "$lock"
+  if [ "$lock_owner_pid" = "$$" ] &&
+     [ "$(cat "$handoff_phase" 2>/dev/null)" = "$$" ]; then
+    rm -f "$handoff_phase" 2>/dev/null
+  fi
   autodev_lock_release_owned "$lock" "$$" || true
 }
 
@@ -761,6 +769,12 @@ if [ "$compact_only" = 1 ]; then
   log "compact-only: skipping handoff (already written by session)"
 else
   t0=$(date +%s)
+  # A live cycle lock alone also describes housekeeping. Mark the handoff phase
+  # before sending so its tool calls cannot start delegated/background work.
+  if [ "$DRY" = 0 ] && ! printf '%s\n' "$$" > "$handoff_phase"; then
+    refile_consumed_request
+    abort_cycle "could not record handoff phase"
+  fi
   send "$handoff_cmd"
   if [ "$DRY" = 0 ]; then
     if ! wait_turn_done "$t0" "$WAIT_IDLE"; then
