@@ -59,6 +59,7 @@ autodev/
     test-stuck-page.sh         # one page per request pending 30 min with only DEFERs
     test-abort-recovery.sh     # aborts are counted, retried, then surfaced as STUCK
     test-install-sweeper.sh    # the generated systemd unit (incl. the KillMode=process guard)
+    test-herdr-panes-snapshot.sh # the sweep's validated, private herdr pane snapshot
     test-cache-warmth.sh       # the cache badge: countdown in the tab, deadline in the status line
     test-fleet-digest.sh       # forced gh-missing / unreadable-root failures: section isolation, not just happy path
     test-pm-nudge.sh           # PM-nudger: classification, firing gates, and the safety ladder
@@ -73,6 +74,20 @@ re-invokes the watcher for any session that still looks like it needs a cycle. I
 nothing itself — the watcher re-applies every gate. After `MAX_ABORTS` consecutive aborted
 cycles it stops retrying and raises `<sid>.stuck`, which the status line shows as
 **⚠ AUTO-HANDOFF STUCK**, so a wedged session cannot keep looking healthy.
+
+At the start of each sweep, the sweeper resolves herdr from `MUX_HERDR`, then `PATH`, then
+`$HOME/.local/bin/herdr`. When one resolves, it runs `pane list` once and atomically publishes
+valid JSON to `$AUTODEV_HOME/state/herdr-panes.json` with mode `0600`. On a query, validation, or
+write failure it logs once and leaves the previous snapshot untouched, so its mtime continues to
+age. The `$AUTODEV_HOME/state/.herdr-panes.failing` marker suppresses repeated failure lines until
+a successful publication clears it and logs recovery. If none of the herdr locations resolve, it
+skips snapshot publication. If herdr resolves but `timeout` is unavailable, it records a failure
+and skips the query so a timer run never invokes herdr without a bound. If the failure marker
+cannot be created and is still absent, it logs the failure anyway. The timeout escalates from
+SIGTERM to SIGKILL after five seconds if herdr does not exit. The snapshot contains pane working
+directories. It is a short-lived cache: consumers should refuse snapshots whose mtime is older
+than about 10 minutes. `AUTODEV_HERDR_TIMEOUT` sets the positive-integer command timeout in
+seconds; absent or invalid values use 10 seconds.
 
 **Code vs. data.** The scripts live in the skill (version-controlled). Runtime *data* —
 state, logs, handoffs, sparring records, autodev progress — lives under **`AUTODEV_HOME`**
