@@ -185,6 +185,43 @@ take_lock() {
       *) die "cannot create $RDIR" ;;
     esac
   fi
+  # A stale PID read cannot authorise removing the directory: another waiter
+  # may already have replaced it. Keep a kernel lock through cleanup and the
+  # mutation, so reapers cannot remove a live replacement. Never unlink this
+  # guard file: all waiters must lock the same inode. FD 9 stays open in this
+  # shell after Python exits; process exit releases it even after SIGKILL.
+  # Without Python or its POSIX locking module, retain the mkdir protocol.
+  if command -v python3 >/dev/null 2>&1; then
+    exec 9>> "$lock.guard" || die "cannot open $lock.guard"
+    local guard_rc
+    python3 -I - "$lock" <<'PY'
+import sys
+import time
+
+try:
+    import fcntl
+except ImportError:
+    sys.exit(3)
+
+deadline = time.monotonic() + 5
+while True:
+    try:
+        fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        break
+    except BlockingIOError:
+        if time.monotonic() >= deadline:
+            print(f'contract: another contract command is holding {sys.argv[1]}',
+                  file=sys.stderr)
+            sys.exit(2)
+        time.sleep(0.1)
+PY
+    guard_rc=$?
+    case "$guard_rc" in
+      0) ;;
+      3) exec 9>&- ;;
+      *) die "cannot acquire $lock.guard" ;;
+    esac
+  fi
   until mkdir "$lock" 2>/dev/null; do
     holder=$(cat "$lock/pid" 2>/dev/null || true)
     if [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; then
