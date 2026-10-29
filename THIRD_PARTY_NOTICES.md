@@ -68,7 +68,8 @@ SOFTWARE.
 ## HumanLayer — `humanlayer/skills`
 
 Source: <https://github.com/humanlayer/skills> (`plugins/show-me/skills/show-me`),
-copied unmodified from upstream commit `653b6411c1f70c275a18e37673b042ff99f67ceb`.
+copied from upstream commit `653b6411c1f70c275a18e37673b042ff99f67ceb`; the local edit is listed in
+`ADAPTATION.md`.
 Copyright (c) 2026 HumanLayer. Licensed under the MIT License; the notice is
 reproduced below.
 

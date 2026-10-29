@@ -18,6 +18,7 @@ After edits, run `python3 bin/lint-skills.py` to confirm nothing broke.
 | 2 | …want Slack notifications | `slack-ask/SKILL.md`, `slack-notify/SKILL.md`, `SETUP.md`, `~/.claude/settings.json` | Create your own Slack bot token (`~/.claude/.slack-bot-token`, never committed), set your channel id in `CC_SLACK_CHANNEL` (required — the helper refuses to send without it), and allowlist the helper path. Full walkthrough in [SETUP.md](SETUP.md). Otherwise mark N/A and ignore these skills. |
 | 3 | …use an Obsidian vault | `obsidian-vault/SKILL.md`, your private `~/.claude/CLAUDE.md` | Point it at **your** vault path (the author's is under Dropbox). N/A if you don't use Obsidian. |
 | 4 | …everyone (global config) | `~/.claude/CLAUDE.md` (private, **not** in this repo) | Build your own global instructions: your Obsidian path and any personal preferences. Don't copy the author's verbatim. |
+| 5 | …use `show-me` | `show-me/SKILL.md` | HTML outputs go to `${SHOW_ME_DIR:-$HOME/Dropbox/remote-work/show-me}`. Set `SHOW_ME_DIR` to your own folder. |
 
 ## Deliberate drift from upstream (vendored Matt Pocock skills)
 
@@ -34,6 +35,7 @@ re-apply each one onto the new upstream base at every sync (current base: v1.3, 
 | `setup-matt-pocock-skills/` | "Always: explore -> present -> confirm -> write" in place of the "not a deterministic script" line; a step-4 `Done when:` gate; Section B (triage labels) always runs because `to-spec` applies them too, not only `triage`; the wayfinder and `improve-codebase-architecture` content is removed. Triage labels also map the `bug`/`enhancement` category roles; the GitHub external-PR filter drops maintainer associations instead of allowlisting three, and the GitLab one compares MR authors against the project member list. |
 | `triage/SKILL.md`, `triage/AGENT-BRIEF.md` | The "never triaged" bucket matches issues with no state-role label rather than no labels at all; tracker content is treated as untrusted data; an external PR's code runs only in an isolated, token-free sandbox, else is reviewed statically; the `.out-of-scope` example brief matches `OUT-OF-SCOPE.md`'s format. |
 | `handoff/SKILL.md` | Local superset (model-invocable, Codex auto-handoff, absolute path, insights routing, reload pointer); upstream changes are ported only when compatible. |
+| `show-me/SKILL.md` (HumanLayer, not Matt Pocock) | Output is always one HTML file, never terminal text; files go to one folder (`SHOW_ME_DIR`) under dated `YYYY.MM.DD <letter> <Name>.html` names; opened with `xdg-open` or `open`. |
 
 ## Checklist
 
@@ -41,6 +43,7 @@ re-apply each one onto the new upstream base at every sync (current base: v1.3, 
 - [ ] 2 — Slack wired up (or N/A)
 - [ ] 3 — Obsidian vault path set (or N/A)
 - [ ] 4 — My own `~/.claude/CLAUDE.md` in place
+- [ ] 5 — `SHOW_ME_DIR` points at my own folder (or N/A)
 - [ ] `python3 bin/lint-skills.py` passes after my edits
 
 ## Not in this repo (install separately)
