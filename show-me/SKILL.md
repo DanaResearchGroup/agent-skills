@@ -1,10 +1,12 @@
 ---
 name: show-me
-description: Help the user understand the current topic visually with concise diagrams, code-shape sketches, and focused HTML artifacts.
+description: Help the user understand the current topic visually with one focused HTML page of diagrams and code-shape sketches, saved to a single show-me folder.
 disable-model-invocation: true
 ---
 
 Help the user understand the current topic of conversation visually. Skip the preamble and keep prose brief. Pick the smallest view that makes the key point clear.
+
+**The output is always one HTML file, never visuals printed in the terminal.** The views below are what goes *inside* the page: render code shapes as styled `<pre>` blocks, diffs with added and removed lines coloured, and Mermaid through the Mermaid JS module. The terminal gets only the file's path.
 
 - Show logic or an algorithm as pseudocode:
 
@@ -115,11 +117,25 @@ function expandSkill(command: string): string {
 }
 ```
 
-- For a visual UI, layout, state comparison, or concept too dense for Mermaid, write one focused HTML file — a diagram, an infographic, or a short slide deck, whichever fits the point. Match the product's colors, type, spacing, and components; use real labels and data; support desktop and mobile. Then open it for the user:
+- For a visual UI, layout, state comparison, or concept too dense for Mermaid, draw it directly in the page — a diagram, an infographic, or a short slide deck, whichever fits the point. Match the product's colors, type, spacing, and components; use real labels and data.
 
+### The file
+
+Write one HTML file per invocation that supports desktop and mobile; inline its styles, and load nothing but the Mermaid module from a CDN. Save every one in a single folder, `${SHOW_ME_DIR:-$HOME/Dropbox/remote-work/show-me}`, never in the repo or the working directory. Name it `YYYY.MM.DD <letter> <Name>.html`: today's date, the next unused letter for that date and name (`a`, then `b`), and a Title Case name. Once the file is written, always open it in the default browser; this step is not optional:
+
+```bash
+DIR="${SHOW_ME_DIR:-$HOME/Dropbox/remote-work/show-me}"; mkdir -p "$DIR"
+D=$(date +%Y.%m.%d); NAME="Session Event Flow"
+F=""   # noclobber creates the name atomically, so two runs never get the same letter
+for L in a b c d e f g h i j k l m n o p q r s t u v w x y z; do
+  ( set -C; : > "$DIR/$D $L $NAME.html" ) 2>/dev/null && { F="$DIR/$D $L $NAME.html"; break; }
+done
+[ -n "$F" ] || { echo "26 pages named $NAME today; pick another name" >&2; exit 1; }
+# write the HTML to "$F" here (it exists, empty)
+xdg-open "$F" 2>/dev/null || open "$F"
 ```
-Bash(open path/to/show-me-{description}.html)
-```
+
+Then print the file's full absolute path. If the open command fails (no display, or a sandbox refusal), say so in one line so the user knows to open the path by hand.
 
 ### guidance
 
