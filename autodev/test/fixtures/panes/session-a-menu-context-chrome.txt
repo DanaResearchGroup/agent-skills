@@ -1,0 +1,3 @@
+Question awaiting confirmation
+ 🔴 AUTO-HANDOFF: ARMED ⟨cc:sess-a⟩
+ Context: Enter to confirm · Esc to cancel

@@ -114,19 +114,36 @@ if [ -f "$reload_marker" ]; then
     log "SKIP reload-pending: request-lib retirement check unavailable"
     exit 0
   fi
+  # Retirement is a mutation too. Never erase a reload belonging to an
+  # in-flight cycle based on a pre-lock idle/handoff observation.
+  reload_cleanup_lock="$STATE/$sid.cycle.lock"
   retired=$(reload_marker_retire_reason "$STATE" "$AUTODEV_HOME/handoffs" "$sid" "$reload_marker" || true)
-  case "$retired" in
-    new-handoff-request)
-      rm -f "$reload_marker" 2>/dev/null
-      log "DROP reload-pending: a newer handoff request superseded it"
-      ;;
-    new-handoff|completed-turn)
-      rm -f "$reload_marker" 2>/dev/null
-      reload_superseded=1
-      log "DROP reload-pending: superseded by $retired"
-      ;;
-    *) reload_retry=1 ;;
-  esac
+  if [ -z "$retired" ]; then
+    reload_retry=1
+  elif autodev_lock_publish "$reload_cleanup_lock" "$$"; then
+    if [ -f "$reload_marker" ]; then
+      # The pre-lock observation only selected this cleanup path; it cannot
+      # authorize deletion of a marker the current cycle replaced meanwhile.
+      retired=$(reload_marker_retire_reason "$STATE" "$AUTODEV_HOME/handoffs" "$sid" "$reload_marker" || true)
+      case "$retired" in
+        new-handoff-request)
+          rm -f "$reload_marker" 2>/dev/null
+          log "DROP reload-pending: a newer handoff request superseded it"
+          ;;
+        new-handoff|completed-turn)
+          rm -f "$reload_marker" 2>/dev/null
+          reload_superseded=1
+          log "DROP reload-pending: superseded by $retired"
+          ;;
+        *) reload_retry=1 ;;
+      esac
+    fi
+    autodev_lock_release_owned "$reload_cleanup_lock" "$$" || true
+  else
+    # The ordinary lock path below can reclaim a dead owner. It will repeat
+    # retirement checks under that lock before sending any pending reload.
+    reload_retry=1
+  fi
 fi
 
 # --- read context % written by the statusline ---
@@ -579,6 +596,7 @@ save_reload_attempt(){ # $1 = attempting|staged; atomically persist ambiguous se
     mv -f "$tmp" "$reload_attempt" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
 }
 defer_awaiting(){ # $1 = where
+  local guard=${MUX_REFUSAL_REASON:-dialog}
   if [ "$post_compaction" = 1 ]; then
     if save_reload_pending; then
       log "RELOAD-PENDING saved after $1"
@@ -588,7 +606,11 @@ defer_awaiting(){ # $1 = where
   fi
   refile_consumed_request
   : > "$STATE/$sid.deferred" 2>/dev/null   # the sweeper pages on a long-pending, only-deferred request
-  log "DEFER awaiting-human ($1): pane shows an open question/permission prompt pct=$pct — retry next sweep"
+  if [ "$guard" = dialog ]; then
+    log "DEFER awaiting-human ($1): pane shows an open question/permission prompt pct=$pct — retry next sweep"
+  else
+    log "DEFER $guard ($1): send guard refused pct=$pct — retry next sweep"
+  fi
   exit 0
 }
 
@@ -669,7 +691,7 @@ if [ "$reload_retry" = 1 ]; then
     exit 0
   fi
   if pane_busy; then
-    log "DEFER reload-pending: pane is busy or awaiting the human"
+    log "DEFER reload-pending: ${MUX_BUSY_REASON:-busy} guard refused; marker retained"
     exit 0
   fi
   clear_reload_attempt_if_consumed
@@ -700,7 +722,7 @@ if [ "$reload_retry" = 1 ]; then
     rm -f "$STATE/$sid.abort-count" "$STATE/$sid.stuck" 2>/dev/null
     log "RELOAD retry sent"
   elif [ "$rc" = "${MUX_REFUSED:-3}" ]; then
-    log "DEFER awaiting-human (reload retry); marker retained"
+    log "DEFER reload-pending: ${MUX_REFUSAL_REASON:-unknown} guard refused (reload retry); marker retained"
   else
     log "DEFER reload retry send failed rc=$rc; marker retained"
   fi

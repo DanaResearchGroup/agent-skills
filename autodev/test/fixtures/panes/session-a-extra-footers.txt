@@ -1,0 +1,15 @@
+❯
+──────────────────────────────────────────────────────
+ 🔴 AUTO-HANDOFF: ARMED  ⟨cc:sess-a⟩  Claude 40k (40.0%)
+ ⏵⏵ auto mode on (shift+tab to cycle)
+                                        ✔ Update installed · Restart to apply
+
+ Context: 40k / 200k
+ Background tasks: 1 running
+ Task output available
+ Status details
+ Terminal notice
+ More status details
+ Another footer
+ Footer details
+ Last footer

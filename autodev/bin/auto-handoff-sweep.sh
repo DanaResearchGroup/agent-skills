@@ -205,10 +205,32 @@ page_stuck(){
   ) 9>"$STATE/$sid.page.lock"
 }
 _page_locked(){
-  local sid=$1 kind=$2 rf key age msg pending=""
+  local sid=$1 kind=$2 rf key age msg owner retired pending=""
   if [ "$kind" = reload-attempt ]; then rf="$STATE/$sid.reload-attempt"
   else rf="$STATE/$sid.$kind"; fi
   [ -f "$rf" ] || return 0
+  if [ "$kind" = reload-pending ]; then
+    # A stale/missing lock owner must not suppress the alert. Recheck inside
+    # the page lock: a watcher may have reclaimed it since the sweep's check.
+    # A lock held by this sweep is the ordinary cleanup-and-page path.
+    autodev_lock_read_owner "$STATE/$sid.cycle.lock"
+    if [ -n "$lock_owner_pid" ] && [ "$lock_owner_pid" != "$$" ] &&
+       kill -0 "$lock_owner_pid" 2>/dev/null; then return 0; fi
+    if [ ! -f "$STATE/$sid.reload-attempt" ]; then
+      [ "$(( now - $(mtime "$rf") ))" -ge "$PAGE_AFTER" ] || return 0
+      retired=""
+      command -v reload_marker_retire_reason >/dev/null 2>&1 &&
+        retired=$(reload_marker_retire_reason "$STATE" "$AUTODEV_HOME/handoffs" "$sid" "$rf" || true)
+      [ -z "$retired" ] || return 0
+    fi
+  fi
+  # Re-read ownership at the page boundary, under the dedupe lock. A reload
+  # for a confirmed reused pane is no longer actionable. Unproved ownership
+  # (including an unavailable pane) must still be visible to the user.
+  if [ "$kind" = reload-pending ] && mux_init "$sid" && mux_pane_live; then
+    owner=$(mux_pane_owner)
+    [ -z "$owner" ] || [ "$owner" = "$sid" ] || return 0
+  fi
   key="$kind:$(date -r "$rf" +%s%N 2>/dev/null)"
   [ "$(cat "$STATE/$sid.paged" 2>/dev/null)" = "$key" ] && return 0
   age=$(( (now - $(mtime "$rf")) / 60 ))
@@ -219,7 +241,7 @@ _page_locked(){
     if [ -n "$pending" ]; then pending=" Pending work also waiting: $pending."; fi
     msg="autodev: tmux input for session $sid may contain staged text after $age min; inspect the pane before submitting anything.$pending"
   elif [ "$kind" = reload-pending ]; then
-    msg="autodev: reload for session $sid pending $age min and the watcher keeps deferring (busy pane or open prompt) — continue it by hand"
+    msg="autodev: reload for session $sid pending $age min and the watcher keeps deferring (presence, dialog, or busy guard) — inspect the pane and continue it by hand"
   else
     msg="autodev: $kind for session $sid pending $age min and the watcher keeps deferring (busy pane or open prompt) — compact it by hand"
   fi
@@ -301,13 +323,28 @@ for pf in "$STATE"/*.herdr-pane "$STATE"/*.tmux-pane; do
             log "$sid" "DROP reload-pending: superseded by $retired"
             reload_retired_exit=1
             ;;
-          *) reload_pending=1 ;;
+          *)
+            reload_pending=1
+            # Page before reachability can skip the session. Hold the cycle
+            # lock so a successful retry or supersession cannot replace the
+            # marker between retirement/age checks and page_stuck's dedupe.
+            if [ ! -f "$reload_attempt" ] &&
+               [ "$(( now - $(mtime "$reload_marker") ))" -ge "$PAGE_AFTER" ]; then
+              page_stuck "$sid" reload-pending
+            fi
+            ;;
         esac
       fi
       cycle_lock_release "$lock" || log "$sid" "ERROR could not release cycle lock after reload cleanup"
     else
       reload_pending=1
       log "$sid" "SKIP reload cleanup: cycle lock $(cycle_lock_block_reason "$lock")"
+      # The pager has its own lock and repeats marker/owner checks there.
+      # Notify without reclaiming this cycle lock or changing reload state.
+      if [ -f "$reload_marker" ] &&
+         [ "$(( now - $(mtime "$reload_marker") ))" -ge "$PAGE_AFTER" ]; then
+        page_stuck "$sid" reload-pending
+      fi
     fi
   fi
 
@@ -408,6 +445,9 @@ for pf in "$STATE"/*.herdr-pane "$STATE"/*.tmux-pane; do
   # DEFER must be newer than the request — an older one says nothing about it.
   for kind in handoff-request compact-request; do
     [ -f "$reload_attempt" ] && continue
+    # Reload has priority. Alternating two identities in the shared .paged
+    # record would page both markers again on every sweep.
+    [ "$reload_pending" = 1 ] && continue
     rf="$STATE/$sid.$kind"
     [ -f "$rf" ] && [ "$STATE/$sid.deferred" -nt "$rf" ] || continue
     [ "$(( now - $(mtime "$rf") ))" -ge "$PAGE_AFTER" ] || continue
@@ -459,9 +499,6 @@ for pf in "$STATE"/*.herdr-pane "$STATE"/*.tmux-pane; do
     continue
   fi
   [ "$reload_retired_exit" = 1 ] && continue
-  if [ "$reload_pending" = 1 ] && [ "$(( now - $(mtime "$reload_marker") ))" -ge "$PAGE_AFTER" ]; then
-    page_stuck "$sid" reload-pending
-  fi
 
   # --- over threshold and working: raise the request the session never filed --
   # Only on the plain threshold path: a pending request (either kind) never gets
