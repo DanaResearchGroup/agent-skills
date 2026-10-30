@@ -207,12 +207,33 @@ sandbox_rm
 # Herdr can recycle pane ids. A new owner clears the old marker without a send.
 setup
 seed_reload
+touch -d '2 hours ago' "$AUTODEV_HOME/handoffs/.latest.$SID"
+touch -d '3 hours ago' "$STATE/$SID.idle"
+touch -d '40 minutes ago' "$STATE/$SID.reload-pending"
+: > "$SB/pages.log"
 printf '%s\n' "$OTHER" > "$SB/herdr/owner"
 printf '%s\n' "$OTHER" > "$STATE/.paneowner-herdr-w1_p7G"
 sweep
+assert_eq "an old reload with a confirmed different pane owner never pages" "$(wc -l < "$SB/pages.log")" 0
+assert_no_file "a confirmed foreign owner consumes no paging dedupe" "$STATE/$SID.paged"
 assert_no_file "a reused pane retires the old marker" "$STATE/$SID.reload-pending"
 assert_contains "the sweeper logs the new owner" "$(LOG)" "pane is now owned by session $OTHER"
 no_reload_typed "a pane owned by another session is never sent the old reload"
+sandbox_rm
+
+# Unknown ownership cannot retire the reload or suppress its only page.
+setup
+seed_reload
+touch -d '2 hours ago' "$AUTODEV_HOME/handoffs/.latest.$SID"
+touch -d '3 hours ago' "$STATE/$SID.idle"
+touch -d '40 minutes ago' "$STATE/$SID.reload-pending"
+: > "$SB/pages.log"
+: > "$SB/herdr/owner"
+rm -f "$STATE/.paneowner-herdr-w1_p7G"
+sweep; sweep
+assert_eq "unknown pane ownership still pages a stuck reload once" "$(wc -l < "$SB/pages.log")" 1
+assert_file "unknown owner retains the pending reload" "$STATE/$SID.reload-pending"
+no_reload_typed "unknown owner never receives reload text"
 sandbox_rm
 
 # A live watcher cycle protects both reload files; after it releases the lock,
@@ -293,6 +314,73 @@ assert_file "a malformed reload marker remains for investigation" "$STATE/$SID.r
 no_reload_typed "a malformed marker is never sent"
 sandbox_rm
 
+# A competing watcher must not retire a marker before it owns the cycle
+# lock: the current owner may be publishing the reload as the idle hook lands.
+for newer in idle handoff; do
+  setup
+  seed_reload
+  if [ "$newer" = idle ]; then newer_file="$STATE/$SID.idle"
+  else newer_file="$AUTODEV_HOME/handoffs/.latest.$SID"; fi
+  touch -d "@$(( $(date +%s) + 2 ))" "$newer_file"
+  mkdir -p "$STATE/$SID.cycle.lock"
+  printf '%s\n' "$$" > "$STATE/$SID.cycle.lock/pid"
+  bash "$BIN/auto-handoff-watch.sh" "$SID" >"$SB/watch-held.out" 2>&1
+  assert_file "$newer: competing watcher preserves the cycle owner's reload marker" "$STATE/$SID.reload-pending"
+  assert_eq "$newer: competing watcher preserves the cycle lock owner" "$(cat "$STATE/$SID.cycle.lock/pid")" "$$"
+  no_reload_typed "$newer: competing watcher sends no reload"
+  rm -rf "$STATE/$SID.cycle.lock"
+  bash "$BIN/auto-handoff-watch.sh" "$SID" >"$SB/watch-released.out" 2>&1
+  assert_no_file "$newer: released lock allows superseded reload cleanup" "$STATE/$SID.reload-pending"
+  no_reload_typed "$newer: superseded reload is never replayed"
+  sandbox_rm
+done
+
+# A presence failure remains distinguishable from both a real dialog and a
+# working pane. Run the actual watcher twice: each run must leave diagnostics.
+setup
+seed_reload
+printf 'claude\n' > "$STATE/$SID.runtime"
+cp "$FX/session-b-status.txt" "$SB/herdr/recent.txt"
+marker_time=$(stat -c %y "$STATE/$SID.reload-pending")
+for run in 1 2; do
+  bash "$BIN/auto-handoff-watch.sh" "$SID" >"$SB/watch-presence.out" 2>&1
+  assert_eq "presence retry $run: refusal log is fresh" \
+    "$(LOG | grep -c 'UNREACHABLE screen presence unproved:')" "$run"
+  assert_eq "presence retry $run: retry names the presence guard" \
+    "$(LOG | grep -c 'DEFER reload-pending: presence guard refused (reload retry); marker retained')" "$run"
+  assert_eq "presence retry $run: marker age is retained for paging" \
+    "$(stat -c %y "$STATE/$SID.reload-pending")" "$marker_time"
+  assert_eq "presence retry $run: screen evidence is saved" \
+    "$(cat "$STATE/$SID.unreachable-screen")" "$(awk 'NF' "$SB/herdr/recent.txt" | tail -n 15)"
+  no_reload_typed "presence retry $run: no reload typed"
+done
+cp "$FX/session-a-status.txt" "$SB/herdr/recent.txt"
+sed -i "s/sess-a/${SID:0:8}/g" "$SB/herdr/recent.txt"
+bash "$BIN/auto-handoff-watch.sh" "$SID" >"$SB/watch-recovery.out" 2>&1
+assert_no_file "own screen recovers on the next watcher run" "$STATE/$SID.reload-pending"
+assert_contains "recovery sends the exact reload" "$(cat "$SB/typed.log")" "RUN $(reload_line)"
+sandbox_rm
+
+setup
+seed_reload
+printf 'working\n' > "$SB/herdr/status"
+bash "$BIN/auto-handoff-watch.sh" "$SID" >"$SB/watch-busy.out" 2>&1
+assert_contains "working retry log names the busy guard" "$(LOG)" "DEFER reload-pending: busy guard refused; marker retained"
+assert_file "working retry retains reload marker" "$STATE/$SID.reload-pending"
+no_reload_typed "working pane never receives a reload"
+sandbox_rm
+
+setup
+enable_tmux
+seed_reload
+printf 'staged\n' > "$STATE/$SID.reload-attempt"
+cp "$FX/idle-prompt.txt" "$SB/tmux-screen.txt"
+bash "$BIN/auto-handoff-watch.sh" "$SID" >"$SB/watch-staged.out" 2>&1
+assert_contains "staged retry log names the staged-input lock" "$(LOG)" "DEFER tmux staged-input lock:"
+assert_file "staged retry retains reload marker" "$STATE/$SID.reload-pending"
+assert_eq "staged retry never types" "$(cat "$SB/tmux-text-sends.log")" ''
+sandbox_rm
+
 # A long-refused reload uses the existing one-page-per-marker stuck path.
 setup
 seed_reload
@@ -303,7 +391,7 @@ cp "$FX/single-select.txt" "$SB/herdr/recent.txt"
 sweep
 assert_eq "PAGE_AFTER sends one page for a stuck reload" "$(wc -l < "$SB/pages.log" | tr -d ' ')" 1
 assert_contains "the page identifies reload work" "$(cat "$SB/pages.log")" "reload for session $SID"
-wait_log "DEFER reload-pending: pane is busy or awaiting the human"
+wait_log "DEFER reload-pending: dialog guard refused"
 no_reload_typed "a stuck reload stays guarded"
 sandbox_rm
 
@@ -325,7 +413,7 @@ assert_eq "pre-staging refusal types no literal" \
 assert_eq "pre-staging refusal leaves the input line empty" \
   "$(cat "$SB/tmux-input.txt")" ""
 assert_contains "pre-staging refusal reaches the live human-input guard" \
-  "$(LOG)" "DEFER awaiting-human (reload retry); marker retained"
+  "$(LOG)" "DEFER reload-pending: dialog guard refused (reload retry); marker retained"
 
 rm -f "$SB/tmux-later.txt"
 : > "$SB/tmux-reads"

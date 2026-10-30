@@ -33,7 +33,10 @@ MUX_BUSY_RE='esc to interrupt|Crunching|Compacting|Waiting for [0-9]|Press up to
 # wording, and only at the very bottom of the pane, where Claude Code draws the
 # live dialog — the same strings further up are transcript, not a dialog.
 #
-#   footer (last 3 non-empty lines, case-insensitive): every question view
+# The tails below exclude a recognized trailing status/footer block first.
+# This keeps notices from hiding live dialog chrome while leaving older quoted
+# dialog text above the live prompt outside the short matching windows.
+#   footer (last 3 non-empty dialog lines, case-insensitive): every question view
 #     (single-select, multi-select, multi-question tabs, preview) ends in
 #     "Enter to select · … to navigate · Esc to cancel"; permission prompts end
 #     in "Esc to cancel · Tab to amend"; MCP forms in "Enter to confirm".
@@ -211,12 +214,16 @@ mux_pane_owner(){
   fi
 }
 
-# One flag and log entry per unreachable episode, even across overlapping
-# evaluations. Keep the binding: a temporary refusal must not destroy retries.
+# One flag per unreachable episode. Screen refusals log once per failed guard
+# (not per redraw poll), so a later watcher run leaves fresh diagnostic evidence.
+# Keep the binding: a temporary refusal must not destroy retries.
 mux_mark_unreachable(){ # $1 sid, $2 reason
-  local sid=$1 reason=$2
+  local sid=$1 reason=$2 created=0
   case "$sid" in ""|*[!A-Za-z0-9._-]*|.|..) return 1 ;; esac
   if (set -C; printf '%s\n' "$reason" > "$STATE/$sid.unreachable") 2>/dev/null; then
+    created=1
+  fi
+  if [ "$created" = 1 ] || [[ "$reason" == 'screen presence unproved:'* ]]; then
     mkdir -p "$AUTODEV_HOME/logs" 2>/dev/null
     printf '%s [%s] UNREACHABLE %s\n' "$(date +'%Y.%m.%d %H.%M.%S')" "$sid" "$reason" \
       >> "$AUTODEV_HOME/logs/auto-handoff.log"
@@ -275,9 +282,10 @@ mux_session_reachable(){ # $1 sid
 # Check the SAME pane immediately before a herdr keystroke. Resolving a new
 # pane mid-cycle could send the tail of an old cycle into another attachment.
 _mux_refuse_unowned(){
-  local screen tag attempt present=0
+  local screen tag attempt snapshot present=0
   [ "$MUX" = herdr ] && [ -n "${MUX_SESSION:-}" ] || return 0
   if ! mux_pane_live || [ "$(mux_pane_owner)" != "$MUX_SESSION" ]; then
+    MUX_REFUSAL_REASON=ownership
     mux_mark_unreachable "$MUX_SESSION" "pane $PANE lost live ownership before send"
     return 1
   fi
@@ -289,19 +297,33 @@ _mux_refuse_unowned(){
       if [ "$attempt" -gt 1 ]; then
         sleep "${AUTODEV_POLL:-1}"
         if ! mux_pane_live || [ "$(mux_pane_owner)" != "$MUX_SESSION" ]; then
+          MUX_REFUSAL_REASON=ownership
           mux_mark_unreachable "$MUX_SESSION" "pane $PANE lost live ownership before send"
           return 1
         fi
       fi
-      if mux_read_screen 5 screen &&
+      screen=""
+      # The newest rendered session must be ours. A tag left above another
+      # session's short screen cannot prove presence, even inside this window.
+      if mux_read_screen 200 screen &&
          { [ "$MUX_SCREEN_SOURCE" != visible ] || [ "$MUX_SCREEN_AT_BOTTOM" = 1 ]; } &&
-         [[ "$(printf '%s\n' "$screen" | awk 'NF' | tail -n 5 | tr -d '\n')" == *"$tag"* ]]; then
+         [ "$(printf '%s\n' "$screen" | awk 'NF' | tail -n 12 | tr -d '\n' |
+              grep -oE '⟨cc:[A-Za-z0-9._-]{1,8}⟩' | tail -n 1)" = "$tag" ]; then
         present=1
         break
       fi
     done
     if [ "$present" != 1 ]; then
-      mux_mark_unreachable "$MUX_SESSION" "screen presence unproved: pane $PANE lacks $tag before send"
+      MUX_REFUSAL_REASON=presence
+      # Keep screen contents out of the shared log. A private temporary file
+      # also replaces a pre-existing snapshot with permissive mode safely.
+      snapshot=$(umask 077; mktemp "$STATE/$MUX_SESSION.unreachable-screen.XXXXXX")
+      if [ -n "$snapshot" ]; then
+        if printf '%s\n' "$screen" | awk 'NF' | tail -n 15 > "$snapshot" &&
+           mv -f "$snapshot" "$STATE/$MUX_SESSION.unreachable-screen"; then :
+        else rm -f "$snapshot"; fi
+      fi
+      mux_mark_unreachable "$MUX_SESSION" "screen presence unproved: pane $PANE lacks a live bottom-most $tag before send"
       return 1
     fi
     if grep -q '^screen presence unproved:' "$STATE/$MUX_SESSION.unreachable" 2>/dev/null; then
@@ -309,7 +331,10 @@ _mux_refuse_unowned(){
     fi
     # A dialog may have opened while we waited, including on an own-prompt
     # send whose original permission to bypass that check is now stale.
-    if [ "$attempt" -gt 1 ] && mux_awaiting_human; then return 1; fi
+    if [ "$attempt" -gt 1 ] && mux_awaiting_human; then
+      MUX_REFUSAL_REASON=dialog
+      return 1
+    fi
   fi
   return 0
 }
@@ -364,7 +389,29 @@ mux_read_screen(){ # $1 = recent line limit (default 80), $2 = output variable
 # stdin only, so the fixtures test exactly what the watchers run.
 mux_text_awaiting_human(){
   local bottom
-  bottom=$(awk 'NF' | tail -n 6)
+  bottom=$(MUX_AWAIT_FOOTER_RE="$MUX_AWAIT_FOOTER_RE" \
+    MUX_AWAIT_CURSOR_RE="$MUX_AWAIT_CURSOR_RE" \
+    MUX_AWAIT_YESNO_RE="$MUX_AWAIT_YESNO_RE" awk '
+    function terminal_footer(s, count) {
+      # Never discard dialog chrome, even in a footer-looking row. ENVIRON
+      # preserves regex backslashes without awk -v interpreting them again.
+      if (tolower(s) ~ ENVIRON["MUX_AWAIT_FOOTER_RE"] ||
+          s ~ ENVIRON["MUX_AWAIT_CURSOR_RE"] ||
+          s ~ ENVIRON["MUX_AWAIT_YESNO_RE"]) return 0
+      if (s ~ /^[[:space:]]*✔ Update installed · Restart to apply$/ ||
+          s ~ /^[[:space:]]*Context:/ ||
+          s ~ /^[[:space:]]*Background tasks:/ ||
+          s ~ /^[[:space:]]*(⏵⏵[[:space:]]*)?auto mode on([[:space:]]|$)/ ||
+          s ~ /^[[:space:]]*[^[:alnum:]]*AUTO-HANDOFF:.*⟨cc:[A-Za-z0-9._-]+⟩/) return 1
+      count=gsub(/─/, "", s)
+      gsub(/[[:space:]]/, "", s)
+      return count >= 3 && length(s) == 0
+    }
+    { if (NF) row[++n]=$0 }
+    END {
+      while (n > 0 && terminal_footer(row[n])) n--
+      for (i=1; i<=n; i++) print row[i]
+    }' | tail -n 6)
   printf '%s\n' "$bottom" | tail -n 3 | grep -Eiq "$MUX_AWAIT_FOOTER_RE" && return 0
   printf '%s\n' "$bottom" | tail -n 4 | grep -Eq "$MUX_AWAIT_CURSOR_RE" && return 0
   printf '%s\n' "$bottom" | grep -Eq "$MUX_AWAIT_YESNO_RE"
@@ -488,8 +535,10 @@ mux_working(){
 # waits it out exactly as it waits out a running turn. herdr `blocked` (parked at
 # a question/permission menu) is busy too: an injected Enter would answer it.
 mux_busy(){
+  MUX_BUSY_REASON=dialog
   mux_awaiting_human && return 0
   [ "$MUX" = herdr ] && [ "$(mux_status)" = blocked ] && return 0
+  MUX_BUSY_REASON=busy
   mux_working
 }
 
@@ -536,8 +585,8 @@ mux_tab_rename(){ # $1 = label
 # sits here, at the keystroke, rather than
 # only in mux_busy, because this is the one place no caller can route around:
 # a future sender that forgets mux_busy still cannot answer a question, and the
-# check runs as late as possible, after any wait the caller did. Callers log the
-# refusal as `DEFER awaiting-human` and retry later exactly as for a busy pane;
+# check runs as late as possible, after any wait the caller did. Senders expose
+# the guard in MUX_REFUSAL_REASON so callers can log why a retry was deferred;
 # nothing escalates a refusal into a send.
 MUX_REFUSED=3
 _mux_refuse_staged_attempt(){
@@ -547,12 +596,14 @@ _mux_refuse_staged_attempt(){
   [ -n "$sid" ] || sid=$(mux_pane_owner)
   [ -n "$sid" ] || return 1
   [ -f "$STATE/$sid.reload-attempt" ] || return 1
+  MUX_REFUSAL_REASON=staged-input
   printf 'mux: refusing tmux input for session %s: staged-input lock is active\n' "$sid" >&2
   return 0
 }
 _mux_refuse_if_awaiting(){
   _mux_refuse_unowned || return 1
   mux_awaiting_human || return 0
+  MUX_REFUSAL_REASON=dialog
   printf 'mux: refused: pane %s is awaiting the human (open question or prompt)\n' "$PANE" >&2
   return 1
 }
@@ -566,6 +617,7 @@ mux_send_line(){ # $1 = text
   # must be able to distinguish a refusal before staging from one that may have
   # left text in the input line.
   MUX_LINE_STAGED=0
+  MUX_REFUSAL_REASON=""
   _mux_refuse_staged_attempt && return "$MUX_REFUSED"
   _mux_refuse_if_awaiting || return "$MUX_REFUSED"
   case "$MUX" in

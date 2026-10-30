@@ -122,4 +122,119 @@ AUTODEV_NO_FLOCK=1 sweep; AUTODEV_NO_FLOCK=1 sweep
 assert_eq "without flock, sequential sweeps still page once" "$(pages)" 1
 sandbox_rm
 
+# Reload paging must precede reachability checks, and use the same per-marker
+# dedupe as requests. A missing pane cannot suppress the only alert.
+setup
+touch -d '2 hours ago' "$AUTODEV_HOME/handoffs/.latest.$SID"
+printf 'reload fixture\n' > "$STATE/$SID.reload-pending"
+touch -d '40 minutes ago' "$STATE/$SID.reload-pending"
+: > "$STATE/$SID.deferred"
+export MUX_LIVE_PANES=""
+sweep; sweep
+assert_eq "unreachable reload pages exactly once across sweeps" "$(pages)" 1
+assert_contains "unreachable page identifies the reload" "$(cat "$SB/pages.log")" "reload for session $SID"
+assert_file "paging retains the reload marker" "$STATE/$SID.reload-pending"
+assert_eq "unreachable pane never launches watcher" "$(cat "$SB/launched.log")" ''
+touch -d '35 minutes ago' "$STATE/$SID.reload-pending"
+sweep
+assert_eq "a different stuck reload marker pages again" "$(pages)" 2
+# A compact request may coexist with the older reload. It must not displace
+# reload's shared dedupe record while that reload remains the active work.
+request '30 minutes ago'
+sweep; sweep
+assert_eq "coexisting compact request cannot re-page the same reload" "$(pages)" 2
+sandbox_rm
+
+setup
+touch -d '2 hours ago' "$AUTODEV_HOME/handoffs/.latest.$SID"
+printf 'reload fixture\n' > "$STATE/$SID.reload-pending"
+touch -d '10 minutes ago' "$STATE/$SID.reload-pending"
+export MUX_LIVE_PANES=""
+sweep
+assert_eq "a young unreachable reload does not page" "$(pages)" 0
+sandbox_rm
+
+setup
+touch -d '2 hours ago' "$AUTODEV_HOME/handoffs/.latest.$SID"
+printf 'reload fixture\n' > "$STATE/$SID.reload-pending"
+touch -d '40 minutes ago' "$STATE/$SID.reload-pending"
+export MUX_LIVE_PANES=""
+printf '#!/usr/bin/env bash\nsleep 1\nprintf "%%s\\n" "$*" >> "$SB/pages.log"\n' > "$SB/fakebin/notify-send"
+bash "$BIN/auto-handoff-sweep.sh" >/dev/null 2>&1 &
+reload_sweep_a=$!
+bash "$BIN/auto-handoff-sweep.sh" >/dev/null 2>&1 &
+reload_sweep_b=$!
+wait "$reload_sweep_a"; wait "$reload_sweep_b"
+assert_eq "overlapping sweeps page a stuck reload exactly once" "$(pages)" 1
+sandbox_rm
+
+# Stale cycle locks are never reclaimed by a sweep, but cannot suppress the
+# overdue reload page. Cover both owner-bearing symlinks and legacy locks.
+for lock_kind in dead-symlink dead-directory missing-owner live-owner; do
+  setup
+  touch -d '2 hours ago' "$AUTODEV_HOME/handoffs/.latest.$SID"
+  printf 'reload fixture\n' > "$STATE/$SID.reload-pending"
+  touch -d '40 minutes ago' "$STATE/$SID.reload-pending"
+  export MUX_LIVE_PANES=""
+  (exit 0) & dead_pid=$!
+  wait "$dead_pid"
+  assert_eq "$lock_kind: fixture owner is dead" "$(kill -0 "$dead_pid" 2>/dev/null && echo live || echo dead)" dead
+  lock="$STATE/$SID.cycle.lock"
+  case "$lock_kind" in
+    dead-symlink) ln -s "/dev/null/autodev-lock-owner/$dead_pid" "$lock" ;;
+    *)
+      mkdir "$lock"
+      case "$lock_kind" in
+        dead-directory) printf '%s\n' "$dead_pid" > "$lock/pid" ;;
+        live-owner) printf '%s\n' "$$" > "$lock/pid" ;;
+      esac ;;
+  esac
+  lock_before=$(stat -c '%i:%Y:%s' "$lock")
+  sweep; sweep
+  if [ "$lock_kind" = live-owner ]; then expected=0; else expected=1; fi
+  assert_eq "$lock_kind: overdue reload pages once unless owner is live" "$(pages)" "$expected"
+  assert_eq "$lock_kind: sweep does not reclaim or modify the cycle lock" "$(stat -c '%i:%Y:%s' "$lock")" "$lock_before"
+  assert_file "$lock_kind: reload marker is retained" "$STATE/$SID.reload-pending"
+  assert_eq "$lock_kind: no unreachable pane watcher launched" "$(cat "$SB/launched.log")" ''
+  sandbox_rm
+done
+
+# Paging checks must happen after taking the page lock, since another
+# watcher may have reclaimed a dead cycle owner in the intervening window.
+setup
+touch -d '2 hours ago' "$AUTODEV_HOME/handoffs/.latest.$SID"
+printf 'reload fixture\n' > "$STATE/$SID.reload-pending"
+touch -d '40 minutes ago' "$STATE/$SID.reload-pending"
+mkdir "$STATE/$SID.cycle.lock"
+export MUX_LIVE_PANES="" LOCK_TEST_LIVE_PID="$$" LOCK_TEST_SID="$SID"
+real_flock=$(command -v flock)
+printf '#!/usr/bin/env bash\nprintf "%%s\n" "$LOCK_TEST_LIVE_PID" > "$STATE/$LOCK_TEST_SID.cycle.lock/pid"\ntouch "$SB/page-lock-race"\nexec "%s" "$@"\n' "$real_flock" > "$SB/fakebin/flock"
+chmod +x "$SB/fakebin/flock"
+PATH="$SB/fakebin:$PATH" sweep
+assert_file "page-lock ownership race was exercised" "$SB/page-lock-race"
+assert_eq "late live cycle owner suppresses the reload page" "$(pages)" 0
+assert_no_file "late live cycle owner consumes no paging dedupe" "$STATE/$SID.paged"
+assert_eq "sweep leaves the late live owner untouched" "$(cat "$STATE/$SID.cycle.lock/pid")" "$$"
+sandbox_rm
+
+for marker_state in young superseded foreign-pane; do
+  setup
+  touch -d '2 hours ago' "$AUTODEV_HOME/handoffs/.latest.$SID"
+  printf 'reload fixture\n' > "$STATE/$SID.reload-pending"
+  touch -d '40 minutes ago' "$STATE/$SID.reload-pending"
+  mkdir "$STATE/$SID.cycle.lock"
+  export MUX_LIVE_PANES=""
+  case "$marker_state" in
+    young) touch -d '10 minutes ago' "$STATE/$SID.reload-pending" ;;
+    superseded) touch "$STATE/$SID.idle" ;;
+    foreign-pane)
+      export MUX_LIVE_PANES="w1:p1"
+      printf 'different-session\n' > "$STATE/.paneowner-herdr-w1_p1" ;;
+  esac
+  sweep
+  assert_eq "$marker_state: blocked cleanup does not page obsolete or young work" "$(pages)" 0
+  assert_file "$marker_state: sweep retains marker without owning the lock" "$STATE/$SID.reload-pending"
+  sandbox_rm
+done
+
 finish

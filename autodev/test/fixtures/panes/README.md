@@ -17,6 +17,9 @@ status lines.
 | `other-row.txt` | single-select with the cursor on the free-text "Other" row, text typed | assembled |
 | `rate-limit-menu.txt` | usage-limit menu ("What do you want to do?" with Stop-and-wait / extra usage rows) | assembled |
 | `idle-after-answer.txt` | idle prompt whose transcript quotes a dialog footer higher up | assembled |
+| `session-a-above-foreign.txt`, `session-a-below-foreign.txt` | both session tags within twelve rows, in opposite orders | synthetic |
+| `session-a-menu-*.txt` | open question, cursor-only submit, or permission prompt with extra status/footer rows | synthetic |
+| `session-a-extra-footers.txt` | session tag twelve non-empty rows from the bottom, extra update/context/task footers | synthetic |
 | `session-a-status.txt`, `session-b-status.txt` | idle prompts with distinct session tags | synthetic |
 
 The real captures come from herdr's saved scrollback (`~/.config/herdr/session-history.json`).

@@ -33,7 +33,7 @@ case "$1 $2" in
     [ -f "$SB/recent-fails" ] && { printf 'partial stale output'; exit 1; }
     [ -f "$SB/recent-empty" ] && exit 0
     [ -f "$SB/recent-blank" ] && { printf '  \n\t\n'; exit 0; }
-    if [ "$7" = 5 ]; then
+    if [ "$7" = 200 ]; then
       n=0
       [ -f "$SB/read-count" ] && n=$(cat "$SB/read-count")
       n=$((n + 1)); printf '%s\n' "$n" > "$SB/read-count"
@@ -91,17 +91,113 @@ for method in line stage key own-key; do
   assert_eq "$method: foreign screen refuses input" "$rc" 3
   assert_eq "$method: no keys or text sent" "$(cat "$SB/typed")" ''
   assert_file "$method: session marked unreachable" "$STATE/sess-a.unreachable"
-  assert_contains "$method: reason identifies missing tag" "$(cat "$STATE/sess-a.unreachable")" 'lacks ⟨cc:sess-a⟩ before send'
+  assert_contains "$method: reason identifies unproved live tag" "$(cat "$STATE/sess-a.unreachable")" 'lacks a live bottom-most ⟨cc:sess-a⟩ before send'
   mux_session_reachable sess-a
   assert_file "$method: metadata cannot clear screen refusal" "$STATE/sess-a.unreachable"
-  send "$method" > "$SB/send.out" 2>&1
-  assert_eq "$method: repeated refusal logs once" "$(wc -l < "$AUTODEV_HOME/logs/auto-handoff.log")" 1
+  assert_eq "$method: first refusal logs once" "$(wc -l < "$AUTODEV_HOME/logs/auto-handoff.log")" 1
+  assert_eq "$method: first refusal saves screen" "$(cat "$STATE/sess-a.unreachable-screen")" "$(awk 'NF' "$SB/screen" | tail -n 15)"
+  chmod 644 "$STATE/sess-a.unreachable-screen"
+  for row in {1..20}; do printf 'private screen row %s\n' "$row"; done > "$SB/screen"
+  cat "$SKILL_DIR/test/fixtures/panes/session-b-status.txt" >> "$SB/screen"
+  send "$method" > "$SB/send.out" 2>&1; rc=$?
+  assert_eq "$method: repeated refusal still refuses" "$rc" 3
+  assert_eq "$method: repeated refusal logs again" "$(wc -l < "$AUTODEV_HOME/logs/auto-handoff.log")" 2
+  assert_eq "$method: snapshot overwritten with last 15 non-empty lines" "$(cat "$STATE/sess-a.unreachable-screen")" "$(awk 'NF' "$SB/screen" | tail -n 15)"
+  assert_eq "$method: snapshot is private even after permissive old file" "$(stat -c %a "$STATE/sess-a.unreachable-screen")" 600
+  assert_not_contains "$method: screen text stays out of shared log" "$(cat "$AUTODEV_HOME/logs/auto-handoff.log")" 'private screen row'
+  assert_eq "$method: repeated refusal sends nothing" "$(cat "$SB/typed")" ''
   cp "$SKILL_DIR/test/fixtures/panes/session-a-status.txt" "$SB/screen"
   send "$method" > "$SB/send.out" 2>&1; rc=$?
   assert_eq "$method: own tag permits input" "$rc" 0
   assert_eq "$method: exactly one send recorded" "$(wc -l < "$SB/typed")" 1
   assert_no_file "$method: screen recovery clears refusal" "$STATE/sess-a.unreachable"
-  assert_contains "$method: bounded explicit text read" "$(cat "$SB/calls")" 'pane read w1:pX --source recent-unwrapped --lines 5 --format text'
+  assert_contains "$method: bounded explicit text read" "$(cat "$SB/calls")" 'pane read w1:pX --source recent-unwrapped --lines 200 --format text'
+  sandbox_rm
+done
+
+# Stale metadata still says ours. The last rendered tag must decide between
+# both short session screens, even when both tags fit inside twelve rows.
+for position in above below; do
+  for method in line stage key own-key; do
+    setup
+    cp "$SKILL_DIR/test/fixtures/panes/session-a-$position-foreign.txt" "$SB/screen"
+    assert_eq "$position/$method: stale metadata names us" "$(mux_pane_owner)" sess-a
+    send "$method" > "$SB/send.out" 2>&1; rc=$?
+    if [ "$position" = above ]; then
+      assert_eq "$method: foreign tag below ours refuses" "$rc" 3
+      assert_eq "$method: foreign last tag is a presence refusal" "$MUX_REFUSAL_REASON" presence
+      assert_eq "$method: stale tag sends nothing" "$(cat "$SB/typed")" ''
+      assert_file "$method: stale tag saves refusal evidence" "$STATE/sess-a.unreachable-screen"
+    else
+      assert_eq "$method: own tag below foreign tag permits send" "$rc" 0
+      assert_eq "$method: own last tag sends exactly once" "$(wc -l < "$SB/typed")" 1
+    fi
+    sandbox_rm
+  done
+  setup
+  touch "$SB/recent-empty"
+  cp "$SKILL_DIR/test/fixtures/panes/session-a-$position-foreign.txt" "$SB/visible"
+  _mux_refuse_unowned > "$SB/send.out" 2>&1; rc=$?
+  if [ "$position" = above ]; then expected=1; else expected=0; fi
+  assert_eq "$position: visible source honors bottom-most tag" "$rc" "$expected"
+  printf '1\n' > "$SB/scroll-offset"
+  _mux_refuse_unowned > "$SB/send.out" 2>&1; rc=$?
+  assert_eq "$position: scrolled visible source still refuses" "$rc" 1
+  sandbox_rm
+done
+
+# The renderer accepts short ids and ids with punctuation/capital letters too.
+for foreign in z A_9.-xY8; do
+  setup
+  sed "s/sess-b/$foreign/g" "$SKILL_DIR/test/fixtures/panes/session-a-above-foreign.txt" > "$SB/screen"
+  mux_send_line reload > "$SB/send.out" 2>&1; rc=$?
+  assert_eq "$foreign: every rendered foreign tag form refuses" "$rc" 3
+  assert_eq "$foreign: refusal is from presence" "$MUX_REFUSAL_REASON" presence
+  assert_eq "$foreign: no reload sent" "$(cat "$SB/typed")" ''
+  sandbox_rm
+done
+
+# Non-visible text must still detect dialogs when the owner tag fits inside
+# the twelve-line window but notices push dialog chrome above its old tails.
+for footer in notice context background all-footers cursor-footers permission-footers context-chrome window-edge; do
+  for method in line stage key; do
+    setup
+    cp "$SKILL_DIR/test/fixtures/panes/session-a-menu-$footer.txt" "$SB/screen"
+    _mux_refuse_unowned > "$SB/presence.out" 2>&1; rc=$?
+    assert_eq "$footer/$method: presence independently passes" "$rc" 0
+    send "$method" > "$SB/send.out" 2>&1; rc=$?
+    assert_eq "$footer/$method: open dialog refuses send" "$rc" 3
+    assert_eq "$footer/$method: refusing guard is dialog" "$MUX_REFUSAL_REASON" dialog
+    assert_eq "$footer/$method: no input sent" "$(cat "$SB/typed")" ''
+    assert_eq "$footer/$method: source was non-visible" "$MUX_SCREEN_SOURCE" recent-unwrapped
+    sandbox_rm
+  done
+done
+
+setup
+cp "$SKILL_DIR/test/fixtures/panes/session-a-extra-footers.txt" "$SB/screen"
+mux_send_line reload > "$SB/send.out" 2>&1; rc=$?
+assert_eq 'plain extra-footers idle pane still accepts reload' "$rc" 0
+assert_eq 'plain extra-footers idle pane receives exactly the reload' "$(cat "$SB/typed")" 'pane run w1:pX reload'
+sandbox_rm
+
+# The tag is twelve non-empty rows from the bottom, with blank lines and
+# additional notices. Both recent text and a live visible fallback must work.
+for source in recent visible; do
+  setup
+  cp "$SKILL_DIR/test/fixtures/panes/session-a-extra-footers.txt" "$SB/screen"
+  if [ "$source" = visible ]; then
+    touch "$SB/recent-empty"
+    cp "$SB/screen" "$SB/visible"
+  fi
+  _mux_refuse_unowned > "$SB/send.out" 2>&1; rc=$?
+  assert_eq "$source: extra footer rows retain the owner tag" "$rc" 0
+  assert_no_file "$source: extra footer fixture proves screen presence" "$STATE/sess-a.unreachable"
+  printf 'one extra row\n' >> "$SB/screen"
+  [ "$source" != visible ] || cp "$SB/screen" "$SB/visible"
+  _mux_refuse_unowned > "$SB/send.out" 2>&1; rc=$?
+  assert_eq "$source: tag thirteen non-empty rows up is old scrollback" "$rc" 1
+  assert_eq "$source: old tag sends nothing" "$(cat "$SB/typed")" ''
   sandbox_rm
 done
 
@@ -157,6 +253,7 @@ for screen in empty unreadable old-tag; do
     unreadable) touch "$SB/read-fails" ;;
     old-tag)
       cat "$SKILL_DIR/test/fixtures/panes/session-a-status.txt" > "$SB/screen"
+      for row in {1..12}; do printf 'old scrollback separator %s\n' "$row"; done >> "$SB/screen"
       cat "$SKILL_DIR/test/fixtures/panes/session-b-status.txt" >> "$SB/screen" ;;
   esac
   mux_send_line /compact > "$SB/send.out" 2>&1; rc=$?
@@ -240,9 +337,9 @@ for recent in empty blank fails; do
   assert_eq "$recent recent: wrapped visible owner tag recovers" "$rc" 0
   assert_no_file "$recent recent: recovery clears refusal" "$STATE/sess-a.unreachable"
   cat "$SKILL_DIR/test/fixtures/panes/session-a-status.txt" > "$SB/visible"
-  printf 'one\ntwo\nthree\nfour\nfive\n' >> "$SB/visible"
+  for row in {1..12}; do printf 'old footer row %s\n' "$row"; done >> "$SB/visible"
   _mux_refuse_unowned; rc=$?
-  assert_eq "$recent recent: old viewport tag outside bottom five refuses" "$rc" 1
+  assert_eq "$recent recent: old viewport tag outside bottom twelve refuses" "$rc" 1
   : > "$SB/visible"
   _mux_refuse_unowned; rc=$?
   assert_eq "$recent recent: blank visible refuses" "$rc" 1
