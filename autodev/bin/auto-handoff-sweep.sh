@@ -156,6 +156,16 @@ BUSY_MIN=$(positive_integer_or_default "${AUTODEV_BUSY_MINUTES:-20}" 20)
 # Continuity: the sweep is the only observer, so two observations further apart
 # than this (a skipped sweep, a stopped timer) do not prove the pane stayed busy.
 BUSY_GAP=$(positive_integer_or_default "${AUTODEV_BUSY_GAP:-600}" 600)
+# A dead session is only one whose watcher heartbeat and context reading are
+# both old AND whose pane is absent from a fresh successful backend listing.
+DEFAULT_DEAD_SESSION_HOURS=24
+DEAD_SESSION_HOURS=$(positive_integer_or_default "${AUTODEV_DEAD_SESSION_HOURS:-$DEFAULT_DEAD_SESSION_HOURS}" "$DEFAULT_DEAD_SESSION_HOURS")
+[ "$DEAD_SESSION_HOURS" -le 87600 ] || DEAD_SESSION_HOURS=$DEFAULT_DEAD_SESSION_HOURS
+DEAD_SESSION_AGE=$(( DEAD_SESSION_HOURS * 3600 ))
+# One sweep may send a few detailed pages, then one summary for the rest.
+DEFAULT_PAGE_BUDGET=3
+PAGE_BUDGET=$(positive_integer_or_default "${AUTODEV_PAGE_BUDGET:-$DEFAULT_PAGE_BUDGET}" "$DEFAULT_PAGE_BUDGET")
+[ "$PAGE_BUDGET" -le 100 ] || PAGE_BUDGET=$DEFAULT_PAGE_BUDGET
 
 # Global kill switch beats everything.
 [ -f "$STATE/disable-auto-compact" ] && exit 0
@@ -163,6 +173,70 @@ BUSY_GAP=$(positive_integer_or_default "${AUTODEV_BUSY_GAP:-600}" 600)
 now=$(date +%s)
 mtime(){ date -r "$1" +%s 2>/dev/null || echo 0; }
 fresh(){ [ -f "$1" ] && [ "$(( now - $(mtime "$1") ))" -le "$2" ]; }
+
+# The page functions can run in a flock subshell. Keep sweep-wide counts in a
+# private temporary file so those updates are visible to the parent sweep.
+PAGE_COUNT_FILE="$STATE/.page-count.$$"
+PAGE_COUNT_READY=1
+if ! printf '0 0\n' > "$PAGE_COUNT_FILE" 2>/dev/null; then
+  PAGE_COUNT_READY=0
+  log "-" "PAGE-SKIP cannot initialize per-sweep page budget; continuing without pages"
+else
+  trap 'rm -f "$PAGE_COUNT_FILE"' EXIT
+fi
+
+page_count_read(){
+  [ "$PAGE_COUNT_READY" = 1 ] || return 1
+  local detailed=0 summarized=0
+  read -r detailed summarized < "$PAGE_COUNT_FILE" 2>/dev/null || true
+  case "$detailed$summarized" in ''|*[!0-9]*) detailed=0; summarized=0 ;; esac
+  PAGE_DETAILED_COUNT=$detailed
+  PAGE_SUMMARY_COUNT=$summarized
+}
+page_count_write(){ [ "$PAGE_COUNT_READY" = 1 ] && printf '%s %s\n' "$1" "$2" > "$PAGE_COUNT_FILE" 2>/dev/null; }
+
+# A missing pane is proven only by a fresh successful listing for its backend.
+# mux_pane_live alone cannot distinguish absence from an unavailable backend.
+pane_absence_proven(){
+  local sid=$1 timeout_cmd listing timeout_seconds
+  mux_init "$sid" || return 1
+  timeout_seconds=$(positive_integer_or_default "${AUTODEV_HERDR_TIMEOUT:-10}" 10)
+  case "$MUX" in
+    herdr)
+      command -v timeout >/dev/null 2>&1 || return 1
+      timeout_cmd=$(command -v timeout) || return 1
+      listing=$("$timeout_cmd" -k 5 "$timeout_seconds" "$MUX_HERDR" pane list 2>/dev/null) || return 1
+      printf '%s\n' "$listing" | jq -e --arg pane "$PANE" \
+        '.result.panes | type == "array" and all(.[]; (.pane_id | type) == "string") and ([.[] | select(.pane_id == $pane)] | length == 0)' \
+        >/dev/null 2>&1
+      ;;
+    tmux)
+      command -v timeout >/dev/null 2>&1 || return 1
+      timeout_cmd=$(command -v timeout) || return 1
+      listing=$("$timeout_cmd" -k 5 "$timeout_seconds" tmux list-panes -a -F '#{pane_id}' 2>/dev/null) || return 1
+      if [ -n "$listing" ] && printf '%s\n' "$listing" | grep -Ev '^%[0-9]+$' | grep -q .; then return 1; fi
+      ! printf '%s\n' "$listing" | grep -qxF -- "$PANE"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+has_pending_marker(){
+  local sid=$1 kind
+  for kind in handoff-request compact-request reload-pending reload-attempt; do
+    [ -f "$STATE/$sid.$kind" ] && return 0
+  done
+  return 1
+}
+
+dead_session_eligible(){
+  local sid=$1 hb="$STATE/$1.heartbeat" ctx="$STATE/$1.ctx"
+  has_pending_marker "$sid" || return 1
+  [ -f "$hb" ] && [ -f "$ctx" ] || return 1
+  [ "$(( now - $(mtime "$hb") ))" -ge "$DEAD_SESSION_AGE" ] || return 1
+  [ "$(( now - $(mtime "$ctx") ))" -ge "$DEAD_SESSION_AGE" ] || return 1
+  pane_absence_proven "$sid"
+}
 
 # Take the per-session cycle lock only when its directory does not already
 # exist. The watcher owns stale-lock reclamation; a sweep never removes a lock.
@@ -204,11 +278,53 @@ page_stuck(){
     _page_locked "$sid" "$kind"
   ) 9>"$STATE/$sid.page.lock"
 }
+_notify_page(){ # $1 sid, $2 message
+  local sid=$1 msg=$2
+  log "$sid" "PAGE $msg"
+  [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] && [ -S "/run/user/$(id -u)/bus" ] &&
+    DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u)/bus" && export DBUS_SESSION_BUS_ADDRESS
+  local -a runner=(); command -v timeout >/dev/null 2>&1 && runner=(timeout "${AUTODEV_PAGE_TIMEOUT:-10}")
+  "${runner[@]}" "${AUTODEV_PAGE_CMD:-notify-send}" "autodev: handoff stuck" "$msg" >/dev/null 2>&1 ||
+    log "$sid" "PAGE notify failed — the PAGE line above is the only record; handled once, not retried"
+}
+_dead_page_locked(){ # $1 sid; caller holds the same per-session page lock as marker pages
+  local sid=$1 key msg notify=0
+  dead_session_eligible "$sid" || return 0
+  [ -f "$STATE/$sid.dead-session.paged" ] && return 0
+  page_count_read || return 0
+  key="dead-session:$(mtime "$STATE/$sid.heartbeat"):$(mtime "$STATE/$sid.ctx")"
+  msg="autodev: dead session $sid has pending markers left behind; inspect and clean them up by hand"
+  page_count_read
+  local detailed=$PAGE_DETAILED_COUNT summarized=$PAGE_SUMMARY_COUNT
+  if [ "$detailed" -lt "$PAGE_BUDGET" ]; then detailed=$(( detailed + 1 )); notify=1; else summarized=$(( summarized + 1 )); fi
+  page_count_write "$detailed" "$summarized" || return 0
+  if ! printf '%s\n' "$key" > "$STATE/$sid.dead-session.paged" 2>/dev/null; then
+    page_count_write "$PAGE_DETAILED_COUNT" "$PAGE_SUMMARY_COUNT" || true
+    log "$sid" "PAGE-SKIP cannot record dead-session page — not paging"
+    return 0
+  fi
+  if [ "$notify" = 1 ]; then _notify_page "$sid" "$msg"; fi
+}
+page_dead_session(){
+  local sid=$1
+  if [ -n "${AUTODEV_NO_FLOCK:-}" ] || ! command -v flock >/dev/null 2>&1; then
+    _dead_page_locked "$sid"; return
+  fi
+  ( flock -n 9 || exit 0; _dead_page_locked "$sid" ) 9>"$STATE/$sid.page.lock"
+}
 _page_locked(){
-  local sid=$1 kind=$2 rf key age msg owner retired pending=""
+  local sid=$1 kind=$2 rf key age msg owner retired pending="" record detailed summarized notify=0
   if [ "$kind" = reload-attempt ]; then rf="$STATE/$sid.reload-attempt"
   else rf="$STATE/$sid.$kind"; fi
   [ -f "$rf" ] || return 0
+  if [ "$kind" = handoff-request ] || [ "$kind" = compact-request ]; then
+    [ -f "$STATE/$sid.deferred" ] &&
+      [ "$STATE/$sid.deferred" -nt "$rf" ] || return 0
+    [ "$(( now - $(mtime "$rf") ))" -ge "$PAGE_AFTER" ] || return 0
+  fi
+  if [ "$kind" = reload-pending ] || [ "$kind" = reload-attempt ]; then
+    [ "$(( now - $(mtime "$rf") ))" -ge "$PAGE_AFTER" ] || return 0
+  fi
   if [ "$kind" = reload-pending ]; then
     # A stale/missing lock owner must not suppress the alert. Recheck inside
     # the page lock: a watcher may have reclaimed it since the sweep's check.
@@ -232,6 +348,10 @@ _page_locked(){
     [ -z "$owner" ] || [ "$owner" = "$sid" ] || return 0
   fi
   key="$kind:$(date -r "$rf" +%s%N 2>/dev/null)"
+  record="$STATE/$sid.paged.$kind"
+  [ "$(cat "$record" 2>/dev/null)" = "$key" ] && return 0
+  # Upgrade compatibility: the previous single-slot record may still describe
+  # this marker. Read it, but leave it untouched.
   [ "$(cat "$STATE/$sid.paged" 2>/dev/null)" = "$key" ] && return 0
   age=$(( (now - $(mtime "$rf")) / 60 ))
   if [ -f "$STATE/$sid.reload-attempt" ]; then
@@ -247,17 +367,16 @@ _page_locked(){
   fi
   # Record BEFORE paging, and refuse to page if the record cannot be kept: an
   # unrecorded page repeats on every sweep.
-  if ! printf '%s\n' "$key" > "$STATE/$sid.paged" 2>/dev/null; then
-    log "$sid" "PAGE-SKIP cannot record $STATE/$sid.paged — not paging (would repeat every sweep): $msg"
+  page_count_read || return 0
+  detailed=$PAGE_DETAILED_COUNT; summarized=$PAGE_SUMMARY_COUNT
+  if [ "$detailed" -lt "$PAGE_BUDGET" ]; then detailed=$(( detailed + 1 )); notify=1; else summarized=$(( summarized + 1 )); fi
+  if ! page_count_write "$detailed" "$summarized"; then return 0; fi
+  if ! printf '%s\n' "$key" > "$record" 2>/dev/null; then
+    page_count_write "$PAGE_DETAILED_COUNT" "$PAGE_SUMMARY_COUNT" || true
+    log "$sid" "PAGE-SKIP cannot record $record — not paging (would repeat every sweep): $msg"
     return 0
   fi
-  log "$sid" "PAGE $msg"
-  # A timer-run sweeper has no session bus in its environment; point at the user's.
-  [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] && [ -S "/run/user/$(id -u)/bus" ] &&
-    DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u)/bus" && export DBUS_SESSION_BUS_ADDRESS
-  local -a runner=(); command -v timeout >/dev/null 2>&1 && runner=(timeout "${AUTODEV_PAGE_TIMEOUT:-10}")
-  "${runner[@]}" "${AUTODEV_PAGE_CMD:-notify-send}" "autodev: handoff stuck" "$msg" >/dev/null 2>&1 ||
-    log "$sid" "PAGE notify failed — the PAGE line above is the only record; handled once, not retried"
+  if [ "$notify" = 1 ]; then _notify_page "$sid" "$msg"; fi
 }
 
 shopt -s nullglob
@@ -294,6 +413,16 @@ for pf in "$STATE"/*.herdr-pane "$STATE"/*.tmux-pane; do
       log "$sid" "SKIP stale $kind (handoff missing or predates the last compaction) — removed"
     fi
   done
+
+  # A marker may be left behind by a dead process. Preserve the existing
+  # satisfied-request cleanup above; only page if pending work remains after it.
+  if [ -f "$STATE/$sid.heartbeat" ] && [ -f "$STATE/$sid.ctx" ] &&
+     [ "$(( now - $(mtime "$STATE/$sid.heartbeat") ))" -ge "$DEAD_SESSION_AGE" ] &&
+     [ "$(( now - $(mtime "$STATE/$sid.ctx") ))" -ge "$DEAD_SESSION_AGE" ] &&
+     has_pending_marker "$sid" && pane_absence_proven "$sid"; then
+    page_dead_session "$sid"
+    continue
+  fi
 
   # Phoenix owns sessions that are waiting out a usage limit; typing at them
   # would only queue input behind a blocked prompt.
@@ -541,5 +670,11 @@ for pf in "$STATE"/*.herdr-pane "$STATE"/*.tmux-pane; do
   log "$sid" "SWEEP re-arming watcher ($reason, aborts=$aborts)"
   setsid "$WATCH" "$sid" </dev/null >/dev/null 2>&1 &
 done
+
+# If the sweep covered more eligible marker identities than its detailed-page
+# budget, send one final page with the count. This page is outside that budget.
+if page_count_read && [ "$PAGE_SUMMARY_COUNT" -gt 0 ]; then
+  _notify_page "-" "autodev: $PAGE_SUMMARY_COUNT additional stale marker(s) were covered by this sweep's page budget"
+fi
 
 exit 0

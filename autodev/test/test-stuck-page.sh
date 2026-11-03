@@ -108,7 +108,7 @@ sandbox_rm
 
 # If the page cannot be RECORDED, do not page at all (it would repeat every sweep).
 setup
-mkdir "$STATE/$SID.paged"
+mkdir "$STATE/$SID.paged.compact-request"
 request '40 minutes ago'; : > "$STATE/$SID.deferred"
 sweep; sweep
 assert_eq "an unrecordable page is not sent" "$(pages)" 0
