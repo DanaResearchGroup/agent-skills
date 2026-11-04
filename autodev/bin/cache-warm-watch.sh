@@ -126,6 +126,20 @@ while :; do
   epoch=$(cc_cache_epoch "$tpath") || epoch=""
   if [ -z "$epoch" ]; then sleep 5; continue; fi
 
+  billing_class=unknown
+  billing_file="$STATE/$sid.billing"
+  if [ -r "$billing_file" ]; then
+    read -r _bill _bill_epoch _extra < "$billing_file" || true
+    if [[ "$_bill" =~ ^(credits|plan|unknown)$ && "$_bill_epoch" =~ ^[0-9]+$ && -z "${_extra:-}" ]]; then billing_class=$_bill; fi
+  fi
+  if [ "$billing_class" = plan ]; then
+    [ "$applied" = "" ] || set_badge "" || exit 0
+    applied=""
+    remaining=$NAPMAX
+    sleep "$NAPMAX"
+    continue
+  fi
+
   # A newer entry than we started with: an API call refreshed the cache. Clear
   # the badge and stand down — this turn's Stop hook will launch a fresh watcher.
   if [ "$epoch" -gt "$baseline" ]; then

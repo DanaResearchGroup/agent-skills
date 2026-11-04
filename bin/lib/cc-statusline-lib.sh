@@ -49,6 +49,29 @@ cc_cache_seg() {
   printf '%b' " \033[2;36mcache⌛${when}\033[0m"
 }
 
+# cc_billing_class <json> -> credits, plan, or unknown. Keep parsing and
+# persistence shared by both statusline entry points.
+cc_billing_class() {
+  jq -r '
+    if (.rate_limits | type) != "object" then "unknown" else
+      [.rate_limits.five_hour, .rate_limits.seven_day]
+      | map(select(type == "object" and (.used_percentage | type == "number"))) as $w
+      | if ($w|length)==0 then "unknown"
+        elif any($w[]; .used_percentage >= 100) then "credits"
+        else "plan" end
+    end
+  ' 2>/dev/null <<<"${1:-}" | grep -E '^(credits|plan|unknown)$' || printf 'unknown\n'
+}
+
+cc_billing_write() {
+  local sid=${1:-} class=${2:-unknown} state=${AUTODEV_HOME:-$HOME/agents}/state tmp
+  [[ "$sid" =~ ^[A-Za-z0-9._-]+$ ]] || return 0
+  case "$class" in credits|plan|unknown) ;; *) class=unknown ;; esac
+  mkdir -p "$state" 2>/dev/null || return 0
+  tmp="$state/$sid.billing.tmp.$$"
+  printf '%s %s\n' "$class" "$(date +%s)" >"$tmp" 2>/dev/null && mv -f "$tmp" "$state/$sid.billing" 2>/dev/null || rm -f "$tmp"
+}
+
 # cc_cache_epoch <transcript_path> -> prints the epoch seconds of the newest
 # transcript entry that represents an API call on THIS session's prompt prefix,
 # i.e. the moment the prompt cache was last refreshed. Prints nothing and

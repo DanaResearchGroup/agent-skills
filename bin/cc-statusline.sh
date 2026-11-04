@@ -26,7 +26,13 @@ c_model='\033[0;36m' r='\033[0m'
 
 # ---- prompt-cache segment: when the cache lapses (see cc_cache_seg) ----
 cache_seg=''
-command -v cc_cache_seg >/dev/null 2>&1 && cache_seg=$(cc_cache_seg "$tpath")
+if command -v cc_billing_class >/dev/null 2>&1; then
+  billing_class=$(cc_billing_class "$input")
+  sid=$(printf '%s' "$input" | jq -r '.session_id // empty')
+  [ -n "$sid" ] || [ -z "$tpath" ] || sid=$(basename "$tpath" .jsonl)
+  cc_billing_write "$sid" "$billing_class"
+  [ "$billing_class" = plan ] || cache_seg=$(cc_cache_seg "$tpath")
+fi
 
 if [ -n "$pct" ]; then
   pct_fmt=$(printf '%s' "$pct" | awk '{printf "%.1f", $1}')
