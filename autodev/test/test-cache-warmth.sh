@@ -188,6 +188,26 @@ sandbox_rm
 
 echo "== it stays out of the way when it should =="
 
+# Plan billing state suppresses badges and removes a suffix already on screen.
+setup
+transcript_aged "$TPATH" 400
+CC_CACHE_TTL=300 CC_CACHE_WARN=30 watch_bg
+wait_label "proj •cold" 8
+printf 'plan %s\n' "$(date +%s)" > "$STATE/$SID.billing"
+wait_label "proj" 8
+assert_eq "plan transition strips the watcher suffix" "$(tab_label "$TAB")" "proj"
+watch_stop
+sandbox_rm
+
+# Missing billing state preserves legacy behavior.
+setup
+transcript_aged "$TPATH" 400
+CC_CACHE_TTL=300 CC_CACHE_WARN=30 watch_bg
+wait_label "proj •cold" 8
+assert_eq "missing billing state still badges" "$(tab_label "$TAB")" "proj •cold"
+watch_stop
+sandbox_rm
+
 # Kill switch, set before launch.
 setup
 transcript_aged "$TPATH" 400
@@ -238,6 +258,20 @@ payload=$(printf '{"session_id":"%s","transcript_path":"%s","model":{"display_na
 
 out=$(printf '%s' "$payload" | CC_CACHE_TTL=300 bash "$SKILL_DIR/../bin/cc-statusline.sh")
 assert_contains "group status line prints the lapse time" "$out" "cache⌛$expected"
+
+plan_payload=$(printf '%s' "$payload" | jq -c '. + {rate_limits:{five_hour:{used_percentage:20},seven_day:{used_percentage:99}}}')
+out=$(printf '%s' "$plan_payload" | CC_CACHE_TTL=300 AUTODEV_HOME="$AUTODEV_HOME" bash "$SKILL_DIR/../bin/cc-statusline.sh")
+assert_not_contains "plan hides cache deadline" "$out" "cache⌛"
+assert_line_start "plan billing state persisted" "$(cat "$STATE/$SID.billing")" "plan "
+
+for window in five_hour seven_day; do
+  credit_payload=$(printf '%s' "$payload" | jq -c --arg w "$window" '. + {rate_limits:{($w):{used_percentage:100}}}')
+  out=$(printf '%s' "$credit_payload" | CC_CACHE_TTL=300 bash "$SKILL_DIR/../bin/cc-statusline.sh")
+  assert_contains "$window exhausted shows deadline" "$out" "cache⌛$expected"
+  assert_line_start "$window exhausted persists credits" "$(cat "$STATE/$SID.billing")" "credits "
+done
+out=$(printf '%s' "$payload" | CC_CACHE_TTL=300 bash "$SKILL_DIR/../bin/cc-statusline.sh")
+assert_line_start "missing rate limits persists unknown" "$(cat "$STATE/$SID.billing")" "unknown "
 assert_not_contains "group status line no longer claims a decaying state" "$out" "cache:hot"
 
 out=$(printf '%s' "$payload" | CC_CACHE_TTL=300 bash "$SKILL_DIR/bin/cc-statusline.sh")

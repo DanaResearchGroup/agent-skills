@@ -77,6 +77,8 @@ loc=""
 if [ -f "$_ccsl_lib" ]; then
   # shellcheck source=/dev/null
   . "$_ccsl_lib"
+  billing_class=$(cc_billing_class "$input")
+  cc_billing_write "$sid" "$billing_class"
   dir=$(printf '%s' "$input" | jq -r '.workspace.current_dir // .cwd // empty')
   loc=$(cc_location "$dir")
 fi
@@ -151,7 +153,7 @@ fi
 # The live countdown is deliberately NOT here: the status line cannot redraw
 # while CC is idle, so cache-warm-watch.sh owns it, in the herdr tab label.
 cache_seg=""
-command -v cc_cache_seg >/dev/null 2>&1 && cache_seg=$(cc_cache_seg "$tpath")
+if [ -f "$_ccsl_lib" ] && [ "$billing_class" != plan ]; then cache_seg=$(cc_cache_seg "$tpath"); fi
 
 session_tag=""
 if [ -n "$sid" ] && command -v mux_session_tag >/dev/null 2>&1; then
