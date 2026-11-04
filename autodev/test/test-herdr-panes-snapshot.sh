@@ -30,7 +30,7 @@ TIMEOUT
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$SB/herdr-calls"
 case "${HERDR_MODE:-success}" in
-  success) printf '%s\n' '{"result":{"panes":[{"cwd":"/tmp/fake-pane"}]}}' ;;
+  success) printf '%s\n' '{"id":"fake-herdr-request","result":{"panes":[{"cwd":"/tmp/fake-pane"}],"status":"ok"}}' ;;
   nonzero) exit 7 ;;
   malformed) printf '%s\n' '{not-json' ;;
   wrong-shape) printf '%s\n' '{"result":{"panes":{}}}' ;;
@@ -61,6 +61,14 @@ sweep_with_path "$WITH_HERDR"
 assert_file 'valid herdr output publishes the pane snapshot' "$snapshot"
 valid=$(jq -e '.result.panes | type == "array"' "$snapshot" >/dev/null 2>&1 && echo yes || echo no)
 assert_eq 'published snapshot has a result.panes array' "$valid" yes
+captured_at=$(jq -r '.captured_at // empty' "$snapshot")
+assert_eq 'published snapshot has a UTC capture timestamp' "$(case "$captured_at" in *Z) echo yes;; *) echo no;; esac)" yes
+captured_parseable=$(python3 -c 'from datetime import datetime; import sys; datetime.fromisoformat(sys.argv[1].replace("Z", "+00:00")); print("yes")' "$captured_at" 2>/dev/null || echo no)
+assert_eq 'capture timestamp parses as ISO-8601' "$captured_parseable" yes
+captured_near_clock=$(python3 -c 'from datetime import datetime,timezone; import sys; t=datetime.fromisoformat(sys.argv[1].replace("Z", "+00:00")); now=datetime.now(timezone.utc); print("yes" if abs((now-t).total_seconds()) <= 5 else "no")' "$captured_at" 2>/dev/null || echo no)
+assert_eq 'capture timestamp is within five seconds of the test clock' "$captured_near_clock" yes
+result_unchanged=$(jq -e '.id == "fake-herdr-request" and .result == {"panes":[{"cwd":"/tmp/fake-pane"}],"status":"ok"}' "$snapshot" >/dev/null 2>&1 && echo yes || echo no)
+assert_eq 'published snapshot preserves herdr id and result' "$result_unchanged" yes
 mode=$(python3 -c 'import os,sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777))' "$snapshot" 2>/dev/null)
 assert_eq 'published snapshot is private' "$mode" 0o600
 calls=0
@@ -133,6 +141,29 @@ assert_no_file 'successful publication clears the failure marker' "$failing_mark
 assert_eq 'successful publication logs one recovery' "$(recovered_count)" "$((recovered_before + 1))"
 HERDR_MODE=success sweep_with_path "$WITH_HERDR"
 assert_eq 'later success does not repeat the recovery log' "$(recovered_count)" "$((recovered_before + 1))"
+
+# Fail jq only for the metadata augmentation (validation must still work).
+REAL_JQ=$(command -v jq)
+export REAL_JQ
+FAIL_AUGMENT="$SB/fail-augment"
+mkdir -p "$FAIL_AUGMENT"
+cat > "$FAIL_AUGMENT/jq" <<'JQ'
+#!/usr/bin/env bash
+case " $* " in
+  *captured_at*) exit 42 ;;
+  *) exec "$REAL_JQ" "$@" ;;
+esac
+JQ
+chmod +x "$FAIL_AUGMENT/jq"
+rm -f "$snapshot" "$failing_marker"
+augment_fail_rc=0
+HOME="$SB/home" PATH="$FAIL_AUGMENT:$WITH_HERDR" "$BIN/auto-handoff-sweep.sh" || augment_fail_rc=$?
+assert_eq 'jq augmentation failure does not fail the sweep' "$augment_fail_rc" 0
+assert_no_file 'jq augmentation failure publishes no snapshot' "$snapshot"
+assert_file 'jq augmentation failure sets the failure marker' "$failing_marker"
+assert_eq 'jq augmentation failure leaves no temporary file' "$(find "$STATE" -maxdepth 1 -name '.herdr-panes.json.*' -print | wc -l)" 0
+HERDR_MODE=success sweep_with_path "$WITH_HERDR"
+assert_no_file 'success after jq augmentation failure clears the marker' "$failing_marker"
 
 # Zero must use the positive default (10s), not GNU timeout's no-deadline mode.
 if [ -n "$REAL_TIMEOUT" ]; then
