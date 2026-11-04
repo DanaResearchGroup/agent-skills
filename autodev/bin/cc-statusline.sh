@@ -82,8 +82,6 @@ if [ -f "$_ccsl_lib" ]; then
   dir=$(printf '%s' "$input" | jq -r '.workspace.current_dir // .cwd // empty')
   loc=$(cc_location "$dir")
 fi
-cache_seg=""
-if [ -f "$_ccsl_lib" ] && [ "$billing_class" != plan ]; then cache_seg=$(cc_cache_seg "$tpath"); fi
 # Autodev-run badge: lit only when THIS session is marked as an autodev run.
 # autodev/SKILL.md touches "$STATE/$sid.autodev" at run start and clears it at
 # the end, so it never bleeds into other concurrent sessions.
