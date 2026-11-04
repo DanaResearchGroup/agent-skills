@@ -77,9 +77,11 @@ cycles it stops retrying and raises `<sid>.stuck`, which the status line shows a
 
 At the start of each sweep, the sweeper resolves herdr from `MUX_HERDR`, then `PATH`, then
 `$HOME/.local/bin/herdr`. When one resolves, it runs `pane list` once and atomically publishes
-valid JSON to `$AUTODEV_HOME/state/herdr-panes.json` with mode `0600`. On a query, validation, or
-write failure it logs once and leaves the previous snapshot untouched, so its mtime continues to
-age. The `$AUTODEV_HOME/state/.herdr-panes.failing` marker suppresses repeated failure lines until
+valid JSON to `$AUTODEV_HOME/state/herdr-panes.json` with mode `0600`. The snapshot preserves
+herdr's `id` and `result` and adds a top-level `captured_at` UTC timestamp taken just after the
+query returns. On a query, validation, timestamp, or write failure it logs once and leaves the
+previous snapshot untouched, so its mtime continues to age. The
+`$AUTODEV_HOME/state/.herdr-panes.failing` marker suppresses repeated failure lines until
 a successful publication clears it and logs recovery. If none of the herdr locations resolve, it
 skips snapshot publication. If herdr resolves but `timeout` is unavailable, it records a failure
 and skips the query so a timer run never invokes herdr without a bound. If the failure marker

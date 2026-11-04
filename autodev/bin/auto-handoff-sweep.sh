@@ -78,15 +78,23 @@ publish_herdr_panes(){
     return 0
   fi
 
-  local pane_json snapshot tmp timeout_seconds
+  local pane_json captured_at snapshot_json snapshot tmp timeout_seconds
   snapshot="$STATE/herdr-panes.json"
   timeout_seconds=$(positive_integer_or_default "${AUTODEV_HERDR_TIMEOUT:-10}" 10)
   if ! pane_json=$("$timeout_cmd" -k 5 "$timeout_seconds" "$herdr_cmd" pane list 2>/dev/null); then
     snapshot_failed "pane list command failed"
     return 0
   fi
+  if ! captured_at=$(date -u +'%Y-%m-%dT%H:%M:%SZ' 2>/dev/null); then
+    snapshot_failed "could not capture pane list timestamp"
+    return 0
+  fi
   if ! printf '%s\n' "$pane_json" | jq -e '.result.panes | type == "array"' >/dev/null 2>&1; then
     snapshot_failed "could not validate pane list JSON"
+    return 0
+  fi
+  if ! snapshot_json=$(printf '%s\n' "$pane_json" | jq -e --arg captured_at "$captured_at" '. + {captured_at: $captured_at}' 2>/dev/null); then
+    snapshot_failed "could not add pane list timestamp"
     return 0
   fi
 
@@ -94,7 +102,7 @@ publish_herdr_panes(){
     snapshot_failed "could not create temporary file"
     return 0
   fi
-  if ! printf '%s\n' "$pane_json" > "$tmp" 2>/dev/null; then
+  if ! printf '%s\n' "$snapshot_json" > "$tmp" 2>/dev/null; then
     rm -f "$tmp" 2>/dev/null
     snapshot_failed "could not write temporary file"
     return 0
