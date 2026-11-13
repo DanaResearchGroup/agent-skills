@@ -393,37 +393,60 @@ export HEAD_SHA=$(gh pr view N --json headRefOid -q .headRefOid)
 gh api graphql -f query='query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){pullRequest(number:$n){comments(first:100){totalCount nodes{databaseId author{login} body createdAt}}}}}' \
   -f o=OWNER -f r=REPO -F n=N \
   --jq '.data.repository.pullRequest.comments as $c
-        | ($c.nodes | map(select(.author.login=="greptile-apps" and (.body|startswith("<!-- greptile_summary -->")))) | last) as $s
-        | ($c.nodes | map(select(.body|test("^\\s*@greptileai\\s+review\\b";"i")))) as $req
+        | [$c.nodes | to_entries[] | .value + {i:.key}] as $n
+        | ($n | map(select(.author.login=="greptile-apps" and (.body|startswith("<!-- greptile_summary -->"))))) as $ss
+        | ($ss | last) as $s
+        | ($n | map(select(.body|test("^\\s*@greptileai\\s+review\\b";"i")))) as $req
         | (($s.body // "") | capture("Last reviewed commit:[^\\n]*?/commit/(?<sha>[0-9a-f]{40})").sha? // null) as $reviewed
         | (($s.body // "") | capture("Reviews \\((?<k>[0-9]+)\\)").k? // null | if . then tonumber else . end) as $rounds
-        | ([$rounds // 0, ($req|length)] | max) as $spent
+        | ($rounds // 0) as $k
+        | (if $k > 0 and ($req | map(select(.i < $ss[0].i)) | length) == 0 then 1 else 0 end) as $auto
+        | ([($req|length), ([$k - $auto, 0] | max)] | min) as $answered
+        | $req[$answered:] as $open
+        | ($k + ($open|length)) as $spent
         | (if $reviewed == env.HEAD_SHA then []
-           else $req | map(select(.body|contains("<!-- greptile-request head=" + env.HEAD_SHA + " -->")))
-                     | map({id:.databaseId, at:.createdAt, stale:((.createdAt|fromdate) < (now - 3600))}) end) as $out
-        | {head:env.HEAD_SHA, reviewed:$reviewed, rounds:$rounds, requests:($req|length), spent:$spent,
-           outstanding:$out, truncated:($c.totalCount > 100),
-           state:(if $reviewed == env.HEAD_SHA then "green" elif ($out|length) > 0 then "pending"
+           else $open | map(select((.body|contains("<!-- greptile-request head=" + env.HEAD_SHA + " -->"))
+                                   or (.body|contains("<!-- greptile-request head=")|not)))
+                      | map({id:.databaseId, at:.createdAt, marked:(.body|contains("<!-- greptile-request head=")),
+                             stale:((.createdAt|fromdate) < (now - 3600))}) end) as $out
+        | {head:env.HEAD_SHA, reviewed:$reviewed, rounds:$rounds, requests:($req|length),
+           unanswered:($open|length), spent:$spent, outstanding:$out, truncated:($c.totalCount > 100),
+           state:(if $reviewed == env.HEAD_SHA then "green"
+                  elif ($out | map(select(.marked)) | length) > 0 then "pending"
+                  elif ($out|length) > 0 then "pending (ambiguous)"
                   elif $spent < 2 then "request" else "capped" end)}'
 ```
-Every request this skill posts names its head in a hidden marker, so the rule reads no timestamps.
-A request is **outstanding** when its marker names `HEAD_SHA` and the summary's `reviewed` is not
-`HEAD_SHA`. `spent` is the larger of the summary's `rounds` and the number of `@greptileai review`
-comments on the PR, marked or not: Greptile spends a round on each request it answers, so counting
-requests errs on the cap's safe side. No summary yet counts as 0 rounds; if a summary exists but
-`rounds` reads null, count the rounds from its body before asking. If `truncated` is true, the PR has
-over 100 comments and the counts may be low: post nothing and report it. Greptile is in one of three
-states: green, pending, or capped out. The `state` field picks one of four cases, in this order;
-`request` is the one action, and it leaves the gate pending:
+A request is **answered** once a round has followed it. Greptile answers requests one round each, in
+comment order, so the snapshot settles which ones are answered by position alone, with no clock:
+`rounds` rounds have run; the first is unrequested (`auto` = 1) only when no request comes before
+the summary comment, because Greptile writes that comment at its first round; every other round
+answers the oldest request not yet answered. The last `unanswered` requests, any head, marked or
+not, are still open. `spent` is `rounds` plus `unanswered`: every round run and every round still
+owed, with each answered request counted once. A request that got no round of its own (two
+requests answered by one round) stays open and keeps `spent` high, which errs on the cap's safe
+side. No summary yet counts as 0 rounds, so every request is open; if a summary exists but `rounds`
+reads null, count the rounds from its body before asking. If `truncated` is true, the PR has over 100
+comments and the counts may be low: post nothing and report it.
+
+An open request is **outstanding** when `reviewed` is not `HEAD_SHA` and the request either names
+`HEAD_SHA` in its hidden marker (`marked`) or carries no marker. Every request this skill posts
+names its head, so a marked request for an earlier head is not outstanding, but it still counts in
+`spent`. An unmarked request (an older run of this skill, or a person) may be for `HEAD_SHA`; the
+snapshot cannot tell. Greptile is in one of three states: green, pending, or capped out. The
+`state` field picks one of four cases, in this order; `request` is the one action, and it leaves
+the gate pending:
 - **`green`: `reviewed` = `HEAD_SHA`** — the gate is green. Request nothing: a review of an
   unchanged head spends a round for nothing. A run that skipped every finding and pushed nothing
   lands here.
-- **`pending`: an outstanding request** — a request for `HEAD_SHA` is already posted. Post nothing:
-  a second request for the same head gets no new review and can spend a round. Report "Greptile
-  re-review pending at `HEAD_SHA`" and end the run. A round takes Greptile minutes; if a row in
-  `outstanding` is `stale` (posted over an hour ago, by GitHub's clock), Greptile has likely
-  dropped it, so the summary says so with the row's `id` and `at`, and leaves the re-request to the
-  user.
+- **`pending` or `pending (ambiguous)`: an outstanding request** — post nothing: a second request
+  for the same head gets no new review and can spend a round. For `pending`, a marked request for
+  `HEAD_SHA` is open: report "Greptile re-review pending at `HEAD_SHA`" and end the run. For
+  `pending (ambiguous)`, only unmarked requests are open: report "Greptile request pending, head
+  unknown" with each unmarked row's `id`, and end the run. The user decides whether that request
+  covers `HEAD_SHA` or should be deleted. In both, name every unmarked row's `id`. A round takes
+  Greptile minutes; if a row in `outstanding` is `stale` (posted over an hour ago, by GitHub's
+  clock), Greptile has likely dropped it, so the summary says so with the row's `id` and `at`, and
+  leaves the re-request to the user.
 - **`request`: no outstanding request, `spent` below 2** — ask for a fresh round. Greptile
   re-reviews only when asked by a PR comment, not through `requested_reviewers`. The second line is
   the marker; it renders as nothing:
@@ -434,11 +457,11 @@ states: green, pending, or capped out. The `state` field picks one of four cases
   The gate is now **pending**. Do not wait for it: report "Greptile re-review pending at `HEAD_SHA`"
   and end the run. Its new findings arrive later; the next run picks them up at step 2.
 - **`capped`: no outstanding request, `spent` 2 or more** — the cap is spent: at most 2 rounds, then
-  fix, file a follow-up, or rebut. Do not ask again. A request still unanswered for an earlier head
-  counts here, so a pending second round leaves no room for a third. Your own verification of the
-  fix (the checks you ran on `HEAD_SHA`) closes the gate, and the run summary says plainly
-  "unreviewed by Greptile since round 2: reviewed `<reviewed>`, head `HEAD_SHA`". Add "one round
-  pending" if `requests` is above `rounds`.
+  fix, file a follow-up, or rebut. Do not ask again. A request still open for an earlier head counts
+  here, so a pending second round leaves no room for a third. Your own verification of the fix (the
+  checks you ran on `HEAD_SHA`) closes the gate, and the run summary says plainly "unreviewed by
+  Greptile since round 2: reviewed `<reviewed>`, head `HEAD_SHA`". Add "`<unanswered>` round(s)
+  pending" if `unanswered` is above 0.
 
 Never report the Greptile gate green for a head Greptile did not review.
 
@@ -446,8 +469,9 @@ Never report the Greptile gate green for a head Greptile did not review.
 the non-trivial ones carrying a one-line reply; every human "discuss" thread carries a reply and is
 intentionally left open; the verification query shows nothing open but those; Greptile, where it
 reviews, is in exactly one of the three states above and the run summary names it (green at the
-head, re-review pending at `HEAD_SHA` — the review is then not complete, so do not report it so — or
-capped out with both SHAs); the run posted no request while one was outstanding at `HEAD_SHA`;
+head, re-review pending at `HEAD_SHA` or pending with an unmarked request's `id` — the review is then
+not complete, so do not report it so — or capped out with both SHAs); the run posted no request while
+one was outstanding;
 and the run summary tells the user which bot findings were skipped and why, and which human threads
 were left open (disagreements and questions) for them to weigh in on — plus any threads the API
 would not let you resolve.
