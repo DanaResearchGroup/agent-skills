@@ -386,25 +386,59 @@ let it abort the run — report which threads you could not resolve so the user 
 **Greptile: gate on its summary, re-request only a new head.** Where Greptile reviews the repo, the
 merge gate is its summary comment: its "Last reviewed commit" SHA equals the current PR head. Never
 gate on Greptile's review objects — their SHAs go stale after a force-push. After the push, re-run
-step 2's summary fetch and read the head:
+step 2's summary read as one snapshot: one GraphQL response that holds the summary and every
+review request, so the reviewed SHA, the round count and the requests all come from the same moment:
 ```bash
-HEAD_SHA=$(gh pr view N --json headRefOid -q .headRefOid)
+export HEAD_SHA=$(gh pr view N --json headRefOid -q .headRefOid)
+gh api graphql -f query='query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){pullRequest(number:$n){comments(first:100){totalCount nodes{databaseId author{login} body createdAt}}}}}' \
+  -f o=OWNER -f r=REPO -F n=N \
+  --jq '.data.repository.pullRequest.comments as $c
+        | ($c.nodes | map(select(.author.login=="greptile-apps" and (.body|startswith("<!-- greptile_summary -->")))) | last) as $s
+        | ($c.nodes | map(select(.body|test("^\\s*@greptileai\\s+review\\b";"i")))) as $req
+        | (($s.body // "") | capture("Last reviewed commit:[^\\n]*?/commit/(?<sha>[0-9a-f]{40})").sha? // null) as $reviewed
+        | (($s.body // "") | capture("Reviews \\((?<k>[0-9]+)\\)").k? // null | if . then tonumber else . end) as $rounds
+        | ([$rounds // 0, ($req|length)] | max) as $spent
+        | (if $reviewed == env.HEAD_SHA then []
+           else $req | map(select(.body|contains("<!-- greptile-request head=" + env.HEAD_SHA + " -->")))
+                     | map({id:.databaseId, at:.createdAt, stale:((.createdAt|fromdate) < (now - 3600))}) end) as $out
+        | {head:env.HEAD_SHA, reviewed:$reviewed, rounds:$rounds, requests:($req|length), spent:$spent,
+           outstanding:$out, truncated:($c.totalCount > 100),
+           state:(if $reviewed == env.HEAD_SHA then "green" elif ($out|length) > 0 then "pending"
+                  elif $spent < 2 then "request" else "capped" end)}'
 ```
-Compare the summary's `reviewed` SHA and `rounds` against it (no summary yet counts as 0 rounds; if
-`rounds` reads null, count the rounds from the body before asking):
-- **`reviewed` = `HEAD_SHA`** — the gate is green. Request nothing: a review of an unchanged head
-  spends a round for nothing. A run that skipped every finding and pushed nothing lands here.
-- **`reviewed` ≠ `HEAD_SHA`, fewer than 2 rounds** — ask for a fresh round. Greptile re-reviews only
-  when asked by a PR comment, not through `requested_reviewers`:
+Every request this skill posts names its head in a hidden marker, so the rule reads no timestamps.
+A request is **outstanding** when its marker names `HEAD_SHA` and the summary's `reviewed` is not
+`HEAD_SHA`. `spent` is the larger of the summary's `rounds` and the number of `@greptileai review`
+comments on the PR, marked or not: Greptile spends a round on each request it answers, so counting
+requests errs on the cap's safe side. No summary yet counts as 0 rounds; if a summary exists but
+`rounds` reads null, count the rounds from its body before asking. If `truncated` is true, the PR has
+over 100 comments and the counts may be low: post nothing and report it. Greptile is in one of three
+states: green, pending, or capped out. The `state` field picks one of four cases, in this order;
+`request` is the one action, and it leaves the gate pending:
+- **`green`: `reviewed` = `HEAD_SHA`** — the gate is green. Request nothing: a review of an
+  unchanged head spends a round for nothing. A run that skipped every finding and pushed nothing
+  lands here.
+- **`pending`: an outstanding request** — a request for `HEAD_SHA` is already posted. Post nothing:
+  a second request for the same head gets no new review and can spend a round. Report "Greptile
+  re-review pending at `HEAD_SHA`" and end the run. A round takes Greptile minutes; if a row in
+  `outstanding` is `stale` (posted over an hour ago, by GitHub's clock), Greptile has likely
+  dropped it, so the summary says so with the row's `id` and `at`, and leaves the re-request to the
+  user.
+- **`request`: no outstanding request, `spent` below 2** — ask for a fresh round. Greptile
+  re-reviews only when asked by a PR comment, not through `requested_reviewers`. The second line is
+  the marker; it renders as nothing:
   ```bash
-  gh pr comment N --body '@greptileai review'
+  gh pr comment N --body "@greptileai review
+  <!-- greptile-request head=$HEAD_SHA -->"
   ```
   The gate is now **pending**. Do not wait for it: report "Greptile re-review pending at `HEAD_SHA`"
   and end the run. Its new findings arrive later; the next run picks them up at step 2.
-- **`reviewed` ≠ `HEAD_SHA`, 2 rounds spent** — the cap is spent: at most 2 rounds, then fix, file a
-  follow-up, or rebut. Do not ask again. Your own verification of the fix (the checks you ran on
-  `HEAD_SHA`) closes the gate, and the run summary says plainly "unreviewed by Greptile since round
-  2: reviewed `<reviewed>`, head `HEAD_SHA`".
+- **`capped`: no outstanding request, `spent` 2 or more** — the cap is spent: at most 2 rounds, then
+  fix, file a follow-up, or rebut. Do not ask again. A request still unanswered for an earlier head
+  counts here, so a pending second round leaves no room for a third. Your own verification of the
+  fix (the checks you ran on `HEAD_SHA`) closes the gate, and the run summary says plainly
+  "unreviewed by Greptile since round 2: reviewed `<reviewed>`, head `HEAD_SHA`". Add "one round
+  pending" if `requests` is above `rounds`.
 
 Never report the Greptile gate green for a head Greptile did not review.
 
@@ -413,9 +447,10 @@ the non-trivial ones carrying a one-line reply; every human "discuss" thread car
 intentionally left open; the verification query shows nothing open but those; Greptile, where it
 reviews, is in exactly one of the three states above and the run summary names it (green at the
 head, re-review pending at `HEAD_SHA` — the review is then not complete, so do not report it so — or
-capped out with both SHAs); and the run summary tells the user which
-bot findings were skipped and why, and which human threads were left open (disagreements and
-questions) for them to weigh in on — plus any threads the API would not let you resolve.
+capped out with both SHAs); the run posted no request while one was outstanding at `HEAD_SHA`;
+and the run summary tells the user which bot findings were skipped and why, and which human threads
+were left open (disagreements and questions) for them to weigh in on — plus any threads the API
+would not let you resolve.
 
 ## 7. Capture the defect class
 
