@@ -1,12 +1,12 @@
 ---
 name: copilot-review
-description: Clear a PR's review comments — Copilot / GitHub Advanced Security bots and human reviewers alike — triage each, fix the real ones, squash each fix into the commit it fixes, rebase onto the base if it has moved (resolving conflicts), force-push with lease, then reply to each thread and resolve the ones it addressed. Bot findings run to completion unattended; a human thread it disagrees with, or that asks a question, gets a reply but stays open and is flagged back to you. Invoking it is the approval to rewrite history and force-push.
+description: Clear a PR's review comments — Copilot / Greptile / GitHub Advanced Security bots and human reviewers alike — triage each, fix the real ones, squash each fix into the commit it fixes, rebase onto the base if it has moved (resolving conflicts), force-push with lease, then reply to each thread and resolve the ones it addressed. Bot findings run to completion unattended; a human thread it disagrees with, or that asks a question, gets a reply but stays open and is flagged back to you. Invoking it is the approval to rewrite history and force-push.
 disable-model-invocation: true
 ---
 
 # copilot-review
 
-Turn a PR's review comments — from the Copilot / security **bots** and from **human reviewers**
+Turn a PR's review comments — from the Copilot / Greptile / security **bots** and from **human reviewers**
 alike — into fixes folded cleanly back into history: **target** the PR → **fetch** the comments →
 **triage** them → fix → **fixup** into the right commits, **rebase** onto the base if it has moved,
 force-push with lease, then **respond** to the threads and **resolve** the ones you addressed.
@@ -53,9 +53,10 @@ a copy-pasted `origin/...` fails outright. `BASE` is the PR's `baseRefName` (usu
 
 ## 2. Fetch the latest review comments
 
-Two kinds of author to fetch: the **bots** (Copilot / GitHub Advanced Security) and the **human
-reviewers** (anyone who isn't you, the PR author). Match on author login, case-insensitive, newest
-review pass only. Copilot re-reviews on every push, so old bot comments may be stale — prefer the
+Two kinds of author to fetch: the **bots** (Copilot / Greptile / GitHub Advanced Security) and the
+**human reviewers** (anyone who isn't you, the PR author). Greptile (`greptile-apps[bot]`) is a bot
+everywhere below, never a human: its threads are triaged address/skip and resolved like Copilot's.
+Match on author login, case-insensitive, newest review pass only. Copilot re-reviews on every push, so old bot comments may be stale — prefer the
 most recent pass and skip threads already marked resolved.
 
 Resolve the PR author first, so the human fetch can exclude your own comments. Export it — `gh`'s
@@ -69,13 +70,25 @@ export ME=$(gh pr view N --json author -q .author.login)
 ```bash
 # Inline review comments — where Copilot and the security bot post line-level findings
 gh api --paginate repos/OWNER/REPO/pulls/N/comments \
-  --jq '.[] | select(.user.login|ascii_downcase|test("copilot|advanced-security|code-scanning"))
+  --jq '.[] | select(.user.login|ascii_downcase|test("copilot|advanced-security|code-scanning|greptile"))
         | {id, login:.user.login, path, line, body, url:.html_url, created:.created_at}'
 
 # Copilot's overall review verdict / summary
 gh api --paginate repos/OWNER/REPO/pulls/N/reviews \
-  --jq '.[] | select(.user.login|ascii_downcase|test("copilot"))
+  --jq '.[] | select(.user.login|ascii_downcase|test("copilot|greptile"))
         | {login:.user.login, state, body, submitted:.submitted_at}'
+```
+
+Greptile's verdict is not a review object: its reviews carry empty bodies and keep stale commit SHAs
+after a force-push. It is one top-level PR comment, edited in place each round, whose body starts
+`<!-- greptile_summary -->`. Read its findings, its round count (`Reviews (K)`) and its
+"Last reviewed commit" SHA:
+```bash
+gh api --paginate repos/OWNER/REPO/issues/N/comments \
+  --jq '.[] | select(.user.login=="greptile-apps[bot]") | select(.body|startswith("<!-- greptile_summary -->"))
+        | {id, updated:.updated_at, body,
+           rounds:(.body|capture("Reviews \\((?<k>[0-9]+)\\)").k? // null),
+           reviewed:(.body|capture("Last reviewed commit:[^\\n]*?/commit/(?<sha>[0-9a-f]{40})").sha? // null)}'
 ```
 
 To avoid re-addressing threads already resolved, check thread resolution and keep only unresolved:
@@ -86,7 +99,7 @@ gh api graphql -f query='query($o:String!,$r:String!,$n:Int!){repository(owner:$
   -f o=OWNER -f r=REPO -F n=N \
   --jq '.data.repository.pullRequest.reviewThreads.nodes[]
         | select(.isResolved==false)
-        | select(.comments.nodes[0].author.login|ascii_downcase|test("copilot|advanced-security|code-scanning"))'
+        | select(.comments.nodes[0].author.login|ascii_downcase|test("copilot|advanced-security|code-scanning|greptile"))'
 ```
 
 This query (and the step-6 listing and verification queries) caps at `reviewThreads(first:100)` — fine
@@ -105,24 +118,24 @@ conversation comments — so fetch all three:
 ```bash
 # Inline review comments from humans (exclude bots and yourself)
 gh api --paginate repos/OWNER/REPO/pulls/N/comments \
-  --jq '.[] | select((.user.login|ascii_downcase|test("copilot|advanced-security|code-scanning"))|not)
+  --jq '.[] | select((.user.login|ascii_downcase|test("copilot|advanced-security|code-scanning|greptile"))|not)
         | select((.user.login|ascii_downcase) != (env.ME|ascii_downcase))
         | {id, login:.user.login, path, line, body, url:.html_url, created:.created_at}'
 
 # Human review verdicts (APPROVED / CHANGES_REQUESTED / COMMENTED) with a non-empty body
 gh api --paginate repos/OWNER/REPO/pulls/N/reviews \
-  --jq '.[] | select((.user.login|ascii_downcase) != (env.ME|ascii_downcase)) | select((.user.login|ascii_downcase|test("copilot|advanced-security|code-scanning"))|not)
+  --jq '.[] | select((.user.login|ascii_downcase) != (env.ME|ascii_downcase)) | select((.user.login|ascii_downcase|test("copilot|advanced-security|code-scanning|greptile"))|not)
         | select((.body // "") != "") | {login:.user.login, state, body, submitted:.submitted_at}'
 
 # Top-level PR conversation comments (the "issue" comments, not tied to a line)
 gh api --paginate repos/OWNER/REPO/issues/N/comments \
   --jq '.[] | select((.user.login|ascii_downcase) != (env.ME|ascii_downcase))
-        | select((.user.login|ascii_downcase|test("copilot|advanced-security|code-scanning"))|not)
+        | select((.user.login|ascii_downcase|test("copilot|advanced-security|code-scanning|greptile"))|not)
         | {id, login:.user.login, body, url:.html_url, created:.created_at}'
 ```
 
 The unresolved-threads GraphQL query above already returns human threads too — widen its filter to
-keep them: replace the bot-only `test("copilot|...")` filter with `select((.comments.nodes[0].author.login|ascii_downcase) != (env.ME|ascii_downcase))` so every non-author review thread lands in the same list, each with its thread `id` for step 6.
+keep them: replace the bot-only `test("copilot|...|greptile")` filter with `select((.comments.nodes[0].author.login|ascii_downcase) != (env.ME|ascii_downcase))` so every non-author review thread lands in the same list, each with its thread `id` for step 6.
 
 **Done when:** every unresolved comment from the latest pass — bot and human — is in hand with its
 body; inline/thread comments also carry their `path`, `line`, and thread `id` (review-verdict bodies
@@ -370,10 +383,37 @@ gh api graphql -f query='query($o:String!,$r:String!,$n:Int!){repository(owner:$
 If a resolve or reply call fails (permissions, a thread that isn't resolvable via the API), don't
 let it abort the run — report which threads you could not resolve so the user can click them shut.
 
+**Greptile: gate on its summary, re-request only a new head.** Where Greptile reviews the repo, the
+merge gate is its summary comment: its "Last reviewed commit" SHA equals the current PR head. Never
+gate on Greptile's review objects — their SHAs go stale after a force-push. After the push, re-run
+step 2's summary fetch and read the head:
+```bash
+HEAD_SHA=$(gh pr view N --json headRefOid -q .headRefOid)
+```
+Compare the summary's `reviewed` SHA and `rounds` against it (no summary yet counts as 0 rounds; if
+`rounds` reads null, count the rounds from the body before asking):
+- **`reviewed` = `HEAD_SHA`** — the gate is green. Request nothing: a review of an unchanged head
+  spends a round for nothing. A run that skipped every finding and pushed nothing lands here.
+- **`reviewed` ≠ `HEAD_SHA`, fewer than 2 rounds** — ask for a fresh round. Greptile re-reviews only
+  when asked by a PR comment, not through `requested_reviewers`:
+  ```bash
+  gh pr comment N --body '@greptileai review'
+  ```
+  The gate is now **pending**. Do not wait for it: report "Greptile re-review pending at `HEAD_SHA`"
+  and end the run. Its new findings arrive later; the next run picks them up at step 2.
+- **`reviewed` ≠ `HEAD_SHA`, 2 rounds spent** — the cap is spent: at most 2 rounds, then fix, file a
+  follow-up, or rebut. Do not ask again. Your own verification of the fix (the checks you ran on
+  `HEAD_SHA`) closes the gate, and the run summary says plainly "unreviewed by Greptile since round
+  2: reviewed `<reviewed>`, head `HEAD_SHA`".
+
+Never report the Greptile gate green for a head Greptile did not review.
+
 **Done when:** every bot thread (addressed and skipped) and every addressed-human thread is resolved,
 the non-trivial ones carrying a one-line reply; every human "discuss" thread carries a reply and is
-intentionally left open; the verification query shows nothing open but those; and the run summary
-tells the user which
+intentionally left open; the verification query shows nothing open but those; Greptile, where it
+reviews, is in exactly one of the three states above and the run summary names it (green at the
+head, re-review pending at `HEAD_SHA` — the review is then not complete, so do not report it so — or
+capped out with both SHAs); and the run summary tells the user which
 bot findings were skipped and why, and which human threads were left open (disagreements and
 questions) for them to weigh in on — plus any threads the API would not let you resolve.
 
