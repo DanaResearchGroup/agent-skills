@@ -319,9 +319,12 @@ assert_eq 'compaction newer than context suppresses stale-threshold fallback' "$
 sandbox_rm
 
 echo '== pending requests and active Stop continuations stay bounded =='
+# The step 5 prose is for a pane the watcher has not refused: owned and live,
+# but busy through three idle windows. A refused pane gets step 6 (below).
+busy() { printf '3\n' > "$STATE/$SID.busy-deferrals"; }
 for active in false true; do
   for kind in handoff-request compact-request; do
-    setup; panes
+    setup; busy
     touch "$STATE/$SID.$kind"
     [ "$kind" = compact-request ] && handoff_pointer "$SID"
     out=$(stop "$active"); stop_rc=$?
@@ -338,13 +341,13 @@ for active in false true; do
   done
 done
 
-setup; panes
+setup; busy
 touch "$STATE/$SID.compact-request"
 assert_eq 'a filed compact marker without its pointer still says only compact' "$(why "$(stop)")" 'type /compact'
 assert_eq 'a marker without its pointer is still reported only once' "$(stop)" ''
 sandbox_rm
 
-setup; panes
+setup; busy
 touch "$STATE/$SID.handoff-request"
 stop > "$SB/first"
 handoff_pointer "$SID"
@@ -353,6 +356,25 @@ assert_eq 'new sibling request gets one compact notice' "$(why "$(stop)")" 'type
 rm "$STATE/$SID.compact-request"
 assert_eq 'removing sibling cannot re-arm an old request notice' "$(stop)" ''
 sandbox_rm
+
+echo '== refused pane with a filed request: the Stop asks, never the prose =='
+for active in false true; do
+  for kind in handoff-request compact-request; do
+    setup; panes   # pane gone: this Stop's reachability check refuses it
+    touch "$STATE/$SID.$kind"
+    [ "$kind" = compact-request ] && handoff_pointer "$SID"
+    out=$(stop "$active")
+    assert_file "$kind active=$active: the Stop's check refused the pane" "$STATE/$SID.unreachable"
+    assert_eq "$kind active=$active: blocks once" "$(block "$out")" block
+    assert_contains "$kind active=$active: asks via AskUserQuestion" "$(why "$out")" 'call the AskUserQuestion tool now'
+    assert_contains "$kind active=$active: says to type /compact" "$(why "$out")" 'type /compact in this pane'
+    assert_no_file "$kind active=$active: no prose receipt" "$STATE/$SID.fallback-request"
+    assert_contains "$kind active=$active: no question asked, one repeat" "$(why "$(stop "$active")")" 'Your turn ended without asking'
+    assert_eq "$kind active=$active: then silent" "$(stop "$active")" ''
+    assert_eq "$kind active=$active: no keys sent" "$(cat "$SB/typed")" ''
+    sandbox_rm
+  done
+done
 
 setup; panes
 stop > "$SB/first" & p1=$!

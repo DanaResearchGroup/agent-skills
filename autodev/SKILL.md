@@ -372,6 +372,16 @@ docs. The scripts are self-locating and store runtime data under **`AUTODEV_HOME
   `{"continue":false}`, which stops Claude even under `/goal`. Bypass: `AUTODEV_NO_HANDOFF_GATE=1`,
   `touch $AUTODEV_HOME/state/<sid>.no-handoff-gate` (one session) or `state/disable-handoff-gate`
   (all). Fails open on any error. Claude Code only — Codex hooks differ and are not gated.
+  `AskUserQuestion` is never denied.
+  It stands down when the watcher can never act: no pane registered, or a herdr pane the watcher
+  refused (`state/<sid>.unreachable`). In the refused case each request gets one notice telling
+  the model to call `AskUserQuestion` before any other work: one question saying automation
+  cannot reach the pane (with the watcher's reason) and the user must type `/compact` in it. The
+  pending question shows the pane as blocked in the fleet view, where prose would scroll past.
+  The first event delivers it: the first tool call is held once (later calls pass), or, when the
+  session files the request and ends its turn with no tool call, the Stop hook
+  (`cc-handoff-gate.sh --stop`) blocks that Stop once. A turn that then ends with no question gets
+  one Stop repeat. The Stop fallback's prose `type /compact` never fires for such a request.
   The sweeper pages (`notify-send`, else a `PAGE` log line) once per request that has been pending
   30 min while the watcher only deferred.
   It also files the `handoff-request` itself (`request-handoff.sh --if-absent`, logged

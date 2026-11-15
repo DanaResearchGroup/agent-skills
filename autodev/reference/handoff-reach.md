@@ -41,7 +41,40 @@ The implementation follows this order:
    keeps that flag true after its first Stop, so suppressing all such Stops
    would miss a threshold crossed mid-loop. Ordinary fallback messages share
    the same 900-second cooldown for active and normal Stops; filed-request
-   notices remain once per marker even after that cooldown expires.
+   notices remain once per marker even after that cooldown expires. This prose
+   notice is only for a pane the watcher has not refused: when
+   `<sid>.unreachable` exists for a herdr binding, step 6 owns the request and
+   the Stop gets the `AskUserQuestion` instruction instead, without the
+   fallback's arming or threshold conditions.
+
+6. The PreToolUse handoff gate (`cc-handoff-gate.sh`) stands down while
+   `<sid>.unreachable` exists for a herdr binding, as it does with no pane: a
+   refused session cannot be compacted by the watcher, so denying tools would
+   park it. Each pending request gets one notice telling the model to call
+   `AskUserQuestion` before any other work: one question saying automation
+   cannot reach the pane (with the reason) and the user must type `/compact` in
+   it, with the options "I will type /compact now" (recommended) and "Continue
+   without compacting". A pending question blocks the pane in the fleet view,
+   where prose scrolls past. The gate allows `AskUserQuestion` in every state.
+   The first event delivers the notice. Either the first tool call is held once
+   with it, or, on the normal handoff path where the session files the request
+   and ends its turn with no further tool call, the Stop hook runs
+   `cc-handoff-gate.sh --stop`, which blocks that Stop once with it. The Stop
+   hook asks the gate before its fallback, and again after the fallback's own
+   reachability check, so a refusal found during that Stop is covered too. If a
+   turn ends with no question after the notice, the next Stop repeats it once;
+   after a question, or after the repeat, Stops are silent. The user sees at
+   most the question, never the step 5 prose. The flag is not compared with the request's mtime: it is
+   written once per episode, so it usually predates the request. For an
+   ownership, no-pane or pane-gone refusal, a successful herdr reachability
+   check removes the flag, and registration skips its throttle while it exists,
+   so a stale flag lasts only until the next re-check (status-line render,
+   Stop, watcher). A Claude session's `screen presence unproved:` flag is
+   different (step 3): `mux_session_reachable` keeps it even after a successful
+   ownership check, and only a successful screen check at the send boundary,
+   which the watcher runs just before it sends input, clears it. A status-line
+   render or a Stop alone does not restore normal gating for that refusal. The
+   tmux path never clears the flag, so a tmux-only binding ignores it.
 
 The fallback preserves the handoff even when a detached worker cannot compact
 itself. A human must attach and type `/compact` in that case. The watcher keeps
