@@ -21,12 +21,48 @@
 #
 # Liveness aid, not a security boundary: ANY error fails OPEN (exit 0, no
 # output). The gate is also a no-op when the request is already satisfied (a
-# compaction is newer than it), when no pane is registered (the watcher can never
-# act, so denying would deadlock the session), or when bypassed:
+# compaction is newer than it), when the watcher can never act, so denying would
+# deadlock the session, or when bypassed. The watcher can never act when:
+#   - no pane is registered, or
+#   - a herdr pane is registered but the watcher refused it and wrote
+#     $STATE/<sid>.unreachable (ownership refused, pane gone, screen presence
+#     unproved). A worker once sat 6.5 h like this, every tool denied. Each
+#     request gets one notice: call AskUserQuestion now, saying automation cannot
+#     reach the pane and the user must type /compact in it. A pending question
+#     shows the pane as blocked in the fleet view, where prose in a long turn
+#     scrolls past. The notice comes from whichever event fires first: the first
+#     tool call is held once with it (later calls pass), or, when the session
+#     files the request and ends its turn with no further tool call, the Stop
+#     hook runs this script with --stop and that Stop is blocked once with it.
+#     If a turn then ends with no AskUserQuestion call, the next Stop repeats it
+#     once. The Stop hook's prose "type /compact" fallback never fires for such
+#     a request.
+#     Staleness: a successful herdr reachability check (mux_session_reachable)
+#     removes an ownership, no-pane or pane-gone flag, and herdr registration
+#     skips its throttle while the flag exists, so such a flag lasts only until
+#     the next re-check (status-line render, Stop, watcher). A Claude session's
+#     "screen presence unproved:" flag is different: mux_session_reachable keeps
+#     it, and only a successful screen check at the send boundary
+#     (_mux_refuse_unowned, run by the watcher just before it sends input)
+#     clears it. A status-line render or a Stop alone never restores normal
+#     gating for it. A stale flag costs only an ungated stretch, the
+#     behaviour before this gate existed. The flag is written once per episode,
+#     so its mtime is the episode start and usually predates the request: it is
+#     NOT compared with the request's mtime. Nothing on the tmux path clears the
+#     flag, so a tmux-only binding ignores it (tmux ownership is last-render-wins).
+# AskUserQuestion is allowed in every state, so the question is never denied.
+# Bypasses:
 #   AUTODEV_NO_HANDOFF_GATE=1        this process tree
 #   $STATE/<sid>.no-handoff-gate     this session
 #   $STATE/disable-handoff-gate      every session
 # Claude Code only; Codex hooks have a different contract and are out of scope.
+
+# --stop: called by cc-stop-hook.sh with the Stop event. Exit 3 means this script
+# owns the pending request's user instruction (stdout, if any, is the Stop block);
+# any other exit leaves the Stop hook's own fallback in charge. Not gated on the
+# fallback's arming or threshold: a filed request on a refused pane is enough.
+mode=pretool
+[ "${1:-}" = --stop ] && mode=stop
 
 input=$(cat) || exit 0
 command -v jq >/dev/null 2>&1 || exit 0
@@ -46,21 +82,91 @@ case "$sid" in ""|*[!A-Za-z0-9._-]*) exit 0 ;; esac
 [ -f "$STATE/disable-handoff-gate" ] && exit 0
 [ -f "$STATE/$sid.no-handoff-gate" ] && exit 0
 
+tool=""
+if [ "$mode" = pretool ]; then
+  tool=$(printf '%s' "$input" | jq -r '.tool_name // empty' 2>/dev/null) || exit 0
+  [ -n "$tool" ] || exit 0
+fi
+
 # Newest still-unsatisfied request for THIS session. Compared with -nt (sub-second
 # where the filesystem has it): a compaction strictly newer than the request
 # satisfies it; an exact tie is kept, since a lost request parks the session while
 # a kept one costs at most one extra /compact. The key is the request's mtime in
 # ns, so two requests filed within one second are still told apart.
 req_key=0
+pending_keys=" "
 for k in compact-request handoff-request; do
   f="$STATE/$sid.$k"
   [ -f "$f" ] || continue
   [ -f "$STATE/$sid.compacted" ] && [ "$STATE/$sid.compacted" -nt "$f" ] && continue
   m=$(date -r "$f" +%s%N 2>/dev/null) || exit 0
+  pending_keys="$pending_keys$m "
   [ "$m" -gt "$req_key" ] && req_key=$m
 done
 # The watcher can only act on a session with a registered pane.
 [ -e "$STATE/$sid.herdr-pane" ] || [ -e "$STATE/$sid.tmux-pane" ] || exit 0
+
+# ...and only on a herdr pane it has not refused (see header). mux_init prefers
+# a non-empty herdr binding, so that is the binding the flag describes.
+if [ -s "$STATE/$sid.herdr-pane" ] && [ -f "$STATE/$sid.unreachable" ]; then
+  # No request (a live cycle alone): stand down silently; that cycle aborts.
+  [ "$req_key" != 0 ] || exit 0
+  notice="$STATE/$sid.unreachable-notice.$req_key"
+  asked="$STATE/$sid.unreachable-asked.$req_key"
+  # The reason is the watcher's own text; keep one printable line of it.
+  why=$(head -n 1 "$STATE/$sid.unreachable" 2>/dev/null | tr -cd '[:print:]' | cut -c1-200)
+  why=${why:-reason unknown}
+  ask="automation cannot reach this session's pane ($why), so no /compact will arrive. Before any other work, call the AskUserQuestion tool now with one question: say that automation cannot reach this pane ($why) and that the user must type /compact in this pane. Offer the options \"I will type /compact now\" (Recommended) and \"Continue without compacting\"."
+  # One notice per request. noclobber makes the claim atomic, so parallel tool
+  # calls and a racing Stop deliver it once. A claim drops the markers of older
+  # requests that are gone or satisfied, and keeps those of every request still
+  # pending, so cancelling a newer request does not re-notify an older one. Keys
+  # above req_key belong to requests filed after the scan above; keep them too.
+  claim_notice() {
+    (set -C; : > "$notice") 2>/dev/null || return 1
+    local f k
+    for f in "$STATE/$sid".unreachable-notice.* "$STATE/$sid".unreachable-asked.* "$STATE/$sid".unreachable-repeat.*; do
+      k=${f##*.}
+      case "$k" in ''|*[!0-9]*) continue ;; esac
+      [ "$k" -lt "$req_key" ] || continue
+      case "$pending_keys" in *" $k "*) ;; *) rm -f "$f" 2>/dev/null ;; esac
+    done
+    return 0
+  }
+  if [ "$mode" = stop ]; then
+    if [ ! -f "$notice" ]; then
+      # The session filed the request and ended its turn with no tool call: this
+      # Stop gives the notice. A claim lost to a racing caller means the notice
+      # was given (silent, still owned); a claim that failed for any other
+      # reason leaves the Stop fallback in charge.
+      if claim_notice; then
+        jq -nc --arg r "Handoff pending, but $ask" '{decision:"block",reason:$r}'
+        exit 3
+      fi
+      [ -f "$notice" ] && exit 3
+      exit 0
+    fi
+    # Repeat once per request, and only if no question was asked. A failed claim
+    # means no repeat, but ownership holds, so no prose notice follows.
+    if [ ! -f "$asked" ] && (set -C; : > "$STATE/$sid.unreachable-repeat.$req_key") 2>/dev/null; then
+      jq -nc --arg r "Your turn ended without asking the user. Handoff pending, but $ask" \
+        '{decision:"block",reason:$r}'
+    fi
+    exit 3
+  fi
+  if [ "$tool" = AskUserQuestion ]; then
+    # Record the question only after the notice, so an earlier unrelated one
+    # does not cancel the repeat.
+    [ -f "$notice" ] && : > "$asked" 2>/dev/null
+    exit 0
+  fi
+  # Any claim failure fails open (no notice, allow).
+  claim_notice || exit 0
+  jq -nc --arg r "handoff pending, but $ask Tools are not gated for this request: after asking, retry this call and carry on." \
+    '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"deny",permissionDecisionReason:$r}}'
+  exit 0
+fi
+[ "$mode" = pretool ] || exit 0
 
 # Housekeeping also takes the cycle lock. Only a phase marker naming its live
 # owner proves the watcher has entered /handoff, before the session files a
@@ -81,9 +187,6 @@ if autodev_lock_path_present "$lock"; then
   fi
 fi
 [ "$req_key" != 0 ] || exit 0
-
-tool=$(printf '%s' "$input" | jq -r '.tool_name // empty' 2>/dev/null) || exit 0
-[ -n "$tool" ] || exit 0
 
 # --- path helpers ------------------------------------------------------------
 # Two kinds of caller. Bash commands are expanded by the shell AFTER this hook
@@ -231,6 +334,7 @@ allowed() {
   # or the background flag's exact nesting. Deny those names conservatively and
   # check tool_input.run_in_background, matching the hook's tool_input envelope.
   case "$tool" in
+    AskUserQuestion) return 0 ;;   # a question to the user is never new work
     Agent|Task|SendMessage) return 1 ;;
     Bash)
       p=$(printf '%s' "$input" | jq -r '.tool_input.run_in_background == true' 2>/dev/null) || exit 0

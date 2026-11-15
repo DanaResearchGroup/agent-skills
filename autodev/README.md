@@ -54,7 +54,7 @@ autodev/
     lib.sh                     # harness: throwaway AUTODEV_HOME, copied bin/, stubbed multiplexer
     test-mission-bleed.sh      # a session may only ever be pointed at its OWN handoff
     test-parked-session.sh     # the sweeper re-arms a session the Stop hook can no longer reach
-    test-handoff-gate.sh       # PreToolUse gate: deny/allow-list, continue:false escalation, bypass, fail-open
+    test-handoff-gate.sh       # PreToolUse gate: deny/allow-list, continue:false escalation, bypass, fail-open, unreachable stand-down + AskUserQuestion notice (tool call or Stop) and its Stop repeat
     test-request-expiry.sh     # requests never expire by age; stale only when satisfied
     test-stuck-page.sh         # one page per request pending 30 min with only DEFERs
     test-abort-recovery.sh     # aborts are counted, retried, then surfaced as STUCK

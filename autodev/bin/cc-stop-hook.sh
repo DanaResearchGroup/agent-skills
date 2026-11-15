@@ -5,6 +5,9 @@
 # this session, block once to request an in-session handoff (or human /compact).
 # Active Stop continuations (including /goal) use the same 900-second cooldown
 # and once-per-request compact notice, so crossing threshold mid-loop is covered.
+# Second exception: a refused herdr pane with a pending request gets the gate's
+# AskUserQuestion instruction instead of the prose fallback: once if no tool call
+# gave it, once more if the turn ended without the question (cc-handoff-gate.sh --stop).
 input=$(cat)
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${AUTODEV_HOME:=$HOME/agents}"; export AUTODEV_HOME
@@ -30,6 +33,17 @@ fi
 # This path works inside the background worker even when no terminal hosts it.
 # Serialize with watcher cycles; re-read context, reachability, requests, and
 # cooldown AFTER taking the lock so overlapping Stops cannot double-block.
+
+# Refused herdr pane (<sid>.unreachable) with a pending request: the PreToolUse
+# gate owns the user instruction (exit 3), an AskUserQuestion notice instead of
+# the fallback's prose "type /compact". If no tool call gave the notice yet, this
+# Stop gives it; if one did and the turn ended without the question, it is
+# repeated once; otherwise the Stop is silent. Any other exit: fallback as before.
+gate_stop() {
+  gate_out=$(printf '%s' "$input" | bash "$HERE/cc-handoff-gate.sh" --stop 2>/dev/null)
+  gate_rc=$?
+}
+
 stop_fallback() (
   [ -f "$STATE/auto-handoff.armed" ] || return 1
   [ -f "$STATE/disable-auto-compact" ] && return 1
@@ -75,6 +89,14 @@ stop_fallback() (
     fi
   done
   if [ "$pending" = 1 ]; then
+    # The reachability check above may have just refused the pane (a worker
+    # with no herdr env registers nothing earlier): consult the gate again.
+    gate_stop
+    if [ "$gate_rc" = 3 ]; then
+      [ -n "$gate_out" ] || return 1
+      printf '%s\n' "$gate_out"
+      return 0
+    fi
     [ -n "$fresh_keys" ] || return 1
     # Keep receipts for earlier requests too: a superseding sibling marker
     # disappearing must not re-arm the notice for an already reported marker.
@@ -95,7 +117,10 @@ stop_fallback() (
   jq -nc --arg reason "Auto-handoff cannot drive this session. Run /handoff to write $hf, then run $command." \
     '{decision:"block",reason:$reason}'
 )
-if stop_fallback; then exit 0; fi
+gate_stop
+if [ "$gate_rc" = 3 ]; then
+  [ -n "$gate_out" ] && { printf '%s\n' "$gate_out"; exit 0; }
+elif stop_fallback; then exit 0; fi
 
 # Test seam shared with the Codex Stop hook; production launches normally.
 [ "${AUTODEV_NO_WATCHERS:-0}" = 1 ] && exit 0

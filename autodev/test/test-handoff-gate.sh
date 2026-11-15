@@ -392,6 +392,226 @@ out=$(gate Bash '{"command":"make test"}')
 assert_eq "handoff-request denies" "$(decision "$out")" deny
 sandbox_rm
 
+# A worker sat 6.5 h with every tool denied: its herdr pane was registered, but
+# the watcher refused it and wrote <sid>.unreachable, so no /compact could come.
+UNREACH='pane w1:p1 ownership refused (owner: 99999999-9999-9999-9999-999999999999)'
+unreachable() { printf '%s\n' "${1:-$UNREACH}" > "$STATE/$SID.unreachable"; }
+
+echo "== watcher gave up on the pane: notice once, then stand down =="
+setup; pending; unreachable
+export KEEP_COUNT=1
+o1=$(gate Bash '{"command":"make test"}')
+assert_eq "1st call is held once to deliver the notice" "$(decision "$o1")" deny
+assert_contains "notice tells the user to type /compact" "$(reason "$o1")" 'type /compact'
+assert_contains "notice says automation cannot reach the pane" "$(reason "$o1")" 'automation cannot reach'
+assert_contains "notice carries the watcher's reason" "$(reason "$o1")" 'ownership refused'
+assert_not_contains "notice does not loop on end your turn" "$(reason "$o1")" 'end your turn'
+assert_contains "notice tells the model to call AskUserQuestion" "$(reason "$o1")" 'call the AskUserQuestion tool now'
+assert_contains "notice puts the question before any other work" "$(reason "$o1")" 'Before any other work'
+assert_contains "notice offers the recommended option" "$(reason "$o1")" '"I will type /compact now" (Recommended)'
+assert_contains "notice offers the way out" "$(reason "$o1")" '"Continue without compacting"'
+for c in b c d e; do
+  out=$(gate Bash "{\"command\":\"$c\"}")
+  assert_eq "call $c after the notice is allowed (no deny, no continue:false)" "$out" ""
+done
+out=$(gate Agent '{}')
+assert_eq "delegated work is not gated either" "$out" ""
+unset KEEP_COUNT
+sandbox_rm
+
+echo "== pane proved reachable again: the gate re-engages and still escalates =="
+setup; pending; unreachable
+export KEEP_COUNT=1
+gate Bash '{"command":"notice"}' >/dev/null
+out=$(gate Bash '{"command":"a"}')
+assert_eq "while unreachable: allowed" "$out" ""
+rm -f "$STATE/$SID.unreachable"   # mux_session_reachable clears it on success
+rm -f "$STATE/$SID.gate-denials"
+o1=$(gate Bash '{"command":"a"}'); o2=$(gate Bash '{"command":"b"}'); o3=$(gate Bash '{"command":"c"}')
+assert_eq "reachable: 1st denial is deny+reason" "$(decision "$o1")" deny
+assert_eq "reachable: documented reason" "$(reason "$o1")" "$REASON"
+assert_eq "reachable: 2nd denial is deny+reason" "$(decision "$o2")" deny
+assert_eq "reachable: 3rd denial still stops the turn" "$o3" "$STOP"
+unset KEEP_COUNT
+sandbox_rm
+
+echo "== compaction satisfies the request; a new request gets its own notice =="
+setup; pending; unreachable
+touch -d '@1000000000.100000000' "$STATE/$SID.compact-request"
+o1=$(gate Bash '{"command":"a"}')
+assert_contains "pending + unreachable: notice" "$(reason "$o1")" 'type /compact'
+touch -d '@1000000000.900000000' "$STATE/$SID.compacted"   # the human typed /compact
+out=$(gate Bash '{"command":"a"}')
+assert_eq "request satisfied by a newer compaction -> allowed, no notice" "$out" ""
+touch -d '@1000000001.000000000' "$STATE/$SID.compact-request"
+o1=$(gate Bash '{"command":"a"}'); o2=$(gate Bash '{"command":"b"}')
+assert_contains "a new request while still unreachable: one fresh notice" "$(reason "$o1")" 'type /compact'
+assert_eq "...and then allowed" "$o2" ""
+sandbox_rm
+
+echo "== concurrent tool calls deliver the notice once =="
+setup; pending; unreachable
+for i in 1 2 3 4 5 6; do
+  ( gate Bash "{\"command\":\"p$i\"}" > "$SB/par.$i" ) &
+done
+wait
+n=$(cat "$SB"/par.* | grep -c 'type /compact')
+assert_eq "six parallel first calls: exactly one notice" "$n" 1
+sandbox_rm
+
+echo "== AskUserQuestion is never denied =="
+setup; pending
+export KEEP_COUNT=1
+q='{"questions":[{"question":"q","options":[]}]}'
+out=$(gate AskUserQuestion "$q")
+assert_eq "reachable pane, request pending: AskUserQuestion allowed" "$out" ""
+out=$(gate Bash '{"command":"make test"}')
+assert_eq "...while other tools are still denied" "$(decision "$out")" deny
+for i in 1 2 3; do gate AskUserQuestion "$q" >/dev/null; done
+out=$(gate Bash '{"command":"make test"}')
+assert_eq "questions do not count toward the escalation" "$(decision "$out")" deny
+unset KEEP_COUNT
+unreachable
+out=$(gate AskUserQuestion "$q")
+assert_eq "unreachable, before the notice: allowed" "$out" ""
+assert_no_file "a question before the notice is not recorded as the answer" "$STATE/$SID.unreachable-asked.$(date -r "$STATE/$SID.compact-request" +%s%N)"
+o1=$(gate Bash '{"command":"a"}')
+assert_contains "the notice still comes on the next other call" "$(reason "$o1")" 'AskUserQuestion'
+out=$(gate AskUserQuestion "$q")
+assert_eq "unreachable, after the notice: allowed" "$out" ""
+sandbox_rm
+
+# A notice the model ignores scrolls past; the pane must block on a question.
+stop_hook() {
+  jq -nc --arg s "$SID" '{session_id:$s,hook_event_name:"Stop",stop_hook_active:false}' |
+    AUTODEV_NO_WATCHERS=1 bash "$BIN/cc-stop-hook.sh" 2>/dev/null
+}
+sblock() { printf '%s' "$1" | jq -r '.decision // empty' 2>/dev/null; }
+swhy()   { printf '%s' "$1" | jq -r '.reason // empty' 2>/dev/null; }
+
+echo "== notice ignored: the next Stop repeats it once =="
+setup; stub_mux; arm; pending; unreachable
+gate Bash '{"command":"a"}' >/dev/null           # the notice
+out=$(gate Bash '{"command":"b"}')
+assert_eq "later calls in the turn still pass" "$out" ""
+s1=$(stop_hook)
+assert_eq "turn ended without a question: Stop blocks" "$(sblock "$s1")" block
+assert_contains "the repeat names AskUserQuestion" "$(swhy "$s1")" 'call the AskUserQuestion tool now'
+assert_contains "the repeat names /compact" "$(swhy "$s1")" 'type /compact'
+assert_contains "the repeat carries the watcher's reason" "$(swhy "$s1")" 'ownership refused'
+s2=$(stop_hook)
+assert_eq "second Stop: silent, no prose fallback either" "$s2" ""
+sandbox_rm
+
+echo "== question asked: no repeat, no prose fallback =="
+setup; stub_mux; arm; pending; unreachable
+gate Bash '{"command":"a"}' >/dev/null
+gate AskUserQuestion '{"questions":[]}' >/dev/null
+assert_eq "Stop after the question is silent" "$(stop_hook)" ""
+sandbox_rm
+
+echo "== request filed, turn ends with no tool call: the Stop asks, not prose =="
+# The normal handoff path: the session files its request and ends its turn, so
+# no PreToolUse call ever delivers the notice.
+setup; stub_mux; arm; pending; handoff_pointer "$SID"; unreachable
+s1=$(stop_hook)
+assert_eq "Stop with no prior tool call blocks" "$(sblock "$s1")" block
+assert_contains "it names AskUserQuestion" "$(swhy "$s1")" 'call the AskUserQuestion tool now'
+assert_contains "it names /compact" "$(swhy "$s1")" 'type /compact'
+assert_contains "it carries the watcher's reason" "$(swhy "$s1")" 'ownership refused'
+assert_not_contains "it is not the prose fallback" "$(swhy "$s1")" 'Auto-handoff cannot drive'
+if [ "$(swhy "$s1")" != 'type /compact' ]; then _pass "it is not the bare prose notice"
+else _fail "it is not the bare prose notice" "got the step 5 prose"; fi
+assert_file "the Stop claims the notice" "$STATE/$SID.unreachable-notice.$(date -r "$STATE/$SID.compact-request" +%s%N)"
+out=$(gate Bash '{"command":"a"}')
+assert_eq "the next tool call is not held for a second notice" "$out" ""
+gate AskUserQuestion '{"questions":[]}' >/dev/null
+assert_eq "a second Stop after the question is silent" "$(stop_hook)" ""
+sandbox_rm
+
+echo "== Stop gave the notice, question ignored: one repeat, then silent =="
+setup; stub_mux; arm; pending; unreachable
+assert_eq "first Stop: the notice" "$(sblock "$(stop_hook)")" block
+s2=$(stop_hook)
+assert_contains "second Stop with no question: the repeat" "$(swhy "$s2")" 'Your turn ended without asking'
+assert_eq "third Stop: silent" "$(stop_hook)" ""
+sandbox_rm
+
+echo "== Stop is not gated on arming or threshold for a refused pane =="
+setup; stub_mux; pending; unreachable
+printf 'pct=10 ts=1\n' > "$STATE/$SID.ctx"
+assert_eq "unarmed, below threshold: the Stop still asks" "$(sblock "$(stop_hook)")" block
+sandbox_rm
+
+echo "== refusal found by this Stop's own reachability check: the Stop asks =="
+# A worker with no herdr env registers nothing before the fallback, so the flag
+# first appears inside the fallback's mux_session_reachable.
+setup; stub_mux; arm; pending; handoff_pointer "$SID"
+printf '%s\n' "mux_session_reachable(){ printf '%s\\n' '$UNREACH' > \"\$STATE/\$1.unreachable\"; return 1; }" >> "$BIN/mux-lib.sh"
+s1=$(stop_hook)
+assert_file "the fallback's check wrote the flag" "$STATE/$SID.unreachable"
+assert_contains "the Stop asks with AskUserQuestion" "$(swhy "$s1")" 'call the AskUserQuestion tool now'
+assert_eq "the prose receipt is not recorded" "$(cat "$STATE/$SID.fallback-request" 2>/dev/null)" ""
+sandbox_rm
+
+echo "== reachable pane: the Stop fallback is unchanged =="
+# Owned and live, but busy through three idle windows: the step 5 prose notice.
+setup; stub_mux; arm; pending; handoff_pointer "$SID"
+printf '3\n' > "$STATE/$SID.busy-deferrals"
+export MUX_LIVE_PANES=w1:p1
+s1=$(stop_hook)
+assert_no_file "no refusal flag" "$STATE/$SID.unreachable"
+assert_eq "fallback blocks once" "$(sblock "$s1")" block
+assert_eq "fallback keeps its own reason" "$(swhy "$s1")" 'type /compact'
+assert_eq "fallback stays once per request" "$(stop_hook)" ""
+unset MUX_LIVE_PANES
+sandbox_rm
+
+echo "== a new request gets its own repeat =="
+setup; stub_mux; pending; unreachable
+touch -d '@1000000000.100000000' "$STATE/$SID.compact-request"
+gate Bash '{"command":"a"}' >/dev/null
+assert_eq "first request: repeat" "$(sblock "$(stop_hook)")" block
+touch -d '@1000000001.000000000' "$STATE/$SID.compact-request"
+s1=$(stop_hook)
+assert_contains "new request before its notice: the Stop gives it" "$(swhy "$s1")" 'Handoff pending, but'
+assert_not_contains "...as a first notice, not a repeat" "$(swhy "$s1")" 'Your turn ended'
+gate Bash '{"command":"a"}' >/dev/null
+assert_eq "new request after its notice: repeat again" "$(sblock "$(stop_hook)")" block
+n=$(find "$STATE" -name "$SID.unreachable-*.1000000000100000000" | wc -l)
+assert_eq "the old request's markers are cleaned up" "$n" 0
+sandbox_rm
+
+echo "== a newer request cancelled: the older pending request keeps its notice =="
+# The newer request's notice must not drop the markers of an older request that
+# is still pending, or cancelling the newer one re-delivers the older one's notice.
+setup; stub_mux; unreachable
+: > "$STATE/$SID.handoff-request"; touch -d '@1000000000.100000000' "$STATE/$SID.handoff-request"
+o1=$(gate Bash '{"command":"a"}')
+assert_contains "older request: its notice" "$(reason "$o1")" 'type /compact'
+gate AskUserQuestion '{"questions":[]}' >/dev/null
+: > "$STATE/$SID.compact-request"; touch -d '@1000000001.000000000' "$STATE/$SID.compact-request"
+o1=$(gate Bash '{"command":"b"}')
+assert_contains "newer request: its own notice" "$(reason "$o1")" 'type /compact'
+AUTODEV_NO_WATCHERS=1 bash "$BIN/request-handoff.sh" "$SID" --compact-only --cancel >/dev/null 2>&1
+assert_no_file "the newer request is cancelled" "$STATE/$SID.compact-request"
+assert_file "the older request is still pending" "$STATE/$SID.handoff-request"
+out=$(gate Bash '{"command":"c"}')
+assert_eq "older request again: no second notice" "$out" ""
+assert_eq "older request was answered: Stop is silent" "$(stop_hook)" ""
+sandbox_rm
+
+echo "== a stale tmux-only flag does not stand the gate down =="
+# Nothing on the tmux path clears <sid>.unreachable (only herdr's reachability
+# check does), so a 'no pane registered' flag outlives the binding written later.
+setup; pending
+rm -f "$STATE/$SID.herdr-pane"; printf '%%1\n' > "$STATE/$SID.tmux-pane"
+unreachable 'no pane registered (pct=40)'
+out=$(gate Bash '{"command":"make test"}')
+assert_eq "tmux binding + flag: still denied" "$(decision "$out")" deny
+assert_eq "tmux binding + flag: the ordinary reason" "$(reason "$out")" "$REASON"
+sandbox_rm
+
 echo "== watcher publishes the phase before handoff and clears it on release =="
 for mode in complete abort replaced; do
   setup; stub_mux; arm
