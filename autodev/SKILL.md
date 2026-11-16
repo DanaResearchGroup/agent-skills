@@ -1,13 +1,13 @@
 ---
 name: autodev
-description: Use when you want to autonomously build a large or long feature end-to-end in one driven session, with automatic adversarial Codex review at every milestone, automatic context handoff/compact/resume past 35%, and Claude Code recovery from usage/session-limit stops (Phoenix). Invoke with the feature description or a path to a spec.
+description: Use when you want to autonomously build a large or long feature end-to-end in one driven session, with automatic adversarial Codex review at every milestone, automatic context handoff/compact/resume past 35% (200k tokens on a Persona seat), and Claude Code recovery from usage/session-limit stops (Phoenix). Invoke with the feature description or a path to a spec.
 argument-hint: "<feature to build, or path to a spec>"
 ---
 
 You are an autonomous feature-development driver. You run a long build loop with two
 always-on behaviors: (1) adversarial Codex review at every milestone via the `spar` skill, and
-(2) reliance on the auto-handoff watcher to handle context compaction past 35% so the
-loop survives across compactions.
+(2) reliance on the auto-handoff watcher to handle context compaction past the session's line
+(35%, or 200k tokens on a Persona seat) so the loop survives across compactions.
 
 Skill syntax is runtime-specific: Claude Code uses `/spar` and `/handoff`; Codex uses `$spar`
 and `$handoff`. Where this workflow says to invoke a skill, use the current host's syntax.
@@ -52,7 +52,8 @@ CTXFILE="$S/${MYSID:-unknown}.ctx"
 [ -n "$MYSID" ] && [ "$MYSID" != "unknown" ] && touch "$S/$MYSID.autodev" 2>/dev/null || true
 echo "SLUG=$SLUG"
 echo "PROGRESS=$DEV/progress.md"
-echo "CTXFILE=$CTXFILE   (read your live context % from here)"
+echo "CTXFILE=$CTXFILE   (your live context reading)"
+echo "CTXCHECK=bash $AUTODEV_BIN/ctx-over.sh ${MYSID:-unknown}   (exit 0 = past your handoff line)"
 echo -n "MUX: "; if [ "${HERDR_ENV:-}" = "1" ]; then echo "herdr"; elif [ -n "${TMUX:-}" ]; then echo "tmux"; else echo "NONE"; fi
 echo -n "AUTO_HANDOFF: "; if [ -f "$S/disable-auto-compact" ]; then echo "DISABLED"; elif [ -f "$S/auto-handoff.armed" ]; then echo "ARMED"; else echo "DRY-RUN"; fi
 if [ -n "${CODEX_SESSION_ID:-${CODEX_THREAD_ID:-}}" ]; then
@@ -62,16 +63,18 @@ else
 fi
 ```
 
-Remember `$CTXFILE` — you read your own live context percentage from it at every phase
-boundary (Phase discipline, below). If `MYSID` is `unknown` (not in herdr or tmux, or the statusline
-hasn't rendered yet), fall back to your own soft estimate of context usage.
+Remember `$CTXFILE` and `CTXCHECK` — at every phase boundary you run `ctx-over.sh` to ask whether
+this session is past its handoff line (Phase discipline, below). It asks the watcher's own question
+(`bin/threshold-lib.sh`), so a Persona seat's 200k-token line counts as well as the 35% default. If
+`MYSID` is `unknown` (not in herdr or tmux, or the statusline hasn't rendered yet), it exits 2;
+fall back to your own soft estimate of context usage.
 
 Interpret the output and tell the user in one line whether the auto-handoff loop is
 actually active for this run. It is active ONLY if: running inside herdr or tmux AND state is
 `ARMED` AND this is a session started AFTER the hooks were installed (hooks load per
 session). If any of those is false, say so plainly:
 - not in herdr/tmux or `DRY-RUN`/`DISABLED` → "Auto-handoff is NOT active; I'll proactively
-  invoke the handoff skill near 35% and ask you to run `/compact`." (Codex review still works.)
+  invoke the handoff skill near my handoff line and ask you to run `/compact`." (Codex review still works.)
 - all true → "Auto-handoff active — I'll keep working through compactions hands-free."
 
 ## Step 1 — Scope and plan
@@ -174,8 +177,8 @@ For each milestone, in order:
 4. **Record.** Update `$DEV/progress.md` (tick the milestone, update Done/Decisions/Next).
    If continuous-checkpoint or git is in use, commit the logical unit.
 5. **Checkpoint beat, then continue.** Before spawning the next phase's work, run the
-   checkpoint beat (see "Phase discipline & checkpoint beats") — quiesce, read `$CTXFILE`,
-   and yield for auto-handoff if `pct > 35`. Otherwise continue to the next milestone
+   checkpoint beat (see "Phase discipline & checkpoint beats") — quiesce, run `ctx-over.sh`,
+   and yield for auto-handoff if it exits 0 (past the line). Otherwise continue to the next milestone
    without waiting for the user.
 
 Spar at EVERY milestone, not just once. The point is continuous adversarial pressure.
@@ -236,7 +239,7 @@ thermo can't actually support) as a last resort to be flagged, not a default.
 The auto-handoff watcher can only invoke the handoff skill and `/compact` when the host is at a genuine
 **idle** prompt — never while a turn is running or **background agents** are still going
 (the host queues input while busy, so the keystrokes are lost). A perpetually-busy run therefore
-never gets checkpointed and blows past 35%. Prevent that:
+never gets checkpointed and blows past its handoff line. Prevent that:
 
 - **Do not overlap phases.** Parallelize *within* a phase (dispatch several subagents at
   once is fine), but **collect every dispatched agent and finish the phase before starting
@@ -249,30 +252,33 @@ never gets checkpointed and blows past 35%. Prevent that:
      compact. Never write a handoff / hit a checkpoint with an agent still running on the
      theory that "the reload will collect it" — it won't, because compaction can't fire on
      a busy pane. Collect every agent first, then checkpoint.
-  2. Read your live context %:
+  2. Ask whether you are past your handoff line — the same decision the watcher makes
+     (`bin/threshold-lib.sh`: 35% by default, 200k tokens on a Persona seat). Do not compare
+     `pct` with a number yourself: on a 1M-window Persona seat 200k reads as `pct=20`.
      ```bash
-     pct=$(sed -n 's/^pct=\([0-9.]*\).*/\1/p' "$CTXFILE" 2>/dev/null); echo "ctx=${pct:-?}%"
+     bash "$AUTODEV_BIN/ctx-over.sh" "${MYSID:-unknown}"; over=$?; echo "over=$over"
      ```
-  3. **If `pct > 35`** (or, if `MYSID` was unknown, your soft estimate says you're past ~a
+     It prints the reading and exits 0 past the line, 1 below it, 2 with no reading.
+  3. **If `over=0`** (or, if it exited 2, your soft estimate says you're past ~a
      third):
      - **Auto-handoff ACTIVE** (preflight showed `TMUX: yes` and `AUTO_HANDOFF: ARMED`):
        update `progress.md`, then **end your turn now** with one line, e.g.
-       `Checkpoint: ctx <pct>%, quiesced at phase boundary — yielding for auto-handoff.`
-       Do NOT spawn the next phase. The watcher (idle pane + high %) will run
+       `Checkpoint: <ctx-over line>, quiesced at phase boundary — yielding for auto-handoff.`
+       Do NOT spawn the next phase. The watcher (idle pane + past the line) will run
        handoff → `/compact` → inject "continue," and you resume by reading the handoff
        + `progress.md` and starting the next phase. This is the deliberate idle beat.
      - **Auto-handoff NOT active**: invoke the handoff skill yourself, update `progress.md`, tell the
        user to run `/compact` then `continue`, and stop.
-  4. **Else** (`pct` comfortable): proceed straight into the next phase — no yield, no stall,
+  4. **Else** (below the line): proceed straight into the next phase — no yield, no stall,
      **unless** the voluntary-handoff case below applies.
 
-Yielding only when `pct > 35` means you never stall the loop for a checkpoint you don't
+Yielding only when `ctx-over.sh` exits 0 means you never stall the loop for a checkpoint you don't
 need, and you always hand the watcher a clean idle window exactly when one is required.
 
-**Voluntary early handoff (below threshold).** The `pct > 35` rule is reactive — it fires
+**Voluntary early handoff (below threshold).** The `ctx-over.sh` beat is reactive — it fires
 *after* you cross the line. But sometimes you are quiesced at a clean phase boundary at, say,
 22% and you *know* the next phase is heavy (a large mechanism review, a wide multi-file
-refactor, a long spar arc) that will blow well past 35% *inside* the phase, where there is no
+refactor, a long spar arc) that will blow well past the line *inside* the phase, where there is no
 idle window for the watcher to use. In that case, hand off *before* opening the phase rather
 than partway through it: raise a voluntary request, then end your turn.
 
@@ -282,33 +288,37 @@ bash "$AUTODEV_BIN/request-handoff.sh"   # drops this session's handoff-request 
 
 This writes `~/agents/state/<sid>.handoff-request`, a second trigger path that makes the
 watcher run the normal handoff → `/compact` → reload on its **next idle Stop even below
-35%**. It bypasses ONLY the threshold — every other safety gate (idle, pane-live,
+the line**. It bypasses ONLY the threshold — every other safety gate (idle, pane-live,
 pane-ownership, cooldown, cycle-lock) still applies. A request never expires by age; it is dropped
 only once satisfied (a compaction newer than it). After raising it, update `progress.md` and **end the turn** —
 do not open the heavy phase, and do **not** invoke the handoff skill yourself: the watcher runs its own
 handoff → `/compact` → reload on the next idle Stop, so a manual handoff here would just
 duplicate it. Changed your mind before the watcher acts? `request-handoff.sh --cancel` removes
 it. Only the **mother** session should call this (it resolves *its own* sid); never from a
-subagent. This is opt-in — the default remains the reactive `pct > 35` beat above.
+subagent. This is opt-in — the default remains the reactive `ctx-over.sh` beat above.
 
 **Already wrote a handoff below threshold?** (You invoked the `handoff` skill
 did.) Do **nothing** — the `handoff` skill files a `compact-request`, and the watcher runs a
 **compact-only** cycle: it skips a second handoff and goes straight to `/compact` → reload, even
-below 35%. File it by hand only if needed — `request-handoff.sh --compact-only` (`--cancel` withdraws).
+below the line. File it by hand only if needed — `request-handoff.sh --compact-only` (`--cancel` withdraws).
 
 ## Step 3 — Context / compaction (resumable by design)
 
-- The auto-handoff watcher (when active) will, past 35% at a turn boundary, automatically
+- The auto-handoff watcher (when active) will, past the line at a turn boundary, automatically
   run handoff → `/compact` → inject "read the handoff and continue execution." You do
   not trigger it. Just keep `progress.md` current so a resumed session continues cleanly.
+- **Persona seats** (working folder under `~/Persona/<name>/`) hand off at **200,000 tokens**
+  instead, set in code (`bin/threshold-lib.sh`), so a 1M-window seat does not run to 350k.
+  `compact_at_tokens = <n>` in that Persona's `PI/model.toml` overrides the number. A seat whose
+  window is not larger than the line, or a reading with no token count, keeps the 35% rule.
 - When a handoff is written (auto or manual), ensure it names this autodev loop and points
   to `$DEV/progress.md`, stating "resume the /autodev loop for <feature> from Next."
 - **On resume after a compaction** (you'll receive an injected instruction to read a
   handoff): read that handoff AND `$DEV/progress.md`, then CONTINUE the loop from `Next`.
   Do not restart from milestone 1; do not re-ask the user what to do.
-- If auto-handoff is NOT active (preflight said so): self-monitor; near ~35% at a clean
-  checkpoint, invoke the handoff skill yourself, update progress.md, and ask the user to run
-  `/compact` then say "continue".
+- If auto-handoff is NOT active (preflight said so): self-monitor with `ctx-over.sh`; near the
+  line at a clean checkpoint, invoke the handoff skill yourself, update progress.md, and ask the
+  user to run `/compact` then say "continue".
 
 ## Step 3b — Usage/session limits (Phoenix auto-resume)
 

@@ -116,7 +116,9 @@ default on current stable builds). Run the agent **inside herdr or tmux** for se
 to work (herdr preferred).
 
 Claude Code supplies `.context_window.used_percentage` through its configurable status-line
-command. Codex has no external status-line command, so its Stop hook reads the newest transcript
+command; the status line records it as `pct=<n> tok=<n> win=<n> ts=<epoch>` in `<sid>.ctx`
+(`tok` is the live context, the `current_usage` sum) and the session's folder in `<sid>.workdir`,
+which a Persona seat's token line needs. Codex has no external status-line command, so its Stop hook reads the newest transcript
 `token_count` event and records `last_token_usage.total_tokens / model_context_window`. This is the
 effective active-context percentage shown by Codex, not cumulative thread usage and not a model's
 larger theoretical maximum.
@@ -139,7 +141,10 @@ Logs: `$AUTODEV_HOME/logs/{auto-handoff,auto-resume}.log`.
 
 ## Tunables (top of the engine scripts)
 
-- `auto-handoff-watch.sh`: `THRESHOLD=35`, `COOLDOWN=900`, `WAIT_IDLE/WAIT_COMPACT`, `SETTLE`.
+- `threshold-lib.sh`: the handoff line for the watcher, the sweep and the Stop hook —
+  `AUTODEV_PCT_LINE=35`, and `AUTODEV_PERSONA_TOKENS=200000` for a Persona seat (working folder
+  under `~/Persona/<name>/`; `compact_at_tokens` in its `PI/model.toml` overrides).
+- `auto-handoff-watch.sh`: `COOLDOWN=900`, `WAIT_IDLE/WAIT_COMPACT`, `SETTLE`.
 - `session-resume-watch.sh`: `BUFFER_MIN=4` (minutes past reset), `CREDITS_WAIT`, `WAKE`, `MAX_WAIT`.
 - `auto-handoff-watch.sh`: `REQUEST_MAX_AGE=3600` — TTL for a `handoff-request` / `compact-request` marker.
 - `cache-warm-watch.sh` (env, not constants): `CC_CACHE_TTL=300` (the prompt-cache window),

@@ -126,6 +126,7 @@ _HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [ -f "$_HERE/lock-lib.sh" ] && . "$_HERE/lock-lib.sh" || exit 0
 [ -f "$_HERE/mux-lib.sh" ] && . "$_HERE/mux-lib.sh"
 [ -f "$_HERE/request-lib.sh" ] && . "$_HERE/request-lib.sh"
+[ -f "$_HERE/threshold-lib.sh" ] && . "$_HERE/threshold-lib.sh" || exit 0
 # Never let a missing lib make every request look stale: fall back to "exists".
 command -v request_valid >/dev/null 2>&1 || request_valid(){ [ -f "${5:-$1/$3.$4}" ]; }
 command -v remove_stale_request >/dev/null 2>&1 || remove_stale_request(){ return 1; }
@@ -134,8 +135,8 @@ WATCH="$_HERE/auto-handoff-watch.sh"
 command -v mux_init >/dev/null 2>&1 || exit 0
 
 # These MUST match auto-handoff-watch.sh. The sweeper only prefilters; every one
-# of these is re-checked authoritatively by the watcher itself.
-THRESHOLD=35
+# of these is re-checked authoritatively by the watcher itself. The handoff line
+# (35%, or a Persona seat's token line) is shared through threshold-lib.sh.
 COOLDOWN=900
 # A request is never expired by age (see request-lib.sh). A request pending this
 # long with the watcher only ever DEFERring is stuck, and the user is paged once.
@@ -156,7 +157,7 @@ CACHE_TTL=300
 MAX_ABORTS=5
 # The threshold alone must stop a busy session: the gate keys on a request file
 # and the watcher only types into an idle pane, so a session that crosses
-# THRESHOLD inside one long turn and never files its own request would run on
+# its handoff line inside one long turn and never files its own request would run on
 # until the turn ends. Past BUSY_MIN minutes of continuous work the sweep files
 # the request for it. Anything but a positive integer falls back to the default
 # (never to "off" or "immediately").
@@ -500,8 +501,7 @@ for pf in "$STATE"/*.herdr-pane "$STATE"/*.tmux-pane; do
   if [ -f "$STATE/$sid.cooldown" ] && [ ! -f "$STATE/auto-handoff.armed" ] \
      && [ ! -f "$STATE/$sid.handoff-request" ] && [ ! -f "$STATE/$sid.compact-request" ] \
      && [ -f "$STATE/$sid.ctx" ]; then
-    cooldown_pct=$(sed -n 's/^pct=\([0-9.]*\).*/\1/p' "$STATE/$sid.ctx")
-    if [ -n "$cooldown_pct" ] && awk "BEGIN{exit !($cooldown_pct > $THRESHOLD)}"; then
+    if autodev_ctx_over "$STATE" "$sid" gt; then
       dry_preview=1
     fi
   fi
@@ -542,8 +542,9 @@ for pf in "$STATE"/*.herdr-pane "$STATE"/*.tmux-pane; do
     [ -f "$ctxf" ] || { rm -f "$STATE/$sid.busy-since" 2>/dev/null; continue; }
     pct=$(sed -n 's/^pct=\([0-9.]*\).*/\1/p' "$ctxf")
     [ -n "$pct" ] || { rm -f "$STATE/$sid.busy-since" 2>/dev/null; continue; }
-    if awk "BEGIN{exit !($pct > $THRESHOLD)}"; then
-      reason="pct=$pct > $THRESHOLD"; thr=1
+    if autodev_ctx_over "$STATE" "$sid" gt; then
+      # shellcheck disable=SC2154  # set by autodev_ctx_over (threshold-lib.sh)
+      reason=$ctx_reason; thr=1
     else
       # The busy clock only measures stretches that qualify for the threshold
       # path; time below threshold cannot contribute to a later stretch.

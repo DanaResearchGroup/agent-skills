@@ -14,7 +14,8 @@
 # can reset) -> "read <handoff> and continue execution".
 # A .compact-request marker triggers a COMPACT-ONLY variant: the handoff step is
 # skipped (a handoff is already written) and the cycle starts at /compact.
-# Triggers: pct > THRESHOLD | pct > COLD_MIN and idle >= CACHE_TTL (cold-cache) |
+# Triggers: context past its line (threshold-lib.sh: pct > 35, or a Persona
+# seat's token line) | pct > COLD_MIN and idle >= CACHE_TTL (cold-cache) |
 # .handoff-request (full cycle) | .compact-request (compact-only).
 sid="$1"
 [ -n "$sid" ] || exit 0
@@ -34,11 +35,12 @@ _HERE="$(cd "$(dirname "$0")" && pwd)"
 [ -f "$_HERE/lock-lib.sh" ] && . "$_HERE/lock-lib.sh" || exit 0
 [ -f "$_HERE/mux-lib.sh" ] && . "$_HERE/mux-lib.sh"
 [ -f "$_HERE/request-lib.sh" ] && . "$_HERE/request-lib.sh"
+[ -f "$_HERE/threshold-lib.sh" ] && . "$_HERE/threshold-lib.sh" || exit 0
 # Never let a missing lib make every request look stale: fall back to "exists".
 command -v request_valid >/dev/null 2>&1 || request_valid(){ [ -f "${5:-$1/$3.$4}" ]; }
 command -v remove_stale_request >/dev/null 2>&1 || remove_stale_request(){ return 1; }
 
-THRESHOLD=35        # act only when used_percentage > THRESHOLD
+# The handoff line (35%, or a Persona seat's token line) lives in threshold-lib.sh.
 # Opportunistic "compact while the cache is already cold" trigger. Compaction
 # always pays a full prompt-prefix rewrite; whether that rewrite is expensive
 # depends entirely on WHEN it happens. Compact while the cache is warm and you
@@ -53,9 +55,10 @@ THRESHOLD=35        # act only when used_percentage > THRESHOLD
 COLD_MIN=25          # only contexts big enough for the saved rewrite to be worth a cycle
 CACHE_TTL=300        # the 5m ephemeral prompt-cache TTL
 # Wait timings are env-overridable so the tests can drive a whole cycle in
-# seconds. THRESHOLD, COOLDOWN, COLD_MIN and CACHE_TTL deliberately are NOT —
+# seconds. COOLDOWN, COLD_MIN and CACHE_TTL deliberately are NOT —
 # auto-handoff-sweep.sh hard-codes the same values, and a divergence between
-# the two would be silent.
+# the two would be silent. The handoff line itself is shared through
+# threshold-lib.sh, so it cannot diverge.
 SETTLE=${AUTODEV_SETTLE:-2}              # settle before the first idle check
 POLL=${AUTODEV_POLL:-3}                  # poll interval while waiting
 PRECHECK=${AUTODEV_PRECHECK:-45}         # max seconds to wait for an idle window before deferring
@@ -157,10 +160,13 @@ else
   pct=$(sed -n 's/^pct=\([0-9.]*\).*/\1/p' "$ctxf")
   [ -n "$pct" ] || exit 0
 fi
-if [ "$pct" != unknown ] && awk "BEGIN{exit !($pct < $THRESHOLD)}" &&
+# Below the line (ge: pct < 35, or tok < token line) clears busy deferrals,
+# re-checked under the cycle lock.
+autodev_ctx_over "$STATE" "$sid" ge; below_rc=$?
+if [ "$pct" != unknown ] && [ "$below_rc" = 1 ] &&
    autodev_lock_publish "$STATE/$sid.cycle.lock" "$$"; then
-  current_pct=$(sed -n 's/^pct=\([0-9.]*\).*/\1/p' "$ctxf" 2>/dev/null)
-  if [ -n "$current_pct" ] && awk "BEGIN{exit !($current_pct < $THRESHOLD)}"; then
+  autodev_ctx_over "$STATE" "$sid" ge; below_rc=$?
+  if [ "$below_rc" = 1 ]; then
     rm -f "$STATE/$sid.busy-deferrals" 2>/dev/null
   fi
   autodev_lock_release_owned "$STATE/$sid.cycle.lock" "$$" || true
@@ -185,7 +191,8 @@ hb_last=0; [ -f "$hbf" ] && hb_last=$(cat "$hbf" 2>/dev/null || echo 0)
 if [ $(( hb_now - hb_last )) -ge "$HEARTBEAT_EVERY" ]; then
   idle_age="?"
   [ -f "$STATE/$sid.idle" ] && idle_age=$(( hb_now - $(cat "$STATE/$sid.idle" 2>/dev/null || echo "$hb_now") ))s
-  log "HEARTBEAT pct=$pct thr=$THRESHOLD idle_age=$idle_age armed=$([ "$DRY" = 0 ] && echo 1 || echo 0)"
+  autodev_ctx_over "$STATE" "$sid" gt
+  log "HEARTBEAT pct=$pct thr=${ctx_line:-?}${ctx_tok:+ tok=$ctx_tok} idle_age=$idle_age armed=$([ "$DRY" = 0 ] && echo 1 || echo 0)"
   printf '%s\n' "$hb_now" > "$hbf" 2>/dev/null
 fi
 
@@ -219,7 +226,7 @@ if [ -z "$reason" ]; then
   fi
 fi
 if [ -z "$reason" ]; then
-  if awk "BEGIN{exit !($pct > $THRESHOLD)}"; then
+  if autodev_ctx_over "$STATE" "$sid" gt; then
     reason=threshold
   elif [ ! -f "$STATE/disable-cold-cache-compact" ] && awk "BEGIN{exit !($pct > $COLD_MIN)}" \
        && [ -f "$STATE/$sid.idle" ]; then
@@ -769,7 +776,8 @@ fi
 
 rm -f "$STATE/$sid.busy-deferrals" 2>/dev/null
 rm -f "$STATE/$sid.deferred" 2>/dev/null   # committed to the cycle: no longer merely deferring
-log "TRIGGER ($reason) pct=$pct thr=$THRESHOLD pane=$pane dry=$DRY"
+autodev_ctx_over "$STATE" "$sid" gt
+log "TRIGGER ($reason) pct=$pct thr=${ctx_line:-?}${ctx_tok:+ tok=$ctx_tok} pane=$pane dry=$DRY"
 # Consume an explicit request NOW that we're committed to the cycle — before any
 # send. A post-send abort (/handoff or /compact may already have landed) must NOT
 # leave the marker to re-fire on the reloaded, already-compacted session; a fresh
