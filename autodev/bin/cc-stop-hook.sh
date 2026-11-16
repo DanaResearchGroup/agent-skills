@@ -49,7 +49,8 @@ stop_fallback() (
   [ -f "$STATE/disable-auto-compact" ] && return 1
   [ -f "$STATE/$sid.limit-wait" ] && return 1
   [ -f "$HERE/lock-lib.sh" ] && . "$HERE/lock-lib.sh" || return 1
-  local lock="$STATE/$sid.cycle.lock" pct busy_n=0 failed=0 now last=0 key="" kind f
+  [ -f "$HERE/threshold-lib.sh" ] && . "$HERE/threshold-lib.sh" || return 1
+  local lock="$STATE/$sid.cycle.lock" busy_n=0 failed=0 now last=0 key="" kind f
   local pending=0 fresh_keys="" receipts="$STATE/$sid.fallback-request"
   autodev_lock_publish "$lock" "$$" || return 1
   trap 'autodev_lock_release_owned "$lock" "$$"' EXIT
@@ -57,8 +58,8 @@ stop_fallback() (
   [ -f "$STATE/disable-auto-compact" ] && return 1
   [ -f "$STATE/$sid.limit-wait" ] && return 1
   [ "$STATE/$sid.compacted" -nt "$STATE/$sid.ctx" ] && return 1
-  pct=$(sed -n 's/^pct=\([0-9.]*\).*/\1/p' "$STATE/$sid.ctx" 2>/dev/null)
-  [ -n "$pct" ] && awk "BEGIN{exit !($pct >= 35)}" || {
+  # Past the line: pct >= 35, or a Persona seat's token line (threshold-lib.sh).
+  autodev_ctx_over "$STATE" "$sid" ge || {
     rm -f "$STATE/$sid.busy-deferrals" 2>/dev/null
     return 1
   }

@@ -301,6 +301,10 @@ below 35%. File it by hand only if needed — `request-handoff.sh --compact-only
 - The auto-handoff watcher (when active) will, past 35% at a turn boundary, automatically
   run handoff → `/compact` → inject "read the handoff and continue execution." You do
   not trigger it. Just keep `progress.md` current so a resumed session continues cleanly.
+- **Persona seats** (working folder under `~/Persona/<name>/`) hand off at **200,000 tokens**
+  instead, set in code (`bin/threshold-lib.sh`), so a 1M-window seat does not run to 350k.
+  `compact_at_tokens = <n>` in that Persona's `PI/model.toml` overrides the number. A seat whose
+  window is not larger than the line, or a reading with no token count, keeps the 35% rule.
 - When a handoff is written (auto or manual), ensure it names this autodev loop and points
   to `$DEV/progress.md`, stating "resume the /autodev loop for <feature> from Next."
 - **On resume after a compaction** (you'll receive an injected instruction to read a

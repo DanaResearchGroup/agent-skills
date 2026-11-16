@@ -22,8 +22,32 @@ if [ -n "$sid" ]; then
   printf 'claude\n' > "$STATE/$sid.runtime.tmp" 2>/dev/null \
     && mv "$STATE/$sid.runtime.tmp" "$STATE/$sid.runtime" 2>/dev/null
   if [ -n "$pct" ]; then
-    printf 'pct=%s ts=%s\n' "$pct" "$(date +%s)" > "$STATE/$sid.ctx.tmp" 2>/dev/null \
+    # Live context tokens and window size for a token line (threshold-lib.sh).
+    # total_input_tokens is the session's cumulative input, not the context, so
+    # the count is the documented current_usage sum, else used_percentage x size
+    # (the same reading cc-context-bar.sh uses). `pct=` stays first and `ts=`
+    # last: fleet-digest.sh and others parse both ends of this line.
+    tokwin=$(printf '%s' "$input" | jq -r '
+      .context_window as $c
+      | ( if ($c.current_usage // null) != null
+            then (($c.current_usage.input_tokens // 0) + ($c.current_usage.cache_creation_input_tokens // 0)
+                  + ($c.current_usage.cache_read_input_tokens // 0))
+          elif ($c.used_percentage // null) != null and ($c.context_window_size // null) != null
+            then (($c.used_percentage * $c.context_window_size / 100) | round)
+          else null end ) as $u
+      | if ($u | type) == "number" and ($c.context_window_size | type) == "number" and $c.context_window_size > 0
+        then " tok=\($u | floor) win=\($c.context_window_size | floor)" else "" end' 2>/dev/null)
+    case "$tokwin" in ' tok='[0-9]*' win='[0-9]*) ;; *) tokwin="" ;; esac
+    printf 'pct=%s%s ts=%s\n' "$pct" "$tokwin" "$(date +%s)" > "$STATE/$sid.ctx.tmp" 2>/dev/null \
       && mv "$STATE/$sid.ctx.tmp" "$STATE/$sid.ctx" 2>/dev/null
+  fi
+  # The session's working folder, so the watchers can tell a Persona seat
+  # (threshold-lib.sh). project_dir is where the session started; the live
+  # current_dir can wander with the session.
+  workdir=$(printf '%s' "$input" | jq -r '.workspace.project_dir // .workspace.current_dir // .cwd // empty')
+  if [ -n "$workdir" ] && [ "$(cat "$STATE/$sid.workdir" 2>/dev/null)" != "$workdir" ]; then
+    printf '%s\n' "$workdir" > "$STATE/$sid.workdir.tmp" 2>/dev/null \
+      && mv "$STATE/$sid.workdir.tmp" "$STATE/$sid.workdir" 2>/dev/null
   fi
   # Register the backend pane (herdr and/or tmux) for the watchers.
   if command -v mux_register >/dev/null 2>&1; then
