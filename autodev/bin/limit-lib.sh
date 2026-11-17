@@ -13,6 +13,10 @@
 #     banners) cannot be trusted;
 #   - no turn completed since ts (<sid>.idle, written by the Stop hook, is not
 #     newer than ts): a completed turn means the session is working again.
+# It is also ACTIVE, whatever the file says, while a resume cycle whose owner is
+# not provably gone (_limit_lock_dead) holds the session's resume lock: past
+# until= that cycle is still reading the pane and may yet send "continue" (it
+# waits up to 30 s for an idle pane), and a handoff sent then would overlap it.
 # Any other file is STALE: readers ignore it, and autodev_limit_wait_active
 # removes it under the session's resume lock, re-checking it there, so a fresh
 # file a new resume cycle wrote in between is never removed. The resume watcher
@@ -69,9 +73,15 @@ _limit_wait_values_active(){ # $1 state, $2 sid, $3 now
   [ "$idle" -le "$LW_TS" ]
 }
 
+# 0 while a resume cycle that is not provably gone holds the session's lock.
+_limit_lock_live(){ # $1 state, $2 sid
+  [ -d "$1/$2.resume.lock" ] && ! _limit_lock_dead "$1/$2.resume.lock"
+}
+
 # autodev_limit_wait_active <state> <sid> [--no-reap]: 0 while the session's
-# usage-limit wait is active. A stale file is removed unless --no-reap (the
-# status line only reads).
+# usage-limit wait is active, or while a live resume cycle holds its lock. A
+# stale file is removed unless --no-reap (the status line only reads: it never
+# takes or breaks the lock).
 autodev_limit_wait_active(){
   local st sid=$2 now f
   st=$(_limit_path "$1"); f="$st/$sid.limit-wait"
@@ -80,8 +90,11 @@ autodev_limit_wait_active(){
   now=$(date +%s)
   autodev_limit_wait_read "$st" "$sid"
   _limit_wait_values_active "$st" "$sid" "$now" && return 0
-  [ "${3:-}" = --no-reap ] && return 1
-  autodev_resume_lock_take "$st" "$sid" || return 1
+  [ "${3:-}" = --no-reap ] && { _limit_lock_live "$st" "$sid"; return; }
+  # The lock is refused while its owner is live: that cycle still owns the
+  # wait. Refused for any other reason (a dead lock another reclaimer is
+  # removing), the wait is stale as before.
+  autodev_resume_lock_take "$st" "$sid" || { _limit_lock_live "$st" "$sid"; return; }
   # Re-check under the lock: a resume cycle may have written a fresh wait
   # between the read above and the lock.
   autodev_limit_wait_read "$st" "$sid"
