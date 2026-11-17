@@ -231,6 +231,35 @@ mux_mark_unreachable(){ # $1 sid, $2 reason
   return 1
 }
 
+# --- the unreachable episode, read by auto-handoff-sweep.sh's stuck-seat alert --
+# <sid>.covered holds "<since> <last> <kind>": the first and the latest refusal
+# of this episode, both epoch seconds. kind is menu | login | other for a screen
+# that covers the composer (the watcher records those at its send), or owner |
+# nopane for a Persona seat whose pane is not its own or is gone (the sweep
+# records those at its reachability check). A refusal that finds no episode, or
+# one after a compaction later than <since>, or after a gap of more than
+# AUTODEV_COVER_GAP since <last>, starts a new one: nobody watched the pane in
+# between. Only a refusal recorded here starts an episode; an <sid>.unreachable
+# flag alone never does. A landed send deletes the file (the watcher's
+# cover_clear), and so does the sweep when it finds the seat reachable again.
+AUTODEV_COVER_GAP=900
+autodev_cover_record(){ # $1 sid, $2 kind
+  local sid=$1 kind=$2 f="$STATE/$1.covered" now since="" last="" comp=0 tmp
+  case "$sid" in ""|*[!A-Za-z0-9._-]*|.|..) return 1 ;; esac
+  now=$(date +%s)
+  [ -f "$f" ] && read -r since last _ < "$f" 2>/dev/null
+  case "$since" in ''|*[!0-9]*) since="" ;; esac
+  case "$last" in ''|*[!0-9]*) since="" ;; esac
+  [ -f "$STATE/$sid.compacted" ] && comp=$(head -n1 "$STATE/$sid.compacted" 2>/dev/null)
+  case "$comp" in ''|*[!0-9]*) comp=0 ;; esac
+  if [ -z "$since" ] || [ $(( now - last )) -gt "$AUTODEV_COVER_GAP" ] || [ "$comp" -ge "$since" ]; then
+    since=$now
+  fi
+  tmp="$f.tmp.$$.${BASHPID:-0}"
+  { printf '%s %s %s\n' "$since" "$now" "$kind" > "$tmp" && mv -f "$tmp" "$f"; } 2>/dev/null ||
+    { rm -f "$tmp" 2>/dev/null; return 1; }
+}
+
 # A pane id may have been renumbered. Resolve only a unique exact session label,
 # then validate current ownership before publishing it. No pid/tty heuristic:
 # a daemon-hosted background conversation may have no attached pane at all.
@@ -250,9 +279,12 @@ mux_resolve_herdr(){
 
 # Positive reachability gate for herdr; tmux retains its prior unknown-owner
 # behavior. Re-run at the send boundary as well as before taking cycle locks.
+# On a refusal, MUX_UNREACHABLE_KIND says why: nopane (none registered, or gone)
+# or owner (live, but not proved ours).
+# shellcheck disable=SC2034  # MUX_UNREACHABLE_KIND is read by auto-handoff-sweep.sh
 mux_session_reachable(){ # $1 sid
   local sid=$1 owner
-  MUX_OWNER=""
+  MUX_OWNER=""; MUX_UNREACHABLE_KIND=nopane
   mux_init "$sid" || {
     mux_mark_unreachable "$sid" 'no pane registered'
     return 1
@@ -264,7 +296,7 @@ mux_session_reachable(){ # $1 sid
     fi
   fi
   owner=$(mux_pane_owner)
-  MUX_OWNER=$owner
+  MUX_OWNER=$owner; MUX_UNREACHABLE_KIND=owner
   if { [ -n "$owner" ] && [ "$owner" != "$sid" ]; } ||
      { [ "$MUX" = herdr ] && [ "$owner" != "$sid" ]; }; then
     mux_mark_unreachable "$sid" "pane $PANE ownership refused (owner: ${owner:-unproved})"
@@ -276,11 +308,27 @@ mux_session_reachable(){ # $1 sid
      ! grep -q '^screen presence unproved:' "$STATE/$sid.unreachable" 2>/dev/null; then
     rm -f "$STATE/$sid.unreachable" 2>/dev/null
   fi
+  MUX_UNREACHABLE_KIND=""
   return 0
 }
 
 # Check the SAME pane immediately before a herdr keystroke. Resolving a new
 # pane mid-cycle could send the tail of an old cycle into another attachment.
+# One read of the screen-presence test: 0 when the newest rendered session at
+# the live bottom of the pane is ours. A tag left above another session's short
+# screen cannot prove presence. Leaves the text it read in MUX_PRESENCE_SCREEN.
+# _mux_refuse_unowned retries it at the send boundary; the sweep's stuck-seat
+# alert asks it once, so both judge a covered screen by the same test.
+mux_screen_present_once(){
+  local tag
+  tag=$(mux_session_tag "$MUX_SESSION")
+  MUX_PRESENCE_SCREEN=""
+  mux_read_screen 200 MUX_PRESENCE_SCREEN &&
+    { [ "$MUX_SCREEN_SOURCE" != visible ] || [ "$MUX_SCREEN_AT_BOTTOM" = 1 ]; } &&
+    [ "$(printf '%s\n' "$MUX_PRESENCE_SCREEN" | awk 'NF' | tail -n 12 | tr -d '\n' |
+         grep -oE '⟨cc:[A-Za-z0-9._-]{1,8}⟩' | tail -n 1)" = "$tag" ]
+}
+
 _mux_refuse_unowned(){
   local screen tag attempt snapshot present=0
   [ "$MUX" = herdr ] && [ -n "${MUX_SESSION:-}" ] || return 0
@@ -290,7 +338,7 @@ _mux_refuse_unowned(){
     return 1
   fi
   if [ "$(cat "$STATE/$MUX_SESSION.runtime" 2>/dev/null)" = claude ]; then
-    tag=$(mux_session_tag "$MUX_SESSION")
+    tag=$(mux_session_tag "$MUX_SESSION")   # named in the refusal below
     # Compaction can leave the bottom region blank during a redraw. Keep this
     # bounded and at the send boundary; recheck ownership after every wait.
     for attempt in 1 2 3 4 5; do
@@ -302,17 +350,12 @@ _mux_refuse_unowned(){
           return 1
         fi
       fi
-      screen=""
-      # The newest rendered session must be ours. A tag left above another
-      # session's short screen cannot prove presence, even inside this window.
-      if mux_read_screen 200 screen &&
-         { [ "$MUX_SCREEN_SOURCE" != visible ] || [ "$MUX_SCREEN_AT_BOTTOM" = 1 ]; } &&
-         [ "$(printf '%s\n' "$screen" | awk 'NF' | tail -n 12 | tr -d '\n' |
-              grep -oE '⟨cc:[A-Za-z0-9._-]{1,8}⟩' | tail -n 1)" = "$tag" ]; then
+      if mux_screen_present_once; then
         present=1
         break
       fi
     done
+    screen=$MUX_PRESENCE_SCREEN
     if [ "$present" != 1 ]; then
       MUX_REFUSAL_REASON=presence
       # Keep screen contents out of the shared log. A private temporary file

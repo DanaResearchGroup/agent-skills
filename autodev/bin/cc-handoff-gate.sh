@@ -36,7 +36,11 @@
 #     hook runs this script with --stop and that Stop is blocked once with it.
 #     If a turn then ends with no AskUserQuestion call, the next Stop repeats it
 #     once. The Stop hook's prose "type /compact" fallback never fires for such
-#     a request.
+#     a request. A Persona seat is the exception: it is never told to open a
+#     menu, since that menu is the cover that parks an unattended seat. Its
+#     notice tells it to end its turn, its Stop is never blocked, and the
+#     sweep's stuck-seat alert reaches a person if the pane stays unreachable,
+#     whatever the reason in the flag.
 #     Staleness: a successful herdr reachability check (mux_session_reachable)
 #     removes an ownership, no-pane or pane-gone flag, and herdr registration
 #     skips its throttle while the flag exists, so such a flag lasts only until
@@ -116,7 +120,38 @@ if [ -s "$STATE/$sid.herdr-pane" ] && [ -f "$STATE/$sid.unreachable" ]; then
   # The reason is the watcher's own text; keep one printable line of it.
   why=$(head -n 1 "$STATE/$sid.unreachable" 2>/dev/null | tr -cd '[:print:]' | cut -c1-200)
   why=${why:-reason unknown}
-  ask="automation cannot reach this session's pane ($why), so no /compact will arrive. Before any other work, call the AskUserQuestion tool now with one question: say that automation cannot reach this pane ($why) and that the user must type /compact in this pane. Offer the options \"I will type /compact now\" (Recommended) and \"Continue without compacting\"."
+  # A Persona seat (threshold-lib.sh's test: its working folder is under
+  # ~/Persona/<name>/) runs unattended, and an open menu is the very cover that
+  # parks it and holds its lane messages. It is never told to open one, for any
+  # reason in the flag: it ends its turn, the watcher retries at every sweep,
+  # and if the pane stays unreachable the sweep's stuck-seat alert
+  # (auto-handoff-sweep.sh) reaches a person on Slack and persona:method. The
+  # sweep judges a Persona seat from <sid>.workdir alone, so a folder known only
+  # from this hook's cwd is written there first: the seat this gate spares the
+  # menu is the seat the sweep alerts for. Without threshold-lib.sh, the menu is
+  # kept.
+  persona=0
+  if [ -f "$_HERE/threshold-lib.sh" ] && . "$_HERE/threshold-lib.sh"; then
+    if [ ! -s "$STATE/$sid.workdir" ]; then
+      wd=$(printf '%s' "$input" | jq -r '.cwd // empty' 2>/dev/null | head -n 1)
+      if [ -n "$wd" ]; then
+        { printf '%s\n' "$wd" > "$STATE/$sid.workdir.tmp.$$" &&
+          mv -f "$STATE/$sid.workdir.tmp.$$" "$STATE/$sid.workdir"; } 2>/dev/null ||
+          rm -f "$STATE/$sid.workdir.tmp.$$" 2>/dev/null
+      fi
+    fi
+    autodev_persona_seat "$STATE" "$sid" && persona=1
+  fi
+  # <sid>.spared proves a live seat was spared the menu while this flag stood.
+  # The sweep alerts for a pane not owned or gone only on that proof, so a
+  # session that died with its request pending, its pane since recycled or
+  # closed, pages no one.
+  [ "$persona" = 1 ] && touch "$STATE/$sid.spared" 2>/dev/null
+  if [ "$persona" = 1 ]; then
+    ask="automation cannot reach this session's pane ($why), so no /compact will arrive yet. This is a Persona seat: do not call AskUserQuestion, since a menu covers the pane and holds its lane messages. Finish the step in hand and end your turn; the watcher retries at every sweep, and if the pane stays unreachable a person is alerted on Slack and persona:method."
+  else
+    ask="automation cannot reach this session's pane ($why), so no /compact will arrive. Before any other work, call the AskUserQuestion tool now with one question: say that automation cannot reach this pane ($why) and that the user must type /compact in this pane. Offer the options \"I will type /compact now\" (Recommended) and \"Continue without compacting\"."
+  fi
   # One notice per request. noclobber makes the claim atomic, so parallel tool
   # calls and a racing Stop deliver it once. A claim drops the markers of older
   # requests that are gone or satisfied, and keeps those of every request still
@@ -133,6 +168,14 @@ if [ -s "$STATE/$sid.herdr-pane" ] && [ -f "$STATE/$sid.unreachable" ]; then
     done
     return 0
   }
+  if [ "$mode" = stop ] && [ "$persona" = 1 ]; then
+    # A Persona seat's turn has ended, which is what its notice asks for. A
+    # Stop block would only start another turn. Claim the notice so the Stop
+    # hook's prose fallback stays silent too, and let the Stop launch the
+    # watcher, which retries the pane.
+    claim_notice || true
+    exit 3
+  fi
   if [ "$mode" = stop ]; then
     if [ ! -f "$notice" ]; then
       # The session filed the request and ended its turn with no tool call: this
@@ -162,7 +205,9 @@ if [ -s "$STATE/$sid.herdr-pane" ] && [ -f "$STATE/$sid.unreachable" ]; then
   fi
   # Any claim failure fails open (no notice, allow).
   claim_notice || exit 0
-  jq -nc --arg r "handoff pending, but $ask Tools are not gated for this request: after asking, retry this call and carry on." \
+  tail_="Tools are not gated for this request: after asking, retry this call and carry on."
+  [ "$persona" = 1 ] && tail_="Tools are not gated for this request."
+  jq -nc --arg r "handoff pending, but $ask $tail_" \
     '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"deny",permissionDecisionReason:$r}}'
   exit 0
 fi

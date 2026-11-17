@@ -388,6 +388,326 @@ _page_locked(){
   if [ "$notify" = 1 ]; then _notify_page "$sid" "$msg"; fi
 }
 
+# --- stuck-seat alert: a seat past its line that automation cannot reach -----
+# The watcher never types under a menu or overlay. It re-files its request and
+# the sweep re-arms it every tick, so the handoff stays queued, but the seat is
+# parked until a person clears the screen. Each refusal is recorded in
+# <sid>.covered ("<since> <last> <kind>", autodev_cover_record in mux-lib.sh):
+# the watcher records a covered screen (menu, login, other) on any seat, and the
+# sweep records a pane not owned (owner) or gone (nopane) on a Persona seat,
+# whose handoff gate orders no AskUserQuestion menu for any reason, so this alert
+# is all that reaches a person. Once a seat past its line has been unreachable
+# for more than STUCK_ALERT_AFTER, send one Slack line to the owner and one
+# session-lane line to the Method Persona, once per episode.
+# <sid>.covered-alert records what was sent for which episode, so a restart
+# does not send again; a failed send is recorded there and retried on the next
+# tick.
+STUCK_ALERT_AFTER=600
+# The latest refusal must be this recent: an unreachable seat is retried every
+# tick, so an older one says nothing about the pane now.
+COVER_FRESH=${AUTODEV_COVER_GAP:-900}
+ALERT_LANE_TO=${AUTODEV_ALERT_LANE_TO:-persona:method}
+
+# Alerts are delivered after the loop has re-armed every watcher, so a slow
+# Slack or lane send never holds up a handoff. At most ALERT_PARALLEL run at
+# once, and none starts once ALERT_BUDGET seconds have passed (the rest retry
+# next tick). One alert is bounded by the page-lock wait (10 s) and two sends
+# (30 s each), so with these defaults delivery ends inside ~135 s, below the
+# 3-minute sweep interval (install.sh SWEEP_EVERY).
+ALERT_PARALLEL=$(positive_integer_or_default "${AUTODEV_ALERT_PARALLEL:-}" 4)
+ALERT_BUDGET=${AUTODEV_ALERT_BUDGET:-60}
+case "$ALERT_BUDGET" in ''|*[!0-9]*) ALERT_BUDGET=60 ;; esac
+alert_queue=()
+# Seats whose alert the budget skipped last tick go first this tick, so slow
+# early sends cannot starve the seats after them (one sid per line).
+ALERT_SKIPPED="$STATE/.alert-skipped"
+
+# covered_due <sid>: the file-only half of the alert's checks. 0 when the seat
+# is past its line and its unreachable episode is over STUCK_ALERT_AFTER old and
+# still current. Sets cov_line, cov_since, cov_kind and the ctx_* readings.
+covered_due(){
+  local sid=$1 f="$STATE/$1.covered" comp=0 _rest
+  cov_line=""; cov_since=""; cov_last=""; cov_kind=""
+  [ -f "$f" ] || return 1
+  cov_line=$(head -n1 "$f" 2>/dev/null) || return 1
+  read -r cov_since cov_last cov_kind _rest <<< "$cov_line" || return 1
+  case "$cov_since" in ''|*[!0-9]*) return 1 ;; esac
+  case "$cov_last" in ''|*[!0-9]*) return 1 ;; esac
+  case "$cov_kind" in menu|login|other|owner|nopane) ;; *) cov_kind=other ;; esac
+  [ $(( now - cov_since )) -gt "$STUCK_ALERT_AFTER" ] || return 1
+  [ $(( now - cov_last )) -le "$COVER_FRESH" ] || return 1
+  [ -f "$STATE/$sid.compacted" ] && comp=$(head -n1 "$STATE/$sid.compacted" 2>/dev/null)
+  case "$comp" in ''|*[!0-9]*) comp=0 ;; esac
+  [ "$comp" -lt "$cov_since" ] || return 1
+  autodev_ctx_over "$STATE" "$sid" gt
+}
+
+# note_unreachable <sid> <kind>: the sweep found a seat's herdr pane gone
+# (nopane) or not its own (owner). On a seat that the handoff gate has spared
+# the menu (a Persona seat, the only kind it spares) since this unreachable
+# flag was raised, record the refusal, and queue the alert once its episode is
+# due. Other seats keep the gate's menu. Without that proof the session may be
+# dead, its request left pending and its pane recycled or closed: such a seat
+# stays unreachable at every tick and would page again after every pause of
+# the sweep.
+note_unreachable(){
+  case "$2" in owner|nopane) ;; *) return 0 ;; esac
+  # True too when there is no <sid>.spared at all.
+  [ "$STATE/$1.unreachable" -nt "$STATE/$1.spared" ] && return 0
+  autodev_cover_record "$1" "$2" || log "$1" "ALERT-SKIP cannot record the unreachable pane ($2) in $STATE/$1.covered"
+  covered_due "$1" && alert_queue+=("$1")
+  return 0
+}
+
+# alert_screen_covered <sid>: 0 when the pane is covered right now, judged by
+# the watcher's own tests at the send boundary (mux-lib.sh): on a Claude seat,
+# no proof that its composer is the bottom-most screen; on any seat, a dialog
+# awaiting the human. Needs mux_init.
+alert_screen_covered(){
+  if [ "$MUX" = herdr ] && [ "$(cat "$STATE/$1.runtime" 2>/dev/null)" = claude ]; then
+    mux_screen_present_once || return 0
+  fi
+  mux_awaiting_human
+}
+
+# alert_episode_end <sid> <why>: the seat is reachable and its screen clear, so
+# the episode is over (a person closed the cover or gave the pane back). Remove
+# <sid>.covered only while it still holds the line read: a refusal recorded
+# meanwhile starts its own count.
+alert_episode_end(){
+  local f="$STATE/$1.covered"
+  if [ "$(head -n1 "$f" 2>/dev/null)" = "$cov_line" ] && rm -f "$f" 2>/dev/null; then
+    log "$1" "ALERT-CLEAR $2 — episode over, no alert"
+  fi
+}
+
+# alert_stuck_now <sid>: read the pane now. Sets al_kind, the reason the alert
+# names. 0 = stuck, alert; 1 = no alert now (a turn is running, or the pane is
+# lost on a seat that is not a Persona); 2 = the seat is reachable and its
+# screen clear, so the episode is over. Ownership is read first: the status and
+# screen of a pane that is not ours belong to another session. Needs mux_init.
+alert_stuck_now(){
+  local owner
+  al_kind=""
+  if ! mux_pane_live; then
+    al_kind=nopane
+  else
+    owner=$(mux_pane_owner)
+    if [ "$owner" != "$1" ] && { [ -n "$owner" ] || [ "$MUX" = herdr ]; }; then
+      al_kind=owner
+    fi
+  fi
+  if [ -n "$al_kind" ]; then
+    # Only a Persona seat on herdr was spared the gate's menu for these.
+    [ "$MUX" = herdr ] && autodev_persona_seat "$STATE" "$1" && return 0
+    return 1
+  fi
+  mux_working && return 1
+  # <sid>.covered outlives a cover the person closed before the watcher's next
+  # send: alert only while the screen is still covered.
+  alert_screen_covered "$1" || return 2
+  case "$cov_kind" in
+    menu|login|other) al_kind=$cov_kind ;;
+    *) if mux_awaiting_human; then al_kind=menu; else al_kind=other; fi ;;
+  esac
+  return 0
+}
+
+# alert_record_read <sid>: sets al_episode, al_slack, al_lane from <sid>.covered-alert.
+alert_record_read(){
+  local key val
+  al_episode=""; al_slack=""; al_lane=""
+  [ -f "$STATE/$1.covered-alert" ] || return 0
+  while IFS='=' read -r key val; do
+    case "$key" in
+      episode) al_episode=$val ;;
+      slack) al_slack=$val ;;
+      lane) al_lane=$val ;;
+    esac
+  done < "$STATE/$1.covered-alert"
+}
+alert_record_write(){ # $1 sid; writes al_episode, al_slack, al_lane
+  local rec="$STATE/$1.covered-alert" tmp="$STATE/$1.covered-alert.tmp.$$"
+  { printf 'episode=%s\nslack=%s\nlane=%s\n' "$al_episode" "$al_slack" "$al_lane" > "$tmp" &&
+    mv -f "$tmp" "$rec"; } 2>/dev/null && return 0
+  rm -f "$tmp" 2>/dev/null
+  log "$1" "ALERT-SKIP cannot record $rec — no send until it can be recorded (an unrecorded send would repeat every tick)"
+  return 1
+}
+alert_sent(){ case "$1" in 'sent '*) return 0 ;; esac; return 1; }
+
+# The seat's name: its herdr tab label (without the cache badge), never a pane id.
+alert_seat_label(){ # $1 sid; needs mux_init
+  local l=""
+  command -v mux_tab_label >/dev/null 2>&1 && l=$(mux_tab_label 2>/dev/null | head -n1)
+  # The lane refuses control and format characters (an emoji's zero-width
+  # joiner is one), and a byte cut could split a character: work in characters.
+  l=$(printf '%s' "$l" | sed -E 's/ (⌛[0-9]+s|•cold)$//' | python3 -c '
+import sys, unicodedata
+s = sys.stdin.buffer.read().decode("utf-8", "replace")
+s = "".join(c for c in s if unicodedata.category(c)[0] != "C" and unicodedata.category(c) not in ("Zl", "Zp"))
+print(s.strip()[:80], end="")' 2>/dev/null) || l=""
+  if [ -n "$l" ]; then printf "'%s'" "$l"; else printf 'an unlabelled seat (session %s)' "${1:0:8}"; fi
+}
+
+# One line of a command's output for the state file and the log: printable, short.
+alert_why(){ # $1 output, $2 exit code
+  local w
+  w=$(printf '%s\n' "$1" | awk 'NF' | head -n1 | tr -d '\000-\037\177' | cut -c1-120)
+  printf '%s' "${w:-exit $2}"
+}
+
+alert_send_slack(){ # $1 text; sets alert_out, returns the helper's exit code
+  local cmd=${AUTODEV_SLACK_CMD:-$HOME/.claude/bin/cc-slack-post.py} chan=${CC_SLACK_CHANNEL:-} rc
+  local settings=${AUTODEV_CLAUDE_SETTINGS:-${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json}
+  # A timer does not inherit Claude Code's env, where the channel id lives.
+  [ -n "$chan" ] || chan=$(jq -r '.env.CC_SLACK_CHANNEL // empty' "$settings" 2>/dev/null)
+  local -a runner=(); command -v timeout >/dev/null 2>&1 && runner=(timeout "${AUTODEV_ALERT_TIMEOUT:-30}")
+  if [ -n "$chan" ]; then
+    alert_out=$(CC_SLACK_CHANNEL=$chan "${runner[@]}" "$cmd" "$1" 2>&1 </dev/null); rc=$?
+  else
+    alert_out=$("${runner[@]}" "$cmd" "$1" 2>&1 </dev/null); rc=$?
+  fi
+  return "$rc"
+}
+
+alert_send_lane(){ # $1 text, $2 message id; sets alert_out. QUEUED (75) is success.
+  local cmd=${AUTODEV_LANE_CMD:-} rc
+  if [ -z "$cmd" ]; then
+    cmd=$(command -v session-send 2>/dev/null) || cmd="$HOME/.local/bin/session-send"
+  fi
+  local -a runner=(); command -v timeout >/dev/null 2>&1 && runner=(timeout "${AUTODEV_ALERT_TIMEOUT:-30}")
+  alert_out=$("${runner[@]}" "$cmd" --to "$ALERT_LANE_TO" --from autodev-sweep --id "$2" --wait 1 "$1" 2>&1 </dev/null); rc=$?
+  [ "$rc" = 75 ] && rc=0
+  return "$rc"
+}
+
+_alert_covered_locked(){ # $1 sid; caller holds <sid>.page.lock
+  local sid=$1 label ctxtxt kindtxt mins host text mid rc why
+  # Re-check under the lock: a send may have landed, or another sweep may have
+  # sent the alert, while this one waited.
+  covered_due "$sid" || return 0
+  alert_record_read "$sid"
+  if [ "$al_episode" != "$cov_since" ]; then al_episode=$cov_since; al_slack=""; al_lane=""; fi
+  { alert_sent "$al_slack" && alert_sent "$al_lane"; } && return 0   # skips the herdr reads
+  alert_stuck_now "$sid"; rc=$?
+  if [ "$rc" = 2 ]; then alert_episode_end "$sid" "the pane is reachable and its screen is clear"; return 0; fi
+  [ "$rc" = 0 ] || return 0
+  # Record before sending: a send whose record cannot be kept would repeat
+  # on every tick.
+  alert_record_write "$sid" || return 0
+  label=$(alert_seat_label "$sid")
+  # shellcheck disable=SC2154  # set by autodev_ctx_over (threshold-lib.sh)
+  ctxtxt="context ${ctx_pct}%${ctx_tok:+, $ctx_tok tokens}"
+  mins=$(( (now - cov_since) / 60 ))
+  case "$al_kind" in
+    owner|nopane)
+      if [ "$al_kind" = owner ]; then kindtxt="pane not owned"; else kindtxt="no pane"; fi
+      text="seat $label is past its handoff line ($ctxtxt) and automation has not reached its pane for $mins min (reason: $kindtxt). The handoff stays queued; a person must find the session and type /compact in it." ;;
+    *)
+      case "$al_kind" in login) kindtxt="login screen" ;; *) kindtxt=$al_kind ;; esac
+      text="seat $label is past its handoff line ($ctxtxt) and its pane has been covered for $mins min (reason: $kindtxt). The handoff stays queued; a person must clear the screen or type /compact in that pane." ;;
+  esac
+  if ! alert_sent "$al_slack"; then
+    host=$(hostname 2>/dev/null || echo unknown-host)
+    alert_send_slack "⚠️ *$host* — \`autodev\` $text"; rc=$?
+    if [ "$rc" = 0 ]; then
+      al_slack="sent $now"; log "$sid" "ALERT slack sent: $text"
+    else
+      why=$(alert_why "$alert_out" "$rc")
+      al_slack="failed $now $why"; log "$sid" "ALERT slack failed: $why — retry next tick"
+    fi
+    alert_record_write "$sid" || return 0
+  fi
+  if ! alert_sent "$al_lane"; then
+    # One id per episode: a retry after a timeout resumes the same message.
+    mid="m-$(printf '%s:%s' "$sid" "$cov_since" | sha256sum | cut -c1-12)"
+    alert_send_lane "autodev: $text" "$mid"; rc=$?
+    if [ "$rc" = 0 ]; then
+      al_lane="sent $now $mid"; log "$sid" "ALERT lane sent to $ALERT_LANE_TO ($mid)"
+    else
+      why=$(alert_why "$alert_out" "$rc")
+      al_lane="failed $now $why"; log "$sid" "ALERT lane failed: $why — retry next tick"
+    fi
+    alert_record_write "$sid" || return 0
+  fi
+}
+
+alert_covered(){ # $1 sid; caller ran mux_init
+  local sid=$1
+  # A cheap filter only; the locked half repeats every check.
+  covered_due "$sid" || return 0
+  if [ -n "${AUTODEV_NO_FLOCK:-}" ] || ! command -v flock >/dev/null 2>&1; then
+    _alert_covered_locked "$sid"; return 0
+  fi
+  (
+    if ! flock -n 9; then
+      log "$sid" "ALERT waiting for the page lock"
+      flock -w "${AUTODEV_ALERT_LOCK_WAIT:-10}" 9 || { log "$sid" "ALERT page lock busy — retry next tick"; exit 0; }
+    fi
+    _alert_covered_locked "$sid"
+  ) 9>"$STATE/$sid.page.lock"
+}
+
+# alert_deliver_one <sid>: one queued alert, in its own background process. It
+# re-resolves the pane and reads the clock anew (the checks and the alert text
+# read $now, set here for this call only); alert_stuck_now reads the pane again
+# under the lock.
+alert_deliver_one(){
+  local sid=$1 now
+  now=$(date +%s)
+  mux_init "$sid" || return 0
+  alert_covered "$sid"
+}
+
+# alert_order: print the queue, the seats skipped last tick first (in the order
+# they were skipped), then the rest in file order.
+alert_order(){
+  local sid q=" ${alert_queue[*]} " first=" "
+  if [ -f "$ALERT_SKIPPED" ]; then
+    while IFS= read -r sid; do
+      case "$sid" in ""|*[!A-Za-z0-9._-]*) continue ;; esac
+      case "$q" in *" $sid "*) ;; *) continue ;; esac
+      case "$first" in *" $sid "*) continue ;; esac
+      first="$first$sid "; printf '%s\n' "$sid"
+    done < "$ALERT_SKIPPED"
+  fi
+  for sid in "${alert_queue[@]}"; do
+    case "$first" in *" $sid "*) continue ;; esac
+    first="$first$sid "; printf '%s\n' "$sid"
+  done
+}
+
+# alert_deliver: run the queued alerts in the background. Called after the loop.
+alert_deliver(){
+  local sid pid start=$SECONDS n skipped="" tmp="$ALERT_SKIPPED.tmp.$$"
+  local -a pids=() order=()
+  mapfile -t order < <(alert_order)
+  for sid in "${order[@]}"; do
+    while :; do
+      n=0
+      for pid in "${pids[@]}"; do kill -0 "$pid" 2>/dev/null && n=$(( n + 1 )); done
+      [ "$n" -lt "$ALERT_PARALLEL" ] && break
+      sleep 0.2
+    done
+    if [ $(( SECONDS - start )) -ge "$ALERT_BUDGET" ]; then
+      log "$sid" "ALERT-SKIP the sweep's alert budget (${ALERT_BUDGET}s) is spent — retry next tick, first in line"
+      skipped="$skipped$sid"$'\n'
+      continue
+    fi
+    alert_deliver_one "$sid" </dev/null &
+    pids+=("$!")
+  done
+  if [ -n "$skipped" ]; then
+    { printf '%s' "$skipped" > "$tmp" && mv -f "$tmp" "$ALERT_SKIPPED"; } 2>/dev/null || rm -f "$tmp" 2>/dev/null
+  else
+    rm -f "$ALERT_SKIPPED" 2>/dev/null
+  fi
+  # Only the alert processes: the watchers this sweep launched are not waited for.
+  [ "${#pids[@]}" -eq 0 ] || wait "${pids[@]}" 2>/dev/null
+  return 0
+}
+
 shopt -s nullglob
 seen=" "
 for pf in "$STATE"/*.herdr-pane "$STATE"/*.tmux-pane; do
@@ -600,10 +920,13 @@ for pf in "$STATE"/*.herdr-pane "$STATE"/*.tmux-pane; do
     [ "$thr" = 1 ] && rm -f "$STATE/$sid.busy-since" 2>/dev/null
     continue
   fi
-  if [ "$MUX" = herdr ] && ! mux_session_reachable "$sid" &&
-     { [ -z "${MUX_OWNER:-}" ] || [ "$MUX_OWNER" = "$sid" ]; }; then
-    [ "$thr" = 1 ] && rm -f "$STATE/$sid.busy-since" 2>/dev/null
-    continue
+  if [ "$MUX" = herdr ] && ! mux_session_reachable "$sid"; then
+    # A Persona seat gets no menu from the gate: this refusal is its alert's.
+    note_unreachable "$sid" "${MUX_UNREACHABLE_KIND:-}"
+    if [ -z "${MUX_OWNER:-}" ] || [ "$MUX_OWNER" = "$sid" ]; then
+      [ "$thr" = 1 ] && rm -f "$STATE/$sid.busy-since" 2>/dev/null
+      continue
+    fi
   fi
   if ! mux_pane_live; then
     [ "$thr" = 1 ] && rm -f "$STATE/$sid.busy-since" 2>/dev/null
@@ -676,9 +999,15 @@ for pf in "$STATE"/*.herdr-pane "$STATE"/*.tmux-pane; do
     fi
   fi
 
+  # A seat past its line whose pane has stayed covered: tell a person once,
+  # after the loop (alert_deliver), so no send delays any watcher.
+  covered_due "$sid" && alert_queue+=("$sid")
+
   log "$sid" "SWEEP re-arming watcher ($reason, aborts=$aborts)"
   setsid "$WATCH" "$sid" </dev/null >/dev/null 2>&1 &
 done
+
+alert_deliver
 
 # If the sweep covered more eligible marker identities than its detailed-page
 # budget, send one final page with the count. This page is outside that budget.

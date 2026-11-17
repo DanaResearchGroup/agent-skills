@@ -30,6 +30,12 @@ sandbox_new() {
   # the watcher at the REAL lib through its test seam — the clock the status line
   # uses is then the clock under test, which is the whole point of sharing it.
   export CC_STATUSLINE_LIB="$SKILL_DIR/../bin/lib/cc-statusline-lib.sh"
+  # The sweep's stuck-seat alert must never reach the real Slack or lane: a
+  # test that wants them installs its own fakes over these tripwires.
+  printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "$SB/real-send-attempt"\nexit 1\n' > "$SB/no-send"
+  chmod +x "$SB/no-send"
+  export AUTODEV_SLACK_CMD="$SB/no-send" AUTODEV_LANE_CMD="$SB/no-send"
+  export AUTODEV_CLAUDE_SETTINGS="$SB/no-settings.json"
   # Tests drive the watcher directly; never let a stray env id leak in.
   unset CLAUDE_CODE_SESSION_ID CODEX_SESSION_ID CODEX_THREAD_ID \
     HERDR_ENV HERDR_PANE_ID HERDR_TAB_ID TMUX_PANE

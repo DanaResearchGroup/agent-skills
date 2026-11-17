@@ -21,6 +21,7 @@ status lines.
 | `session-a-menu-*.txt` | open question, cursor-only submit, or permission prompt with extra status/footer rows | synthetic |
 | `session-a-extra-footers.txt` | session tag twelve non-empty rows from the bottom, extra update/context/task footers | synthetic |
 | `session-a-status.txt`, `session-b-status.txt` | idle prompts with distinct session tags | synthetic |
+| `login-screen.txt` | the login-method picker, which covers the composer and status line | assembled |
 
 The real captures come from herdr's saved scrollback (`~/.config/herdr/session-history.json`).
 This repo is public, so the question and option wording was replaced with neutral text. The chrome

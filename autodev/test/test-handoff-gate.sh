@@ -663,4 +663,95 @@ STUB
   sandbox_rm
 done
 
+# A Persona seat runs unattended: an AskUserQuestion menu would be the very
+# cover that parks it and holds its lane messages. (I-429)
+COVERED='screen presence unproved: pane w1:p1 lacks a live bottom-most ⟨cc:77777777⟩ before send'
+persona_seat() { # $1 = how the gate learns the folder: workdir | cwd | elsewhere
+  export AUTODEV_PERSONA_ROOT="$SB/Persona"
+  mkdir -p "$AUTODEV_PERSONA_ROOT/method/PI" "$SB/elsewhere"
+  case "$1" in
+    workdir)   printf '%s\n' "$AUTODEV_PERSONA_ROOT/method" > "$STATE/$SID.workdir" ;;
+    elsewhere) printf '%s\n' "$SB/elsewhere" > "$STATE/$SID.workdir" ;;
+    cwd)       rm -f "$STATE/$SID.workdir" ;;
+  esac
+}
+
+echo "== Persona seat, refused pane: the notice orders no menu =="
+setup; pending; unreachable "$COVERED"; persona_seat workdir
+o1=$(gate Bash '{"command":"make test"}')
+assert_eq "Persona: the 1st call is held once for the notice" "$(decision "$o1")" deny
+assert_contains "Persona: the notice says it is a Persona seat" "$(reason "$o1")" 'This is a Persona seat'
+assert_contains "Persona: the notice forbids the menu" "$(reason "$o1")" 'do not call AskUserQuestion'
+assert_not_contains "Persona: no order to call AskUserQuestion" "$(reason "$o1")" 'call the AskUserQuestion tool now'
+assert_contains "Persona: the notice says to end the turn" "$(reason "$o1")" 'end your turn'
+assert_contains "Persona: the notice names who is alerted" "$(reason "$o1")" 'Slack and persona:method'
+assert_contains "Persona: the notice carries the watcher's reason" "$(reason "$o1")" 'screen presence unproved'
+assert_not_contains "Persona: no 'after asking' tail" "$(reason "$o1")" 'after asking'
+out=$(gate Bash '{"command":"b"}')
+assert_eq "Persona: later calls pass" "$out" ""
+sandbox_rm
+
+echo "== Persona seat, refused pane: the Stop is never blocked =="
+setup; stub_mux; arm; pending; handoff_pointer "$SID"; unreachable "$COVERED"; persona_seat workdir
+s1=$(stop_hook)
+assert_eq "Persona: the Stop does not block (the turn ends)" "$s1" ""
+assert_file "Persona: the Stop claims the notice, so no later call is held" "$STATE/$SID.unreachable-notice.$(date -r "$STATE/$SID.compact-request" +%s%N)"
+assert_eq "Persona: the prose fallback stays silent" "$(cat "$STATE/$SID.fallback-request" 2>/dev/null)" ""
+assert_eq "Persona: a second Stop does not block either" "$(stop_hook)" ""
+out=$(gate Bash '{"command":"a"}')
+assert_eq "Persona: no notice held after the Stop claimed it" "$out" ""
+sandbox_rm
+
+echo "== Persona seat: every unreachable reason gets no menu and no Stop block =="
+# The watcher's and the sweep's own flag texts (mux-lib.sh). The sweep alerts
+# for each of them (test-covered-seat.sh), so none may order the menu.
+for flag in 'pane w1:p1 ownership refused (owner: other-sid)' \
+            'pane w1:p1 lost live ownership before send' \
+            'registered pane w1:p1 is not live; no unique session match' \
+            'no pane registered'; do
+  setup; pending; unreachable "$flag"; persona_seat workdir
+  o1=$(gate Bash '{"command":"a"}')
+  assert_contains "Persona [$flag]: the Persona notice" "$(reason "$o1")" 'This is a Persona seat'
+  assert_not_contains "Persona [$flag]: no menu order" "$(reason "$o1")" 'call the AskUserQuestion tool now'
+  assert_contains "Persona [$flag]: the notice carries the reason" "$(reason "$o1")" "($flag)"
+  assert_contains "Persona [$flag]: a person is alerted if it stays unreachable" "$(reason "$o1")" 'if the pane stays unreachable a person is alerted'
+  sandbox_rm
+  setup; stub_mux; arm; pending; handoff_pointer "$SID"; unreachable "$flag"; persona_seat workdir
+  assert_eq "Persona [$flag]: the Stop is not blocked" "$(stop_hook)" ""
+  sandbox_rm
+done
+
+echo "== a seat outside ~/Persona refused for ownership keeps the menu =="
+setup; pending; unreachable 'pane w1:p1 ownership refused (owner: other-sid)'; persona_seat elsewhere
+o1=$(gate Bash '{"command":"a"}')
+assert_contains "non-Persona ownership: the menu is still ordered" "$(reason "$o1")" 'call the AskUserQuestion tool now'
+assert_not_contains "non-Persona ownership: no Persona notice" "$(reason "$o1")" 'Persona seat'
+sandbox_rm
+
+echo "== Persona seat known only from the hook's cwd =="
+setup; pending; unreachable "$COVERED"; persona_seat cwd
+o1=$(jq -nc --arg s "$SID" --arg c "$AUTODEV_PERSONA_ROOT/method/work" \
+  '{session_id:$s,tool_name:"Bash",tool_input:{command:"a"},cwd:$c,hook_event_name:"PreToolUse"}' |
+  bash "$BIN/cc-handoff-gate.sh" 2>/dev/null)
+assert_contains "cwd under ~/Persona/<name>/: a Persona notice" "$(reason "$o1")" 'This is a Persona seat'
+# The sweep reads only <sid>.workdir: the seat spared the menu must be one it alerts for.
+assert_eq "cwd-only Persona: the folder is written where the sweep reads it" \
+  "$(cat "$STATE/$SID.workdir" 2>/dev/null)" "$AUTODEV_PERSONA_ROOT/method/work"
+sandbox_rm
+setup; pending; unreachable "$COVERED"; persona_seat elsewhere
+jq -nc --arg s "$SID" --arg c "$AUTODEV_PERSONA_ROOT/method/work" \
+  '{session_id:$s,tool_name:"Bash",tool_input:{command:"a"},cwd:$c,hook_event_name:"PreToolUse"}' |
+  bash "$BIN/cc-handoff-gate.sh" >/dev/null 2>&1
+assert_eq "a known workdir is never overwritten by the hook's cwd" \
+  "$(cat "$STATE/$SID.workdir" 2>/dev/null)" "$SB/elsewhere"
+sandbox_rm
+
+echo "== a seat outside ~/Persona keeps the menu =="
+setup; pending; unreachable "$COVERED"; persona_seat elsewhere
+o1=$(gate Bash '{"command":"a"}')
+assert_contains "non-Persona: the menu is still ordered" "$(reason "$o1")" 'call the AskUserQuestion tool now'
+assert_not_contains "non-Persona: no Persona notice" "$(reason "$o1")" 'Persona seat'
+sandbox_rm
+unset AUTODEV_PERSONA_ROOT
+
 finish
