@@ -16,6 +16,11 @@ mkdir -p "$STATE" 2>/dev/null
 
 # Multiplexer abstraction (herdr | tmux) for pane registration.
 [ -f "$HERE/mux-lib.sh" ] && . "$HERE/mux-lib.sh"
+# limit-lib.sh: whether a session's usage-limit wait is still active (a stale
+# <sid>.limit-wait is ignored and removed). Without it, fall back to presence.
+[ -f "$HERE/limit-lib.sh" ] && . "$HERE/limit-lib.sh"
+command -v autodev_limit_wait_active >/dev/null 2>&1 ||
+  autodev_limit_wait_active(){ [ -f "$1/$2.limit-wait" ]; }
 
 sid=$(printf '%s' "$input" | jq -r '.session_id // empty')
 tpath=$(printf '%s' "$input" | jq -r '.transcript_path // empty')
@@ -47,7 +52,7 @@ gate_stop() {
 stop_fallback() (
   [ -f "$STATE/auto-handoff.armed" ] || return 1
   [ -f "$STATE/disable-auto-compact" ] && return 1
-  [ -f "$STATE/$sid.limit-wait" ] && return 1
+  autodev_limit_wait_active "$STATE" "$sid" && return 1
   [ -f "$HERE/lock-lib.sh" ] && . "$HERE/lock-lib.sh" || return 1
   [ -f "$HERE/threshold-lib.sh" ] && . "$HERE/threshold-lib.sh" || return 1
   local lock="$STATE/$sid.cycle.lock" busy_n=0 failed=0 now last=0 key="" kind f
@@ -56,7 +61,7 @@ stop_fallback() (
   trap 'autodev_lock_release_owned "$lock" "$$"' EXIT
   [ -f "$STATE/auto-handoff.armed" ] || return 1
   [ -f "$STATE/disable-auto-compact" ] && return 1
-  [ -f "$STATE/$sid.limit-wait" ] && return 1
+  autodev_limit_wait_active "$STATE" "$sid" && return 1
   [ "$STATE/$sid.compacted" -nt "$STATE/$sid.ctx" ] && return 1
   # Past the line: pct >= 35, or a Persona seat's token line (threshold-lib.sh).
   autodev_ctx_over "$STATE" "$sid" ge || {

@@ -1,0 +1,14 @@
+● The edit is in place.
+
+  ⎿  You've hit your 5-hour limit · resets 7:30am (Asia/Jerusalem)
+     /usage-credits to finish what you’re working on.
+
+● Usage limit reached · continuing automatically at 7:30am · esc to cancel
+
+✻ Sautéed for 1m 5s · done 6:35 AM
+
+────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────
+   🔴 AUTO-HANDOFF: ARMED  ⟨cc:55555555⟩  Opus 87.4k (9.0%)
+  ⏵⏵ auto mode on (shift+tab to cycle)

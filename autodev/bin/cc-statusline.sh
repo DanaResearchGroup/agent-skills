@@ -12,6 +12,9 @@ mkdir -p "$STATE" 2>/dev/null
 _HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 _MUXLIB="$_HERE/mux-lib.sh"
 [ -f "$_MUXLIB" ] && . "$_MUXLIB"
+[ -f "$_HERE/limit-lib.sh" ] && . "$_HERE/limit-lib.sh"
+command -v autodev_limit_wait_active >/dev/null 2>&1 ||
+  autodev_limit_wait_active(){ [ -f "$1/$2.limit-wait" ]; }
 
 sid=$(printf '%s' "$input" | jq -r '.session_id // empty')
 tpath=$(printf '%s' "$input" | jq -r '.transcript_path // empty')
@@ -70,13 +73,22 @@ if [ -n "$sid" ]; then
 fi
 
 # ---- auto-handoff state badge (very visible; kill switch beats armed) ----
-# Phoenix (session-limit auto-resume) takes over the badge while it is waiting to resume.
+# Phoenix (session-limit auto-resume) takes over the badge while it is waiting to
+# resume; a stale limit-wait (limit-lib.sh) shows nothing. Read-only here: the
+# watchers remove stale files.
 lw="$STATE/$sid.limit-wait"
-if [ -n "$sid" ] && [ -f "$lw" ]; then
-  lw_h=$(sed -n 's/.*human=\([^ ]*\).*/\1/p' "$lw" 2>/dev/null)
+if [ -n "$sid" ] && autodev_limit_wait_active "$STATE" "$sid" --no-reap; then
+  # human= is "7:30am_Asia/Jerusalem" (or "Nov16_8:00am_..."): the badge shows the time.
+  lw_h=$(sed -n 's/.*human=\([^ ]*\).*/\1/p' "$lw" 2>/dev/null | sed -E 's/_[A-Za-z]+\/[A-Za-z0-9_+\/-]+$//; s/_/ /g')
   badge="\033[1;5;97;45m ⏳ AUTO-RESUME @ ${lw_h:-reset} \033[0m"  # bold + blink, white on magenta
 elif [ -f "$STATE/disable-auto-compact" ]; then
   badge="\033[1;97;100m ⛔ AUTO-HANDOFF: OFF \033[0m"        # bold white on grey
+elif [ -n "$sid" ] && [ -f "$STATE/$sid.unreachable" ] &&
+     grep -Eq '^(no pane registered|registered pane .* is not live)' "$STATE/$sid.unreachable" 2>/dev/null; then
+  # The flag names a pane that is gone (a closed worker pane), not a covered
+  # screen. This session is rendering, so it is alive: it just has no pane the
+  # watcher can type into. Not UNREACHABLE, which means a live pane refused.
+  badge="\033[1;30;47m ⚪ AUTO-HANDOFF: NO PANE \033[0m"  # bold black on white
 elif [ -n "$sid" ] && [ -f "$STATE/$sid.unreachable" ]; then
   badge="\033[1;5;97;101m ⚠ AUTO-HANDOFF: UNREACHABLE \033[0m"
 elif [ -n "$sid" ] && [ -f "$STATE/$sid.stuck" ]; then

@@ -174,7 +174,8 @@ sweep
 assert_no_file "herdr blocked: no request" "$REQ"
 sandbox_rm
 
-setup; clock 1500; : > "$STATE/$SID.limit-wait"
+setup; clock 1500
+printf 'until=%s reset=%s human=7:30am ts=%s\n' "$(( $(date +%s) + 3600 ))" "$(( $(date +%s) + 3360 ))" "$(date +%s)" > "$STATE/$SID.limit-wait"
 sweep
 assert_no_file "limit-wait session: no request" "$REQ"
 assert_no_file "limit-wait clears the busy clock" "$CLOCK"
@@ -182,6 +183,14 @@ rm -f "$STATE/$SID.limit-wait"
 sweep
 assert_no_file "working after limit-wait starts a fresh duration" "$REQ"
 assert_file "working after limit-wait starts a fresh clock" "$CLOCK"
+sandbox_rm
+
+# A limit-wait past its until= is stale: the sweep removes it and proceeds.
+setup; clock 1500
+printf 'until=%s reset=%s human=7:30am ts=%s\n' "$(( $(date +%s) - 60 ))" "$(( $(date +%s) - 300 ))" "$(( $(date +%s) - 4000 ))" > "$STATE/$SID.limit-wait"
+sweep
+assert_no_file "stale limit-wait: removed by the sweep" "$STATE/$SID.limit-wait"
+assert_file "stale limit-wait: the 25-minute busy stretch raises the request" "$REQ"
 sandbox_rm
 
 echo "== a request already pending is never duplicated or overwritten =="

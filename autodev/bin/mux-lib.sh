@@ -337,7 +337,10 @@ _mux_refuse_unowned(){
     mux_mark_unreachable "$MUX_SESSION" "pane $PANE lost live ownership before send"
     return 1
   fi
-  if [ "$(cat "$STATE/$MUX_SESSION.runtime" 2>/dev/null)" = claude ]; then
+  # mux_send_key --own-dialog waives the tag test (and only that) for a dialog
+  # the caller opened and proved, which covers the row the tag is drawn on.
+  if [ "$(cat "$STATE/$MUX_SESSION.runtime" 2>/dev/null)" = claude ] &&
+     [ "${MUX_PRESENCE_WAIVED:-0}" != 1 ]; then
     tag=$(mux_session_tag "$MUX_SESSION")   # named in the refusal below
     # Compaction can leave the bottom region blank during a redraw. Keep this
     # bounded and at the send boundary; recheck ownership after every wait.
@@ -691,17 +694,26 @@ mux_stage_text(){ # $1 = text
 # Send a single named key (e.g. Escape) with no literal text.
 #   --own-prompt  skip the guard. ONLY for a dialog the caller itself opened a
 #                 moment ago with its own command in this same cycle (Codex's
-#                 /compact confirmation, the dialog /usage-credits opens on a
-#                 limit-stopped session), where no human question can be open.
-mux_send_key(){ # [--own-prompt] $1 = key
+#                 /compact confirmation), where no human question can be open.
+#   --own-dialog  as --own-prompt, and also waive the screen-presence tag: for a
+#                 dialog that covers the status row (the login picker
+#                 /usage-credits opens), which hides the tag the check reads.
+#                 The pane must still be live and ours, and the caller must have
+#                 proved from the screen that the dialog sits right under the
+#                 echo of its own command (session-resume-watch.sh does).
+mux_send_key(){ # [--own-prompt|--own-dialog] $1 = key
+  local waive=0
   _mux_refuse_staged_attempt && return "$MUX_REFUSED"
-  if [ "${1:-}" = --own-prompt ]; then
-    _mux_refuse_unowned || return "$MUX_REFUSED"
-    shift
-  else _mux_refuse_if_awaiting || return "$MUX_REFUSED"; fi
+  case "${1:-}" in
+    --own-prompt|--own-dialog)
+      [ "$1" = --own-dialog ] && waive=1
+      MUX_PRESENCE_WAIVED=$waive _mux_refuse_unowned || return "$MUX_REFUSED"
+      shift ;;
+    *) _mux_refuse_if_awaiting || return "$MUX_REFUSED" ;;
+  esac
   case "$MUX" in
     tmux)  tmux send-keys -t "$PANE" "$1" ;;
-    herdr) _mux_refuse_unowned || return "$MUX_REFUSED"
+    herdr) MUX_PRESENCE_WAIVED=$waive _mux_refuse_unowned || return "$MUX_REFUSED"
            "$MUX_HERDR" pane send-keys "$PANE" "$1" >/dev/null 2>&1 ;;
     *) return 1 ;;
   esac

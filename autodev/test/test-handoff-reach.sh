@@ -209,7 +209,10 @@ panes
 reach; reach
 assert_file 'background worker without an attachment is unreachable' "$STATE/$SID.unreachable"
 assert_eq 'unreachable reason logs once per episode' "$(log_text | grep -c UNREACHABLE)" 1
-assert_contains 'badge exposes unreachable state' "$(badge)" 'AUTO-HANDOFF: UNREACHABLE'
+# Its pane is gone, not covered: the badge says so, and does not read as a
+# live pane that refused (UNREACHABLE).
+assert_contains 'badge exposes the missing pane' "$(badge)" 'AUTO-HANDOFF: NO PANE'
+assert_not_contains 'a gone pane is not shown as UNREACHABLE' "$(badge)" 'UNREACHABLE'
 out=$(stop)
 assert_eq 'no attached pane immediately triggers fallback' "$(block "$out")" block
 assert_contains 'fallback names the compact-only request step' "$(why "$out")" '--compact-only --handoff'

@@ -1,0 +1,10 @@
+● Earlier work.
+
+  ⎿  You've hit your 5-hour limit · resets 7:30am (Asia/Jerusalem)
+     /usage-credits to finish what you’re working on.
+
+────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────
+   🔴 AUTO-HANDOFF: ARMED  ⟨cc:55555555⟩  Opus 87.4k (9.0%)
+  ⏵⏵ auto mode on (shift+tab to cycle)

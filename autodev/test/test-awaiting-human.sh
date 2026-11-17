@@ -429,7 +429,9 @@ setup
   cat "$FX/single-select.txt"; } > "$SB/herdr/screen.txt"
 bash "$BIN/session-resume-watch.sh" "$SID" >/dev/null 2>&1
 nothing_typed "limit banner + open question: nothing typed, no Escape"
-assert_contains "Phoenix logs DEFER awaiting-human" "$(LOG auto-resume)" "DEFER awaiting-human"
+# The question covers the composer, so the banner above it is not live: the
+# watcher detects nothing and never reaches a send.
+assert_contains "Phoenix detects no live banner under an open question" "$(LOG auto-resume)" "NO-DETECT pane=w1:p7G reason=no-composer"
 sandbox_rm
 
 finish

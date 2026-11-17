@@ -127,6 +127,11 @@ _HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [ -f "$_HERE/mux-lib.sh" ] && . "$_HERE/mux-lib.sh"
 [ -f "$_HERE/request-lib.sh" ] && . "$_HERE/request-lib.sh"
 [ -f "$_HERE/threshold-lib.sh" ] && . "$_HERE/threshold-lib.sh" || exit 0
+# limit-lib.sh: whether a session's usage-limit wait is still active (a stale
+# <sid>.limit-wait is ignored and removed). Without it, fall back to presence.
+[ -f "$_HERE/limit-lib.sh" ] && . "$_HERE/limit-lib.sh"
+command -v autodev_limit_wait_active >/dev/null 2>&1 ||
+  autodev_limit_wait_active(){ [ -f "$1/$2.limit-wait" ]; }
 # Never let a missing lib make every request look stale: fall back to "exists".
 command -v request_valid >/dev/null 2>&1 || request_valid(){ [ -f "${5:-$1/$3.$4}" ]; }
 command -v remove_stale_request >/dev/null 2>&1 || remove_stale_request(){ return 1; }
@@ -720,6 +725,31 @@ alert_deliver(){
   return 0
 }
 
+# clear_presence_flag <sid>: drop a "screen presence unproved" <sid>.unreachable
+# (and a needs-owner.list line) when the pane is live and ours and its screen
+# ends in an empty composer with our session tag at the bottom and no dialog.
+# The same tests the watcher's send boundary runs (mux-lib.sh), so a flag only
+# clears on the evidence that would have let a send land. Other flags are left
+# to mux_session_reachable, which clears them on its own evidence.
+clear_presence_flag(){
+  local sid=$1 f="$STATE/$1.unreachable" screen before
+  grep -q '^screen presence unproved:' "$f" 2>/dev/null || return 0
+  before=$(stat -c '%Y %s' "$f" 2>/dev/null; cat "$f" 2>/dev/null)
+  [ "$(cat "$STATE/$sid.runtime" 2>/dev/null)" = claude ] || return 0
+  mux_init "$sid" && [ "$MUX" = herdr ] || return 0
+  mux_pane_live && [ "$(mux_pane_owner)" = "$sid" ] || return 0
+  mux_screen_present_once || return 0
+  screen=$MUX_PRESENCE_SCREEN
+  printf '%s\n' "$screen" | python3 "$_HERE/limit-banner.py" --composer-clear || return 0
+  mux_awaiting_human && return 0
+  # Re-check the flag just before removing it: one rewritten meanwhile holds
+  # newer evidence than this read, so keep it.
+  [ "$(stat -c '%Y %s' "$f" 2>/dev/null; cat "$f" 2>/dev/null)" = "$before" ] || return 0
+  rm -f "$f" 2>/dev/null && log "$sid" "CLEAR unreachable: pane $PANE shows a clear, live composer"
+  command -v autodev_needs_owner_clear >/dev/null 2>&1 && autodev_needs_owner_clear "$STATE" "$sid"
+  return 0
+}
+
 shopt -s nullglob
 seen=" "
 for pf in "$STATE"/*.herdr-pane "$STATE"/*.tmux-pane; do
@@ -765,9 +795,15 @@ for pf in "$STATE"/*.herdr-pane "$STATE"/*.tmux-pane; do
     continue
   fi
 
+  # A screen-presence flag clears on evidence, not only at the next send: a
+  # pane whose composer is clear, live and ours loses it here, so its badge
+  # turns back and a session past its line hands off on this same pass.
+  clear_presence_flag "$sid"
+
   # Phoenix owns sessions that are waiting out a usage limit; typing at them
-  # would only queue input behind a blocked prompt.
-  if [ -f "$STATE/$sid.limit-wait" ]; then
+  # would only queue input behind a blocked prompt. A stale wait is removed here
+  # and the session is swept as usual.
+  if autodev_limit_wait_active "$STATE" "$sid"; then
     # The pane is waiting on a usage-limit reset, not continuously working.
     rm -f "$STATE/$sid.busy-since" 2>/dev/null
     continue

@@ -36,6 +36,11 @@ _HERE="$(cd "$(dirname "$0")" && pwd)"
 [ -f "$_HERE/mux-lib.sh" ] && . "$_HERE/mux-lib.sh"
 [ -f "$_HERE/request-lib.sh" ] && . "$_HERE/request-lib.sh"
 [ -f "$_HERE/threshold-lib.sh" ] && . "$_HERE/threshold-lib.sh" || exit 0
+# limit-lib.sh: whether a session's usage-limit wait is still active (a stale
+# <sid>.limit-wait is ignored and removed). Without it, fall back to presence.
+[ -f "$_HERE/limit-lib.sh" ] && . "$_HERE/limit-lib.sh"
+command -v autodev_limit_wait_active >/dev/null 2>&1 ||
+  autodev_limit_wait_active(){ [ -f "$1/$2.limit-wait" ]; }
 # Never let a missing lib make every request look stale: fall back to "exists".
 command -v request_valid >/dev/null 2>&1 || request_valid(){ [ -f "${5:-$1/$3.$4}" ]; }
 command -v remove_stale_request >/dev/null 2>&1 || remove_stale_request(){ return 1; }
@@ -102,7 +107,11 @@ if [ -f "$STATE/disable-auto-compact" ]; then exit 0; fi
 
 # --- defer while Phoenix is handling a usage/session limit for this session ---
 # (sending /handoff or /compact into a limited session would just be blocked/queued).
-if [ -f "$STATE/$sid.limit-wait" ]; then log "SKIP session-limit resume pending"; exit 0; fi
+# Only while the wait is active: a stale limit-wait (past its until=, or older
+# than the session's last completed turn) is removed and the cycle proceeds.
+LIMIT_WAIT_REAPED=0
+if autodev_limit_wait_active "$STATE" "$sid"; then log "SKIP session-limit resume pending"; exit 0; fi
+[ "$LIMIT_WAIT_REAPED" = 1 ] && log "DROP stale limit-wait (its wait is over); proceeding"
 
 # --- arm state: absent => dry-run (log only, never send keys) ---
 DRY=1
@@ -790,7 +799,7 @@ fi
 
 # Re-check for a session-limit resume that Phoenix may have registered in the race window
 # between our top-of-script check and now (both watchers launch on the same Stop).
-if [ -f "$STATE/$sid.limit-wait" ]; then log "SKIP session-limit resume pending (late)"; exit 0; fi
+if autodev_limit_wait_active "$STATE" "$sid"; then log "SKIP session-limit resume pending (late)"; exit 0; fi
 
 # Honor a late cancel: reason=requested was latched before the idle-gate wait, so
 # request-handoff.sh --cancel (or a manual rm) may have removed the marker in the

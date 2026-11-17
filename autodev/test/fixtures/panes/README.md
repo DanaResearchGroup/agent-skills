@@ -3,7 +3,7 @@
 Bottom-of-pane text for the mux tests, as `herdr pane read` returns it.
 `test-awaiting-human.sh` and `test-pm-nudge.sh` distinguish open dialogs from
 idle prompts; `test-screen-presence.sh` checks the session tags on synthetic
-status lines.
+status lines; `test-limit-resume.sh` reads the `limit-*` screens.
 
 | File | State | Source |
 |---|---|---|
@@ -22,6 +22,10 @@ status lines.
 | `session-a-extra-footers.txt` | session tag twelve non-empty rows from the bottom, extra update/context/task footers | synthetic |
 | `session-a-status.txt`, `session-b-status.txt` | idle prompts with distinct session tags | synthetic |
 | `login-screen.txt` | the login-method picker, which covers the composer and status line | assembled |
+| `limit-live.txt`, `limit-live-glued.txt` | a live usage-limit banner: only Claude Code's own trailer rows, then the composer box (the glued copy has full-width rows run together, as herdr's unwrapped read returns them) | synthetic |
+| `limit-scrollback.txt`, `limit-after-output.txt`, `limit-prose.txt`, `limit-no-reset.txt` | a banner that is not live: older output after it, prose quoting it, a limit line with no reset | synthetic |
+| `limit-midnight.txt`, `limit-two-banners.txt`, `limit-no-done.txt`, `limit-weekly.txt` | the reset-day cases `limit-banner.py` pins | synthetic |
+| `limit-login-picker.txt`, `limit-after-credits.txt` | the login picker `/usage-credits` opened under the banner, and the screen after Escape closed it | assembled from a real capture |
 
 The real captures come from herdr's saved scrollback (`~/.config/herdr/session-history.json`).
 This repo is public, so the question and option wording was replaced with neutral text. The chrome

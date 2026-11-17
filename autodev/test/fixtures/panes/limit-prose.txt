@@ -1,0 +1,9 @@
+● When you hit your session limit, the pane shows: You've hit your 5-hour limit · resets 7:30am (Asia/Jerusalem)
+
+✻ Brewed for 16s · done 6:40 AM
+
+────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────
+   🔴 AUTO-HANDOFF: ARMED  ⟨cc:55555555⟩  Opus 87.4k (9.0%)
+  ⏵⏵ auto mode on (shift+tab to cycle)
