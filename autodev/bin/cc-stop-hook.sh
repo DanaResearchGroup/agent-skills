@@ -148,8 +148,8 @@ elif stop_fallback; then exit 0; fi
 # Launch the watchers fully detached so they survive this hook returning and can
 # poll for later turns. Each self-gates (threshold, lock, cooldown, arm).
 #  - auto-handoff-watch: context-% threshold -> handoff/compact/reload.
-#  - session-resume-watch (Phoenix): usage/session-limit banner -> usage-credits or
-#    wait-for-reset -> continue.
+#  - session-resume-watch (Phoenix): usage/session-limit banner -> wait for the
+#    reset -> continue.
 #  - cache-warm-watch: prompt-cache TTL -> countdown in the tab label. Turn end is
 #    exactly when the cache starts ageing unobserved, because the status line
 #    stops being rendered the moment CC goes idle.

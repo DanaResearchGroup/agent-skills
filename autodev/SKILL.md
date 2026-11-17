@@ -331,11 +331,9 @@ behaves so you resume cleanly:
 
 - Phoenix acts only on a **live** banner: the newest content on the pane, with a reset time
   that parses and lies ahead (`bin/limit-banner.py`). A banner in the scrollback does nothing.
-- It first runs `/usage-credits` (the banner's own suggested action), closes any dialog that
-  opens, and checks for an empty composer. A dialog it cannot close stops all typing into the
-  pane and lists it in `~/agents/state/needs-owner.list` for the owner.
-- If credits don't resume work (or are disabled via `~/agents/state/no-usage-credits`), Phoenix
+- It never types `/usage-credits` (it opened a login picker that covered panes for hours). It
   sleeps until a few minutes **past** the reset, then sends `continue`.
+  `~/agents/state/disable-auto-resume` turns Phoenix off.
 - While it waits, the status line shows a `⏳ AUTO-RESUME @ <time>` badge, it writes
   `~/agents/state/<sid>.limit-wait`, and the auto-handoff watcher **defers** (no handoff/
   compact into a limited session). The wait ends at the reset, at your next completed turn,
@@ -423,10 +421,10 @@ docs. The scripts are self-locating and store runtime data under **`AUTODEV_HOME
 - `bin/sessionstart-compact.sh` — shared post-compaction reload-instruction backup.
 - `bin/auto-handoff-watch.sh` — context-threshold → handoff/`/compact`/reload engine; emits
   `/handoff` on Claude Code and `$handoff` on Codex.
-- `bin/session-resume-watch.sh` — **Phoenix** usage/session-limit → `/usage-credits`/wait → `continue`.
+- `bin/session-resume-watch.sh` — **Phoenix** usage/session-limit → wait → `continue`.
 
 Control switches live in `$AUTODEV_HOME/state/` (`auto-handoff.armed`, `disable-auto-compact`,
-`disable-auto-resume`, `no-usage-credits`); logs in `$AUTODEV_HOME/logs/`. Hooks load per
+`disable-auto-resume`); logs in `$AUTODEV_HOME/logs/`. Hooks load per
 session, so install/relocation takes effect for **new** sessions only.
 
 ## Rules

@@ -690,9 +690,8 @@ clear_presence_flag(){
 # limit_wait_screen_check <sid>: a <sid>.limit-wait whose pane shows no live
 # usage-limit banner now is removed. A false detection, or a wait whose limit
 # is over, must not hold the handoff off. Two guards (I-449 review): the check
-# runs only under the session's resume lock, so a live resume cycle, whose own
-# /usage-credits picker may cover the composer for a moment, keeps its wait
-# (it ends that wait itself when the banner leaves the live area); and the file
+# runs only under the session's resume lock, so a live resume cycle keeps its
+# wait (it ends that wait itself when the banner leaves the live area); and the file
 # goes only on positive evidence, an empty composer at the bottom of the pane
 # with no live banner over it (limit-banner.py --composer-clear, then
 # --live-only). A screen with no composer proves nothing and keeps the file.
@@ -712,7 +711,7 @@ _limit_wait_screen_check_locked(){ # $1 sid; caller holds the resume lock
   [ "$MUX" != herdr ] || [ "$(mux_pane_owner)" = "$sid" ] || return 0
   mux_read_screen 200 screen || return 0
   printf '%s\n' "$screen" | python3 "$_HERE/limit-banner.py" --composer-clear >/dev/null 2>&1 || return 0
-  printf '%s\n' "$screen" | python3 "$_HERE/limit-banner.py" --live-only --after-credits >/dev/null 2>&1
+  printf '%s\n' "$screen" | python3 "$_HERE/limit-banner.py" --live-only >/dev/null 2>&1
   [ "$?" = 1 ] || return 0
   rm -f "$f" 2>/dev/null && log "$sid" "DROP limit-wait: pane $PANE shows no live usage-limit banner"
 }

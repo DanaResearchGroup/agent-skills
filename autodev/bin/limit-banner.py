@@ -47,12 +47,7 @@ Output (one line):
 
 Other modes:
   --live-only        exit 0 while a live banner is on screen, whatever its time
-  --after-credits    also accept, under the banner, the rows this watcher's own
-                     /usage-credits leaves there (OWN_CREDITS_ROWS)
   --composer-clear   exit 0 when the screen ends in an EMPTY composer box
-  --own-dialog CMD   exit 0 when a dialog is drawn below the echo of CMD, the
-                     newest prompt row on screen ("❯ /usage-credits"), and no
-                     composer box is live
   --describe         print "key=<Escape|Ctrl-C> screen=<one line>": what the
                      bottom of the screen shows and the key that would clear it
 """
@@ -95,15 +90,6 @@ TRAILERS = [
     re.compile(r"^●\s+Usage limit reached(?: again)? · continuing automatically at .+ · esc to cancel$"),
     re.compile(r"^●\s+Goal paused · usage limit reached · continues automatically when it resets$"),
     DONE,
-]
-
-# What this watcher's own /usage-credits leaves under the banner once its
-# picker is closed: the echoed command, the picker's exit, and Claude Code's
-# notice that its own automatic continue stopped with the login change.
-OWN_CREDITS_ROWS = [
-    re.compile(r"^❯\s+/usage-credits$"),
-    re.compile(r"^⎿\s+Login interrupted$"),
-    re.compile(r"^●\s+Automatic continue stopped · .*$"),
 ]
 
 MONTHS = {m: i + 1 for i, m in enumerate(
@@ -254,25 +240,11 @@ def describe(lines):
     return "key=%s screen=%s" % (key, shown)
 
 
-def own_dialog(lines, cmd):
-    if composer_box(lines) is not None:
-        return False
-    prompts = [i for i, s in enumerate(lines) if PROMPT.match(s) and not OPTION.match(s)]
-    if not prompts:
-        return False
-    last = prompts[-1]
-    if re.sub(r"\s+", " ", lines[last].strip()) != "❯ " + cmd:
-        return False
-    return last < len(lines) - 1          # the dialog is drawn below the echo
-
-
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--now", type=float)
     ap.add_argument("--live-only", action="store_true")
-    ap.add_argument("--after-credits", action="store_true")
     ap.add_argument("--composer-clear", action="store_true")
-    ap.add_argument("--own-dialog")
     ap.add_argument("--describe", action="store_true")
     a = ap.parse_args(argv)
     now = a.now if a.now is not None else time.time()
@@ -281,13 +253,11 @@ def main(argv=None):
     if a.describe:
         print(describe(lines))
         return 0
-    if a.own_dialog:
-        return 0 if own_dialog(lines, a.own_dialog) else 1
     if a.composer_clear:
         box = composer_box(lines)
         return 0 if box and [s.strip() for s in lines[box[0] + 1:box[1]]] == ["❯"] else 1
 
-    m, rest = live_banner(lines, OWN_CREDITS_ROWS if a.after_credits else ())
+    m, rest = live_banner(lines)
     if m is None:
         reason = rest if any(ANY_BANNER.search(s) for s in lines) else "no-banner"
         print("none reason=%s" % reason)

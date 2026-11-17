@@ -2,7 +2,7 @@
 # Bug: a pane injector answered the owner's open question by typing into it.
 #
 # The watchers type text + Enter into Claude Code panes (/handoff, /compact,
-# continue, /usage-credits, the PM nudge) once the pane is "not busy". That
+# continue, the PM nudge) once the pane is "not busy". That
 # check counted a pane sitting at an open AskUserQuestion menu as idle: herdr
 # reports the form as `blocked`, and mux_busy mapped idle|done|blocked to
 # "safe". The Enter then selected the pre-highlighted option — the one marked

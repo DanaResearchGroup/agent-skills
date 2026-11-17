@@ -6,9 +6,10 @@
 # the pane's last 200 rows, so an old banner in the scrollback started a fresh
 # wait (once of about 20 hours, from a reset that had already passed), and
 # while <sid>.limit-wait existed the handoff watcher skipped the session. Its
-# /usage-credits opened a login picker in 12 of 19 sends; the Escape meant to
-# close it was refused because the picker hides the status row whose session
-# tag the send guard reads, so six sessions sat on the picker for hours.
+# /usage-credits opened a login picker in 12 of 19 sends, and six sessions sat
+# on the picker for hours. The owner then ordered the watcher never to type
+# that command again: the path is gone, and a check here and in ci.sh fails on
+# any send of it from bin/.
 #
 # Detector cases run limit-banner.py on fixed screens at a fixed clock
 # (TZ=Asia/Jerusalem). Watcher cases run the REAL mux-lib.sh against a fake
@@ -21,8 +22,7 @@ SID=55555555-5555-5555-5555-555555555555
 FX="$SKILL_DIR/test/fixtures/panes"
 DET="$SKILL_DIR/bin/limit-banner.py"
 export TZ=Asia/Jerusalem
-export AUTODEV_POLL=0 AUTODEV_DETECT_RECHECK=0 AUTODEV_CREDITS_WAIT=0 \
-       AUTODEV_ESC_WAIT=0 AUTODEV_RESUME_WAKE=1
+export AUTODEV_POLL=0 AUTODEV_DETECT_RECHECK=0 AUTODEV_RESUME_WAKE=1
 ORIG_PATH="$PATH"
 
 at() { date -d "$1" +%s; }                     # a wall-clock instant, local zone
@@ -73,17 +73,12 @@ assert_eq "weekly banner with a date" \
   "reset=$(at '2026-11-20 08:00') human=Nov20_8:00am_Asia/Jerusalem kind=weekly"
 assert_eq "--live-only: a live banner whose reset passed is still on screen" \
   "$(detect limit-live '2026-11-17 11:12' --live-only)" "live"
-assert_eq "--live-only: our own /usage-credits rows end the live banner" \
-  "$(detect limit-after-credits '2026-11-17 06:40' --live-only)" "none reason=not-newest"
-assert_eq "--live-only --after-credits: unless the cycle sent /usage-credits itself" \
-  "$(detect limit-after-credits '2026-11-17 06:40' --live-only --after-credits)" "live"
-python3 "$DET" --own-dialog /usage-credits < "$FX/limit-login-picker.txt"
-assert_eq "--own-dialog: the picker sits right under our command" "$?" 0
-python3 "$DET" --own-dialog /usage-credits < "$FX/rate-limit-menu.txt"
-assert_eq "--own-dialog: a menu not under our command is not ours" "$?" 1
-python3 "$DET" --own-dialog /usage-credits < "$FX/limit-after-credits.txt"
-assert_eq "--own-dialog: no dialog once the composer is back" "$?" 1
-python3 "$DET" --composer-clear < "$FX/limit-after-credits.txt"
+for gone in --after-credits "--own-dialog x"; do
+  # shellcheck disable=SC2086
+  python3 "$DET" $gone < "$FX/limit-live.txt" >/dev/null 2>&1
+  assert_eq "the detector has no $gone mode left (the credits path is gone)" "$?" 2
+done
+python3 "$DET" --composer-clear < "$FX/presence-clear.txt"
 assert_eq "--composer-clear: empty composer box" "$?" 0
 python3 "$DET" --composer-clear < "$FX/limit-login-picker.txt"
 assert_eq "--composer-clear: a picker is not a clear composer" "$?" 1
@@ -174,7 +169,6 @@ sandbox_rm
 
 echo "== watcher: a live banner with a future reset =="
 setup
-: > "$STATE/no-usage-credits"
 live_screen -1 3 > "$SB/herdr/screen.txt"
 reset_epoch=$(date -d "$(date -d '3 minutes' +'%H:%M')" +%s)
 bash "$BIN/session-resume-watch.sh" "$SID" </dev/null >/dev/null 2>&1 &
@@ -196,7 +190,6 @@ assert_eq "nothing typed during the wait" "$(typed)" ""
 sandbox_rm
 
 setup
-: > "$STATE/no-usage-credits"
 live_screen -1 3 > "$SB/herdr/screen.txt"
 bash "$BIN/session-resume-watch.sh" "$SID" </dev/null >/dev/null 2>&1 &
 wpid=$!
@@ -210,7 +203,6 @@ sandbox_rm
 # The condition changes while the watcher takes the resume lock: the first read
 # shows a live banner, the read under the lock shows the session moved on.
 setup
-: > "$STATE/no-usage-credits"
 live_screen -1 3 > "$SB/herdr/screen.txt"
 cp "$FX/limit-after-output.txt" "$SB/herdr/from-read-2.txt"
 resume
@@ -222,7 +214,6 @@ sandbox_rm
 # A reader that is removing a stale wait holds the resume lock for a moment;
 # the watcher waits it out instead of dropping a fresh detection.
 setup
-: > "$STATE/no-usage-credits"
 live_screen -1 3 > "$SB/herdr/screen.txt"
 sleep 30 & holder=$!
 ( . "$BIN/limit-lib.sh"; autodev_resume_lock_take "$STATE" "$SID" "$holder" )
@@ -237,58 +228,54 @@ cp "$FX/limit-after-output.txt" "$SB/herdr/screen.txt"
 wait_exit "$wpid"
 sandbox_rm
 
-echo "== watcher: never leave a dialog it opened =="
+echo "== the watcher never types /usage-credits (owner order 2026-11-17) =="
+# No script under bin/ sends it; the one allowed hit is the detector's pattern
+# for the banner's own hint line, which it reads and never sends.
+hits=$(grep -rniE 'usage[-_ ]?credits' "$SKILL_DIR/bin" | grep -vF "limit-banner.py:" ; \
+       grep -niE 'usage[-_ ]?credits' "$SKILL_DIR/bin/limit-banner.py" | grep -vF 're.compile(r"^/usage-credits to finish what you')
+assert_eq "no script under autodev/bin names /usage-credits outside the banner pattern" "$hits" ""
 setup
 live_screen -1 3 > "$SB/herdr/screen.txt"
-cp "$FX/limit-login-picker.txt" "$SB/herdr/after-run.txt"
-cp "$FX/limit-after-credits.txt" "$SB/herdr/after-key.txt"
 bash "$BIN/session-resume-watch.sh" "$SID" </dev/null >/dev/null 2>&1 &
 wpid=$!
 wait_log auto-resume "then sending continue"
-assert_eq "/usage-credits, then one Escape for the picker it opened" "$(typed)" "RUN /usage-credits
-KEY Escape"
-assert_contains "Escape went through although the picker hides the session tag" "$(LOG auto-resume)" "SENT key: [Escape]"
-assert_contains "the composer is verified empty" "$(LOG auto-resume)" "composer verified empty after /usage-credits"
-assert_no_file "no needs-owner line" "$STATE/needs-owner.list"
-cp "$FX/limit-after-output.txt" "$SB/herdr/screen.txt"
+assert_not_contains "a live banner, armed, no switch set: /usage-credits is never typed" "$(typed)" "usage-credits"
+assert_eq "nothing at all is typed while it waits" "$(typed)" ""
+assert_file "it waits for the reset instead" "$STATE/$SID.limit-wait"
+: > "$STATE/disable-auto-resume"
 wait_exit "$wpid"
+assert_contains "disable-auto-resume set during the wait: it stops" "$(LOG auto-resume)" "ABORT disabled during wait"
+assert_no_file "and its limit-wait goes" "$STATE/$SID.limit-wait"
+assert_eq "nothing typed" "$(typed)" ""
 sandbox_rm
 
 setup
+: > "$STATE/disable-auto-resume"
 live_screen -1 3 > "$SB/herdr/screen.txt"
-cp "$FX/limit-login-picker.txt" "$SB/herdr/after-run.txt"   # Escape changes nothing
 resume
-assert_eq "a picker that will not close: three Escapes, then no more typing" "$(typed)" "RUN /usage-credits
-KEY Escape
-KEY Escape
-KEY Escape"
-assert_eq "one needs-owner line" "$(wc -l < "$STATE/needs-owner.list" 2>/dev/null)" "1"
+assert_eq "disable-auto-resume set: a live banner gets nothing typed" "$(typed)" ""
+assert_no_file "and no limit-wait" "$STATE/$SID.limit-wait"
+assert_eq "and no log line (the switch is checked first)" "$(LOG auto-resume)" ""
+sandbox_rm
+
+echo "== a pane on needs-owner.list gets nothing typed until its screen is clear =="
+setup
+cp "$FX/limit-login-picker.txt" "$SB/herdr/screen.txt"   # still covered
+( . "$BIN/limit-lib.sh"; autodev_needs_owner_set "$STATE" "$SID" "fixture tab" Ctrl-C "a login picker" )
 line=$(cat "$STATE/needs-owner.list" 2>/dev/null)
 assert_contains "the line names the session and its tab" "$line" "$SID	fixture tab	since="
 assert_contains "the line names the key that would clear it" "$line" "key=Ctrl-C"
-assert_contains "the line says what the screen shows" "$line" "screen="
-assert_contains "the log says it stopped" "$(LOG auto-resume)" "STOP a dialog opened by /usage-credits would not close"
-assert_no_file "limit-wait does not outlive the stop" "$STATE/$SID.limit-wait"
 since=$(sed -n 's/.*since=\([^	]*\).*/\1/p' "$STATE/needs-owner.list")
-: > "$SB/typed.log"
 resume
-assert_eq "the next run types nothing into a listed pane" "$(typed)" ""
+assert_eq "a listed pane gets nothing typed" "$(typed)" ""
 assert_contains "and says why" "$(LOG auto-resume)" "is on needs-owner.list; typing nothing"
 ( . "$BIN/limit-lib.sh"; sleep 1; autodev_needs_owner_set "$STATE" "$SID" "fixture tab" Escape "again" )
 assert_eq "written twice for the same pane: still one line" "$(wc -l < "$STATE/needs-owner.list")" "1"
 assert_contains "updated in place, first since= kept" "$(cat "$STATE/needs-owner.list")" "since=$since	key=Escape	screen=again"
-cp "$FX/limit-after-credits.txt" "$SB/herdr/screen.txt"   # the owner closed it
+cp "$FX/presence-clear.txt" "$SB/herdr/screen.txt"   # the owner closed it
 resume
 assert_contains "a clear composer takes the pane off the list" "$(LOG auto-resume)" "CLEAR needs-owner: pane w1:p7 shows an empty composer again"
 assert_eq "no line left for the pane" "$(grep -c "^$SID" "$STATE/needs-owner.list")" "0"
-sandbox_rm
-
-setup
-live_screen -1 3 > "$SB/herdr/screen.txt"
-cp "$FX/rate-limit-menu.txt" "$SB/herdr/after-run.txt"   # a menu not under our command
-resume
-assert_eq "a dialog it cannot prove it opened gets no Escape" "$(typed)" "RUN /usage-credits"
-assert_eq "and one needs-owner line" "$(wc -l < "$STATE/needs-owner.list" 2>/dev/null)" "1"
 sandbox_rm
 
 echo "== limit-wait never outlives the limit =="
@@ -370,7 +357,7 @@ sandbox_rm
 echo "== flags clear on evidence; a dead pane is not UNREACHABLE =="
 setup
 printf 'screen presence unproved: pane w1:p7 lacks a live bottom-most ⟨cc:55555555⟩ before send\n' > "$STATE/$SID.unreachable"
-cp "$FX/limit-after-credits.txt" "$SB/herdr/screen.txt"
+cp "$FX/presence-clear.txt" "$SB/herdr/screen.txt"
 timeout 60 bash "$BIN/auto-handoff-sweep.sh" </dev/null >/dev/null 2>&1
 assert_no_file "clear, live composer: the sweep drops the flag" "$STATE/$SID.unreachable"
 assert_contains "and logs it" "$(LOG auto-handoff)" "CLEAR unreachable: pane w1:p7 shows a clear, live composer"
@@ -384,7 +371,7 @@ sandbox_rm
 setup
 printf 'pct=50 ts=%s\n' "$(date +%s)" > "$STATE/$SID.ctx"
 printf 'screen presence unproved: pane w1:p7 lacks a live bottom-most ⟨cc:55555555⟩ before send\n' > "$STATE/$SID.unreachable"
-cp "$FX/limit-after-credits.txt" "$SB/herdr/screen.txt"
+cp "$FX/presence-clear.txt" "$SB/herdr/screen.txt"
 stub_watcher 2>/dev/null || true
 timeout 60 bash "$BIN/auto-handoff-sweep.sh" </dev/null >/dev/null 2>&1
 assert_no_file "over the threshold: the flag clears" "$STATE/$SID.unreachable"

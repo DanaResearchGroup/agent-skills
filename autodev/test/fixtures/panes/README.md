@@ -26,7 +26,7 @@ status lines; `test-limit-resume.sh` reads the `limit-*` screens.
 | `limit-scrollback.txt`, `limit-after-output.txt`, `limit-prose.txt`, `limit-no-reset.txt` | a banner that is not live: older output after it, prose quoting it, a limit line with no reset | synthetic |
 | `limit-midnight.txt`, `limit-two-banners.txt`, `limit-no-done.txt`, `limit-weekly.txt` | the reset-day cases `limit-banner.py` pins | synthetic |
 | `presence-clear.txt` | an empty composer with the session tag at the live bottom, after a picker closed | synthetic |
-| `limit-login-picker.txt`, `limit-after-credits.txt` | the login picker `/usage-credits` opened under the banner, and the screen after Escape closed it | assembled from a real capture |
+| `limit-login-picker.txt` | a login picker covering the composer under a limit banner (a covered screen; the watcher no longer types the command that opened it) | assembled from a real capture |
 
 The real captures come from herdr's saved scrollback (`~/.config/herdr/session-history.json`).
 This repo is public, so the question and option wording was replaced with neutral text. The chrome

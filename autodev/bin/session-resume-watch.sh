@@ -2,13 +2,13 @@
 # Phoenix — session-limit auto-resume watcher.
 # Sibling of auto-handoff-watch.sh, launched (detached) by the same Stop hook once per turn.
 # Purpose: when a CC turn ends because the *usage/session limit* was hit (a pane banner like
-#   "You've hit your session limit · resets 6:20am (Asia/Jerusalem)"
-#   "/usage-credits to finish what you're working on."),
-# automatically try to keep working:
-#   1. run /usage-credits (the banner's own suggested action), close any dialog it
-#      opened, and verify an empty composer. A dialog that will not close stops all
-#      typing into the pane and lists it in ~/agents/state/needs-owner.list.
-#   2. wait until a few minutes PAST the reset, then send "continue".
+#   "You've hit your session limit · resets 6:20am (Asia/Jerusalem)"),
+# wait until a few minutes PAST the reset, then send "continue".
+#
+# It never types the paid-credits command the banner suggests (owner order,
+# 2026-11-17): on this host it opened a login picker in 12 of 19 sends, and
+# that picker covered the pane for hours. autodev/test/ci.sh greps bin/ for
+# the command and fails on any send of it.
 #
 # Only a LIVE banner counts: the newest content on the pane, with a reset that
 # parses and lies ahead (limit-banner.py). The wait ends, typing nothing, when a
@@ -21,7 +21,6 @@
 #   - Global kill switch:      ~/agents/state/disable-auto-compact   (present => whole system off)
 #   - Phoenix-only kill switch: ~/agents/state/disable-auto-resume    (present => this off)
 #   - Arming:                  ~/agents/state/auto-handoff.armed      (absent  => dry-run, log only)
-#   - Skip paid credits:       ~/agents/state/no-usage-credits        (present => go straight to wait)
 #   - Per-session pane:        ~/agents/state/<sid>.{herdr,tmux}-pane (required to act)
 #   - Per-session lock:        only one resume waiter per session at a time.
 #   - While waiting it writes  ~/agents/state/<sid>.limit-wait        (statusline badge +
@@ -47,12 +46,10 @@ BANNER="$_HERE/limit-banner.py"
 [ -f "$BANNER" ] || exit 0
 
 BUFFER_MIN=4      # send "continue" this many minutes PAST the stated reset time
-CREDITS_WAIT=${AUTODEV_CREDITS_WAIT:-8}  # seconds to wait after /usage-credits before checking if the limit cleared
 DETECT_RECHECK=${AUTODEV_DETECT_RECHECK:-3}  # seconds between the two initial banner checks
 WAKE=${AUTODEV_RESUME_WAKE:-60}  # re-check interval during the long wait-for-reset sleep
 MAX_WAIT=93600      # 26h sanity cap; a parsed wait longer than this is treated as a parse error
 POLL=3
-ESC_WAIT=${AUTODEV_ESC_WAIT:-1}   # seconds between an Escape and the composer check
 
 log(){ printf '%s [%s] %s\n' "$(date +'%Y.%m.%d %H.%M.%S')" "$sid" "$*" >> "$LOG"; }
 
@@ -108,15 +105,6 @@ send(){ # one literal line + Enter to the pane (via herdr/tmux)
     log "SENT: [$text]"
   fi
 }
-send_key(){ # [--own-dialog] a named key (e.g. Escape), no literal
-  local own=""; [ "$1" = --own-dialog ] && { own="$1"; shift; }
-  local key="$1"
-  if [ "$DRY" = 1 ]; then log "DRY would send-key: [$key]"; else
-    mux_send_key ${own:+"$own"} "$key" 2>>"$LOG"
-    [ "$?" = "${MUX_REFUSED:-3}" ] && { log "REFUSED key [$key] (${MUX_REFUSAL_REASON:-unknown})"; return 1; }
-    log "SENT key: [$key]"
-  fi
-}
 wait_pane_idle(){ local d=$(( $(date +%s) + ${1:-30} )); while [ "$(date +%s)" -lt "$d" ]; do pane_busy || return 0; sleep "$POLL"; done; return 1; }
 
 # composer_clear: the composer box is live, empty, ours, and under no dialog.
@@ -126,35 +114,6 @@ composer_clear(){
     mux_screen_present_once || return 1
   fi
   ! mux_awaiting_human
-}
-
-# needs_owner <why>: stop typing into this pane and list it for the owner.
-needs_owner(){
-  local label desc key shown
-  label=$(mux_tab_label 2>/dev/null | head -n1 | sed -E 's/ (⌛[0-9]+s|•cold)$//')
-  desc=$(verdict --describe 2>/dev/null)
-  key=$(printf '%s' "$desc" | sed -n 's/^key=\([^ ]*\) .*/\1/p'); shown=${desc#* screen=}
-  autodev_needs_owner_set "$STATE" "$sid" "$label" "${key:-Escape}" "${shown:-(unread)}" ||
-    log "WARN could not write $STATE/needs-owner.list"
-  log "STOP $1; no more typing into pane $pane; listed in needs-owner.list (clear with ${key:-Escape})"
-  exit 0
-}
-
-# close_own_dialog: after our own /usage-credits, close whatever it opened and
-# verify an empty composer. Escape is sent only to a dialog drawn right under
-# the echo of our command (the proof it is ours: the screen-presence tag is
-# hidden under it). 0 = composer clear; 1 = it would not close, or the screen
-# shows something this cycle cannot prove it opened.
-close_own_dialog(){
-  local i
-  for i in 1 2 3; do
-    composer_clear && { log "composer verified empty after /usage-credits"; return 0; }
-    verdict --own-dialog /usage-credits >/dev/null || return 1
-    send_key --own-dialog Escape || return 1
-    sleep "$ESC_WAIT"
-  done
-  composer_clear && { log "composer verified empty after /usage-credits"; return 0; }
-  return 1
 }
 
 # --- a pane listed for the owner gets nothing typed until its screen is clear ---
@@ -205,31 +164,10 @@ fi
 start=$now
 printf 'until=%s reset=%s human=%s ts=%s\n' "$tgt" "$reset" "$human" "$start" > "$STATE/$sid.limit-wait" 2>/dev/null
 
-# --- step 1: try /usage-credits (banner's own suggested action), unless disabled ---
-credits_sent=0
-if [ ! -f "$STATE/no-usage-credits" ]; then
-  send "/usage-credits"
-  if [ "$DRY" = 0 ]; then
-    credits_sent=1
-    sleep "$CREDITS_WAIT"
-    # Our own command may have opened a dialog (a login-method picker on this
-    # host). Never leave it: close it, or stop and tell the owner.
-    close_own_dialog || needs_owner "a dialog opened by /usage-credits would not close"
-    if mux_working; then
-      log "CYCLE COMPLETE via usage-credits: work resumed (dry=$DRY)"; exit 0
-    fi
-    log "usage-credits did not resume work; waiting for the reset"
-  fi
-else
-  log "usage-credits skipped (no-usage-credits set); waiting for reset"
-fi
-
-# --- step 2: wait until a few minutes past reset, then send continue ---
+# --- wait until a few minutes past reset, then send continue ---
 # The wait ends early, typing nothing, when a turn completes or the banner is
 # no longer the newest content on the pane.
-live(){
-  if [ "$credits_sent" = 1 ]; then verdict --live-only --after-credits; else verdict --live-only; fi >/dev/null 2>&1
-}
+live(){ verdict --live-only >/dev/null 2>&1; }
 log "waiting ${wait_s}s (until $(date -d "@$tgt" +'%Y.%m.%d %H.%M.%S' 2>/dev/null || echo "$tgt")) then sending continue"
 while [ "$(date +%s)" -lt "$tgt" ]; do
   pane_live || { log "ABORT pane gone during wait"; exit 0; }

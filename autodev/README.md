@@ -11,8 +11,9 @@ keeps such a run alive across the two things that normally kill it:
   Claude background sessions without a reachable, owned pane use an in-session Stop-hook
   fallback; see [handoff reachability](reference/handoff-reach.md) for ownership, recovery,
   and the one-shot human `/compact` notice after a request is filed.
-- **Phoenix** (session-limit auto-resume) — on a usage/session-limit stop, runs
-  `/usage-credits` or waits until past the stated reset time, then sends `continue`.
+- **Phoenix** (session-limit auto-resume) — on a usage/session-limit stop, waits until past
+  the stated reset time, then sends `continue`. It never types `/usage-credits` (owner order,
+  2026-11-17; `test/ci.sh` fails on any send of it from `bin/`).
 - **PM-nudger** — in a multi-pane campaign, notices when the PM session has gone quiet *and* its
   whole worker fleet has finished, and nudges the PM to collect and close. Separate installer,
   separate kill switch — see [PM-nudger](#pm-nudger-nudge-a-pm-whose-fleet-has-finished).
@@ -43,7 +44,7 @@ autodev/
     auto-handoff-watch.sh      # engine: context-threshold (or handoff-request marker) → handoff/compact/reload
     auto-handoff-sweep.sh      # LEVEL trigger: timer-driven; re-arms the engine for parked sessions
     request-handoff.sh         # helper: raise/cancel a voluntary below-threshold handoff-request for this session
-    session-resume-watch.sh    # Phoenix engine: usage/session-limit → credits / wait → continue
+    session-resume-watch.sh    # Phoenix engine: usage/session-limit → wait → continue
     fleet-digest.sh            # cron'able: one JSON snapshot of sessions/panes/worktrees/PRs (evidence only)
     pm-nudge-sweep.sh          # LEVEL trigger: PM idle + fleet finished → nudge the PM
     pm-nudge-compose.py        # the nudge's WORDS only: one bare Haiku call, in its own venv
@@ -131,7 +132,6 @@ larger theoretical maximum.
 | `auto-handoff.armed` | **Arm** — real `send-keys`. Absent ⇒ **dry-run** (logs only). Default: dry-run. |
 | `disable-auto-compact` | Global kill switch (beats armed). Badge ⇒ ⛔. |
 | `disable-auto-resume` | Phoenix only off. |
-| `no-usage-credits` | Phoenix skips the paid `/usage-credits` step; always waits for the free reset. |
 | `pm-nudge.armed` / `disable-pm-nudge` | PM-nudger arm / kill switch — see [PM-nudger](#pm-nudger-nudge-a-pm-whose-fleet-has-finished). Independent of the files above. |
 | `disable-cache-badge` | Cache-warmth badge off. Honoured at the next poll (≤ `CC_CACHE_NAP_MAX`), and it strips any badge already on a tab on its way out. |
 
@@ -146,7 +146,7 @@ Logs: `$AUTODEV_HOME/logs/{auto-handoff,auto-resume}.log`.
   `AUTODEV_PCT_LINE=35`, and `AUTODEV_PERSONA_TOKENS=200000` for a Persona seat (working folder
   under `~/Persona/<name>/`; `compact_at_tokens` in its `PI/model.toml` overrides).
 - `auto-handoff-watch.sh`: `COOLDOWN=900`, `WAIT_IDLE/WAIT_COMPACT`, `SETTLE`.
-- `session-resume-watch.sh`: `BUFFER_MIN=4` (minutes past reset), `CREDITS_WAIT`, `WAKE`, `MAX_WAIT`.
+- `session-resume-watch.sh`: `BUFFER_MIN=4` (minutes past reset), `WAKE`, `MAX_WAIT`.
 - `auto-handoff-watch.sh`: `REQUEST_MAX_AGE=3600` — TTL for a `handoff-request` / `compact-request` marker.
 - `cache-warm-watch.sh` (env, not constants): `CC_CACHE_TTL=300` (the prompt-cache window),
   `CC_CACHE_WARN=30` (when the countdown appears), `CC_CACHE_MAXLIFE=7200`, `CC_CACHE_NAP_MAX=60`.
@@ -495,9 +495,7 @@ its panes sit in `.../scm-pm2`, and the ticket label on `wH:p28` is what makes `
   watchers' waits treat it like a running turn. Senders log `DEFER awaiting-human` and retry on the
   next sweep/Stop; a deferral stamps no cooldown and no abort count, and never escalates into a send.
   `mux_send_key --own-prompt` is the one bypass, for a dialog the caller's own command just opened
-  (Codex's `/compact` confirmation). `--own-dialog` also waives the screen-presence tag, for the
-  login picker `/usage-credits` opens, which hides the status row; Phoenix sends it only after
-  proving the dialog sits right under the echo of its own command.
+  (Codex's `/compact` confirmation).
   Fixtures: `test/fixtures/panes/`; tests: `test/test-awaiting-human.sh`.
 - `/compact` cannot be triggered by the model or a hook — only the user or the external
   watcher (via herdr or tmux). The host does not reliably auto-continue after `/compact`; the watcher's explicit
@@ -510,9 +508,9 @@ its panes sit in `.../scm-pm2`, and the ticket label on `wH:p28` is what makes `
   guaranteed by herdr, and are env-overridable for exactly that reason.
 - **Phoenix unverified-live premises** (can't be probed without a real limit; the
   parse→wait→continue path is dry-run-verified): (a) that the `Stop` hook fires when a turn
-  is cut off by the limit; (b) what `/usage-credits` does in the TUI. On this host (client
-  2.1.326) it opens a "Select login method" picker; Phoenix closes it with Escape, verifies an
-  empty composer, and lists the pane in `needs-owner.list` if it will not close.
+  is cut off by the limit; (b) that the reset time the banner states is when work can resume.
+  Phoenix no longer types `/usage-credits`: on this host (client 2.1.326) it opened a "Select
+  login method" picker in 12 of 19 sends, which covered the pane for hours.
 
 ## Uninstall
 

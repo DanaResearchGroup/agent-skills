@@ -125,7 +125,7 @@ mux_busy(){ mux_awaiting_human || [ "${MUX_BUSY:-0}" = 1 ]; }
 mux_session_name(){ :; }
 mux_send_line(){ mux_awaiting_human && return 3; printf '%s\n' "$1" >> "$SB/sent.log"; }
 mux_send_key(){
-  case "$1" in --own-prompt|--own-dialog) shift ;; *) mux_awaiting_human && return 3 ;; esac
+  case "$1" in --own-prompt) shift ;; *) mux_awaiting_human && return 3 ;; esac
   printf 'KEY:%s\n' "$1" >> "$SB/sent.log"
 }
 STUB

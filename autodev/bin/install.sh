@@ -159,5 +159,4 @@ echo "  touch \"$AUTODEV_HOME/state/auto-handoff.armed\"     # arm (badge -> ðŸ”
 echo "  touch \"$AUTODEV_HOME/state/disable-auto-compact\"   # global kill switch (badge -> â›”)"
 echo "  touch \"$AUTODEV_HOME/state/disable-auto-resume\"    # Phoenix off only"
 echo "  touch \"$AUTODEV_HOME/state/disable-handoff-gate\"  # PreToolUse gate off (per session: <sid>.no-handoff-gate; env AUTODEV_NO_HANDOFF_GATE=1)"
-echo "  touch \"$AUTODEV_HOME/state/no-usage-credits\"       # Phoenix: skip paid credits, wait for reset"
 echo "Logs: $AUTODEV_HOME/logs/{auto-handoff,auto-resume}.log"
