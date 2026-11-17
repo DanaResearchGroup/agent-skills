@@ -28,7 +28,7 @@ esac
 : "${AUTODEV_HOME:=$HOME/agents}"
 
 command -v jq >/dev/null 2>&1 || { echo "error: jq is required" >&2; exit 1; }
-for f in cc-statusline.sh cc-stop-hook.sh codex-stop-hook.sh cc-sessionstart-compact.sh sessionstart-compact.sh auto-handoff-watch.sh auto-handoff-sweep.sh session-resume-watch.sh request-handoff.sh cache-warm-watch.sh cc-handoff-gate.sh request-lib.sh lock-lib.sh threshold-lib.sh; do
+for f in cc-statusline.sh cc-stop-hook.sh codex-stop-hook.sh cc-sessionstart-compact.sh sessionstart-compact.sh auto-handoff-watch.sh auto-handoff-sweep.sh session-resume-watch.sh request-handoff.sh cache-warm-watch.sh cc-handoff-gate.sh request-lib.sh lock-lib.sh threshold-lib.sh limit-lib.sh alert-lib.sh limit-banner.py; do
   [ -f "$HERE/$f" ] || { echo "error: missing $HERE/$f" >&2; exit 1; }
   chmod +x "$HERE/$f"
 done
@@ -159,5 +159,4 @@ echo "  touch \"$AUTODEV_HOME/state/auto-handoff.armed\"     # arm (badge -> ðŸ”
 echo "  touch \"$AUTODEV_HOME/state/disable-auto-compact\"   # global kill switch (badge -> â›”)"
 echo "  touch \"$AUTODEV_HOME/state/disable-auto-resume\"    # Phoenix off only"
 echo "  touch \"$AUTODEV_HOME/state/disable-handoff-gate\"  # PreToolUse gate off (per session: <sid>.no-handoff-gate; env AUTODEV_NO_HANDOFF_GATE=1)"
-echo "  touch \"$AUTODEV_HOME/state/no-usage-credits\"       # Phoenix: skip paid credits, wait for reset"
 echo "Logs: $AUTODEV_HOME/logs/{auto-handoff,auto-resume}.log"

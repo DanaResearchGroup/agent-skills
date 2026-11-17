@@ -16,6 +16,11 @@ mkdir -p "$STATE" 2>/dev/null
 
 # Multiplexer abstraction (herdr | tmux) for pane registration.
 [ -f "$HERE/mux-lib.sh" ] && . "$HERE/mux-lib.sh"
+# limit-lib.sh: whether a session's usage-limit wait is still active (a stale
+# <sid>.limit-wait is ignored and removed). Without it, fall back to presence.
+[ -f "$HERE/limit-lib.sh" ] && . "$HERE/limit-lib.sh"
+command -v autodev_limit_wait_active >/dev/null 2>&1 ||
+  autodev_limit_wait_active(){ [ -f "$1/$2.limit-wait" ]; }
 
 sid=$(printf '%s' "$input" | jq -r '.session_id // empty')
 tpath=$(printf '%s' "$input" | jq -r '.transcript_path // empty')
@@ -47,7 +52,7 @@ gate_stop() {
 stop_fallback() (
   [ -f "$STATE/auto-handoff.armed" ] || return 1
   [ -f "$STATE/disable-auto-compact" ] && return 1
-  [ -f "$STATE/$sid.limit-wait" ] && return 1
+  autodev_limit_wait_active "$STATE" "$sid" && return 1
   [ -f "$HERE/lock-lib.sh" ] && . "$HERE/lock-lib.sh" || return 1
   [ -f "$HERE/threshold-lib.sh" ] && . "$HERE/threshold-lib.sh" || return 1
   local lock="$STATE/$sid.cycle.lock" busy_n=0 failed=0 now last=0 key="" kind f
@@ -56,7 +61,7 @@ stop_fallback() (
   trap 'autodev_lock_release_owned "$lock" "$$"' EXIT
   [ -f "$STATE/auto-handoff.armed" ] || return 1
   [ -f "$STATE/disable-auto-compact" ] && return 1
-  [ -f "$STATE/$sid.limit-wait" ] && return 1
+  autodev_limit_wait_active "$STATE" "$sid" && return 1
   [ "$STATE/$sid.compacted" -nt "$STATE/$sid.ctx" ] && return 1
   # Past the line: pct >= 35, or a Persona seat's token line (threshold-lib.sh).
   autodev_ctx_over "$STATE" "$sid" ge || {
@@ -64,10 +69,21 @@ stop_fallback() (
     return 1
   }
   mux_session_reachable "$sid" || failed=1
-  # Metadata stays reachable so the watcher can retry its screen check. A
-  # persisted screen refusal still needs the in-session handoff fallback.
+  # A "screen presence unproved" flag is not trusted as it stands: re-check the
+  # screen now (a clear, live composer drops it). One still standing counts as
+  # a failure only while it is younger than one sweep interval, and then only
+  # for the in-session /handoff fallback below, never for an instruction to the
+  # human: an older one has outlived a sweep's own re-check, and a covered
+  # screen is the sweep's to report (needs-owner.list, one Slack line).
+  presence_only=0
   if grep -q '^screen presence unproved:' "$STATE/$sid.unreachable" 2>/dev/null; then
-    failed=1
+    command -v mux_presence_flag_recheck >/dev/null 2>&1 &&
+      mux_presence_flag_recheck "$sid" >/dev/null 2>&1
+    if [ -f "$STATE/$sid.unreachable" ] &&
+       [ $(( $(date +%s) - $(date -r "$STATE/$sid.unreachable" +%s 2>/dev/null || echo 0) )) -lt "${AUTODEV_SWEEP_INTERVAL:-180}" ]; then
+      [ "$failed" = 1 ] || presence_only=1
+      failed=1
+    fi
   fi
   if [ -f "$STATE/$sid.busy-deferrals" ] &&
      ! [ "$STATE/$sid.compacted" -nt "$STATE/$sid.busy-deferrals" ]; then
@@ -90,6 +106,9 @@ stop_fallback() (
     fi
   done
   if [ "$pending" = 1 ]; then
+    # A covered screen alone never asks for /compact to be typed: the pane is
+    # live and ours, the watcher retries it, and the sweep reports a cover.
+    [ "$presence_only" = 1 ] && return 1
     # The reachability check above may have just refused the pane (a worker
     # with no herdr env registers nothing earlier): consult the gate again.
     gate_stop
@@ -129,8 +148,8 @@ elif stop_fallback; then exit 0; fi
 # Launch the watchers fully detached so they survive this hook returning and can
 # poll for later turns. Each self-gates (threshold, lock, cooldown, arm).
 #  - auto-handoff-watch: context-% threshold -> handoff/compact/reload.
-#  - session-resume-watch (Phoenix): usage/session-limit banner -> usage-credits or
-#    wait-for-reset -> continue.
+#  - session-resume-watch (Phoenix): usage/session-limit banner -> wait for the
+#    reset -> continue.
 #  - cache-warm-watch: prompt-cache TTL -> countdown in the tab label. Turn end is
 #    exactly when the cache starts ageing unobserved, because the status line
 #    stops being rendered the moment CC goes idle.

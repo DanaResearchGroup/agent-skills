@@ -1,0 +1,16 @@
+● Earlier work.
+
+  ⎿  You've hit your 5-hour limit · resets 7:30am (Asia/Jerusalem)
+     /usage-credits to finish what you’re working on.
+
+✻ Sautéed for 1m 5s · done 6:35 AM
+
+❯ /usage-credits
+────────────────────────────────────────────────────────────
+  Login
+  Starting new login following /usage-credits. Exit with Ctrl-C to use existing account.
+  Select login method:
+  ❯ 1. Claude account with subscription · Individual, Team, or Enterprise
+    2. Anthropic Console account · API usage billing
+    3. 3rd-party platform · Amazon Bedrock, Microsoft Foundry, Google Vertex AI
+  Esc to cancel

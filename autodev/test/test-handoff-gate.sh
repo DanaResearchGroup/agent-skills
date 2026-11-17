@@ -695,11 +695,15 @@ echo "== Persona seat, refused pane: the Stop is never blocked =="
 setup; stub_mux; arm; pending; handoff_pointer "$SID"; unreachable "$COVERED"; persona_seat workdir
 s1=$(stop_hook)
 assert_eq "Persona: the Stop does not block (the turn ends)" "$s1" ""
-assert_file "Persona: the Stop claims the notice, so no later call is held" "$STATE/$SID.unreachable-notice.$(date -r "$STATE/$SID.compact-request" +%s%N)"
+# The stub reports this pane live and ours, so its screen-presence flag names a
+# pane the watcher types into: no notice at all (I-449), and the request is
+# gated as on any reachable pane, so the turn ends and the watcher serves it.
+assert_no_file "Persona: a live, owned pane's screen-presence flag gives no notice" "$STATE/$SID.unreachable-notice.$(date -r "$STATE/$SID.compact-request" +%s%N)"
 assert_eq "Persona: the prose fallback stays silent" "$(cat "$STATE/$SID.fallback-request" 2>/dev/null)" ""
 assert_eq "Persona: a second Stop does not block either" "$(stop_hook)" ""
 out=$(gate Bash '{"command":"a"}')
-assert_eq "Persona: no notice held after the Stop claimed it" "$out" ""
+assert_eq "Persona: the request is gated as on a reachable pane" "$(decision "$out")" deny
+assert_not_contains "Persona: and no menu is ordered" "$(reason "$out")" 'AskUserQuestion tool now'
 sandbox_rm
 
 echo "== Persona seat: every unreachable reason gets no menu and no Stop block =="

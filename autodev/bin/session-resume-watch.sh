@@ -2,12 +2,17 @@
 # Phoenix — session-limit auto-resume watcher.
 # Sibling of auto-handoff-watch.sh, launched (detached) by the same Stop hook once per turn.
 # Purpose: when a CC turn ends because the *usage/session limit* was hit (a pane banner like
-#   "You've hit your session limit · resets 6:20am (Asia/Jerusalem)"
-#   "/usage-credits to finish what you're working on."),
-# automatically try to keep working:
-#   1. run /usage-credits (the banner's own suggested action). If that clears the limit,
-#      send "continue" and resume.
-#   2. else parse the reset time, sleep until a few minutes PAST it, then send "continue".
+#   "You've hit your session limit · resets 6:20am (Asia/Jerusalem)"),
+# wait until a few minutes PAST the reset, then send "continue".
+#
+# It never types the paid-credits command the banner suggests (owner order,
+# 2026-11-17): on this host it opened a login picker in 12 of 19 sends, and
+# that picker covered the pane for hours. autodev/test/ci.sh greps bin/ for
+# the command and fails on any send of it.
+#
+# Only a LIVE banner counts: the newest content on the pane, with a reset that
+# parses and lies ahead (limit-banner.py). The wait ends, typing nothing, when a
+# turn completes or the banner stops being the newest content.
 #
 # The context-% signal lives in the statusline JSON; the *limit* signal does NOT — it is only
 # rendered in the pane. So this watcher detects it by reading the pane text (herdr or tmux), not a marker file.
@@ -16,11 +21,11 @@
 #   - Global kill switch:      ~/agents/state/disable-auto-compact   (present => whole system off)
 #   - Phoenix-only kill switch: ~/agents/state/disable-auto-resume    (present => this off)
 #   - Arming:                  ~/agents/state/auto-handoff.armed      (absent  => dry-run, log only)
-#   - Skip paid credits:       ~/agents/state/no-usage-credits        (present => go straight to wait)
 #   - Per-session pane:        ~/agents/state/<sid>.{herdr,tmux}-pane (required to act)
 #   - Per-session lock:        only one resume waiter per session at a time.
 #   - While waiting it writes  ~/agents/state/<sid>.limit-wait        (statusline badge +
-#                              the handoff watcher defers while it exists).
+#                              the handoff watcher defers while it is active;
+#                              limit-lib.sh says when it is stale).
 #   - Everything logged to     ~/agents/logs/auto-resume.log
 sid="$1"
 [ -n "$sid" ] || exit 0
@@ -34,17 +39,17 @@ mkdir -p "$STATE" "$LOGDIR" 2>/dev/null
 # Multiplexer abstraction (herdr | tmux). Absent => watcher safely no-ops.
 _HERE="$(cd "$(dirname "$0")" && pwd)"
 [ -f "$_HERE/mux-lib.sh" ] && . "$_HERE/mux-lib.sh"
+# The limit-wait file, the resume lock and needs-owner.list (shared with the
+# handoff watcher and the sweep), and the banner detector.
+[ -f "$_HERE/limit-lib.sh" ] && . "$_HERE/limit-lib.sh" || exit 0
+BANNER="$_HERE/limit-banner.py"
+[ -f "$BANNER" ] || exit 0
 
 BUFFER_MIN=4      # send "continue" this many minutes PAST the stated reset time
-CREDITS_WAIT=8      # seconds to wait after /usage-credits before checking if the limit cleared
-DETECT_RECHECK=3    # seconds between the two initial banner checks
-WAKE=60             # re-check interval during the long wait-for-reset sleep
+DETECT_RECHECK=${AUTODEV_DETECT_RECHECK:-3}  # seconds between the two initial banner checks
+WAKE=${AUTODEV_RESUME_WAKE:-60}  # re-check interval during the long wait-for-reset sleep
 MAX_WAIT=93600      # 26h sanity cap; a parsed wait longer than this is treated as a parse error
 POLL=3
-
-# Usage/session-limit banner markers (Phoenix-specific; herdr has no native state
-# for this, so the banner is always detected by reading pane text via mux_capture).
-LIMIT_RE='hit your (session|usage|rate)[ ]?limit|(session|usage|rate) limit reached|limit reached ·|hit your limit'
 
 log(){ printf '%s [%s] %s\n' "$(date +'%Y.%m.%d %H.%M.%S')" "$sid" "$*" >> "$LOG"; }
 
@@ -79,8 +84,9 @@ if [ -n "$owner" ] && [ "$owner" != "$sid" ]; then
   exit 0
 fi
 
-snapshot(){ mux_capture; }
-has_limit(){ mux_capture | grep -Eiq "$LIMIT_RE"; }
+snapshot(){ local s; mux_read_screen 200 s || return 1; printf '%s\n' "$s"; }
+# verdict [limit-banner.py flags]: the detector's one line on the pane read now.
+verdict(){ snapshot | python3 "$BANNER" "$@"; }
 pane_busy(){ mux_busy; }
 pane_live(){ mux_pane_live; }
 
@@ -99,102 +105,86 @@ send(){ # one literal line + Enter to the pane (via herdr/tmux)
     log "SENT: [$text]"
   fi
 }
-send_key(){ # [--own-prompt] a named key (e.g. Escape), no literal
-  local own=""; [ "$1" = --own-prompt ] && { own="$1"; shift; }
-  local key="$1"
-  if [ "$DRY" = 1 ]; then log "DRY would send-key: [$key]"; else
-    mux_send_key ${own:+"$own"} "$key" 2>>"$LOG"
-    [ "$?" = "${MUX_REFUSED:-3}" ] && defer_awaiting "key $key"
-    log "SENT key: [$key]"
-  fi
-}
 wait_pane_idle(){ local d=$(( $(date +%s) + ${1:-30} )); while [ "$(date +%s)" -lt "$d" ]; do pane_busy || return 0; sleep "$POLL"; done; return 1; }
 
-# --- detect the limit banner (two cheap checks; on a normal turn this exits fast) ---
-has_limit || { sleep "$DETECT_RECHECK"; has_limit || exit 0; }
+# composer_clear: the composer box is live, empty, ours, and under no dialog.
+composer_clear(){
+  verdict --composer-clear >/dev/null || return 1
+  if [ "$MUX" = herdr ] && [ "$(cat "$STATE/$sid.runtime" 2>/dev/null)" = claude ]; then
+    mux_screen_present_once || return 1
+  fi
+  ! mux_awaiting_human
+}
+
+# --- a pane listed for the owner gets nothing typed until its screen is clear ---
+if autodev_needs_owner_get "$STATE" "$sid" >/dev/null; then
+  if composer_clear; then
+    autodev_needs_owner_clear "$STATE" "$sid"
+    log "CLEAR needs-owner: pane $pane shows an empty composer again"
+  else
+    log "SKIP pane $pane is on needs-owner.list; typing nothing"
+    exit 0
+  fi
+fi
+
+# --- detect a LIVE banner (two cheap checks; on a normal turn this exits fast) ---
+# Only a banner that is the newest content on the pane, with a reset that parses
+# and lies ahead, counts (limit-banner.py says how the day is chosen). A banner
+# in the scrollback, a passed reset, prose quoting one, or no reset: nothing.
+v=$(verdict) || { sleep "$DETECT_RECHECK"; v=$(verdict); } || {
+  case "$v" in *reason=no-banner*|'') ;; *) log "NO-DETECT pane=$pane ${v#none }" ;; esac
+  exit 0
+}
 
 # --- one waiter per session ---
-lock="$STATE/$sid.resume.lock"
-if ! mkdir "$lock" 2>/dev/null; then log "SKIP resume already in progress"; exit 0; fi
-cleanup(){ rmdir "$lock" 2>/dev/null || true; rm -f "$STATE/$sid.limit-wait" 2>/dev/null || true; }
+# A reader removing a stale limit-wait holds this lock for a moment (limit-lib.sh),
+# and it may run on the same Stop: retry briefly before deciding a cycle owns it.
+tries=${AUTODEV_RESUME_LOCK_TRIES:-5}
+until autodev_resume_lock_take "$STATE" "$sid"; do
+  tries=$(( tries - 1 ))
+  [ "$tries" -gt 0 ] || { log "SKIP resume already in progress"; exit 0; }
+  sleep 1
+done
+cleanup(){ rm -f "$STATE/$sid.limit-wait" 2>/dev/null; autodev_resume_lock_release "$STATE" "$sid"; }
 trap cleanup EXIT
+# Re-check under the lock: the screen may have moved on while we waited for it.
+v=$(verdict) || { log "NO-DETECT pane=$pane ${v#none } (re-check under the lock)"; exit 0; }
 
-resetline=$(snapshot | grep -Ei 'resets' | head -1 | tr -s ' ')
-log "LIMIT detected pane=$pane dry=$DRY reset='${resetline:-<none>}'"
-
-# --- parse reset time (+ optional IANA tz in parens) from the banner ---
-H=""; M="00"; AP=""; TZN=""; tgt=""
-if [[ "$resetline" =~ resets[^0-9]*([0-9]{1,2})(:([0-9]{2}))?[[:space:]]*([AaPp])[Mm] ]]; then
-  H="${BASH_REMATCH[1]}"; M="${BASH_REMATCH[3]:-00}"; AP="${BASH_REMATCH[4]}"
-fi
-[[ "$resetline" =~ \(([A-Za-z]+/[A-Za-z_]+)\) ]] && TZN="${BASH_REMATCH[1]}"
-if [ -n "$H" ]; then
-  ampm="${AP,,}m"; timestr="$H:$M $ampm"; now=$(date +%s)
-  if [ -n "$TZN" ]; then
-    tgt=$(TZ="$TZN" date -d "$timestr" +%s 2>/dev/null)
-    [ -n "$tgt" ] && [ "$tgt" -le "$now" ] && tgt=$(TZ="$TZN" date -d "tomorrow $timestr" +%s 2>/dev/null)
-  else
-    tgt=$(date -d "$timestr" +%s 2>/dev/null)
-    [ -n "$tgt" ] && [ "$tgt" -le "$now" ] && tgt=$(date -d "tomorrow $timestr" +%s 2>/dev/null)
-  fi
-  [ -n "$tgt" ] && tgt=$(( tgt + BUFFER_MIN*60 ))
-fi
-human="${H:+$H:$M$ampm}${TZN:+ $TZN}"; [ -n "$human" ] || human="unknown"
-printf 'until=%s human=%s ts=%s\n' "${tgt:-0}" "$human" "$(date +%s)" > "$STATE/$sid.limit-wait" 2>/dev/null
-log "parsed reset: human='$human' target_epoch='${tgt:-<unparsed>}'"
-
-# --- step 1: try /usage-credits (banner's own suggested action), unless disabled ---
-if [ ! -f "$STATE/no-usage-credits" ]; then
-  send "/usage-credits"
-  if [ "$DRY" = 0 ]; then
-    sleep "$CREDITS_WAIT"
-    if ! has_limit; then
-      # limit cleared. If work auto-resumed (pane busy), don't inject a spurious "continue".
-      sleep 2
-      if pane_busy; then log "usage-credits cleared limit; work already resuming — no continue needed";
-      else wait_pane_idle 20; send "continue"; log "usage-credits cleared limit; sent continue"; fi
-      log "CYCLE COMPLETE via usage-credits (dry=$DRY)"; exit 0
-    fi
-    log "usage-credits did not clear the limit; falling back to wait-for-reset"
-    # Dismiss any dialog /usage-credits itself opened. That is our own prompt: a
-    # limit-stopped session runs no turn, so it cannot have put a question to the
-    # human since the guarded /usage-credits send above found none open.
-    send_key --own-prompt Escape
-    sleep 1
-  fi
-else
-  log "usage-credits skipped (no-usage-credits set); waiting for reset"
-fi
-
-# --- step 2: wait until a few minutes past reset, then send continue ---
-if [ -z "$tgt" ]; then
-  log "WARN could not parse a reset time from the banner; leaving it to the user. Exiting."
-  exit 0
-fi
-now=$(date +%s); wait_s=$(( tgt - now ))
+reset=""; human=""; kind=""
+for kv in $v; do
+  case "$kv" in reset=*) reset=${kv#reset=} ;; human=*) human=${kv#human=} ;; kind=*) kind=${kv#kind=} ;; esac
+done
+case "$reset" in ''|*[!0-9]*) log "WARN detector gave no reset epoch [$v]; typing nothing"; exit 0 ;; esac
+now=$(date +%s); tgt=$(( reset + BUFFER_MIN*60 )); wait_s=$(( tgt - now ))
+log "LIMIT detected pane=$pane dry=$DRY kind=$kind reset='${human//_/ }' ($(date -d "@$reset" +'%Y.%m.%d %H.%M' 2>/dev/null || echo "$reset")) wait=${wait_s}s"
 if [ "$wait_s" -gt "$MAX_WAIT" ]; then
-  log "WARN parsed reset is ${wait_s}s away (> ${MAX_WAIT}s cap); treating as parse error, leaving to user. Exiting."
+  log "WARN reset is ${wait_s}s away (> ${MAX_WAIT}s cap); leaving it to the user. Exiting."
   exit 0
 fi
-if [ "$wait_s" -lt 0 ]; then wait_s=0; fi
-log "waiting ${wait_s}s (until $(date -d "@$tgt" +'%Y.%m.%d %H.%M.%S' 2>/dev/null || echo "$tgt")) then sending continue"
+start=$now
+printf 'until=%s reset=%s human=%s ts=%s\n' "$tgt" "$reset" "$human" "$start" > "$STATE/$sid.limit-wait" 2>/dev/null
 
-start=$(date +%s)
+# --- wait until a few minutes past reset, then send continue ---
+# The wait ends early, typing nothing, when a turn completes or the banner is
+# no longer the newest content on the pane.
+live(){ verdict --live-only >/dev/null 2>&1; }
+log "waiting ${wait_s}s (until $(date -d "@$tgt" +'%Y.%m.%d %H.%M.%S' 2>/dev/null || echo "$tgt")) then sending continue"
 while [ "$(date +%s)" -lt "$tgt" ]; do
-  # bail if the pane died, the system was disabled, or the user took over (a turn completed
-  # after we started waiting -> the .idle marker advanced past our start).
   pane_live || { log "ABORT pane gone during wait"; exit 0; }
-  [ -f "$STATE/disable-auto-compact" ] || [ -f "$STATE/disable-auto-resume" ] && { log "ABORT disabled during wait"; exit 0; }
+  { [ -f "$STATE/disable-auto-compact" ] || [ -f "$STATE/disable-auto-resume" ]; } && { log "ABORT disabled during wait"; exit 0; }
   if [ -f "$STATE/$sid.idle" ]; then
     iv=$(cat "$STATE/$sid.idle" 2>/dev/null || echo 0)
-    [ "${iv:-0}" -gt "$start" ] 2>/dev/null && { log "ABORT user took over during wait (a turn completed)"; exit 0; }
+    [ "${iv:-0}" -gt "$start" ] 2>/dev/null && { log "ABORT a turn completed during wait"; exit 0; }
   fi
-  sleep "$WAKE"
+  live || { log "ABORT banner gone from the live area during wait"; exit 0; }
+  left=$(( tgt - $(date +%s) )); [ "$left" -gt "$WAKE" ] && left=$WAKE; [ "$left" -lt 1 ] && left=1
+  sleep "$left"
 done
 
-# reset time reached — resume.
+# reset time reached — resume, if the session is still parked on the banner.
 pane_live || { log "ABORT pane gone at reset"; exit 0; }
-[ "$DRY" = 0 ] && wait_pane_idle 30
+live || { log "ABORT banner gone from the live area at reset; no continue"; exit 0; }
+if [ "$DRY" = 0 ] && ! wait_pane_idle 30; then log "ABORT pane busy at reset; no continue"; exit 0; fi
 send "continue"
 log "CYCLE COMPLETE via wait-for-reset (dry=$DRY)"
 exit 0
