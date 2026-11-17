@@ -14,9 +14,10 @@ identity is what actually triggers a notification.
 
 ## Config
 
-- **Channel**: the id in `$CC_SLACK_CHANNEL` (e.g. `C0123456789`; find yours in
-  Slack via channel name → About → **Copy channel ID**). The helper requires it
-  and exits with `ERR` when unset — wiring in [SETUP.md](../SETUP.md).
+- **Channel**: the helper finds it itself: `CC_SLACK_CHANNEL` in its env, else
+  `env.CC_SLACK_CHANNEL` in `~/.claude/settings.json` (e.g. `C0123456789`; find
+  yours in Slack via channel name → About → **Copy channel ID**). Nothing needs
+  exporting — wiring in [SETUP.md](../SETUP.md).
 - **Send helper**: `$HOME/.claude/bin/cc-slack-post.py "<message>"`
   — posts as the bot (token from `~/.claude/.slack-bot-token`), allowlisted so it
   runs without a prompt. The command may use `$HOME`, but the
@@ -35,5 +36,13 @@ identity is what actually triggers a notification.
    ```
    Use ✅ for success, ⚠️ for needs-attention, ❌ for failure.
 
-Do not wait for a reply. If the helper prints `ERR …`, report it (token missing
-or bot not in channel).
+Do not wait for a reply. Read the helper's exit code:
+
+- **0** — posted.
+- **78** — no channel is set: nothing was sent, and the helper logged the line
+  as unposted. Do not retry and do not fail the task for it; keep reporting in
+  the session as usual. Then run
+  `$HOME/.claude/bin/cc-slack-post.py --no-channel-notice slack-notify` and
+  repeat any line it prints (`slack: no channel`, at most once a day).
+- **1** — the post failed (`ERR …`: token missing, bot not in the channel, or a
+  network error); it is logged as unposted too. Report it.

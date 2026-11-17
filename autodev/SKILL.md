@@ -403,7 +403,8 @@ docs. The scripts are self-locating and store runtime data under **`AUTODEV_HOME
   gone, once the gate has spared it the menu (`state/<sid>.spared`). Each line names the tab label, context reading and reason. The
   handoff stays queued, and the sweep retries it every tick. The episode lives in
   `state/<sid>.covered`, the sends in `state/<sid>.covered-alert`; a failed send is retried on
-  the next tick. The sweep re-reads the screen first, and a cleared one ends the episode with no
+  the next tick. With no Slack channel set, the poster logs the line as unposted and the sweep
+  does not retry it. The sweep re-reads the screen first, and a cleared one ends the episode with no
   alert. Alerts go out only after every watcher is re-armed, and a seat the time budget skipped
   goes first on the next tick. See `reference/handoff-reach.md` step 7.
   It also files the `handoff-request` itself (`request-handoff.sh --if-absent`, logged

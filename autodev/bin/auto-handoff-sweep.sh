@@ -534,7 +534,7 @@ alert_record_write(){ # $1 sid; writes al_episode, al_slack, al_lane
   log "$1" "ALERT-SKIP cannot record $rec — no send until it can be recorded (an unrecorded send would repeat every tick)"
   return 1
 }
-alert_sent(){ case "$1" in 'sent '*) return 0 ;; esac; return 1; }
+alert_sent(){ case "$1" in 'sent '*|'unposted '*) return 0 ;; esac; return 1; }   # unposted: settled, logged by the poster
 
 # The seat's name: its herdr tab label (without the cache badge), never a pane id.
 alert_seat_label(){ # $1 sid; needs mux_init
@@ -558,17 +558,24 @@ alert_why(){ # $1 output, $2 exit code
 }
 
 alert_send_slack(){ # $1 text; sets alert_out, returns the helper's exit code
-  local cmd=${AUTODEV_SLACK_CMD:-$HOME/.claude/bin/cc-slack-post.py} chan=${CC_SLACK_CHANNEL:-} rc
-  local settings=${AUTODEV_CLAUDE_SETTINGS:-${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json}
-  # A timer does not inherit Claude Code's env, where the channel id lives.
-  [ -n "$chan" ] || chan=$(jq -r '.env.CC_SLACK_CHANNEL // empty' "$settings" 2>/dev/null)
+  # The poster finds the channel itself (its env, else Claude Code's settings
+  # file), so a timer that lacks Claude Code's env still reaches Slack.
+  local cmd=${AUTODEV_SLACK_CMD:-$HOME/.claude/bin/cc-slack-post.py} rc
   local -a runner=(); command -v timeout >/dev/null 2>&1 && runner=(timeout "${AUTODEV_ALERT_TIMEOUT:-30}")
-  if [ -n "$chan" ]; then
-    alert_out=$(CC_SLACK_CHANNEL=$chan "${runner[@]}" "$cmd" "$1" 2>&1 </dev/null); rc=$?
-  else
-    alert_out=$("${runner[@]}" "$cmd" "$1" 2>&1 </dev/null); rc=$?
-  fi
+  alert_out=$(CC_SLACK_CALLER=autodev-sweep "${runner[@]}" "$cmd" "$1" 2>&1 </dev/null); rc=$?
   return "$rc"
+}
+
+# alert_no_channel_notice <sid>: the poster's once-a-day "slack: no channel"
+# line for this caller, into the sweep's log and onto stderr.
+alert_no_channel_notice(){
+  local cmd=${AUTODEV_SLACK_CMD:-$HOME/.claude/bin/cc-slack-post.py} line
+  # The same limit as the sends: a stalled notice must not hold back the lane line.
+  local -a runner=(); command -v timeout >/dev/null 2>&1 && runner=(timeout "${AUTODEV_ALERT_TIMEOUT:-30}")
+  line=$("${runner[@]}" "$cmd" --no-channel-notice autodev-sweep 2>/dev/null </dev/null | head -n1) || true
+  [ -n "$line" ] || return 0
+  log "$1" "$line"
+  printf '%s\n' "$line" >&2
 }
 
 alert_send_lane(){ # $1 text, $2 message id; sets alert_out. QUEUED (75) is success.
@@ -613,6 +620,11 @@ _alert_covered_locked(){ # $1 sid; caller holds <sid>.page.lock
     alert_send_slack "⚠️ *$host* — \`autodev\` $text"; rc=$?
     if [ "$rc" = 0 ]; then
       al_slack="sent $now"; log "$sid" "ALERT slack sent: $text"
+    elif [ "$rc" = 78 ]; then
+      # No channel: the poster logged the line as unposted. Settle it for this
+      # episode, so the unposted count is one per episode, not one per tick.
+      al_slack="unposted $now no-channel"; log "$sid" "ALERT slack not posted: no channel (in the unposted log)"
+      alert_no_channel_notice "$sid"
     else
       why=$(alert_why "$alert_out" "$rc")
       al_slack="failed $now $why"; log "$sid" "ALERT slack failed: $why — retry next tick"

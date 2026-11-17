@@ -15,9 +15,11 @@ see `slack-notify` for the full rationale.)
 
 ## Config
 
-- **Channel**: the id in `$CC_SLACK_CHANNEL` (e.g. `C0123456789`; find yours in
-  Slack via channel name → About → **Copy channel ID**). The helper requires it
-  and exits with `ERR` when unset — wiring in [SETUP.md](../SETUP.md).
+- **Channel**: the helper finds it itself: `CC_SLACK_CHANNEL` in its env, else
+  `env.CC_SLACK_CHANNEL` in `~/.claude/settings.json` (e.g. `C0123456789`; find
+  yours in Slack via channel name → About → **Copy channel ID**). Nothing needs
+  exporting — wiring in [SETUP.md](../SETUP.md). To read the thread you need the
+  id itself: `$HOME/.claude/bin/cc-slack-post.py --which-channel` prints it.
 - **Send helper**: `$HOME/.claude/bin/cc-slack-post.py "<message>" [thread_ts]`
   — posts as the bot (reads the bot token from `~/.claude/.slack-bot-token`),
   prints `OK` then the message `ts`. It's allowlisted in settings.json, so it
@@ -52,8 +54,14 @@ see `slack-notify` for the full rationale.)
    _Reply in this thread._"
    ```
    The first output line is `OK`; the **second line is the thread root `ts`** —
-   keep it, it's your routing key. (If it prints `ERR …`, report it and stop;
-   common causes: token file missing, or the bot isn't in the channel.)
+   keep it, it's your routing key.
+   - **Exit 78 — no channel is set.** Nothing was sent; the helper logged the
+     line as unposted. Do not retry and do not fail the turn: run
+     `$HOME/.claude/bin/cc-slack-post.py --no-channel-notice slack-ask`, repeat
+     any line it prints (`slack: no channel`, at most once a day), and ask the
+     question in the session instead (`AskUserQuestion`). Skip steps 3–4.
+   - **Exit 1 — `ERR …`.** The post failed (token file missing, bot not in the
+     channel, network); it is logged as unposted. Report it and stop.
 
 3. **Wait for a reply (polling loop with backoff).** Foreground `sleep` is
    blocked in this harness, so wait by running a **backgrounded** Bash command
@@ -67,7 +75,8 @@ see `slack-notify` for the full rationale.)
    | 65 min onward | `sleep 1800` (every 30 min) |
 
    On each wake:
-   - Call `slack_read_thread` with `channel_id` = the `$CC_SLACK_CHANNEL` id and
+   - Call `slack_read_thread` with `channel_id` = the channel id (from
+     `--which-channel`) and
      `message_ts = <ts>`.
    - Look for the **last** message whose `user` is `$CC_SLACK_USER` and whose `ts`
      is greater than the root `ts`.

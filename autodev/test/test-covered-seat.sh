@@ -305,13 +305,73 @@ assert_eq 'unrecordable alert: no lane line' "$(lines "$SB/lane.log")" 0
 assert_contains 'unrecordable alert: the log says why' "$(log_text)" 'ALERT-SKIP cannot record'
 sandbox_rm
 
-echo '== the Slack channel comes from Claude Code settings when the timer lacks it =='
+echo '== no Slack channel: the real poster logs it, the sweep goes on, one notice a day =='
+# The real poster, with no channel in its env or in a fixture settings file.
+# Its API URL and proxies point at a closed loopback port, so even a poster that
+# tried to post could reach nothing.
+no_channel_tick() { # $1 day (YYYY-MM-DD); one tick of a new episode
+  rm -f "$STATE/$SID.covered-alert"
+  age_episode "$2"
+  CC_SLACK_TODAY=$1 bash "$BIN/auto-handoff-sweep.sh" >/dev/null 2>"$SB/sweep.err"; SWEEP_RC=$?
+  local end=$(( $(date +%s) + 30 ))
+  while pgrep -f "$BIN/auto-handoff-watch.sh" >/dev/null 2>&1 && [ "$(date +%s)" -lt "$end" ]; do sleep 0.1; done
+}
+notices() { grep -c 'slack: no channel' "$AUTODEV_HOME/logs/auto-handoff.log" 2>/dev/null || true; }
 setup
 unset CC_SLACK_CHANNEL
-printf '{"env":{"CC_SLACK_CHANNEL":"CFROMSETTINGS"}}\n' > "$SB/settings.json"
-export AUTODEV_CLAUDE_SETTINGS="$SB/settings.json"
+mkdir -p "$SB/claude-config"
+printf '{"env":{"OTHER":"x"}}\n' > "$SB/claude-config/settings.json"
+export CLAUDE_CONFIG_DIR="$SB/claude-config" CC_SLACK_API_URL=http://127.0.0.1:9/api \
+  http_proxy=http://127.0.0.1:9 https_proxy=http://127.0.0.1:9 HTTPS_PROXY=http://127.0.0.1:9
+export AUTODEV_SLACK_CMD="$SKILL_DIR/../bin/cc-slack-post.py"
+tick; age_episode 660
+no_channel_tick 2026-11-17 660
+assert_eq 'no channel: the sweep exits 0' "$SWEEP_RC" 0
+assert_eq 'no channel: the lane line still goes out' "$(lines "$SB/lane.log")" 1
+assert_contains 'no channel: the episode records the line as unposted' "$(cat "$STATE/$SID.covered-alert")" 'slack=unposted '
+assert_contains 'no channel: the sweep log says so' "$(log_text)" 'ALERT slack not posted: no channel'
+assert_eq 'no channel: one unposted line, from the sweep' \
+  "$(jq -r '[.reason, .caller] | join(" ")' "$STATE/slack-unposted.jsonl")" 'no-channel autodev-sweep'
+assert_eq 'no channel: first run of the day prints the notice' "$(notices)" 1
+assert_contains 'no channel: the notice reaches stderr too' "$(cat "$SB/sweep.err")" 'slack: no channel'
+tick
+assert_eq 'no channel: the settled episode is not retried' "$(awk 'NF' "$STATE/slack-unposted.jsonl" | wc -l | tr -d ' ')" 1
+no_channel_tick 2026-11-17 700
+assert_eq 'no channel: a second episode logs a second line' "$(awk 'NF' "$STATE/slack-unposted.jsonl" | wc -l | tr -d ' ')" 2
+assert_eq 'no channel: the same day prints no second notice' "$(notices)" 1
+assert_eq 'no channel: second run exits 0' "$SWEEP_RC" 0
+no_channel_tick 2026-11-18 740
+assert_eq 'no channel: the next day prints it again' "$(notices)" 2
+assert_eq 'no channel: the lane got one line per episode' "$(lines "$SB/lane.log")" 3
+unset CLAUDE_CONFIG_DIR CC_SLACK_API_URL http_proxy https_proxy HTTPS_PROXY
+sandbox_rm
+
+echo '== a notice that hangs does not hold back the lane line =='
+# The send says "no channel" (78); the notice then hangs far past the limit.
+setup
+cat > "$SB/fakebin/stall-poster" <<'FAKE'
+#!/usr/bin/env bash
+if [ "$1" = --no-channel-notice ]; then echo $$ > "$SB/notice.pid"; exec sleep 120; fi
+echo "ERR slack: no channel"; exit 78
+FAKE
+chmod +x "$SB/fakebin/stall-poster"
+export AUTODEV_SLACK_CMD="$SB/fakebin/stall-poster" AUTODEV_ALERT_TIMEOUT=2
+tick; age_episode 660
+t0=$(date +%s); tick; took=$(( $(date +%s) - t0 ))
+assert_eq 'stalled notice: the notice was asked for' "$([ -f "$SB/notice.pid" ] && echo yes)" yes
+assert_eq 'stalled notice: the lane line still goes out' "$(lines "$SB/lane.log")" 1
+assert_eq 'stalled notice: the tick ends near the limit, not the hang' "$([ "$took" -lt 20 ] && echo yes || echo "no ($took s)")" yes
+kill "$(cat "$SB/notice.pid" 2>/dev/null)" 2>/dev/null || true
+unset AUTODEV_ALERT_TIMEOUT
+sandbox_rm
+
+echo '== the poster, not the sweep, finds the channel in Claude Code settings =='
+setup
+unset CC_SLACK_CHANNEL
+mkdir -p "$CLAUDE_CONFIG_DIR"
+printf '{"env":{"CC_SLACK_CHANNEL":"CFROMSETTINGS"}}\n' > "$CLAUDE_CONFIG_DIR/settings.json"
 tick; age_episode 660; tick
-assert_contains 'channel read from settings.json' "$(cat "$SB/slack.log")" 'channel=CFROMSETTINGS '
+assert_contains 'the sweep passes no channel of its own' "$(cat "$SB/slack.log")" 'channel=<unset> '
 sandbox_rm
 
 echo '== no alert unless the seat is still stuck =='

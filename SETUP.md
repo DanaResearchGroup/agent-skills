@@ -93,8 +93,9 @@ currently in the file; just rotate.
 
 ### 3. Channel id + allowlist — per machine
 Merge into `~/.claude/settings.json` (not in this repo), with your own channel
-id from step 2 (there is no default channel — the helper refuses to send
-without `CC_SLACK_CHANNEL`):
+id from step 2. There is no default channel. The helper reads
+`env.CC_SLACK_CHANNEL` from this file itself, so systemd units and plain shells
+that never see Claude Code's env need nothing exported:
 ```json
 {
   "env": {
@@ -123,8 +124,32 @@ The sender (`bin/cc-slack-post.py`) reads:
 
 | Env var | Default | Meaning |
 |---|---|---|
-| `CC_SLACK_CHANNEL` | — (required) | Target channel id, e.g. `C0123456789`; set to a member id to DM. The helper exits with an error when unset |
+| `CC_SLACK_CHANNEL` | `env.CC_SLACK_CHANNEL` in the settings file | Target channel id, e.g. `C0123456789`; set to a member id to DM. The environment wins over the file |
+| `CLAUDE_CONFIG_DIR` | `~/.claude` | Where the settings file (`settings.json`) is. The helper opens it read-only and takes only `env.CC_SLACK_CHANNEL` |
 | `CC_SLACK_TOKEN_FILE` | `~/.claude/.slack-bot-token` | Path to the `xoxb-` token |
+| `CC_SLACK_CALLER` | the parent process's name | The calling program, as written to the unposted log |
+| `AUTODEV_HOME` | `~/agents` | Its `state/` holds the unposted log and the notice markers |
+
+Exit codes: `0` posted; `1` post failed (token, network, Slack error); `2` usage
+error; `78` no channel — nothing sent, no request made, one `ERR` line that says
+where to set it. A missing, empty, unreadable or malformed settings file, or a
+non-string value, counts as no channel.
+
+Every line not posted (exit `1` or `78`) appends one JSON line to
+`${AUTODEV_HOME:-$HOME/agents}/state/slack-unposted.jsonl`: time, calling
+program, reason (`no-channel`, `token-unreadable`, `request-failed`,
+`slack-error`), message length. The message text is never written. Read-only
+helpers:
+
+```bash
+cc-slack-post.py --which-channel                    # the channel and where it came from; 78 if none
+cc-slack-post.py --unposted [--since 2026-11-01] [--json]   # count not posted, by reason, first seen
+cc-slack-post.py --no-channel-notice <caller>       # "slack: no channel", at most once a day per caller
+```
+
+A caller that gets exit `78` keeps going (the line is already logged) and runs
+`--no-channel-notice <caller>`, which prints `slack: no channel` on the first
+call of the day through a marker `state/slack-no-channel.<caller>.<date>`.
 
 The `slack-ask` skill additionally reads `CC_SLACK_USER` — your own Slack member id, e.g.
 `U0123456789` (Profile → ⋮ → Copy member ID). It is how the skill tells your reply from the bot's

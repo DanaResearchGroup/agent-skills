@@ -57,7 +57,7 @@ autodev/
     test-handoff-gate.sh       # PreToolUse gate: deny/allow-list, continue:false escalation, bypass, fail-open, unreachable stand-down + AskUserQuestion notice (tool call or Stop) and its Stop repeat; a Persona seat gets no menu order for any reason
     test-request-expiry.sh     # requests never expire by age; stale only when satisfied
     test-stuck-page.sh         # one page per request pending 30 min with only DEFERs
-    test-covered-seat.sh       # a covered seat past its line: marker kept, nothing typed, one Slack + lane line per episode after 10 min; a Persona seat's lost pane; cleared screen, delivery after the watchers, parallel and time bounds, skipped seats first
+    test-covered-seat.sh       # a covered seat past its line: marker kept, nothing typed, one Slack + lane line per episode after 10 min; a Persona seat's lost pane; cleared screen, delivery after the watchers, parallel and time bounds, skipped seats first; no Slack channel: logged unposted, not retried, one notice a day
     test-abort-recovery.sh     # aborts are counted, retried, then surfaced as STUCK
     test-install-sweeper.sh    # the generated systemd unit (incl. the KillMode=process guard)
     test-herdr-panes-snapshot.sh # the sweep's validated, private herdr pane snapshot
