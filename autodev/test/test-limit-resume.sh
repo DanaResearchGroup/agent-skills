@@ -167,27 +167,54 @@ assert_no_file "live banner, reset passed: no limit-wait" "$STATE/$SID.limit-wai
 assert_contains "live banner, reset passed: logged why" "$(LOG auto-resume)" "NO-DETECT pane=w1:p7 reason=reset-passed"
 sandbox_rm
 
+# pin_tz HH:MM:SS: a fixed-offset zone in which the local clock reads that time
+# now. It moves date, python and the watcher's log stamps together; a date shim
+# on PATH cannot, because the detector reads python's clock.
+pin_tz() {
+  local want off a sign=-
+  want=$(( 10#${1:0:2}*3600 + 10#${1:3:2}*60 + 10#${1:6:2} ))
+  off=$(( ((want - $(date -u +%s) % 86400) % 86400 + 86400) % 86400 ))   # seconds east
+  [ "$off" -gt 43200 ] && off=$(( off - 86400 ))
+  [ "$off" -lt 0 ] && sign=+                     # POSIX TZ counts west as positive
+  a=${off#-}
+  printf 'PIN%s%d:%02d:%02d\n' "$sign" $(( a / 3600 )) $(( a % 3600 / 60 )) $(( a % 60 ))
+}
+# future_reset_case LABEL [SED] [RESET]: banner a minute ago, reset 3 minutes
+# ahead; SED edits the screen, RESET (a date string) is the reset it must give.
+future_reset_case() {
+  local p=$1 lw w exp wpid reset_epoch
+  setup
+  live_screen -1 3 | sed -e "${2:-}" > "$SB/herdr/screen.txt"
+  # Keep the date: from 23:57 the reset 3 minutes ahead falls tomorrow.
+  reset_epoch=$(date -d "$(date -d '3 minutes' +'%Y-%m-%d %H:%M')" +%s)
+  bash "$BIN/session-resume-watch.sh" "$SID" </dev/null >/dev/null 2>&1 &
+  wpid=$!
+  wait_log auto-resume "then sending continue"
+  lw=$(cat "$STATE/$SID.limit-wait" 2>/dev/null)
+  [ -z "${3:-}" ] || assert_contains "$p: the reset is $3" "$lw" " reset=$(date -d "$3" +%s) "
+  assert_contains "$p: limit-wait until= is the reset plus the 4-minute buffer" "$lw" "until=$(( reset_epoch + 240 )) reset=$reset_epoch "
+  assert_contains "$p: the log names the detection and the wait" "$(LOG auto-resume)" "LIMIT detected pane=w1:p7 dry=0 kind=5-hour"
+  w=$(sed -n 's/.* wait=\([0-9]*\)s$/\1/p' "$AUTODEV_HOME/logs/auto-resume.log" | head -n1)
+  exp=$(( reset_epoch + 240 - $(date +%s) ))
+  [ -n "$w" ] && [ $(( w - exp )) -le 3 ] && [ $(( exp - w )) -le 3 ]
+  assert_eq "$p: the logged wait is the time to reset+buffer (got ${w:-none}, expected ~$exp)" "$?" 0
+  # The session prints new output under the banner: the wait ends, nothing typed.
+  cp "$FX/limit-after-output.txt" "$SB/herdr/screen.txt"
+  wait_exit "$wpid"
+  assert_contains "$p: banner gone from the live area: the wait ends" "$(LOG auto-resume)" "ABORT banner gone from the live area during wait"
+  assert_no_file "$p: and limit-wait is gone with it" "$STATE/$SID.limit-wait"
+  assert_eq "$p: nothing typed during the wait" "$(typed)" ""
+  sandbox_rm
+}
+
 echo "== watcher: a live banner with a future reset =="
-setup
-live_screen -1 3 > "$SB/herdr/screen.txt"
-reset_epoch=$(date -d "$(date -d '3 minutes' +'%H:%M')" +%s)
-bash "$BIN/session-resume-watch.sh" "$SID" </dev/null >/dev/null 2>&1 &
-wpid=$!
-wait_log auto-resume "then sending continue"
-lw=$(cat "$STATE/$SID.limit-wait" 2>/dev/null)
-assert_contains "limit-wait until= is the reset plus the 4-minute buffer" "$lw" "until=$(( reset_epoch + 240 )) reset=$reset_epoch "
-assert_contains "the log names the detection and the wait" "$(LOG auto-resume)" "LIMIT detected pane=w1:p7 dry=0 kind=5-hour"
-w=$(sed -n 's/.* wait=\([0-9]*\)s$/\1/p' "$AUTODEV_HOME/logs/auto-resume.log" | head -n1)
-exp=$(( reset_epoch + 240 - $(date +%s) ))
-[ -n "$w" ] && [ $(( w - exp )) -le 3 ] && [ $(( exp - w )) -le 3 ]
-assert_eq "the logged wait is the time to reset+buffer (got ${w:-none}, expected ~$exp)" "$?" 0
-# The session prints new output under the banner: the wait ends, nothing typed.
-cp "$FX/limit-after-output.txt" "$SB/herdr/screen.txt"
-wait_exit "$wpid"
-assert_contains "banner gone from the live area: the wait ends" "$(LOG auto-resume)" "ABORT banner gone from the live area during wait"
-assert_no_file "and limit-wait is gone with it" "$STATE/$SID.limit-wait"
-assert_eq "nothing typed during the wait" "$(typed)" ""
-sandbox_rm
+future_reset_case "now"
+
+echo "== watcher: across midnight, clock pinned to 23:58, 'resets 12:01am' is tomorrow =="
+TZ=$(pin_tz 23:58:02)
+# Drop the zone tag: it would read the reset in Asia/Jerusalem, not the pinned zone.
+future_reset_case "23:58" 's/ (Asia\/Jerusalem)//' "tomorrow 00:01"
+TZ=Asia/Jerusalem
 
 setup
 live_screen -1 3 > "$SB/herdr/screen.txt"
