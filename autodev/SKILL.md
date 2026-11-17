@@ -392,8 +392,20 @@ docs. The scripts are self-locating and store runtime data under **`AUTODEV_HOME
   session files the request and ends its turn with no tool call, the Stop hook
   (`cc-handoff-gate.sh --stop`) blocks that Stop once. A turn that then ends with no question gets
   one Stop repeat. The Stop fallback's prose `type /compact` never fires for such a request.
+  A Persona seat (working folder under `~/Persona/<name>/`) is never told to open that menu, which
+  would park it, whatever the reason in the flag: its notice says to end its turn, its Stop is
+  not blocked, and the stuck-seat alert below reaches a person.
   The sweeper pages (`notify-send`, else a `PAGE` log line) once per request that has been pending
   30 min while the watcher only deferred.
+  A seat past its line whose pane has been covered (open menu, login screen, no composer on
+  screen) for more than 10 min gets one Slack line to the owner and one session-lane line to
+  `persona:method` per episode; a Persona seat gets them too when its pane is not its own or is
+  gone, once the gate has spared it the menu (`state/<sid>.spared`). Each line names the tab label, context reading and reason. The
+  handoff stays queued, and the sweep retries it every tick. The episode lives in
+  `state/<sid>.covered`, the sends in `state/<sid>.covered-alert`; a failed send is retried on
+  the next tick. The sweep re-reads the screen first, and a cleared one ends the episode with no
+  alert. Alerts go out only after every watcher is re-armed, and a seat the time budget skipped
+  goes first on the next tick. See `reference/handoff-reach.md` step 7.
   It also files the `handoff-request` itself (`request-handoff.sh --if-absent`, logged
   `REQUEST raised (threshold, busy Nm)`) when a session is over the threshold and its pane has
   worked continuously for 20 min (`AUTODEV_BUSY_MINUTES`), so a session stuck in one long turn is

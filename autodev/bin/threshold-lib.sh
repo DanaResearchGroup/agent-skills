@@ -48,6 +48,15 @@ autodev_token_line() {
   printf '%s\n' "$n"
 }
 
+# autodev_persona_seat <state-dir> <sid>: 0 when the session is a Persona seat,
+# judged from <sid>.workdir by the same test as its token line. The handoff gate
+# and the sweep's stuck-seat alert both ask this, so they cannot disagree.
+autodev_persona_seat() {
+  local wd=""
+  [ -f "$1/$2.workdir" ] && wd=$(head -n1 "$1/$2.workdir" 2>/dev/null)
+  [ -n "$(autodev_token_line "$wd")" ]
+}
+
 # autodev_ctx_lines <state-dir> <sid>: print "<token line or -> <percent line>".
 autodev_ctx_lines() {
   local wd="" tl

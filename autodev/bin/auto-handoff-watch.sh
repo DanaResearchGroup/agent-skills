@@ -602,8 +602,36 @@ save_reload_attempt(){ # $1 = attempting|staged; atomically persist ambiguous se
   printf '%s\n' "$value" > "$tmp" 2>/dev/null &&
     mv -f "$tmp" "$reload_attempt" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
 }
+# --- covered-pane episode (autodev_cover_record in mux-lib.sh) ---------------
+# A send refused by a covered screen (an open dialog, or no proof that the
+# composer is on screen) is recorded in <sid>.covered, with what covers it.
+COVER_LOGIN_RE='/login|login method|log in to|sign in|oauth|api key|authenticat|not logged in'
+cover_kind(){ # $1 = guard (dialog | presence); prints menu | login | other
+  local cover_text=""  # not "text": mux_read_screen has a local of that name
+  if [ "$1" = presence ]; then
+    cover_text=$(cat "$STATE/$sid.unreachable-screen" 2>/dev/null)
+  elif command -v mux_read_screen >/dev/null 2>&1; then
+    mux_read_screen 80 cover_text 2>/dev/null || cover_text=""
+  fi
+  # A login picker is a dialog too, so it is named first.
+  if printf '%s\n' "$cover_text" | awk 'NF' | tail -n 15 | grep -Eiq "$COVER_LOGIN_RE"; then
+    echo login
+  elif [ "$1" = dialog ]; then
+    echo menu
+  else
+    echo other
+  fi
+}
+cover_note(){ # $1 = guard; other guards (ownership, staged input) are not a covered screen
+  case "$1" in dialog|presence) ;; *) return 0 ;; esac
+  command -v autodev_cover_record >/dev/null 2>&1 || return 0
+  autodev_cover_record "$sid" "$(cover_kind "$1")" || true
+}
+cover_clear(){ rm -f "$STATE/$sid.covered" 2>/dev/null; }
+
 defer_awaiting(){ # $1 = where
   local guard=${MUX_REFUSAL_REASON:-dialog}
+  cover_note "$guard"
   if [ "$post_compaction" = 1 ]; then
     if save_reload_pending; then
       log "RELOAD-PENDING saved after $1"
@@ -663,6 +691,7 @@ send(){ # send one literal line + Enter to the registered pane (via herdr/tmux)
     [ "$rc" = "${MUX_REFUSED:-3}" ] && defer_awaiting "refused [$text]"
     [ "$rc" = 0 ] || abort_cycle "send failed for [$text]"
     landed=1
+    cover_clear   # a send landed: the covered-pane episode, if any, is over
     log "SENT: [$text]"
   fi
 }

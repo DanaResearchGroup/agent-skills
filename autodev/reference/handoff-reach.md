@@ -64,7 +64,18 @@ The implementation follows this order:
    reachability check, so a refusal found during that Stop is covered too. If a
    turn ends with no question after the notice, the next Stop repeats it once;
    after a question, or after the repeat, Stops are silent. The user sees at
-   most the question, never the step 5 prose. The flag is not compared with the request's mtime: it is
+   most the question, never the step 5 prose. A Persona seat (working folder
+   under `~/Persona/<name>/`, the test `threshold-lib.sh` uses for the 200k
+   line) is the exception. It runs unattended, and an open menu is the cover
+   that parks it and holds its lane messages. Its notice says not to call
+   `AskUserQuestion` and to end its turn. Its Stop is never blocked: the Stop
+   claims the notice silently and launches the watcher, and step 7's alert
+   reaches a person if the pane stays unreachable, for every reason in the
+   flag (covered screen, ownership, missing or detached pane, unproved
+   presence). The sweep judges a Persona seat from `<sid>.workdir` alone, so
+   the gate writes the hook's cwd there when the file is missing. Each time
+   the gate spares a Persona seat the menu it touches `<sid>.spared`, the
+   proof step 7 needs that the seat was alive while its flag stood. The flag is not compared with the request's mtime: it is
    written once per episode, so it usually predates the request. For an
    ownership, no-pane or pane-gone refusal, a successful herdr reachability
    check removes the flag, and registration skips its throttle while it exists,
@@ -75,6 +86,59 @@ The implementation follows this order:
    which the watcher runs just before it sends input, clears it. A status-line
    render or a Stop alone does not restore normal gating for that refusal. The
    tmux path never clears the flag, so a tmux-only binding ignores it.
+
+7. A covered pane keeps its handoff queued, and a stuck seat is made loud.
+   The watcher never types under a menu or overlay. On a dialog refusal or a
+   screen-presence refusal it re-files the request it consumed and records
+   the refusal in `<sid>.covered` as `<since> <last> <kind>`. Since is the
+   episode start, last is the latest refusal, and kind is `menu`, `login` or
+   `other`. On a Persona seat the sweep also records its own reachability
+   refusals there, as `owner` (the pane is live but not proved this
+   session's) or `nopane` (the pane is gone and no other pane carries the
+   session): the gate orders such a seat no menu for any reason, so this
+   alert is all that reaches a person. It does so only when `<sid>.spared`
+   is not older than `<sid>.unreachable`, that is when the gate has spared
+   the live seat the menu since the flag was raised. A session that died
+   with its request pending, its pane since recycled or closed, is refused
+   at every tick but never runs the gate, so it starts no episode and pages
+   no one. Other seats record no `owner` or `nopane` episode and keep the
+   gate's menu. One writer,
+   `autodev_cover_record` in `mux-lib.sh`, serves both. A send that lands
+   deletes the file, which ends the episode. A compaction after `since`, or
+   a gap of more than 15 minutes between two refusals, starts a new episode.
+   Only a refusal recorded by this code starts one: an `<sid>.unreachable`
+   flag alone, however old, never does, so a flag left from before the
+   install starts its 10 minutes at the first refusal recorded after it. The
+   sweep re-arms the watcher on every tick, so a seat compacts on the first
+   tick after its screen clears.
+   A seat can be past its line (`ctx-over.sh`), unreachable for more than 10
+   minutes, refused within the last 15 minutes, with no compaction since the
+   episode began and no turn running. Such a seat gets one Slack line to the
+   owner (`cc-slack-post.py`; the channel comes from `CC_SLACK_CHANNEL`, else
+   from `env` in Claude Code's `settings.json`). It also gets one session-lane
+   line to `persona:method`, sent once per episode. Each line names the seat
+   by its herdr tab label (never a pane id), its context reading and the
+   reason: `menu`, `login screen`, `other`, `pane not owned` or `no pane`.
+   `<sid>.covered-alert` records the episode and each send, so a
+   later sweep process never sends again. A failed send is recorded there
+   with its first output line and retried on the next tick. Lane retries
+   reuse one message id per episode. The sweep repeats every check under
+   `<sid>.page.lock` before it sends, and reads the pane again: ownership
+   first, so another session's status or screen is never read. A pane gone
+   or not this session's alerts a Persona seat only, with that reason. A pane
+   that is ours again is read with the watcher's own presence and dialog
+   tests (`mux_screen_present_once`, `mux_awaiting_human`). `<sid>.covered`
+   outlives a cover that the person closed before the watcher's next send. A
+   reachable pane with a clear screen ends the episode with no alert: the
+   sweep deletes the file if it still holds the line it read. Alerts are sent only after the sweep has re-armed every
+   watcher, so a slow send never delays a handoff. At most 4 run at once
+   (`AUTODEV_ALERT_PARALLEL`). None starts after 60 s
+   (`AUTODEV_ALERT_BUDGET`); a skipped alert is retried on the next tick,
+   ahead of the others (`state/.alert-skipped`), so slow early sends cannot
+   starve the seats after them. With
+   the 10 s lock wait and two 30 s sends, delivery ends inside the 3-minute
+   sweep interval. Overrides: `AUTODEV_SLACK_CMD`,
+   `AUTODEV_LANE_CMD`, `AUTODEV_ALERT_LANE_TO`, `AUTODEV_CLAUDE_SETTINGS`.
 
 The fallback preserves the handoff even when a detached worker cannot compact
 itself. A human must attach and type `/compact` in that case. The watcher keeps
@@ -185,3 +249,18 @@ renumbering, ambiguous matches, detached/unlabelled background sessions, badge
 recovery, threshold and cooldown gates, repeated busy evaluations, pending
 request notices, overlapping Stops, and ownership/context changes during checks.
 The suite runs against temporary state and a fake herdr and sends no real input.
+
+`bash autodev/test/test-covered-seat.sh` drives the real sweep, watcher and
+mux library against a fake herdr serving menu, login and other screens, with
+fake Slack and lane commands. It covers a marker kept across covered ticks
+with nothing typed, compaction on the first clear tick, one Slack line and
+one lane line after 10 minutes and none before, a second episode, failed
+sends retried, an episode that ends while the sweep waits for the lock, a
+screen cleared before the alert, alerts sent only after every watcher is
+re-armed, and the parallel and time bounds on delivery. On a Persona seat it
+covers a pane not owned and a pane gone (no menu, one alert after 10 minutes,
+none at 9), a flag from before the install that starts no episode, a dead seat
+the gate never spared that starts none either, a pane lost
+while the alert waits for the lock, and a pane given back. A seat outside
+`~/Persona` refused for ownership keeps the menu and gets no alert. With three
+slow seats and a budget for one send, each seat is tried within three ticks.
