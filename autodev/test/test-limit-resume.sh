@@ -347,7 +347,7 @@ setup
 lw_write -10 -3600
 mkdir "$STATE/$SID.resume.lock"          # the earlier watcher's lock: no pid file
 ( . "$BIN/limit-lib.sh"; autodev_limit_wait_active "$STATE" "$SID" ); rc=$?
-assert_eq "stale, under a pid-less lock from the earlier watcher: ignored" "$rc" 1
+assert_eq "stale, under a pid-less lock from the earlier watcher: its waiter may still run, active" "$rc" 0
 assert_file "and left alone while that waiter may still run" "$STATE/$SID.limit-wait"
 touch -d '27 hours ago' "$STATE/$SID.resume.lock"
 ( . "$BIN/limit-lib.sh"; autodev_limit_wait_active "$STATE" "$SID" ); rc=$?
@@ -360,7 +360,7 @@ lw_write -10 -3600
 sleep 300 & holder=$!
 ( . "$BIN/limit-lib.sh"; autodev_resume_lock_take "$STATE" "$SID" "$holder" )
 ( . "$BIN/limit-lib.sh"; autodev_limit_wait_active "$STATE" "$SID" ); rc=$?
-assert_eq "stale and a live resume cycle holds the lock: ignored" "$rc" 1
+assert_eq "stale and a live resume cycle holds the lock: that cycle owns it, active" "$rc" 0
 assert_file "and left for that cycle to remove" "$STATE/$SID.limit-wait"
 kill "$holder" 2>/dev/null; wait "$holder" 2>/dev/null
 ( . "$BIN/limit-lib.sh"; autodev_limit_wait_active "$STATE" "$SID" ); rc=$?
