@@ -176,6 +176,9 @@ sandbox_rm
 
 setup; clock 1500
 printf 'until=%s reset=%s human=7:30am ts=%s\n' "$(( $(date +%s) + 3600 ))" "$(( $(date +%s) + 3360 ))" "$(date +%s)" > "$STATE/$SID.limit-wait"
+# The sweep checks a limit-wait against the screen: show it a live banner.
+sed -e "s/done 6:35 AM/done $(date -d '-1 minutes' +'%-I:%M %p')/" \
+    -e "s/7:30am/$(TZ=Asia/Jerusalem date -d '+56 minutes' +'%-I:%M%P')/g" "$FX/limit-live.txt" > "$SB/herdr/screen.txt"
 sweep
 assert_no_file "limit-wait session: no request" "$REQ"
 assert_no_file "limit-wait clears the busy clock" "$CLOCK"

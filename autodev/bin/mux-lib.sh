@@ -385,6 +385,34 @@ _mux_refuse_unowned(){
   return 0
 }
 
+# mux_presence_flag_recheck <sid>: re-run the send boundary's screen test on a
+# "screen presence unproved" <sid>.unreachable. 0 = the pane is live and ours,
+# our session tag is at the live bottom, the composer box is empty and no
+# dialog is open; the flag (and the session's needs-owner.list line) is removed
+# then, unless it changed while the screen was read (newer evidence). 1 = no
+# such flag, or the screen is still covered or unreadable: the flag stays.
+# Shared by the sweep, the Stop hook and the PreToolUse gate (I-449): before
+# this, only a later send cleared the flag, so one written under a picker that
+# then closed outlived the picker by hours.
+mux_presence_flag_recheck(){
+  local sid=$1 f="$STATE/$1.unreachable" before banner
+  banner="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/limit-banner.py"
+  case "$sid" in ""|*[!A-Za-z0-9._-]*|.|..) return 1 ;; esac
+  grep -q '^screen presence unproved:' "$f" 2>/dev/null || return 1
+  before=$(stat -c '%Y %s' "$f" 2>/dev/null; cat "$f" 2>/dev/null)
+  [ "$(cat "$STATE/$sid.runtime" 2>/dev/null)" = claude ] || return 1
+  mux_init "$sid" && [ "$MUX" = herdr ] || return 1
+  mux_pane_live && [ "$(mux_pane_owner)" = "$sid" ] || return 1
+  mux_screen_present_once || return 1
+  [ -f "$banner" ] || return 1
+  printf '%s\n' "$MUX_PRESENCE_SCREEN" | python3 "$banner" --composer-clear >/dev/null 2>&1 || return 1
+  mux_awaiting_human && return 1
+  [ "$(stat -c '%Y %s' "$f" 2>/dev/null; cat "$f" 2>/dev/null)" = "$before" ] || return 1
+  rm -f "$f" 2>/dev/null || return 1
+  command -v autodev_needs_owner_clear >/dev/null 2>&1 && autodev_needs_owner_clear "$STATE" "$sid"
+  return 0
+}
+
 # herdr agent state for the pane: prints idle|working|blocked|done|unknown.
 # Prints nothing under tmux (no native state; callers fall back to the scrape).
 mux_status(){

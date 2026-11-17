@@ -495,7 +495,9 @@ its panes sit in `.../scm-pm2`, and the ticket label on `wH:p28` is what makes `
   watchers' waits treat it like a running turn. Senders log `DEFER awaiting-human` and retry on the
   next sweep/Stop; a deferral stamps no cooldown and no abort count, and never escalates into a send.
   `mux_send_key --own-prompt` is the one bypass, for a dialog the caller's own command just opened
-  (Codex's `/compact` confirmation, the dialog `/usage-credits` opens on a limit-stopped session).
+  (Codex's `/compact` confirmation). `--own-dialog` also waives the screen-presence tag, for the
+  login picker `/usage-credits` opens, which hides the status row; Phoenix sends it only after
+  proving the dialog sits right under the echo of its own command.
   Fixtures: `test/fixtures/panes/`; tests: `test/test-awaiting-human.sh`.
 - `/compact` cannot be triggered by the model or a hook — only the user or the external
   watcher (via herdr or tmux). The host does not reliably auto-continue after `/compact`; the watcher's explicit
@@ -508,8 +510,9 @@ its panes sit in `.../scm-pm2`, and the ticket label on `wH:p28` is what makes `
   guaranteed by herdr, and are env-overridable for exactly that reason.
 - **Phoenix unverified-live premises** (can't be probed without a real limit; the
   parse→wait→continue path is dry-run-verified): (a) that the `Stop` hook fires when a turn
-  is cut off by the limit; (b) exactly what `/usage-credits` does in the TUI — if it opens a
-  dialog Phoenix can't navigate, it correctly falls through to wait-for-reset.
+  is cut off by the limit; (b) what `/usage-credits` does in the TUI. On this host (client
+  2.1.326) it opens a "Select login method" picker; Phoenix closes it with Escape, verifies an
+  empty composer, and lists the pane in `needs-owner.list` if it will not close.
 
 ## Uninstall
 

@@ -44,16 +44,25 @@
 #     Staleness: a successful herdr reachability check (mux_session_reachable)
 #     removes an ownership, no-pane or pane-gone flag, and herdr registration
 #     skips its throttle while the flag exists, so such a flag lasts only until
-#     the next re-check (status-line render, Stop, watcher). A Claude session's
-#     "screen presence unproved:" flag is different: mux_session_reachable keeps
-#     it, and only a successful screen check at the send boundary
-#     (_mux_refuse_unowned, run by the watcher just before it sends input)
-#     clears it. A status-line render or a Stop alone never restores normal
-#     gating for it. A stale flag costs only an ungated stretch, the
-#     behaviour before this gate existed. The flag is written once per episode,
+#     the next re-check (status-line render, Stop, watcher, and this gate
+#     before any notice). A Claude session's "screen presence unproved:" flag
+#     names a live pane the watcher types into, so it never gives the notice
+#     (I-449): the request is gated as on any reachable pane. The flag clears
+#     on evidence (mux_presence_flag_recheck in mux-lib.sh) here, at a Stop,
+#     at each sweep pass and at a landed send. The flag is written once per episode,
 #     so its mtime is the episode start and usually predates the request: it is
 #     NOT compared with the request's mtime. Nothing on the tmux path clears the
 #     flag, so a tmux-only binding ignores it (tmux ownership is last-render-wins).
+#     Bound: that gating ends at the first of (a) the compaction (the request is
+#     satisfied), (b) the flag clearing (this episode is over; a later flag
+#     starts a new one), and (c) AUTODEV_GATE_BOUND seconds (600) from the
+#     first call it held the request under the flag, measured from the epoch
+#     in <sid>.gate-bound.<key>, a stamp only this gate writes. On (c) the
+#     request is released for good (<sid>.gate-released.<key>): one GATE-RELEASE
+#     line in the handoff log, the sweep's covered-pane Slack line once per
+#     episode (alert-lib.sh, the same <sid>.covered-alert record), and tools
+#     pass. Without the bound a compact that never came held every tool, so the
+#     seat could not even write its own record.
 # AskUserQuestion is allowed in every state, so the question is never denied.
 # Bypasses:
 #   AUTODEV_NO_HANDOFF_GATE=1        this process tree
@@ -110,9 +119,111 @@ done
 # The watcher can only act on a session with a registered pane.
 [ -e "$STATE/$sid.herdr-pane" ] || [ -e "$STATE/$sid.tmux-pane" ] || exit 0
 
+# The bound's markers (see header) of requests no longer pending go: a
+# compaction satisfied them, which is end (a). A request the bound released
+# passes for good.
+for f in "$STATE/$sid".gate-bound.* "$STATE/$sid".gate-released.*; do
+  [ -e "$f" ] || [ -L "$f" ] || continue
+  case "$pending_keys" in *" ${f##*.} "*) ;; *) rm -f "$f" 2>/dev/null ;; esac
+done
+[ "$mode" = pretool ] && [ "$req_key" != 0 ] && [ -e "$STATE/$sid.gate-released.$req_key" ] && exit 0
+
+# A "screen presence unproved" flag names a pane the watcher types into: the
+# pane is live and ours, only its screen was covered at the last send. It is
+# never a reason to ask the human (I-449: the menu this notice ordered was
+# itself the cover that kept the watcher out, for hours). Re-check the screen
+# now; a clear composer drops the flag. Either way the request is gated as on
+# any reachable pane, so the turn ends and the watcher's next attempt (at this
+# Stop, or the sweep within 3 minutes) serves it. A pane that stays covered is
+# the sweep's to report: needs-owner.list and one Slack line, never a menu.
+# Any other flag is re-checked too before it can order a menu: one written by
+# a process that could not reach the backend (a sandboxed command; seen in the
+# I-449 first-use run) named a live pane "not live", and the notice then
+# ordered the very menu that covers it. mux_session_reachable removes an
+# ownership, no-pane or pane-gone flag when the pane is live and ours now.
+presence_flag=0
+if [ -s "$STATE/$sid.herdr-pane" ] && [ -f "$STATE/$sid.unreachable" ] && [ -f "$_HERE/mux-lib.sh" ]; then
+  # shellcheck source=/dev/null
+  . "$_HERE/mux-lib.sh"
+  [ -f "$_HERE/limit-lib.sh" ] && . "$_HERE/limit-lib.sh"
+  # Only a pane live and ours now is one the watcher will type into; a pane
+  # gone or taken keeps the notice below (nothing else can reach it).
+  if mux_session_reachable "$sid" >/dev/null 2>&1; then
+    presence_flag=1
+    mux_presence_flag_recheck "$sid" >/dev/null 2>&1 || true
+  fi
+fi
+
+# gate_release_notify <held seconds>: end (c), once per request: one log line,
+# then the covered-pane Slack line through the sweep's own record, so the
+# episode gets one line whichever of the two sends first.
+gate_release_notify(){
+  local held=$1 f="$STATE/$sid.covered" since="" kind="" text_since
+  [ -f "$_HERE/alert-lib.sh" ] && . "$_HERE/alert-lib.sh" || return 0
+  [ -f "$_HERE/threshold-lib.sh" ] && . "$_HERE/threshold-lib.sh"
+  alert_log "$sid" "GATE-RELEASE a handoff request was held ${held}s (bound ${gate_bound}s) under a covered screen (screen presence unproved) and no /compact came; tools pass for this request"
+  # The episode is <sid>.covered (the watcher records each refused send). The
+  # flag still stands after the re-check above, so the screen is covered now:
+  # record that, which starts an episode when none is current.
+  [ -f "$f" ] && read -r _ _ kind _ < "$f" 2>/dev/null
+  case "$kind" in menu|login|other) ;; *) kind=other ;; esac
+  autodev_cover_record "$sid" "$kind" 2>/dev/null || return 0
+  read -r since _ < "$f" 2>/dev/null || return 0
+  case "$since" in ''|*[!0-9]*) return 0 ;; esac
+  # The line's minutes: since the episode began, or since this gate first held
+  # the request, whichever is earlier.
+  text_since=$since; [ "$gate_start" -lt "$since" ] && text_since=$gate_start
+  # shellcheck disable=SC2034,SC2154  # al_* and alert_text: alert-lib.sh's interface
+  _gate_slack(){
+    alert_record_read "$sid"
+    if [ "$al_episode" != "$since" ]; then al_episode=$since; al_slack=""; al_lane=""; fi
+    alert_sent "$al_slack" && return 0
+    alert_record_write "$sid" || return 0   # record before sending, as the sweep does
+    alert_covered_text "$sid" "$kind" "$text_since"
+    alert_slack_once "$sid" "$alert_text"
+  }
+  if [ -n "${AUTODEV_NO_FLOCK:-}" ] || ! command -v flock >/dev/null 2>&1; then
+    _gate_slack
+  else
+    ( flock -w "${AUTODEV_ALERT_LOCK_WAIT:-10}" 9 || exit 0; _gate_slack ) 9>"$STATE/$sid.page.lock"
+  fi
+  return 0
+}
+
+# The bound (see header). Only a request (a numeric key, not a live cycle) on a
+# pane this gate just found live and ours is bounded here.
+if [ "$presence_flag" = 1 ]; then
+  if [ ! -f "$STATE/$sid.unreachable" ]; then
+    # (b) The flag cleared: the pane is clear, the watcher serves the request
+    # at this turn's end, and this episode's bound is over.
+    rm -f "$STATE/$sid".gate-bound.* 2>/dev/null
+  elif [ "$mode" = pretool ] && case "$req_key" in ''|0|*[!0-9]*) false ;; esac; then
+    gate_bound=${AUTODEV_GATE_BOUND:-600}
+    case "$gate_bound" in ''|*[!0-9]*) gate_bound=600 ;; esac
+    stamp="$STATE/$sid.gate-bound.$req_key"
+    now=$(date +%s)
+    gate_start=$(head -n1 "$stamp" 2>/dev/null)
+    case "$gate_start" in
+      ''|*[!0-9]*)
+        # None yet, or not a stamp of ours (unreadable, a link): write it.
+        rm -f "$stamp" 2>/dev/null
+        (set -C; printf '%s\n' "$now" > "$stamp") 2>/dev/null
+        gate_start=$(head -n1 "$stamp" 2>/dev/null)
+        # A bound that cannot be measured fails open, as every error here does.
+        case "$gate_start" in ''|*[!0-9]*) exit 0 ;; esac ;;
+    esac
+    if [ $(( now - gate_start )) -ge "$gate_bound" ]; then
+      # (c) One claim per request: parallel calls release it once.
+      (set -C; : > "$STATE/$sid.gate-released.$req_key") 2>/dev/null &&
+        gate_release_notify "$(( now - gate_start ))"
+      exit 0
+    fi
+  fi
+fi
+
 # ...and only on a herdr pane it has not refused (see header). mux_init prefers
 # a non-empty herdr binding, so that is the binding the flag describes.
-if [ -s "$STATE/$sid.herdr-pane" ] && [ -f "$STATE/$sid.unreachable" ]; then
+if [ -s "$STATE/$sid.herdr-pane" ] && [ -f "$STATE/$sid.unreachable" ] && [ "$presence_flag" = 0 ]; then
   # No request (a live cycle alone): stand down silently; that cycle aborts.
   [ "$req_key" != 0 ] || exit 0
   notice="$STATE/$sid.unreachable-notice.$req_key"

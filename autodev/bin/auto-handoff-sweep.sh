@@ -71,6 +71,7 @@ publish_herdr_panes(){
   else
     return 0
   fi
+  HERDR_PRESENT=1   # session_live: an unlisted herdr may host an unbound session
 
   local timeout_cmd
   if ! timeout_cmd=$(command -v timeout 2>/dev/null); then
@@ -117,10 +118,17 @@ publish_herdr_panes(){
     snapshot_failed "could not publish snapshot"
     return 0
   fi
+  PANES_PUBLISHED=1   # this run's listing: session_live reads it
   snapshot_recovered
 }
 
+PANES_PUBLISHED=0
+HERDR_PRESENT=0
 publish_herdr_panes
+FLAGS_CLEARED_HERE=0
+shopt -s nullglob
+FLAGS_AT_START=$(for f in "$STATE"/*.unreachable; do s=${f##*/}; printf '%s\n' "${s%.unreachable}"; done)
+shopt -u nullglob
 
 _HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [ -f "$_HERE/lock-lib.sh" ] && . "$_HERE/lock-lib.sh" || exit 0
@@ -130,6 +138,8 @@ _HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # limit-lib.sh: whether a session's usage-limit wait is still active (a stale
 # <sid>.limit-wait is ignored and removed). Without it, fall back to presence.
 [ -f "$_HERE/limit-lib.sh" ] && . "$_HERE/limit-lib.sh"
+# alert-lib.sh: the covered-pane Slack line, shared with the handoff gate.
+[ -f "$_HERE/alert-lib.sh" ] && . "$_HERE/alert-lib.sh" || exit 0
 command -v autodev_limit_wait_active >/dev/null 2>&1 ||
   autodev_limit_wait_active(){ [ -f "$1/$2.limit-wait" ]; }
 # Never let a missing lib make every request look stale: fall back to "exists".
@@ -444,7 +454,22 @@ covered_due(){
   [ -f "$STATE/$sid.compacted" ] && comp=$(head -n1 "$STATE/$sid.compacted" 2>/dev/null)
   case "$comp" in ''|*[!0-9]*) comp=0 ;; esac
   [ "$comp" -lt "$cov_since" ] || return 1
-  autodev_ctx_over "$STATE" "$sid" gt
+  # Past its line, or with a compact/handoff request pending over 10 minutes
+  # (I-449: a request below the line on a covered pane reached nobody).
+  autodev_ctx_over "$STATE" "$sid" gt || request_pending_over "$sid" 600
+}
+
+# request_pending_over <sid> <seconds>: a compact/handoff request no compaction
+# has satisfied, older than <seconds>.
+request_pending_over(){
+  local k f
+  for k in compact-request handoff-request; do
+    f="$STATE/$1.$k"
+    [ -f "$f" ] || continue
+    [ -f "$STATE/$1.compacted" ] && [ "$STATE/$1.compacted" -nt "$f" ] && continue
+    [ $(( now - $(mtime "$f") )) -ge "$2" ] && return 0
+  done
+  return 1
 }
 
 # note_unreachable <sid> <kind>: the sweep found a seat's herdr pane gone
@@ -484,6 +509,7 @@ alert_episode_end(){
   if [ "$(head -n1 "$f" 2>/dev/null)" = "$cov_line" ] && rm -f "$f" 2>/dev/null; then
     log "$1" "ALERT-CLEAR $2 — episode over, no alert"
   fi
+  command -v autodev_needs_owner_clear >/dev/null 2>&1 && autodev_needs_owner_clear "$STATE" "$1"
 }
 
 # alert_stuck_now <sid>: read the pane now. Sets al_kind, the reason the alert
@@ -518,71 +544,6 @@ alert_stuck_now(){
   return 0
 }
 
-# alert_record_read <sid>: sets al_episode, al_slack, al_lane from <sid>.covered-alert.
-alert_record_read(){
-  local key val
-  al_episode=""; al_slack=""; al_lane=""
-  [ -f "$STATE/$1.covered-alert" ] || return 0
-  while IFS='=' read -r key val; do
-    case "$key" in
-      episode) al_episode=$val ;;
-      slack) al_slack=$val ;;
-      lane) al_lane=$val ;;
-    esac
-  done < "$STATE/$1.covered-alert"
-}
-alert_record_write(){ # $1 sid; writes al_episode, al_slack, al_lane
-  local rec="$STATE/$1.covered-alert" tmp="$STATE/$1.covered-alert.tmp.$$"
-  { printf 'episode=%s\nslack=%s\nlane=%s\n' "$al_episode" "$al_slack" "$al_lane" > "$tmp" &&
-    mv -f "$tmp" "$rec"; } 2>/dev/null && return 0
-  rm -f "$tmp" 2>/dev/null
-  log "$1" "ALERT-SKIP cannot record $rec — no send until it can be recorded (an unrecorded send would repeat every tick)"
-  return 1
-}
-alert_sent(){ case "$1" in 'sent '*|'unposted '*) return 0 ;; esac; return 1; }   # unposted: settled, logged by the poster
-
-# The seat's name: its herdr tab label (without the cache badge), never a pane id.
-alert_seat_label(){ # $1 sid; needs mux_init
-  local l=""
-  command -v mux_tab_label >/dev/null 2>&1 && l=$(mux_tab_label 2>/dev/null | head -n1)
-  # The lane refuses control and format characters (an emoji's zero-width
-  # joiner is one), and a byte cut could split a character: work in characters.
-  l=$(printf '%s' "$l" | sed -E 's/ (⌛[0-9]+s|•cold)$//' | python3 -c '
-import sys, unicodedata
-s = sys.stdin.buffer.read().decode("utf-8", "replace")
-s = "".join(c for c in s if unicodedata.category(c)[0] != "C" and unicodedata.category(c) not in ("Zl", "Zp"))
-print(s.strip()[:80], end="")' 2>/dev/null) || l=""
-  if [ -n "$l" ]; then printf "'%s'" "$l"; else printf 'an unlabelled seat (session %s)' "${1:0:8}"; fi
-}
-
-# One line of a command's output for the state file and the log: printable, short.
-alert_why(){ # $1 output, $2 exit code
-  local w
-  w=$(printf '%s\n' "$1" | awk 'NF' | head -n1 | tr -d '\000-\037\177' | cut -c1-120)
-  printf '%s' "${w:-exit $2}"
-}
-
-alert_send_slack(){ # $1 text; sets alert_out, returns the helper's exit code
-  # The poster finds the channel itself (its env, else Claude Code's settings
-  # file), so a timer that lacks Claude Code's env still reaches Slack.
-  local cmd=${AUTODEV_SLACK_CMD:-$HOME/.claude/bin/cc-slack-post.py} rc
-  local -a runner=(); command -v timeout >/dev/null 2>&1 && runner=(timeout "${AUTODEV_ALERT_TIMEOUT:-30}")
-  alert_out=$(CC_SLACK_CALLER=autodev-sweep "${runner[@]}" "$cmd" "$1" 2>&1 </dev/null); rc=$?
-  return "$rc"
-}
-
-# alert_no_channel_notice <sid>: the poster's once-a-day "slack: no channel"
-# line for this caller, into the sweep's log and onto stderr.
-alert_no_channel_notice(){
-  local cmd=${AUTODEV_SLACK_CMD:-$HOME/.claude/bin/cc-slack-post.py} line
-  # The same limit as the sends: a stalled notice must not hold back the lane line.
-  local -a runner=(); command -v timeout >/dev/null 2>&1 && runner=(timeout "${AUTODEV_ALERT_TIMEOUT:-30}")
-  line=$("${runner[@]}" "$cmd" --no-channel-notice autodev-sweep 2>/dev/null </dev/null | head -n1) || true
-  [ -n "$line" ] || return 0
-  log "$1" "$line"
-  printf '%s\n' "$line" >&2
-}
-
 alert_send_lane(){ # $1 text, $2 message id; sets alert_out. QUEUED (75) is success.
   local cmd=${AUTODEV_LANE_CMD:-} rc
   if [ -z "$cmd" ]; then
@@ -595,7 +556,7 @@ alert_send_lane(){ # $1 text, $2 message id; sets alert_out. QUEUED (75) is succ
 }
 
 _alert_covered_locked(){ # $1 sid; caller holds <sid>.page.lock
-  local sid=$1 label ctxtxt kindtxt mins host text mid rc why
+  local sid=$1 label text mid rc why nscreen ndesc nkey
   # Re-check under the lock: a send may have landed, or another sweep may have
   # sent the alert, while this one waited.
   covered_due "$sid" || return 0
@@ -608,34 +569,26 @@ _alert_covered_locked(){ # $1 sid; caller holds <sid>.page.lock
   # Record before sending: a send whose record cannot be kept would repeat
   # on every tick.
   alert_record_write "$sid" || return 0
-  label=$(alert_seat_label "$sid")
-  # shellcheck disable=SC2154  # set by autodev_ctx_over (threshold-lib.sh)
-  ctxtxt="context ${ctx_pct}%${ctx_tok:+, $ctx_tok tokens}"
-  mins=$(( (now - cov_since) / 60 ))
-  case "$al_kind" in
-    owner|nopane)
-      if [ "$al_kind" = owner ]; then kindtxt="pane not owned"; else kindtxt="no pane"; fi
-      text="seat $label is past its handoff line ($ctxtxt) and automation has not reached its pane for $mins min (reason: $kindtxt). The handoff stays queued; a person must find the session and type /compact in it." ;;
-    *)
-      case "$al_kind" in login) kindtxt="login screen" ;; *) kindtxt=$al_kind ;; esac
-      text="seat $label is past its handoff line ($ctxtxt) and its pane has been covered for $mins min (reason: $kindtxt). The handoff stays queued; a person must clear the screen or type /compact in that pane." ;;
-  esac
-  if ! alert_sent "$al_slack"; then
-    host=$(hostname 2>/dev/null || echo unknown-host)
-    alert_send_slack "⚠️ *$host* — \`autodev\` $text"; rc=$?
-    if [ "$rc" = 0 ]; then
-      al_slack="sent $now"; log "$sid" "ALERT slack sent: $text"
-    elif [ "$rc" = 78 ]; then
-      # No channel: the poster logged the line as unposted. Settle it for this
-      # episode, so the unposted count is one per episode, not one per tick.
-      al_slack="unposted $now no-channel"; log "$sid" "ALERT slack not posted: no channel (in the unposted log)"
-      alert_no_channel_notice "$sid"
-    else
-      why=$(alert_why "$alert_out" "$rc")
-      al_slack="failed $now $why"; log "$sid" "ALERT slack failed: $why — retry next tick"
-    fi
-    alert_record_write "$sid" || return 0
+  alert_covered_text "$sid" "$al_kind" "$cov_since"
+  # shellcheck disable=SC2154  # set by alert_covered_text (alert-lib.sh)
+  label=$alert_label text=$alert_text
+  # The pane goes on needs-owner.list (one line per session, updated in place):
+  # the human is needed, and no menu may be ordered for it.
+  if command -v autodev_needs_owner_set >/dev/null 2>&1; then
+    # Read the screen only of a pane that is ours (al_kind menu/login/other):
+    # another session's screen is never read.
+    case "$al_kind" in
+      owner)  ndesc="key=- screen=(the pane is not this session's)" ;;
+      nopane) ndesc="key=- screen=(no pane)" ;;
+      *) nscreen=""; mux_read_screen 80 nscreen 2>/dev/null || nscreen=""
+         ndesc=$(printf '%s\n' "$nscreen" | python3 "$_HERE/limit-banner.py" --describe 2>/dev/null) ;;
+    esac
+    nkey=$(printf '%s' "$ndesc" | sed -n 's/^key=\([^ ]*\) .*/\1/p')
+    autodev_needs_owner_set "$STATE" "$sid" "${label//\'/}" "${nkey:-Escape}" "${ndesc#* screen=}" ||
+      log "$sid" "ALERT-SKIP cannot write $STATE/needs-owner.list"
   fi
+  # One Slack line per episode, shared with the handoff gate's bound.
+  alert_slack_once "$sid" "$text" || return 0
   if ! alert_sent "$al_lane"; then
     # One id per episode: a retry after a timeout resumes the same message.
     mid="m-$(printf '%s:%s' "$sid" "$cov_since" | sha256sum | cut -c1-12)"
@@ -725,29 +678,166 @@ alert_deliver(){
   return 0
 }
 
-# clear_presence_flag <sid>: drop a "screen presence unproved" <sid>.unreachable
-# (and a needs-owner.list line) when the pane is live and ours and its screen
-# ends in an empty composer with our session tag at the bottom and no dialog.
-# The same tests the watcher's send boundary runs (mux-lib.sh), so a flag only
-# clears on the evidence that would have let a send land. Other flags are left
-# to mux_session_reachable, which clears them on its own evidence.
+# clear_presence_flag <sid>: a "screen presence unproved" flag clears on
+# evidence at each sweep pass, not only at the next send (mux-lib.sh's
+# mux_presence_flag_recheck, the same tests the send boundary runs).
 clear_presence_flag(){
-  local sid=$1 f="$STATE/$1.unreachable" screen before
-  grep -q '^screen presence unproved:' "$f" 2>/dev/null || return 0
-  before=$(stat -c '%Y %s' "$f" 2>/dev/null; cat "$f" 2>/dev/null)
-  [ "$(cat "$STATE/$sid.runtime" 2>/dev/null)" = claude ] || return 0
-  mux_init "$sid" && [ "$MUX" = herdr ] || return 0
-  mux_pane_live && [ "$(mux_pane_owner)" = "$sid" ] || return 0
-  mux_screen_present_once || return 0
-  screen=$MUX_PRESENCE_SCREEN
-  printf '%s\n' "$screen" | python3 "$_HERE/limit-banner.py" --composer-clear || return 0
-  mux_awaiting_human && return 0
-  # Re-check the flag just before removing it: one rewritten meanwhile holds
-  # newer evidence than this read, so keep it.
-  [ "$(stat -c '%Y %s' "$f" 2>/dev/null; cat "$f" 2>/dev/null)" = "$before" ] || return 0
-  rm -f "$f" 2>/dev/null && log "$sid" "CLEAR unreachable: pane $PANE shows a clear, live composer"
-  command -v autodev_needs_owner_clear >/dev/null 2>&1 && autodev_needs_owner_clear "$STATE" "$sid"
+  mux_presence_flag_recheck "$1" || return 0
+  log "$1" "CLEAR unreachable: pane $PANE shows a clear, live composer"
+  FLAGS_CLEARED_HERE=$(( FLAGS_CLEARED_HERE + 1 ))
+}
+
+# limit_wait_screen_check <sid>: a <sid>.limit-wait whose pane shows no live
+# usage-limit banner now is removed. A false detection, or a wait whose limit
+# is over, must not hold the handoff off. Two guards (I-449 review): the check
+# runs only under the session's resume lock, so a live resume cycle, whose own
+# /usage-credits picker may cover the composer for a moment, keeps its wait
+# (it ends that wait itself when the banner leaves the live area); and the file
+# goes only on positive evidence, an empty composer at the bottom of the pane
+# with no live banner over it (limit-banner.py --composer-clear, then
+# --live-only). A screen with no composer proves nothing and keeps the file.
+limit_wait_screen_check(){
+  local sid=$1 f="$STATE/$1.limit-wait"
+  [ -f "$f" ] || return 0
+  command -v autodev_resume_lock_take >/dev/null 2>&1 || return 0
+  autodev_resume_lock_take "$STATE" "$sid" || return 0
+  _limit_wait_screen_check_locked "$sid"
+  autodev_resume_lock_release "$STATE" "$sid"
   return 0
+}
+_limit_wait_screen_check_locked(){ # $1 sid; caller holds the resume lock
+  local sid=$1 f="$STATE/$1.limit-wait" screen
+  [ -f "$f" ] || return 0
+  mux_init "$sid" && mux_pane_live || return 0
+  [ "$MUX" != herdr ] || [ "$(mux_pane_owner)" = "$sid" ] || return 0
+  mux_read_screen 200 screen || return 0
+  printf '%s\n' "$screen" | python3 "$_HERE/limit-banner.py" --composer-clear >/dev/null 2>&1 || return 0
+  printf '%s\n' "$screen" | python3 "$_HERE/limit-banner.py" --live-only --after-credits >/dev/null 2>&1
+  [ "$?" = 1 ] || return 0
+  rm -f "$f" 2>/dev/null && log "$sid" "DROP limit-wait: pane $PANE shows no live usage-limit banner"
+}
+
+# --- dead sessions and the per-run summary ----------------------------------
+# A session is dead when no herdr pane hosts it and none is bound to it (by the
+# fresh listing this sweep published), its tmux pane (if any) is gone, and it
+# wrote nothing for DEAD_SESSION_HOURS: its markers and flags, and its ctx,
+# heartbeat and idle readings, are all that old (the files the sweep itself
+# rewrites, SWEEP_WRITES, are not counted). Its markers, flags and pane
+# binding then move to $AUTODEV_HOME/state-archive/<date>/, with one log line,
+# so the pending count and the flag count describe live sessions only, and the
+# sweep stops re-checking (and re-flagging) a pane that is gone. Its context
+# reading stays; a session that comes back registers its pane again from its
+# status line.
+REAP_KINDS="compact-request handoff-request reload-pending reload-attempt unreachable unreachable-screen covered covered-alert limit-wait stuck deferred spared busy-since paged busy-deferrals fallback-request herdr-pane tmux-pane herdr-tab"
+# Per-session files the sweep itself (re)writes: never evidence of the session.
+SWEEP_WRITES="covered covered-alert busy-since stuck"
+PANES_JSON=""
+panes_json(){ # the listing published this run, or nothing
+  [ -n "$PANES_JSON" ] && { printf '%s' "$PANES_JSON"; return 0; }
+  [ "${PANES_PUBLISHED:-0}" = 1 ] || return 1
+  PANES_JSON=$(cat "$STATE/herdr-panes.json" 2>/dev/null) || return 1
+  printf '%s' "$PANES_JSON"
+}
+# session_live <sid>: 0 live, 1 dead, 2 unknown. Each binding is checked on
+# its own backend: a herdr binding against this run's listing, a tmux binding
+# against tmux. Unknown when a backend the session needs could not be read: its
+# herdr binding without a listing, its tmux binding without tmux, or, with no
+# binding at all, herdr installed but not listed (it may host the session).
+session_live(){
+  local sid=$1 pane="" listing="" have_list=0 unknown=0 bound=0
+  listing=$(panes_json) && have_list=1
+  if [ "$have_list" = 1 ] && printf '%s\n' "$listing" | jq -e --arg s "$sid" \
+       'any(.result.panes[]?; (.agent_session.value? // "") == $s)' >/dev/null 2>&1; then
+    return 0
+  fi
+  if [ -s "$STATE/$sid.herdr-pane" ]; then
+    bound=1
+    pane=$(head -n1 "$STATE/$sid.herdr-pane" 2>/dev/null)
+    if [ "$have_list" = 0 ]; then
+      unknown=1
+    elif [ -n "$pane" ] && printf '%s\n' "$listing" | jq -e --arg p "$pane" \
+         'any(.result.panes[]?; .pane_id == $p)' >/dev/null 2>&1; then
+      # The pane is live; whether it is still ours is the loop's question.
+      return 0
+    fi
+  fi
+  if [ -s "$STATE/$sid.tmux-pane" ]; then
+    bound=1
+    if ! command -v tmux >/dev/null 2>&1; then
+      unknown=1
+    elif tmux list-panes -a -F '#{pane_id}' 2>/dev/null | grep -qxF -- "$(head -n1 "$STATE/$sid.tmux-pane")"; then
+      return 0
+    fi
+  fi
+  [ "$bound" = 0 ] && [ "$have_list" = 0 ] && [ "${HERDR_PRESENT:-0}" = 1 ] && unknown=1
+  [ "$unknown" = 1 ] && return 2
+  return 1
+}
+reap_dead_sessions(){
+  local f sid k n day dir newest t seen_r=" "
+  day=$(date +%Y-%m-%d); dir="$AUTODEV_HOME/state-archive/$day"
+  for f in "$STATE"/*.unreachable "$STATE"/*.compact-request "$STATE"/*.handoff-request \
+           "$STATE"/*.reload-pending "$STATE"/*.reload-attempt "$STATE"/*.limit-wait "$STATE"/*.covered; do
+    sid=${f##*/}; sid=${sid%.*}
+    case "$sid" in ""|*[!A-Za-z0-9._-]*) continue ;; esac
+    case "$seen_r" in *" $sid "*) continue ;; esac
+    seen_r="$seen_r$sid "
+    newest=0
+    for k in $REAP_KINDS ctx heartbeat idle; do
+      # The sweep's own writes say nothing about the session (I-449 review):
+      # note_unreachable rewrites <sid>.covered at every pass.
+      case " $SWEEP_WRITES " in *" $k "*) continue ;; esac
+      [ -e "$STATE/$sid.$k" ] || continue
+      t=$(mtime "$STATE/$sid.$k"); [ "$t" -gt "$newest" ] && newest=$t
+    done
+    [ $(( now - newest )) -ge "$DEAD_SESSION_AGE" ] || continue
+    session_live "$sid"; [ "$?" = 1 ] || continue
+    mkdir -p "$dir" 2>/dev/null || { log "$sid" "REAP-SKIP cannot create $dir"; return 0; }
+    n=0
+    for k in $REAP_KINDS; do
+      [ -e "$STATE/$sid.$k" ] || continue
+      mv -f "$STATE/$sid.$k" "$dir/" 2>/dev/null && n=$(( n + 1 ))
+    done
+    for f in "$STATE/$sid".unreachable-notice.* "$STATE/$sid".unreachable-asked.* "$STATE/$sid".unreachable-repeat.* \
+             "$STATE/$sid".gate-bound.* "$STATE/$sid".gate-released.*; do
+      mv -f "$f" "$dir/" 2>/dev/null && n=$(( n + 1 ))
+    done
+    command -v autodev_needs_owner_clear >/dev/null 2>&1 && autodev_needs_owner_clear "$STATE" "$sid"
+    [ "$n" -gt 0 ] && log "$sid" "REAP dead session (no live pane, nothing written for ${DEAD_SESSION_HOURS}h): moved $n file(s) to $dir"
+  done
+  return 0
+}
+# sweep_summary: one line per run, in the log and on stdout: flags set and
+# cleared since the previous run, flags present, and compact/handoff requests
+# pending over 10 minutes on live sessions ("?" without a fresh listing).
+# Plain bash (no sort/comm): the sweep runs where PATH may be minimal.
+flag_sids(){ local f s; for f in "$STATE"/*.unreachable; do s=${f##*/}; printf '%s\n' "${s%.unreachable}"; done; }
+sweep_summary(){
+  local prev="$STATE/.sweep-flags" f sid set=0 cleared=0 present=0 pending=0 unknown=0 line
+  local -A was=() now_=()
+  # Since the previous run; on the first run, since this run began.
+  if [ -f "$prev" ]; then
+    while IFS= read -r sid; do [ -n "$sid" ] && was[$sid]=1; done < "$prev"
+  else
+    while IFS= read -r sid; do [ -n "$sid" ] && was[$sid]=1; done <<< "$FLAGS_AT_START"
+  fi
+  while IFS= read -r sid; do [ -n "$sid" ] && now_[$sid]=1; done < <(flag_sids)
+  present=${#now_[@]}
+  for sid in "${!now_[@]}"; do [ -n "${was[$sid]:-}" ] || set=$(( set + 1 )); done
+  for sid in "${!was[@]}"; do [ -n "${now_[$sid]:-}" ] || cleared=$(( cleared + 1 )); done
+  { for sid in "${!now_[@]}"; do printf '%s\n' "$sid"; done; } > "$prev.tmp.$$" 2>/dev/null &&
+    mv -f "$prev.tmp.$$" "$prev" 2>/dev/null
+  for f in "$STATE"/*.compact-request "$STATE"/*.handoff-request; do
+    sid=${f##*/}; sid=${sid%.*}
+    [ $(( now - $(mtime "$f") )) -ge 600 ] || continue
+    [ -f "$STATE/$sid.compacted" ] && [ "$STATE/$sid.compacted" -nt "$f" ] && continue
+    session_live "$sid"
+    case $? in 0) pending=$(( pending + 1 )) ;; 2) unknown=1 ;; esac
+  done
+  [ "$unknown" = 1 ] && pending="$pending?"
+  line="SWEEP-SUMMARY flags_set=$set flags_cleared=$cleared flags_present=$present pending_over_10m=$pending"
+  log "-" "$line"
+  printf '%s\n' "$line"
 }
 
 shopt -s nullglob
@@ -799,6 +889,8 @@ for pf in "$STATE"/*.herdr-pane "$STATE"/*.tmux-pane; do
   # pane whose composer is clear, live and ours loses it here, so its badge
   # turns back and a session past its line hands off on this same pass.
   clear_presence_flag "$sid"
+  # A limit-wait with no live usage-limit banner on the pane is over.
+  limit_wait_screen_check "$sid"
 
   # Phoenix owns sessions that are waiting out a usage limit; typing at them
   # would only queue input behind a blocked prompt. A stale wait is removed here
@@ -1056,6 +1148,8 @@ for pf in "$STATE"/*.herdr-pane "$STATE"/*.tmux-pane; do
 done
 
 alert_deliver
+reap_dead_sessions
+sweep_summary
 
 # If the sweep covered more eligible marker identities than its detailed-page
 # budget, send one final page with the count. This page is outside that budget.

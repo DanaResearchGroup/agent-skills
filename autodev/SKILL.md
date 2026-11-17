@@ -329,13 +329,18 @@ pane banner like `You've hit your session limit · resets 6:20am` /
 launched by the same `Stop` hook. You do NOT do anything special for it — but know how it
 behaves so you resume cleanly:
 
-- On a limit stop, Phoenix first runs `/usage-credits` (the banner's own suggested action).
-  If that clears the limit, it sends `continue` and you pick up where you left off.
-- If credits don't clear it (or are disabled via `~/agents/state/no-usage-credits`), Phoenix
-  parses the reset time, sleeps until a few minutes **past** it, then sends `continue`.
+- Phoenix acts only on a **live** banner: the newest content on the pane, with a reset time
+  that parses and lies ahead (`bin/limit-banner.py`). A banner in the scrollback does nothing.
+- It first runs `/usage-credits` (the banner's own suggested action), closes any dialog that
+  opens, and checks for an empty composer. A dialog it cannot close stops all typing into the
+  pane and lists it in `~/agents/state/needs-owner.list` for the owner.
+- If credits don't resume work (or are disabled via `~/agents/state/no-usage-credits`), Phoenix
+  sleeps until a few minutes **past** the reset, then sends `continue`.
 - While it waits, the status line shows a `⏳ AUTO-RESUME @ <time>` badge, it writes
   `~/agents/state/<sid>.limit-wait`, and the auto-handoff watcher **defers** (no handoff/
-  compact into a limited session).
+  compact into a limited session). The wait ends at the reset, at your next completed turn,
+  or when the banner stops being the newest content, whichever comes first; the sweep also
+  drops a `limit-wait` whose pane shows no live banner.
 - Phoenix is a **no-compaction** resume: your context is intact across the limit, so a plain
   `continue` resumes the loop directly. When you receive that `continue` after an
   `⏳ AUTO-RESUME`, just carry on from `progress.md` `Next` — do not restart or re-ask.

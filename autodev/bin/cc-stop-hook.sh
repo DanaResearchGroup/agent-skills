@@ -69,10 +69,21 @@ stop_fallback() (
     return 1
   }
   mux_session_reachable "$sid" || failed=1
-  # Metadata stays reachable so the watcher can retry its screen check. A
-  # persisted screen refusal still needs the in-session handoff fallback.
+  # A "screen presence unproved" flag is not trusted as it stands: re-check the
+  # screen now (a clear, live composer drops it). One still standing counts as
+  # a failure only while it is younger than one sweep interval, and then only
+  # for the in-session /handoff fallback below, never for an instruction to the
+  # human: an older one has outlived a sweep's own re-check, and a covered
+  # screen is the sweep's to report (needs-owner.list, one Slack line).
+  presence_only=0
   if grep -q '^screen presence unproved:' "$STATE/$sid.unreachable" 2>/dev/null; then
-    failed=1
+    command -v mux_presence_flag_recheck >/dev/null 2>&1 &&
+      mux_presence_flag_recheck "$sid" >/dev/null 2>&1
+    if [ -f "$STATE/$sid.unreachable" ] &&
+       [ $(( $(date +%s) - $(date -r "$STATE/$sid.unreachable" +%s 2>/dev/null || echo 0) )) -lt "${AUTODEV_SWEEP_INTERVAL:-180}" ]; then
+      [ "$failed" = 1 ] || presence_only=1
+      failed=1
+    fi
   fi
   if [ -f "$STATE/$sid.busy-deferrals" ] &&
      ! [ "$STATE/$sid.compacted" -nt "$STATE/$sid.busy-deferrals" ]; then
@@ -95,6 +106,9 @@ stop_fallback() (
     fi
   done
   if [ "$pending" = 1 ]; then
+    # A covered screen alone never asks for /compact to be typed: the pane is
+    # live and ours, the watcher retries it, and the sweep reports a cover.
+    [ "$presence_only" = 1 ] && return 1
     # The reachability check above may have just refused the pane (a worker
     # with no herdr env registers nothing earlier): consult the gate again.
     gate_stop

@@ -463,7 +463,7 @@ assert_eq "no list file (a glob that matches nothing): clear is a no-op" "$rc" 0
 assert_no_file "and creates nothing" "$empty/needs-owner.list"
 AUTODEV_HOME="$SB/empty-home" STATE="$SB/empty-home/state" bash "$BIN/auto-handoff-sweep.sh" > "$SB/out" 2>&1; rc=$?
 assert_eq "a sweep over a state dir whose pane glob matches nothing: exit 0" "$rc" 0
-assert_eq "and no output" "$(cat "$SB/out")" ""
+assert_eq "and only its one-line summary" "$(cat "$SB/out")" "SWEEP-SUMMARY flags_set=0 flags_cleared=0 flags_present=0 pending_over_10m=0"
 sandbox_rm
 
 finish

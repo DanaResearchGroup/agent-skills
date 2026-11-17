@@ -636,7 +636,14 @@ cover_note(){ # $1 = guard; other guards (ownership, staged input) are not a cov
   command -v autodev_cover_record >/dev/null 2>&1 || return 0
   autodev_cover_record "$sid" "$(cover_kind "$1")" || true
 }
-cover_clear(){ rm -f "$STATE/$sid.covered" 2>/dev/null; }
+# A landed send ends the episode, and with it the session's needs-owner.list
+# line: the sweep's alert_episode_end never runs once <sid>.covered is gone,
+# and a menu-only refusal leaves no presence flag whose clearing would drop it.
+cover_clear(){
+  rm -f "$STATE/$sid.covered" 2>/dev/null
+  command -v autodev_needs_owner_clear >/dev/null 2>&1 && autodev_needs_owner_clear "$STATE" "$sid"
+  return 0
+}
 
 defer_awaiting(){ # $1 = where
   local guard=${MUX_REFUSAL_REASON:-dialog}

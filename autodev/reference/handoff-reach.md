@@ -80,12 +80,24 @@ The implementation follows this order:
    ownership, no-pane or pane-gone refusal, a successful herdr reachability
    check removes the flag, and registration skips its throttle while it exists,
    so a stale flag lasts only until the next re-check (status-line render,
-   Stop, watcher). A Claude session's `screen presence unproved:` flag is
-   different (step 3): `mux_session_reachable` keeps it even after a successful
-   ownership check, and only a successful screen check at the send boundary,
-   which the watcher runs just before it sends input, clears it. A status-line
-   render or a Stop alone does not restore normal gating for that refusal. The
-   tmux path never clears the flag, so a tmux-only binding ignores it.
+   Stop, watcher). The gate re-runs that check itself before it gives any
+   notice, so a flag written by a process that could not reach the backend
+   orders no menu on a live pane. A Claude session's `screen presence
+   unproved:` flag names a pane the watcher types into, so it never orders a
+   menu or a "type /compact" instruction: the request is gated as on any
+   reachable pane, the turn ends, and the watcher serves it. That flag clears
+   on evidence (`mux_presence_flag_recheck`: live, ours, our tag at the live
+   bottom, an empty composer, no dialog) at the next sweep pass, Stop or gated
+   tool call, as well as at a landed send. A covered pane with a request
+   pending over 10 minutes goes on `needs-owner.list` with one Slack line
+   (step 7). That gating is bounded: it ends at the compaction, at the flag
+   clearing, or 10 minutes (`AUTODEV_GATE_BOUND`) after the first call it
+   held the request, measured from the epoch in `<sid>.gate-bound.<key>`, a
+   stamp only the gate writes. At the bound the gate logs one `GATE-RELEASE`
+   line, sends the same covered-pane Slack line (`alert-lib.sh`, one per
+   episode, shared with the sweep through `<sid>.covered-alert`), and lets
+   tools pass for that request. The tmux path never clears the flag, so a
+   tmux-only binding ignores it.
 
 7. A covered pane keeps its handoff queued, and a stuck seat is made loud.
    The watcher never types under a menu or overlay. On a dialog refusal or a
