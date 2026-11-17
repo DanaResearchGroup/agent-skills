@@ -39,7 +39,8 @@ The current tree carries no such references.
   Every invocation is checked separately and a finding in any of them fails the
   build. `--redact` keeps a found secret out of the CI logs.
 - **No baked-in private ids** — the Slack helper (`bin/cc-slack-post.py`)
-  requires `CC_SLACK_CHANNEL` and refuses to send without it, instead of
+  takes its channel from `CC_SLACK_CHANNEL` or the local settings file and
+  refuses to send without one (exit 78, logged as unposted), instead of
   defaulting to a real private channel id.
 - **No secrets in argv** — [SETUP.md](SETUP.md) enters the bot token via
   `read -s`, never as a command-line literal, into a mode-600 file outside

@@ -35,7 +35,8 @@ sandbox_new() {
   printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "$SB/real-send-attempt"\nexit 1\n' > "$SB/no-send"
   chmod +x "$SB/no-send"
   export AUTODEV_SLACK_CMD="$SB/no-send" AUTODEV_LANE_CMD="$SB/no-send"
-  export AUTODEV_CLAUDE_SETTINGS="$SB/no-settings.json"
+  # The real poster, if a test runs it, must not read the owner's settings.
+  export CLAUDE_CONFIG_DIR="$SB/no-claude-config"
   # Tests drive the watcher directly; never let a stray env id leak in.
   unset CLAUDE_CODE_SESSION_ID CODEX_SESSION_ID CODEX_THREAD_ID \
     HERDR_ENV HERDR_PANE_ID HERDR_TAB_ID TMUX_PANE

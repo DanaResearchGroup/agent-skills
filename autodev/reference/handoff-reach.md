@@ -114,8 +114,11 @@ The implementation follows this order:
    A seat can be past its line (`ctx-over.sh`), unreachable for more than 10
    minutes, refused within the last 15 minutes, with no compaction since the
    episode began and no turn running. Such a seat gets one Slack line to the
-   owner (`cc-slack-post.py`; the channel comes from `CC_SLACK_CHANNEL`, else
-   from `env` in Claude Code's `settings.json`). It also gets one session-lane
+   owner (`cc-slack-post.py`, which finds the channel itself: `CC_SLACK_CHANNEL`,
+   else `env` in Claude Code's `settings.json`). With no channel the poster exits
+   78 and logs the line as unposted; the sweep records the Slack half of the
+   episode as `unposted`, never retries it, and logs `slack: no channel` at most
+   once a day. It also gets one session-lane
    line to `persona:method`, sent once per episode. Each line names the seat
    by its herdr tab label (never a pane id), its context reading and the
    reason: `menu`, `login screen`, `other`, `pane not owned` or `no pane`.
@@ -138,7 +141,7 @@ The implementation follows this order:
    starve the seats after them. With
    the 10 s lock wait and two 30 s sends, delivery ends inside the 3-minute
    sweep interval. Overrides: `AUTODEV_SLACK_CMD`,
-   `AUTODEV_LANE_CMD`, `AUTODEV_ALERT_LANE_TO`, `AUTODEV_CLAUDE_SETTINGS`.
+   `AUTODEV_LANE_CMD`, `AUTODEV_ALERT_LANE_TO`.
 
 The fallback preserves the handoff even when a detached worker cannot compact
 itself. A human must attach and type `/compact` in that case. The watcher keeps
