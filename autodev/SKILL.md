@@ -59,7 +59,7 @@ echo -n "AUTO_HANDOFF: "; if [ -f "$S/disable-auto-compact" ]; then echo "DISABL
 if [ -n "${CODEX_SESSION_ID:-${CODEX_THREAD_ID:-}}" ]; then
   echo "PHOENIX (limit-resume): CLAUDE-ONLY"
 else
-  echo -n "PHOENIX (limit-resume): "; if [ -f "$S/disable-auto-compact" ] || [ -f "$S/disable-auto-resume" ]; then echo "DISABLED"; elif [ -f "$S/auto-handoff.armed" ]; then echo "ARMED"; else echo "DRY-RUN"; fi
+  echo -n "PHOENIX (limit-resume): "; if [ -f "$S/disable-auto-compact" ]; then echo "DISABLED"; elif [ -f "$S/auto-resume.log-only" ]; then echo "LOG-ONLY"; elif [ -f "$S/disable-auto-resume" ]; then echo "DISABLED"; elif [ -f "$S/auto-handoff.armed" ]; then echo "ARMED"; else echo "DRY-RUN"; fi
 fi
 ```
 
@@ -333,7 +333,8 @@ behaves so you resume cleanly:
   that parses and lies ahead (`bin/limit-banner.py`). A banner in the scrollback does nothing.
 - It never types `/usage-credits` (it opened a login picker that covered panes for hours). It
   sleeps until a few minutes **past** the reset, then sends `continue`.
-  `~/agents/state/disable-auto-resume` turns Phoenix off.
+  `~/agents/state/disable-auto-resume` turns Phoenix off. `~/agents/state/auto-resume.log-only`
+  makes it detect and log only, typing nothing, even when it is off (README, Control switches).
 - While it waits, the status line shows a `⏳ AUTO-RESUME @ <time>` badge, it writes
   `~/agents/state/<sid>.limit-wait`, and the auto-handoff watcher **defers** (no handoff/
   compact into a limited session). The wait ends at the reset, at your next completed turn,

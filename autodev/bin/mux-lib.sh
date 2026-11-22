@@ -170,6 +170,18 @@ mux_init(){ # $1 = sid
   return 1
 }
 
+# The pane's working directories, one per line (herdr: cwd and foreground_cwd).
+# Prints nothing when unknown. Read-only.
+mux_pane_cwd(){
+  case "$MUX" in
+    tmux)  tmux display-message -p -t "$PANE" '#{pane_current_path}' 2>/dev/null ;;
+    herdr) "$MUX_HERDR" pane get "$PANE" 2>/dev/null \
+             | jq -r '(.result.pane // .result) | (.cwd, .foreground_cwd)
+                      | select(type == "string" and length > 0)' 2>/dev/null ;;
+    *) : ;;
+  esac
+}
+
 # Is the registered pane still live? 0 = live, 1 = gone/unknown.
 mux_pane_live(){
   case "$MUX" in

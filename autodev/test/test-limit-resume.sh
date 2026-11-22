@@ -90,6 +90,7 @@ assert_contains "--describe: the picker names Ctrl-C" \
 # $SB/herdr/after-run.txt    swapped in when a line is typed (pane run)
 # $SB/herdr/after-key.txt    swapped in when a key is sent (pane send-keys)
 # $SB/typed.log              every pane run / send-keys, one per line
+# $SB/herdr/cwd              the pane cwd `pane get` reports (absent: none)
 setup() {
   sandbox_new
   mkdir -p "$SB/herdr" "$SB/fakebin"
@@ -100,11 +101,15 @@ setup() {
 H="$SB/herdr"
 case "${1:-} ${2:-}" in
   "pane get")
-      printf '{"result":{"pane":{"pane_id":"%s","agent_status":"%s","agent_session":{"value":"%s"},"scroll":{"offset_from_bottom":0}}}}\n' \
-        "$3" "$(cat "$H/status")" "$(cat "$H/owner" 2>/dev/null)" ;;
+      printf '{"result":{"pane":{"pane_id":"%s","agent_status":"%s","agent_session":{"value":"%s"},"cwd":"%s","scroll":{"offset_from_bottom":0}}}}\n' \
+        "$3" "$(cat "$H/status")" "$(cat "$H/owner" 2>/dev/null)" "$(cat "$H/cwd" 2>/dev/null)" ;;
   "pane read")
       n=$(( $(cat "$H/reads" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$H/reads"
-      if [ -f "$H/from-read-2.txt" ] && [ "$n" -ge 2 ]; then cat "$H/from-read-2.txt"; else cat "$H/screen.txt"; fi ;;
+      if [ -f "$H/from-read-2.txt" ] && [ "$n" -ge 2 ]; then cat "$H/from-read-2.txt"; else cat "$H/screen.txt"; fi
+      # owner-after-read: "<n> <sid>" — another session takes the pane once read n is served.
+      if [ -f "$H/owner-after-read" ] && [ "$n" -ge "$(cut -d' ' -f1 "$H/owner-after-read")" ]; then
+        cut -d' ' -f2 "$H/owner-after-read" > "$H/owner"
+      fi ;;
   "pane run")
       printf 'RUN %s\n' "$4" >> "$SB/typed.log"
       [ -f "$H/after-run.txt" ] && cp "$H/after-run.txt" "$H/screen.txt"
@@ -478,6 +483,424 @@ assert_no_file "and creates nothing" "$empty/needs-owner.list"
 AUTODEV_HOME="$SB/empty-home" STATE="$SB/empty-home/state" bash "$BIN/auto-handoff-sweep.sh" > "$SB/out" 2>&1; rc=$?
 assert_eq "a sweep over a state dir whose pane glob matches nothing: exit 0" "$rc" 0
 assert_eq "and only its one-line summary" "$(cat "$SB/out")" "SWEEP-SUMMARY flags_set=0 flags_cleared=0 flags_present=0 pending_over_10m=0"
+sandbox_rm
+
+echo "== log-only (I-571): the detector runs on the pane, nothing is typed =="
+# Every mux function that can type into a pane records the call in sent.log, on
+# top of the fake herdr's typed.log. send() is the watcher's own: its two log
+# words (DRY would send, SENT:) are its record. A log-only run must leave all
+# three empty.
+record_sends() {
+  cat >> "$BIN/mux-lib.sh" <<'REC'
+mux_send_line(){ printf 'mux_send_line %s\n' "$*" >> "$SB/sent.log"; }
+mux_send_key(){ printf 'mux_send_key %s\n' "$*" >> "$SB/sent.log"; }
+mux_stage_text(){ printf 'mux_stage_text %s\n' "$*" >> "$SB/sent.log"; }
+REC
+  : > "$SB/sent.log"
+}
+sends() { # every send call this run made, from all three records
+  cat "$SB/sent.log" "$SB/typed.log" 2>/dev/null
+  grep -E 'DRY would send|SENT:' "$AUTODEV_HOME/logs/auto-resume.log" 2>/dev/null
+}
+screens_dir() { printf '%s/logs/auto-resume-screens' "$AUTODEV_HOME"; }
+screens() { find "$(screens_dir)" -type f 2>/dev/null | wc -l; }
+mode() { stat -c %a "$1" 2>/dev/null; }
+# state_list: every path under $STATE with its mtime, to prove log-only writes none.
+state_list() { find "$STATE" -printf '%p %T@\n' 2>/dev/null | sort; }
+
+# The switch table. Columns: disable-auto-compact, auto-resume.log-only,
+# disable-auto-resume, auto-handoff.armed; then what must happen on a live banner.
+#   off     nothing runs: no log line, no limit-wait, nothing sent
+#   logonly LOG-ONLY line and a saved screen; no limit-wait, no lock, nothing sent
+#   wait    the armed path: LIMIT detected (dry=0|1) and a limit-wait; nothing sent yet
+while read -r c l r a want; do
+  case "$c" in '#'*|'') continue ;; esac
+  row="compact=$c log-only=$l disable-resume=$r armed=$a"
+  setup; record_sends
+  rm -f "$STATE/auto-handoff.armed"
+  [ "$c" = 1 ] && : > "$STATE/disable-auto-compact"
+  [ "$l" = 1 ] && : > "$STATE/auto-resume.log-only"
+  [ "$r" = 1 ] && : > "$STATE/disable-auto-resume"
+  [ "$a" = 1 ] && : > "$STATE/auto-handoff.armed"
+  live_screen -1 3 > "$SB/herdr/screen.txt"
+  before=$(state_list)
+  if [ "$want" = wait ]; then
+    bash "$BIN/session-resume-watch.sh" "$SID" </dev/null >/dev/null 2>&1 &
+    wpid=$!
+    wait_log auto-resume "then sending continue"
+    assert_contains "$row: the armed path detects" "$(LOG auto-resume)" "LIMIT detected pane=w1:p7 dry=$(( 1 - a ))"
+    assert_file "$row: and waits (limit-wait)" "$STATE/$SID.limit-wait"
+    cp "$FX/limit-after-output.txt" "$SB/herdr/screen.txt"
+    wait_exit "$wpid"
+    assert_not_contains "$row: no LOG-ONLY line" "$(LOG auto-resume)" "LOG-ONLY"
+  else
+    resume
+    assert_no_file "$row: no limit-wait" "$STATE/$SID.limit-wait"
+    assert_eq "$row: nothing under state/ written" "$(state_list)" "$before"
+    if [ "$want" = logonly ]; then
+      assert_contains "$row: LOG-ONLY detection logged" "$(LOG auto-resume)" "LOG-ONLY would send [continue] pane=w1:p7 kind=5-hour reset="
+      assert_eq "$row: one screen saved" "$(screens)" 1
+      assert_not_contains "$row: the armed path never ran" "$(LOG auto-resume)" "LIMIT detected"
+    else
+      assert_eq "$row: no log line at all" "$(LOG auto-resume)" ""
+      assert_eq "$row: no screen saved" "$(screens)" 0
+    fi
+  fi
+  assert_eq "$row: no send call" "$(sends)" ""
+  sandbox_rm
+done <<'TABLE'
+# c l r a want
+1 0 0 0 off
+1 0 0 1 off
+1 0 1 0 off
+1 0 1 1 off
+1 1 0 0 off
+1 1 0 1 off
+1 1 1 0 off
+1 1 1 1 off
+0 1 0 0 logonly
+0 1 0 1 logonly
+0 1 1 0 logonly
+0 1 1 1 logonly
+0 0 1 0 off
+0 0 1 1 off
+0 0 0 0 wait
+0 0 0 1 wait
+TABLE
+
+# An armed wait already running when the owner sets log-only never types.
+setup; record_sends
+live_screen -1 3 > "$SB/herdr/screen.txt"
+bash "$BIN/session-resume-watch.sh" "$SID" </dev/null >/dev/null 2>&1 &
+wpid=$!
+wait_log auto-resume "then sending continue"
+assert_file "an armed wait is running" "$STATE/$SID.limit-wait"
+: > "$STATE/auto-resume.log-only"
+wait_exit "$wpid"
+assert_contains "log-only set during an armed wait: it stops" "$(LOG auto-resume)" "ABORT log-only set during wait; no continue"
+assert_no_file "and its limit-wait goes" "$STATE/$SID.limit-wait"
+assert_eq "and no send call" "$(sends)" ""
+sandbox_rm
+
+echo "== log-only: what it logs and saves =="
+setup; record_sends
+: > "$STATE/auto-resume.log-only"; : > "$STATE/disable-auto-resume"
+live_screen -1 3 > "$SB/herdr/screen.txt"
+resume
+line=$(grep -F 'LOG-ONLY would send' "$AUTODEV_HOME/logs/auto-resume.log")
+assert_contains "the line carries the verdict fields" "$line" "human="
+assert_contains "and the time it would send" "$line" " until="
+assert_contains "and a UTC stamp" "$line" " at=20"
+f=$(find "$(screens_dir)" -type f)
+assert_contains "the screen file is <UTC stamp>-<sid>.txt" "${f##*/}" "Z-$SID.txt"
+assert_contains "the log names the saved file" "$(LOG auto-resume)" "LOG-ONLY screen-saved ${f##*/}"
+assert_eq "the saved screen is mode 600" "$(mode "$f")" 600
+assert_eq "its directory is mode 700" "$(mode "$(screens_dir)")" 700
+assert_eq "it is the screen the detector judged" "$(cat "$f")" "$(cat "$SB/herdr/screen.txt")"
+resume
+assert_eq "a second detection the same second gets its own file" "$(screens)" 2
+assert_eq "no send call" "$(sends)" ""
+sandbox_rm
+
+setup; record_sends
+: > "$STATE/auto-resume.log-only"
+cp "$FX/limit-scrollback.txt" "$SB/herdr/screen.txt"
+resume
+assert_contains "a scrollback banner: LOG-ONLY NO-DETECT with the reason" "$(LOG auto-resume)" "LOG-ONLY NO-DETECT pane=w1:p7 reason=not-newest"
+assert_not_contains "and no detection" "$(LOG auto-resume)" "LOG-ONLY would send"
+assert_eq "and no screen" "$(screens)" 0
+assert_eq "and no send call" "$(sends)" ""
+sandbox_rm
+
+setup; record_sends
+: > "$STATE/auto-resume.log-only"
+live_screen -1 3 > "$SB/herdr/screen.txt"
+printf 'someone-else\n' > "$SB/herdr/owner"
+printf '%s\n' someone-else > "$STATE/.paneowner-herdr-w1_p7"
+printf 'pct=1 ts=%s\n' "$(( $(date +%s) + 5 ))" > "$STATE/someone-else.ctx"
+resume
+assert_contains "a pane not proved ours: skipped" "$(LOG auto-resume)" "LOG-ONLY SKIP pane=w1:p7 not proved ours"
+assert_no_file "and its screen is never read" "$SB/herdr/reads"
+assert_eq "and no send call" "$(sends)" ""
+sandbox_rm
+
+# Another session takes the pane during the recheck wait. The first read shows
+# no banner; the second would show the new owner's live banner. Proved ours
+# before the second read (case 1) and before it is judged (case 2), or skipped.
+for n in 1 2; do
+  setup; record_sends
+  : > "$STATE/auto-resume.log-only"
+  printf 'plain output, no banner\n' > "$SB/herdr/screen.txt"
+  live_screen -1 3 > "$SB/herdr/from-read-2.txt"
+  printf 'pct=1 ts=%s\n' "$(( $(date +%s) + 5 ))" > "$STATE/someone-else.ctx"
+  printf '%s someone-else\n' "$n" > "$SB/herdr/owner-after-read"
+  resume
+  assert_contains "owner changes after read $n: skipped" "$(LOG auto-resume)" "LOG-ONLY SKIP pane=w1:p7 not proved ours (owner: someone-else)"
+  assert_not_contains "owner changes after read $n: no detection logged" "$(LOG auto-resume)" "LOG-ONLY would send"
+  assert_eq "owner changes after read $n: no screen file" "$(screens)" 0
+  assert_eq "owner changes after read $n: reads taken" "$(cat "$SB/herdr/reads")" "$n"
+  assert_eq "owner changes after read $n: no send call" "$(sends)" ""
+  sandbox_rm
+done
+
+echo "== log-only: a pane under a no-save prefix is counted, not saved =="
+for case_ in listed unknown-cwd unlisted; do
+  setup; record_sends
+  : > "$STATE/auto-resume.log-only"
+  live_screen -1 3 > "$SB/herdr/screen.txt"
+  printf '# local list\n\n  %s/work/held  \n' "$SB" > "$STATE/auto-resume.no-save"
+  case "$case_" in
+    listed)      printf '%s/work/held/sub' "$SB" > "$SB/herdr/cwd" ;;
+    unknown-cwd) rm -f "$SB/herdr/cwd" ;;
+    unlisted)    printf '%s/work/open' "$SB" > "$SB/herdr/cwd" ;;
+  esac
+  resume
+  assert_contains "$case_: the detection is counted" "$(LOG auto-resume)" "LOG-ONLY would send"
+  if [ "$case_" = unlisted ]; then
+    assert_eq "$case_: its screen is saved" "$(screens)" 1
+    assert_not_contains "$case_: not withheld" "$(LOG auto-resume)" "screen-withheld"
+  else
+    assert_contains "$case_: logged as withheld" "$(LOG auto-resume)" "LOG-ONLY screen-withheld pane=w1:p7"
+    assert_eq "$case_: no screen file written" "$(screens)" 0
+    assert_not_contains "$case_: the log names no cwd" "$(LOG auto-resume)" "$SB/work"
+  fi
+  assert_eq "$case_: no send call" "$(sends)" ""
+  sandbox_rm
+done
+
+echo "== log-only: each record carries the proof fields on its own line =="
+# The owner judges the 48-hour log-only run from these lines alone, so every
+# detection and every NO-DETECT with a reason names: seat=, cwd=, screen_sha256=,
+# banner=, verdict= and would_type=. Values are read back the way a shell would.
+field() { # $1 log line, $2 key: the value of key=, shell-unquoted; exit 1 if absent
+  python3 - "$1" "$2" <<'PY'
+import shlex, sys
+for tok in shlex.split(sys.argv[1]):
+    k, _, v = tok.partition("=")
+    if k == sys.argv[2]:
+        print(v)
+        sys.exit(0)
+sys.exit(1)
+PY
+}
+sha() { sha256sum | cut -d' ' -f1; }
+banner_row() { grep -F 'hit your' "$1" | sed 's/^[[:space:]]*//'; }
+# The text the armed path's send() types, read from the watcher itself, so
+# would_type= cannot drift from it.
+SEND_TEXT=$(sed -n 's/^send "\([^"]*\)"$/\1/p' "$SKILL_DIR/bin/session-resume-watch.sh")
+assert_eq "the armed path sends one fixed text" "$SEND_TEXT" continue
+
+setup; record_sends
+: > "$STATE/auto-resume.log-only"
+printf '%s/work/open dir' "$SB" > "$SB/herdr/cwd"
+live_screen -1 3 > "$SB/herdr/screen.txt"
+resume
+line=$(grep -F 'LOG-ONLY would send' "$AUTODEV_HOME/logs/auto-resume.log")
+f=$(find "$(screens_dir)" -type f)
+assert_eq "detection: seat= is the session" "$(field "$line" seat)" "$SID"
+assert_eq "detection: cwd= is the pane cwd" "$(field "$line" cwd)" "$SB/work/open dir"
+assert_eq "detection: screen_sha256= is the hash of the screen judged (the saved file)" \
+  "$(field "$line" screen_sha256)" "$(sha < "$f")"
+assert_eq "detection: banner= is the matched banner line" "$(field "$line" banner)" "$(banner_row "$SB/herdr/screen.txt")"
+assert_contains "detection: banner= is quoted" "$line" "banner='"
+assert_eq "detection: verdict=live" "$(field "$line" verdict)" live
+assert_eq "detection: would_type= is what send() would type" "$(field "$line" would_type)" "$SEND_TEXT"
+assert_contains "detection: would_type= is quoted" "$line" "would_type='$SEND_TEXT'"
+assert_eq "detection: still no send call" "$(sends)" ""
+sandbox_rm
+
+setup; record_sends
+: > "$STATE/auto-resume.log-only"
+printf '%s/work/open' "$SB" > "$SB/herdr/cwd"
+cp "$FX/limit-scrollback.txt" "$SB/herdr/screen.txt"
+resume
+line=$(grep -F 'LOG-ONLY NO-DETECT' "$AUTODEV_HOME/logs/auto-resume.log")
+assert_eq "NO-DETECT: seat=" "$(field "$line" seat)" "$SID"
+assert_eq "NO-DETECT: cwd=" "$(field "$line" cwd)" "$SB/work/open"
+assert_eq "NO-DETECT: screen_sha256= of the screen judged" \
+  "$(field "$line" screen_sha256)" "$(printf '%s\n' "$(cat "$SB/herdr/screen.txt")" | sha)"
+assert_eq "NO-DETECT: banner= is the banner line it saw" "$(field "$line" banner)" "$(banner_row "$SB/herdr/screen.txt")"
+assert_eq "NO-DETECT: verdict=history:<the detector's reason>" "$(field "$line" verdict)" "history:not-newest"
+field "$line" would_type >/dev/null
+assert_eq "NO-DETECT: would_type= is present" "$?" 0
+assert_eq "NO-DETECT: and empty: nothing would be typed" "$(field "$line" would_type)" ""
+sandbox_rm
+
+# Another session takes the pane just after a first read that detects: the
+# cwd read next is the new owner's, so nothing is logged or kept.
+setup; record_sends
+: > "$STATE/auto-resume.log-only"
+printf '%s/work/theirs' "$SB" > "$SB/herdr/cwd"
+live_screen -1 3 > "$SB/herdr/screen.txt"
+printf 'pct=1 ts=%s\n' "$(( $(date +%s) + 5 ))" > "$STATE/someone-else.ctx"
+printf '1 someone-else\n' > "$SB/herdr/owner-after-read"
+resume
+assert_contains "owner changes after a detecting read: skipped" "$(LOG auto-resume)" "LOG-ONLY SKIP pane=w1:p7 not proved ours (owner: someone-else)"
+assert_not_contains "owner changes after a detecting read: no detection logged" "$(LOG auto-resume)" "LOG-ONLY would send"
+assert_not_contains "owner changes after a detecting read: the new owner's cwd is not logged" "$(LOG auto-resume)" "$SB/work/theirs"
+assert_eq "owner changes after a detecting read: no screen file" "$(screens)" 0
+assert_eq "owner changes after a detecting read: no send call" "$(sends)" ""
+sandbox_rm
+
+# A withheld pane: no cwd, no banner text, but the hash all the same.
+setup; record_sends
+: > "$STATE/auto-resume.log-only"
+printf '%s/work/held\n' "$SB" > "$STATE/auto-resume.no-save"
+printf '%s/work/held/sub' "$SB" > "$SB/herdr/cwd"
+live_screen -1 3 > "$SB/herdr/screen.txt"
+resume
+line=$(grep -F 'LOG-ONLY would send' "$AUTODEV_HOME/logs/auto-resume.log")
+assert_eq "withheld: seat=" "$(field "$line" seat)" "$SID"
+assert_contains "withheld: cwd=withheld" "$line" " cwd=withheld "
+assert_contains "withheld: banner=withheld" "$line" " banner=withheld "
+assert_eq "withheld: screen_sha256= is still the screen's hash" \
+  "$(field "$line" screen_sha256)" "$(printf '%s\n' "$(cat "$SB/herdr/screen.txt")" | sha)"
+assert_eq "withheld: verdict=live" "$(field "$line" verdict)" live
+assert_not_contains "withheld: the log names no cwd" "$(LOG auto-resume)" "$SB/work"
+assert_not_contains "withheld: the log quotes no banner" "$(LOG auto-resume)" "hit your"
+sandbox_rm
+
+# A screen-save failure still hashes the screen.
+setup; record_sends
+: > "$STATE/auto-resume.log-only"
+live_screen -1 3 > "$SB/herdr/screen.txt"
+mkdir -p "$(dirname "$(screens_dir)")"; : > "$(screens_dir)"   # a file where the directory goes
+resume
+line=$(grep -F 'LOG-ONLY would send' "$AUTODEV_HOME/logs/auto-resume.log")
+assert_contains "save failed: logged" "$(LOG auto-resume)" "LOG-ONLY screen-save-failed"
+assert_eq "save failed: screen_sha256= is still the screen's hash" \
+  "$(field "$line" screen_sha256)" "$(printf '%s\n' "$(cat "$SB/herdr/screen.txt")" | sha)"
+sandbox_rm
+
+# A prose row quoting a banner, hostile to a shell and longer than 200 chars:
+# banner= reads back as the row (its first 200 characters), and evaluating the line runs nothing.
+setup; record_sends
+: > "$STATE/auto-resume.log-only"
+long="You've hit your usage limit \$(touch $SB/pwned) \`touch $SB/pwned\` ; touch $SB/pwned '\" $(printf 'x%.0s' $(seq 1 300))"
+{ printf '● %s\n\n' "$long"; sed -n '/^────/,$p' "$FX/limit-live.txt"; } > "$SB/herdr/screen.txt"
+resume
+line=$(grep -F 'LOG-ONLY NO-DETECT' "$AUTODEV_HOME/logs/auto-resume.log")
+b=$(field "$line" banner)
+assert_eq "hostile banner: read back as the row, cut to 200 chars" "$b" "$(python3 -c 'import sys; print(sys.argv[1][:200])' "● $long")"
+assert_eq "hostile banner: verdict=history:not-newest" "$(field "$line" verdict)" "history:not-newest"
+( eval "set -- ${line#*LOG-ONLY }" ) 2>/dev/null
+assert_no_file "hostile banner: evaluating the line runs nothing" "$SB/pwned"
+sandbox_rm
+
+echo "== StopFailure hook: the second judge =="
+sf() { printf '%s' "$1" | bash "$BIN/cc-stopfailure-hook.sh"; }
+setup
+sf "{\"session_id\":\"$SID\",\"hook_event_name\":\"StopFailure\",\"error\":\"rate_limit\"}"
+assert_eq "rate_limit: one STOPFAILURE line" \
+  "$(grep -cE "^STOPFAILURE $SID rate_limit [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$" "$AUTODEV_HOME/logs/auto-resume.log")" 1
+sf "{\"session_id\":\"$SID\",\"error\":\"billing_error\"}"
+assert_contains "billing_error: logged too" "$(LOG auto-resume)" "STOPFAILURE $SID billing_error "
+sf "{\"session_id\":\"$SID\",\"error\":\"server_error\"}"
+sf '{"session_id":"../x","error":"rate_limit"}'
+assert_eq "another error, or a bad session id: nothing" "$(wc -l < "$AUTODEV_HOME/logs/auto-resume.log")" 2
+: > "$STATE/disable-auto-compact"
+sf "{\"session_id\":\"$SID\",\"error\":\"rate_limit\"}"
+assert_eq "disable-auto-compact: nothing" "$(wc -l < "$AUTODEV_HOME/logs/auto-resume.log")" 2
+sandbox_rm
+
+echo "== auto-resume-report.py: the days of proof =="
+setup
+REP="$BIN/auto-resume-report.py"
+NOW=$(date -u -d '2026-11-22 12:00:00' +%s)
+lo() { # $1 sid, $2 UTC time, $3 what
+  printf '2026.11.22 00.00.00 [%s] LOG-ONLY %s at=%s\n' "$1" "$3" "$(date -u -d "$2" +%Y-%m-%dT%H:%M:%SZ)"
+}
+{
+  lo aaa '2026-11-22 10:00:00' 'would send [continue] pane=w1:p1 kind=5-hour'
+  lo aaa '2026-11-22 10:00:00' 'screen-saved x.txt'
+  printf 'STOPFAILURE aaa rate_limit 2026-11-22T09:57:00Z\n'
+  lo bbb '2026-11-21 08:00:00' 'would send [continue] pane=w1:p2 kind=5-hour'
+  lo bbb '2026-11-21 08:00:00' 'screen-withheld pane=w1:p2'
+  printf 'STOPFAILURE ccc rate_limit 2026-11-21T09:00:00Z\n'
+  printf 'STOPFAILURE bbb rate_limit 2026-11-21T07:50:00Z\n'
+  lo ddd '2026-11-10 08:00:00' 'would send [continue] pane=w1:p3 kind=5-hour'
+  lo ddd '2026-11-10 08:00:00' 'screen-saved y.txt'
+  printf '2026.11.22 00.00.00 [eee] LOG-ONLY NO-DETECT pane=w1:p4 reason=not-newest at=2026-11-22T11:00:00Z\n'
+} > "$AUTODEV_HOME/logs/auto-resume.log"
+out=$(python3 "$REP" --now "$NOW")
+assert_contains "default window is 7 days" "$out" "log-only report: 7 day(s)"
+assert_contains "detections in the window" "$out" "detections: 2"
+assert_contains "screens saved" "$out" "screens saved: 1"
+assert_contains "screens withheld" "$out" "screens withheld: 1"
+assert_contains "StopFailure events" "$out" "StopFailure events: 3"
+assert_contains "a detection 3 min after its StopFailure is matched; 10 min is not" "$out" "detections with no StopFailure within 5 min: 1"
+assert_contains "the unmatched detection is listed" "$out" "  2026-11-21T08:00:00Z bbb"
+assert_contains "StopFailure events no detection saw" "$out" "StopFailure events with no detection within 5 min: 2"
+out=$(AUTODEV_LOGONLY_DAYS=30 python3 "$REP" --now "$NOW")
+assert_contains "AUTODEV_LOGONLY_DAYS sets the window" "$out" "log-only report: 30 day(s)"
+assert_contains "and the older detection counts" "$out" "detections: 3"
+out=$(AUTODEV_LOGONLY_DAYS=30 python3 "$REP" --now "$NOW" --days 1)
+assert_contains "--days beats the env" "$out" "detections: 1"
+AUTODEV_LOGONLY_DAYS=0 python3 "$REP" --now "$NOW" >/dev/null 2>&1
+assert_eq "a days setting of 0 is refused" "$?" 1
+sum_before=$(md5sum < "$AUTODEV_HOME/logs/auto-resume.log")
+python3 "$REP" >/dev/null
+assert_eq "the report only reads" "$(md5sum < "$AUTODEV_HOME/logs/auto-resume.log")" "$sum_before"
+# A pair split by a window edge is matched both ways; only its in-window half is counted.
+{
+  lo fff '2026-11-21 11:58:00' 'would send [continue] pane=w1:p5 kind=5-hour'   # 2 min before the start
+  printf 'STOPFAILURE fff rate_limit 2026-11-21T12:01:00Z\n'                    # 1 min after it
+} > "$AUTODEV_HOME/logs/auto-resume.log"
+out=$(python3 "$REP" --now "$NOW" --days 1)
+assert_contains "window start: the StopFailure is counted" "$out" "StopFailure events: 1"
+assert_contains "window start: the detection is not" "$out" "detections: 0"
+assert_contains "window start: no unmatched detection" "$out" "detections with no StopFailure within 5 min: 0"
+assert_contains "window start: no unmatched StopFailure" "$out" "StopFailure events with no detection within 5 min: 0"
+{
+  printf 'STOPFAILURE ggg rate_limit 2026-11-22T11:59:00Z\n'                    # 1 min before the end
+  lo ggg '2026-11-22 12:02:00' 'would send [continue] pane=w1:p6 kind=5-hour'   # 2 min after it
+} > "$AUTODEV_HOME/logs/auto-resume.log"
+out=$(python3 "$REP" --now "$NOW" --days 1)
+assert_contains "window end: the StopFailure is counted" "$out" "StopFailure events: 1"
+assert_contains "window end: the detection is not" "$out" "detections: 0"
+assert_contains "window end: no unmatched detection" "$out" "detections with no StopFailure within 5 min: 0"
+assert_contains "window end: no unmatched StopFailure" "$out" "StopFailure events with no detection within 5 min: 0"
+
+echo "== auto-resume-report.py: one row per detection, paired true / false / missed =="
+SHA_H=$(printf 'h' | sha256sum | cut -d' ' -f1)
+SHA_J=$(printf 'j' | sha256sum | cut -d' ' -f1)
+proof() { # $1 sid, $2 sha, $3 cwd field, $4 banner field: the proof fields as the watcher writes them
+  printf "pane=w1:p1 kind=5-hour seat=%s cwd=%s screen_sha256=%s banner=%s verdict=live would_type='continue'" "$1" "$3" "$2" "$4"
+}
+{
+  lo hhh '2026-11-22 10:00:00' "would send [continue] $(proof hhh "$SHA_H" "'/work/a b'" "'⎿  You'\\''ve hit your 5-hour limit · resets 7:30am'")"
+  printf 'STOPFAILURE hhh rate_limit 2026-11-22T09:58:00Z\n'
+  lo iii '2026-11-22 11:00:00' "would send [continue] $(proof iii "$SHA_H" "'/work/c'" "'⎿  You'\\''ve hit your 5-hour limit · resets 9am'")"
+  lo jjj '2026-11-22 10:30:00' "would send [continue] $(proof jjj "$SHA_J" withheld withheld)"
+  lo jjj '2026-11-22 10:30:00' 'screen-withheld pane=w1:p1'
+  printf 'STOPFAILURE jjj rate_limit 2026-11-22T10:29:00Z\n'
+  printf 'STOPFAILURE jjj rate_limit 2026-11-22T06:00:00Z\n'
+  printf 'STOPFAILURE kkk billing_error 2026-11-22T08:00:00Z\n'
+  lo lll '2026-11-22 11:30:00' 'NO-DETECT pane=w1:p9 reason=not-newest seat=lll cwd=withheld screen_sha256=0 banner=withheld verdict=history:not-newest would_type='\'\'
+} > "$AUTODEV_HOME/logs/auto-resume.log"
+out=$(python3 "$REP" --now "$NOW" --days 1)
+row() { printf '%s\n' "$out" | grep -E "^  $1 " ; }
+# drow <time> <sid>: that detection-table row, runs of spaces squeezed to one.
+drow() { printf '%s\n' "$out" | sed -n '/^per detection/,$p' | grep -E "^  $1 +$2 " | tr -s ' '; }
+assert_eq "seat table: a detection with a StopFailure is true" "$(row hhh | tr -s ' ')" " hhh 1 0 0"
+assert_eq "seat table: a detection without one is false" "$(row iii | tr -s ' ')" " iii 0 1 0"
+assert_eq "seat table: a StopFailure no detection saw is missed" "$(row kkk | tr -s ' ')" " kkk 0 0 1"
+assert_eq "seat table: a withheld seat shows counts only" "$(row jjj | tr -s ' ')" " jjj 1 0 1 withheld: counts only"
+r=$(drow 2026-11-22T10:00:00Z hhh)
+assert_contains "detection row: pair true, with its StopFailure" "$r" " true 2026-11-22T09:58:00Z rate_limit "
+assert_contains "detection row: verdict" "$r" " live "
+assert_contains "detection row: would_type, quoted" "$r" " 'continue' "
+assert_contains "detection row: screen_sha256" "$r" " $SHA_H "
+assert_contains "detection row: cwd, quoted" "$r" " '/work/a b' "
+assert_contains "detection row: banner, quoted" "$r" "'⎿ You'\"'\"'ve hit your 5-hour limit · resets 7:30am'"
+r=$(drow 2026-11-22T11:00:00Z iii)
+assert_contains "detection row: pair false, no StopFailure" "$r" " false - "
+r=$(drow 2026-11-22T08:00:00Z kkk)
+assert_contains "missed row: the StopFailure no detection saw" "$r" " missed 2026-11-22T08:00:00Z billing_error "
+assert_eq "withheld seat: no detection or missed row" \
+  "$(printf '%s\n' "$out" | sed -n '/^per detection/,$p' | grep -cE '^  2026-[^ ]+ +jjj ')" 0
+assert_not_contains "withheld seat: its hash is not shown" "$out" "$SHA_J"
+assert_eq "a NO-DETECT is no detection row" "$(printf '%s\n' "$out" | grep -c ' lll ')" 0
 sandbox_rm
 
 finish

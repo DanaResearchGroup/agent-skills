@@ -50,16 +50,24 @@ Other modes:
   --composer-clear   exit 0 when the screen ends in an EMPTY composer box
   --describe         print "key=<Escape|Ctrl-C> screen=<one line>": what the
                      bottom of the screen shows and the key that would clear it
+  --evidence         after the one line above, a second line for the log-only
+                     proof: "verdict=live" or "verdict=history:<reason>" (this
+                     run's own result), then "banner=<row>", the banner row it
+                     matched (else the newest row naming a limit, else empty),
+                     shell-quoted, control characters blanked, at most
+                     BANNER_MAX characters. Same exit code; judges nothing anew.
 """
 
 import argparse
 import datetime as dt
 import re
+import shlex
 import sys
 import time
 
 MAX_STATUS = 6        # non-empty status rows allowed under the composer box
 MAX_COMPOSER = 12     # prompt rows allowed inside the composer box
+BANNER_MAX = 200      # characters of the banner row --evidence prints
 
 RULE = re.compile(r"^\s*─{3,}[─\s]*$")
 PROMPT = re.compile(r"^\s*❯(\s|$)")
@@ -240,12 +248,24 @@ def describe(lines):
     return "key=%s screen=%s" % (key, shown)
 
 
+def evidence(lines, m, result):
+    """The --evidence line: this run's result, and the banner row it judged."""
+    if m is not None:
+        row = m.string
+    else:
+        row = next((s for s in reversed(lines) if ANY_BANNER.search(s)), "")
+    row = re.sub(r"[\x00-\x1f\x7f]", " ", row.strip())[:BANNER_MAX]
+    verdict = "live" if result is None else "history:%s" % result
+    return "verdict=%s banner=%s" % (verdict, shlex.quote(row))
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--now", type=float)
     ap.add_argument("--live-only", action="store_true")
     ap.add_argument("--composer-clear", action="store_true")
     ap.add_argument("--describe", action="store_true")
+    ap.add_argument("--evidence", action="store_true")
     a = ap.parse_args(argv)
     now = a.now if a.now is not None else time.time()
     lines = rows(sys.stdin.read())
@@ -261,6 +281,8 @@ def main(argv=None):
     if m is None:
         reason = rest if any(ANY_BANNER.search(s) for s in lines) else "no-banner"
         print("none reason=%s" % reason)
+        if a.evidence:
+            print(evidence(lines, None, reason))
         return 1
     if a.live_only:
         print("live")
@@ -268,9 +290,13 @@ def main(argv=None):
     r, human = reset_epoch(m["when"], rest, now)
     if r is None:
         print("none reason=%s" % human)
+        if a.evidence:
+            print(evidence(lines, m, human))
         return 1
     kind = re.sub(r"\s+", "-", m["kind"].strip()) or "usage"
     print("reset=%d human=%s kind=%s" % (r, human, kind))
+    if a.evidence:
+        print(evidence(lines, m, None))
     return 0
 
 
