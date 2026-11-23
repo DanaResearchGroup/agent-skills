@@ -20,6 +20,8 @@
 # Conservative + reversible, same doctrine as the handoff watcher:
 #   - Global kill switch:      ~/agents/state/disable-auto-compact   (present => whole system off)
 #   - Phoenix-only kill switch: ~/agents/state/disable-auto-resume    (present => this off)
+#   - Log-only:                ~/agents/state/auto-resume.log-only    (present => detect and log,
+#                              type nothing; beats disable-auto-resume and armed)
 #   - Arming:                  ~/agents/state/auto-handoff.armed      (absent  => dry-run, log only)
 #   - Per-session pane:        ~/agents/state/<sid>.{herdr,tmux}-pane (required to act)
 #   - Per-session lock:        only one resume waiter per session at a time.
@@ -53,8 +55,130 @@ POLL=3
 
 log(){ printf '%s [%s] %s\n' "$(date +'%Y.%m.%d %H.%M.%S')" "$sid" "$*" >> "$LOG"; }
 
+# --- log-only mode (I-571): run the detector on the real pane, type nothing ---
+# The owner turns the watcher back on only once its detections are proven true.
+# This mode is the instrument: per detection it logs one LOG-ONLY line with the
+# verdict and saves the screen it judged (mode 600, directory 700) to
+# $LOGDIR/auto-resume-screens/<UTC stamp>-<sid>.txt. It never reaches send(),
+# any mux send/key function, the resume lock or <sid>.limit-wait, and it writes
+# nothing under $STATE. A pane whose cwd starts with a prefix listed in
+# $STATE/auto-resume.no-save (one per line, local only) is counted, not saved.
+# bin/auto-resume-report.py summarises the log over AUTODEV_LOGONLY_DAYS.
+logonly_log(){ log "$* at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"; }
+# 0 = withhold this pane's screen. $1 is the pane's cwd list (mux_pane_cwd).
+# An unreadable list, or a list with a pane whose cwd cannot be read, withholds
+# too: no proof the pane is not listed.
+logonly_withheld(){
+  local list="$STATE/auto-resume.no-save" cwds="$1" p c
+  [ -e "$list" ] || return 1
+  [ -r "$list" ] || return 0
+  [ -n "$cwds" ] || return 0
+  while IFS= read -r p || [ -n "$p" ]; do
+    p=${p%$'\r'}
+    p="${p#"${p%%[![:space:]]*}"}"; p="${p%"${p##*[![:space:]]}"}"
+    # shellcheck disable=SC2088  # a literal leading ~ in the list, expanded here
+    case "$p" in ''|'#'*) continue ;; "~"|"~/"*) p="$HOME${p#\~}" ;; esac
+    while IFS= read -r c; do
+      case "$c" in "$p"*) return 0 ;; esac
+    done <<< "$cwds"
+  done < "$list"
+  return 1
+}
+# $1 single-quoted, so a shell (or shlex) reads the field back as $1 exactly.
+logonly_quote(){ local s=$1 q="'\\''"; printf "'%s'" "${s//\'/$q}"; }
+# Save $1 (the screen judged) under a fresh name; print that name.
+logonly_save(){
+  local dir="$LOGDIR/auto-resume-screens" f
+  [ -L "$dir" ] && return 1
+  ( umask 077; mkdir -p "$dir" ) 2>/dev/null && chmod 700 "$dir" 2>/dev/null || return 1
+  f="$dir/$(date -u +%Y%m%dT%H%M%SZ)-$sid.txt"
+  [ -e "$f" ] || [ -L "$f" ] && f="${f%.txt}-$$.txt"
+  ( umask 077; set -C; printf '%s\n' "$1" > "$f" ) 2>/dev/null || return 1
+  chmod 600 "$f" 2>/dev/null || return 1
+  printf '%s\n' "${f##*/}"
+}
+# Go on only for a pane proved ours (herdr: positively; tmux: no other owner),
+# so the instrument never reads or keeps another seat's screen. Else log a skip
+# ($1 says what was not done) and exit. Read-only: no flag is set.
+logonly_owned(){
+  local owner
+  owner=$(mux_pane_owner)
+  if [ "$owner" != "$sid" ] && { [ "$MUX" = herdr ] || [ -n "$owner" ]; }; then
+    logonly_log "LOG-ONLY SKIP pane=$pane not proved ours (owner: ${owner:-unproved}); $1"
+    exit 0
+  fi
+}
+logonly_run(){ # never returns
+  local screen v ev rc kv reset="" human="" kind="" tgt f what would="" cwds cwd held=1
+  local verdict="unknown" banner="''" sha
+  command -v mux_init >/dev/null 2>&1 || exit 0
+  mux_init "$sid" || exit 0
+  pane="$PANE"
+  mux_pane_live || exit 0
+  logonly_owned "screen not read"
+  # The same two checks as the armed path, each on one held screen, so the
+  # file saved is exactly the screen the detector judged. Another session can
+  # take the pane during the recheck wait, so the second read is proved ours
+  # both before it is taken and before it is judged.
+  screen=""; mux_read_screen 200 screen
+  v=$(printf '%s\n' "$screen" | python3 "$BANNER" --evidence); rc=$?
+  if [ "$rc" != 0 ]; then
+    sleep "$DETECT_RECHECK"
+    logonly_owned "screen not read"
+    screen=""; mux_read_screen 200 screen
+    logonly_owned "screen not kept"
+    v=$(printf '%s\n' "$screen" | python3 "$BANNER" --evidence); rc=$?
+  fi
+  # limit-banner.py --evidence: line 1 is the verdict the armed path reads,
+  # line 2 "verdict=live|history:<reason> banner=<quoted row>", taken as given.
+  ev=""; case "$v" in *$'\n'*) ev=${v#*$'\n'}; v=${v%%$'\n'*} ;; esac
+  case "$ev" in "verdict="*" banner="*)
+    verdict=${ev%% banner=*}; verdict=${verdict#verdict=}; banner=${ev#* banner=} ;;
+  esac
+  if [ "$rc" != 0 ]; then
+    case "$v" in *reason=no-banner*|'') exit 0 ;; esac
+    what="NO-DETECT pane=$pane ${v#none }"
+  else
+    for kv in $v; do
+      case "$kv" in reset=*) reset=${kv#reset=} ;; human=*) human=${kv#human=} ;; kind=*) kind=${kv#kind=} ;; esac
+    done
+    # what send() would type: the armed path types nothing without a reset
+    # epoch; test-limit-resume.sh pins this text to its send line.
+    case "$reset" in ''|*[!0-9]*) tgt="" ;; *) tgt=$(( reset + BUFFER_MIN*60 )); would="continue" ;; esac
+    what="would send [$would] pane=$pane kind=$kind reset=$reset human=$human until=$tgt wait=$(( ${tgt:-0} - $(date +%s) ))s"
+  fi
+  # The proof fields: the owner judges the run from these lines alone. A
+  # withheld pane keeps its hash but names neither its cwd nor its banner.
+  cwds=$(mux_pane_cwd 2>/dev/null)
+  # The screen and the cwd were both read while the pane was ours, or neither
+  # is logged or kept: another session can take it after a read that detects.
+  logonly_owned "screen not kept"
+  logonly_withheld "$cwds" && held=0
+  sha=$(printf '%s\n' "$screen" | sha256sum 2>/dev/null); sha=${sha%% *}
+  if [ "$held" = 0 ]; then
+    cwd=withheld; banner=withheld
+  else
+    cwd=${cwds%%$'\n'*}
+    if [ -n "$cwd" ]; then cwd=$(logonly_quote "$cwd"); else cwd=unknown; fi
+  fi
+  logonly_log "LOG-ONLY $what seat=$sid cwd=$cwd screen_sha256=${sha:-unknown} banner=$banner verdict=$verdict would_type=$(logonly_quote "$would")"
+  [ "$rc" = 0 ] || exit 0
+  if [ "$held" = 0 ]; then
+    logonly_log "LOG-ONLY screen-withheld pane=$pane"
+  elif f=$(logonly_save "$screen"); then
+    logonly_log "LOG-ONLY screen-saved $f"
+  else
+    logonly_log "LOG-ONLY screen-save-failed pane=$pane"
+  fi
+  exit 0
+}
+
 # --- kill switches ---
+# Precedence (I-571): disable-auto-compact => nothing at all. auto-resume.log-only
+# => detect and log only, whatever the other switches say. Otherwise
+# disable-auto-resume => exit before detection.
 [ -f "$STATE/disable-auto-compact" ] && exit 0
+[ -f "$STATE/auto-resume.log-only" ] && logonly_run
 [ -f "$STATE/disable-auto-resume" ] && exit 0
 
 # --- arm state: absent => dry-run ---
@@ -172,6 +296,7 @@ log "waiting ${wait_s}s (until $(date -d "@$tgt" +'%Y.%m.%d %H.%M.%S' 2>/dev/nul
 while [ "$(date +%s)" -lt "$tgt" ]; do
   pane_live || { log "ABORT pane gone during wait"; exit 0; }
   { [ -f "$STATE/disable-auto-compact" ] || [ -f "$STATE/disable-auto-resume" ]; } && { log "ABORT disabled during wait"; exit 0; }
+  [ -f "$STATE/auto-resume.log-only" ] && { log "ABORT log-only set during wait; no continue"; exit 0; }
   if [ -f "$STATE/$sid.idle" ]; then
     iv=$(cat "$STATE/$sid.idle" 2>/dev/null || echo 0)
     [ "${iv:-0}" -gt "$start" ] 2>/dev/null && { log "ABORT a turn completed during wait"; exit 0; }
@@ -185,6 +310,8 @@ done
 pane_live || { log "ABORT pane gone at reset"; exit 0; }
 live || { log "ABORT banner gone from the live area at reset; no continue"; exit 0; }
 if [ "$DRY" = 0 ] && ! wait_pane_idle 30; then log "ABORT pane busy at reset; no continue"; exit 0; fi
+# Log-only, set at any time before this line, means nothing is ever typed.
+[ -f "$STATE/auto-resume.log-only" ] && { log "ABORT log-only set at reset; no continue"; exit 0; }
 send "continue"
 log "CYCLE COMPLETE via wait-for-reset (dry=$DRY)"
 exit 0

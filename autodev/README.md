@@ -132,6 +132,8 @@ larger theoretical maximum.
 | `auto-handoff.armed` | **Arm** — real `send-keys`. Absent ⇒ **dry-run** (logs only). Default: dry-run. |
 | `disable-auto-compact` | Global kill switch (beats armed). Badge ⇒ ⛔. |
 | `disable-auto-resume` | Phoenix only off. |
+| `auto-resume.log-only` | Phoenix **log-only**: detect on the real pane, log `LOG-ONLY` lines and save each judged screen (mode 600) to `logs/auto-resume-screens/`; type nothing. Beats `disable-auto-resume` and `auto-handoff.armed`; `disable-auto-compact` still beats it. |
+| `auto-resume.no-save` | Optional, local only: one path prefix per line. A log-only detection on a pane whose cwd starts with one is counted (`LOG-ONLY screen-withheld`), its screen not saved. |
 | `pm-nudge.armed` / `disable-pm-nudge` | PM-nudger arm / kill switch — see [PM-nudger](#pm-nudger-nudge-a-pm-whose-fleet-has-finished). Independent of the files above. |
 | `disable-cache-badge` | Cache-warmth badge off. Honoured at the next poll (≤ `CC_CACHE_NAP_MAX`), and it strips any badge already on a tab on its way out. |
 
@@ -139,6 +141,23 @@ Claude Code status-line badge: 🟡 DRY-RUN · 🔴 ARMED · ⛔ OFF · ⏳ AUTO
 Codex keeps its native status line; inspect the state files or log instead. Phoenix remains a
 Claude Code-only feature; Codex support in this harness covers handoff/compact/reload.
 Logs: `$AUTODEV_HOME/logs/{auto-handoff,auto-resume}.log`.
+
+A limit stop fires Claude Code's `StopFailure` hook, not `Stop` (the turn loop returns on the API
+error before the Stop hooks), so `cc-stop-hook.sh` does not launch Phoenix on the limit stop
+itself. `cc-stopfailure-hook.sh` logs `STOPFAILURE <sid> <error> <UTC>` to `auto-resume.log` for
+`rate_limit` and `billing_error`. `bin/auto-resume-report.py` summarises log-only mode over the
+days of proof (`--days`, else `AUTODEV_LOGONLY_DAYS`, default 7): detections, screens saved and
+withheld, StopFailure events, and the detections with no StopFailure within 5 minutes.
+
+Each log-only detection (`LOG-ONLY would send`) and each `LOG-ONLY NO-DETECT` with a reason
+carries, on its one line: `seat=<sid>`, `cwd=<pane cwd>` (`withheld` under a no-save prefix),
+`screen_sha256=` of the exact screen judged (also when withheld or not saved),
+`banner=<the banner row>` (shell-quoted, at most 200 characters; `withheld` when withheld),
+`verdict=live` or `verdict=history:<reason>` (from `limit-banner.py --evidence`), and
+`would_type=` (what `send()` would type, quoted; empty on a NO-DETECT). The report then prints a
+per-seat table (true: a StopFailure for that session within 5 minutes; false: none; missed: a
+StopFailure no detection saw) and one row per detection with those fields. A seat with any
+withheld record shows its counts only.
 
 ## Tunables (top of the engine scripts)
 

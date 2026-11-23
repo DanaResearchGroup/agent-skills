@@ -174,6 +174,15 @@ assert_eq "a string-valued PreToolUse is left untouched" "$(cmp -s "$SB/settings
 assert_eq "and install exits non-zero rather than clobbering it" "$([ "$rc" -ne 0 ] && echo nonzero || echo zero)" nonzero
 sandbox_rm
 
+# The StopFailure hook (I-571): registered once, for the two limit errors only.
+setup_install
+run_install; run_install
+assert_eq "StopFailure hook registered once across two installs" \
+  "$(jq --arg c "$BIN/cc-stopfailure-hook.sh" '[.hooks.StopFailure[]?.hooks[]? | select(.command==$c)] | length' "$SB/settings.json")" 1
+assert_eq "its matcher is the limit errors" \
+  "$(jq -r '.hooks.StopFailure[0].matcher' "$SB/settings.json")" "rate_limit|billing_error"
+sandbox_rm
+
 # Re-install is a fixed point.
 setup_install
 printf '{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"/a.sh"}]}]}}\n' > "$SB/settings.json"
