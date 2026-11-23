@@ -15,12 +15,25 @@ events no detection saw). Per detection: its UTC time, seat, pair (true/false,
 and missed rows for the unseen StopFailure events), the StopFailure it pairs
 with, and the proof fields its LOG-ONLY line carries (verdict, would_type,
 screen_sha256, cwd, banner), shell-quoted. A seat with any withheld record
-(cwd=withheld, banner=withheld or screen-withheld) shows in the seat table only.
+(cwd=withheld, banner=withheld or screen-withheld) shows in the seat table only:
+the two unmatched lists count its events but print no line for them.
+
+Since the StopFailure hook launches the watcher (I-575) it also prints: true
+stops detected (the window's StopFailure events with a detection within 5
+minutes, out of all of them); the first day a watcher was launched from
+StopFailure (the first STOPFAILURE-LAUNCH line in the whole log), from which
+the days of proof count; and the first real stop: the first detection in the
+whole log that a STOPFAILURE-LAUNCH for its session started (at most 5 minutes
+before it) and whose screen_sha256 differs from the hash of every fixture
+screen in --fixtures (default: this skill's test/fixtures/panes). When either
+of these belongs to a withheld seat, its line keeps the day or says "yes", and
+prints no time, seat or hash.
 
 N is the days of proof: --days, else AUTODEV_LOGONLY_DAYS, else 7.
 
-Usage: auto-resume-report.py [--days N] [--log PATH] [--now EPOCH]
+Usage: auto-resume-report.py [--days N] [--log PATH] [--now EPOCH] [--fixtures DIR]
 """
+import hashlib
 import argparse
 import datetime as dt
 import os
@@ -33,6 +46,8 @@ LOGONLY = re.compile(r"^\S+ \S+ \[(?P<sid>[^\]]+)\] LOG-ONLY (?P<what>\S+)(?P<re
 AT = re.compile(r" at=(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)$")
 PROOF = ("seat", "cwd", "screen_sha256", "banner", "verdict", "would_type")
 STOPFAIL = re.compile(r"^STOPFAILURE (\S+) (\S+) (\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)$")
+LAUNCH = re.compile(r"^STOPFAILURE-LAUNCH (\S+) (\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)$")
+FIXTURES = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "test", "fixtures", "panes")
 
 
 def epoch(iso):
@@ -70,6 +85,25 @@ def table(rows):
             for r in rows]
 
 
+def fixture_hashes(d):
+    """sha256 of each fixture screen, raw and as the watcher hashes a read of it
+    (trailing newlines cut, one added back). None when there is no fixture."""
+    out = set()
+    try:
+        names = sorted(os.listdir(d))
+    except OSError:
+        return None
+    for n in names:
+        try:
+            with open(os.path.join(d, n), "rb") as fh:
+                b = fh.read()
+        except OSError:
+            continue
+        out.add(hashlib.sha256(b).hexdigest())
+        out.add(hashlib.sha256(b.rstrip(b"\n") + b"\n").hexdigest())
+    return out or None
+
+
 def days_setting(arg):
     raw = arg if arg is not None else os.environ.get("AUTODEV_LOGONLY_DAYS", "7")
     if not re.fullmatch(r"[1-9][0-9]*", str(raw)):
@@ -82,6 +116,7 @@ def main():
     ap.add_argument("--days")
     ap.add_argument("--log")
     ap.add_argument("--now", type=int)
+    ap.add_argument("--fixtures", default=FIXTURES)
     a = ap.parse_args()
     days = days_setting(a.days)
     home = os.environ.get("AUTODEV_HOME") or os.path.expanduser("~/agents")
@@ -90,6 +125,7 @@ def main():
     since = now - days * 86400
 
     detections, saved, withheld, failures, held_seats = [], 0, 0, [], set()
+    launches, every_det = [], []
     lo, hi = since - MATCH_S, now + MATCH_S
     try:
         with open(path, encoding="utf-8", errors="replace") as fh:
@@ -100,6 +136,10 @@ def main():
         m = STOPFAIL.match(line)
         if m:
             failures.append((m.group(1), m.group(2), epoch(m.group(3))))
+            continue
+        m = LAUNCH.match(line)
+        if m:
+            launches.append((m.group(1), epoch(m.group(2))))
             continue
         m = LOGONLY.match(line)
         if not m:
@@ -113,6 +153,8 @@ def main():
         proof = proof_fields(rest)
         if what == "screen-withheld" or "withheld" in (proof.get("cwd"), proof.get("banner")):
             held_seats.add(sid)
+        if what == "would":
+            every_det.append((sid, t, proof))
         if what == "would" and lo <= t <= hi:
             detections.append((sid, t, rest.split(" seat=")[0], proof))
         if not since <= t <= now:
@@ -144,11 +186,42 @@ def main():
     print(f"screens withheld: {withheld}")
     print(f"StopFailure events: {len(window_fail)}")
     print(f"detections with no StopFailure within 5 min: {len(lone_det)}")
+    # A withheld seat is counted in both totals but has no per-event line.
     for sid, t, rest, _ in lone_det:
-        print(f"  {utc(t)} {sid} {rest}")
+        if sid not in held_seats:
+            print(f"  {utc(t)} {sid} {rest}")
     print(f"StopFailure events with no detection within 5 min: {len(lone_fail)}")
     for sid, err, t in lone_fail:
-        print(f"  {utc(t)} {sid} {err}")
+        if sid not in held_seats:
+            print(f"  {utc(t)} {sid} {err}")
+    print(f"true stops detected: {len(window_fail) - len(lone_fail)} of {len(window_fail)}"
+          " (StopFailure events with a detection within 5 min)")
+    first_launch = min(launches, key=lambda r: r[1], default=None)
+    if first_launch is None:
+        print("StopFailure launch live since: never (no STOPFAILURE-LAUNCH in the log)")
+    else:
+        sid, t = first_launch
+        # A withheld seat's launch gives the day only: no time, no sid.
+        which = "from a withheld seat" if sid in held_seats else utc(t)
+        print(f"StopFailure launch live since: {utc(t)[:10]} (first STOPFAILURE-LAUNCH {which};"
+              " proof days count from then)")
+    fx = fixture_hashes(a.fixtures)
+
+    def launched(sid, t):
+        return any(s == sid and 0 <= t - lt <= MATCH_S for s, lt in launches)
+    if fx is None:
+        print(f"first real stop: unknown (no fixture screens in {a.fixtures})")
+    else:
+        real = [(t, sid, p) for sid, t, p in every_det
+                if launched(sid, t) and p.get("screen_sha256") and p["screen_sha256"] not in fx]
+        if not real:
+            print("first real stop: none yet")
+        else:
+            t, sid, p = min(real, key=lambda r: r[0])
+            if sid in held_seats:  # caught, but no time, sid or hash
+                print("first real stop: yes (withheld seat; counts only)")
+            else:
+                print(f"first real stop: {utc(t)} {sid} screen_sha256={p['screen_sha256']}")
 
     seats = {}
     rows = []

@@ -104,6 +104,8 @@ case "${1:-} ${2:-}" in
       printf '{"result":{"pane":{"pane_id":"%s","agent_status":"%s","agent_session":{"value":"%s"},"cwd":"%s","scroll":{"offset_from_bottom":0}}}}\n' \
         "$3" "$(cat "$H/status")" "$(cat "$H/owner" 2>/dev/null)" "$(cat "$H/cwd" 2>/dev/null)" ;;
   "pane read")
+      # hold-read: the read waits while it exists, so a watcher stays running.
+      while [ -f "$H/hold-read" ]; do sleep 0.1; done
       n=$(( $(cat "$H/reads" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$H/reads"
       if [ -f "$H/from-read-2.txt" ] && [ "$n" -ge 2 ]; then cat "$H/from-read-2.txt"; else cat "$H/screen.txt"; fi
       # owner-after-read: "<n> <sid>" — another session takes the pane once read n is served.
@@ -788,7 +790,8 @@ assert_no_file "hostile banner: evaluating the line runs nothing" "$SB/pwned"
 sandbox_rm
 
 echo "== StopFailure hook: the second judge =="
-sf() { printf '%s' "$1" | bash "$BIN/cc-stopfailure-hook.sh"; }
+# The launch is tested in its own section below: here the hook only logs.
+sf() { printf '%s' "$1" | AUTODEV_NO_WATCHERS=1 bash "$BIN/cc-stopfailure-hook.sh"; }
 setup
 sf "{\"session_id\":\"$SID\",\"hook_event_name\":\"StopFailure\",\"error\":\"rate_limit\"}"
 assert_eq "rate_limit: one STOPFAILURE line" \
@@ -802,6 +805,138 @@ assert_eq "another error, or a bad session id: nothing" "$(wc -l < "$AUTODEV_HOM
 sf "{\"session_id\":\"$SID\",\"error\":\"rate_limit\"}"
 assert_eq "disable-auto-compact: nothing" "$(wc -l < "$AUTODEV_HOME/logs/auto-resume.log")" 2
 sandbox_rm
+
+echo "== StopFailure launches the watcher (I-575) =="
+# A limit stop fires StopFailure, never Stop, so this hook is what puts the
+# watcher on a live banner. Its own session id: the checks count watcher
+# processes by command line.
+SID_A=$SID
+SID=57557557-5755-5755-5755-$(printf '%012d' "$$")
+sfh() { # $1 error (default rate_limit): the hook, as Claude Code runs it
+  printf '{"session_id":"%s","transcript_path":"/x/%s.jsonl","hook_event_name":"StopFailure","error":"%s","last_assistant_message":"API Error"}' \
+    "$SID" "$SID" "${1:-rate_limit}" | bash "$BIN/cc-stopfailure-hook.sh"
+}
+# One watcher per session id: its $(...) subshells carry its command line too.
+watchers() {
+  local p; p=$(pgrep -f "session-resume-watch\\.sh $SID\$" | tr '\n' ',')
+  if [ -n "$p" ]; then ps -o sid= -p "${p%,}" | sort -u | wc -l; else echo 0; fi
+}
+wait_watchers() { # $1 count, $2 label: bounded; the watchers this test started reach it
+  local end=$(( $(date +%s) + 30 ))
+  until [ "$(watchers)" = "$1" ] || [ "$(date +%s)" -ge "$end" ]; do sleep 0.1; done
+  assert_eq "$2" "$(watchers)" "$1"
+}
+lines() { grep -c -- "$1" "$AUTODEV_HOME/logs/auto-resume.log" 2>/dev/null; }
+sent_calls() { wc -l < "$SB/sent.log"; }
+
+# First use, with the switches as the owner runs the proof: log-only on, the
+# watcher off, armed. One live banner: one detection with every proof field,
+# verdict=live, nothing typed, and the report pairs it true.
+setup; record_sends
+: > "$STATE/auto-resume.log-only"; : > "$STATE/disable-auto-resume"
+printf '%s/work/live' "$SB" > "$SB/herdr/cwd"
+live_screen -1 3 > "$SB/herdr/screen.txt"
+sfh
+wait_log auto-resume "LOG-ONLY would send"
+wait_watchers 0 "first use: the launched watcher has ended"
+assert_eq "first use: one STOPFAILURE line" "$(lines "^STOPFAILURE $SID rate_limit ")" 1
+assert_eq "first use: one STOPFAILURE-LAUNCH line" "$(lines "^STOPFAILURE-LAUNCH $SID ")" 1
+assert_eq "first use: one detection" "$(lines 'LOG-ONLY would send')" 1
+line=$(grep -F 'LOG-ONLY would send' "$AUTODEV_HOME/logs/auto-resume.log")
+f=$(find "$(screens_dir)" -type f)
+assert_eq "first use: seat=" "$(field "$line" seat)" "$SID"
+assert_eq "first use: cwd=" "$(field "$line" cwd)" "$SB/work/live"
+assert_eq "first use: screen_sha256= of the saved screen" "$(field "$line" screen_sha256)" "$(sha < "$f")"
+assert_eq "first use: banner=" "$(field "$line" banner)" "$(banner_row "$SB/herdr/screen.txt")"
+assert_eq "first use: verdict=live" "$(field "$line" verdict)" live
+assert_eq "first use: would_type=" "$(field "$line" would_type)" "$SEND_TEXT"
+assert_eq "first use: the mux send mock was called 0 times" "$(sent_calls)" 0
+assert_eq "first use: nothing typed, nothing sent" "$(sends)" ""
+assert_no_file "first use: no limit-wait" "$STATE/$SID.limit-wait"
+assert_lock_absent "first use: no resume lock" "$STATE/$SID.resume.lock"
+out=$(python3 "$BIN/auto-resume-report.py" --now "$(( $(date +%s) + 1 ))" --days 1 --fixtures "$FX")
+assert_contains "first use: the report row is true" \
+  "$(printf '%s\n' "$out" | sed -n '/^per detection/,$p' | grep -F " $SID " | tr -s ' ')" " $SID true "
+assert_contains "first use: true stops detected 1 of 1" "$out" "true stops detected: 1 of 1 "
+assert_contains "first use: B is live from today" "$out" "StopFailure launch live since: $(date -u +%Y-%m-%d) "
+assert_contains "first use: a screen no fixture has is the first real stop" "$out" " $SID screen_sha256=$(sha < "$f")"
+sandbox_rm
+
+# History only: the banner sits in the scrollback. verdict=history:<reason>, no detection.
+setup; record_sends
+: > "$STATE/auto-resume.log-only"; : > "$STATE/disable-auto-resume"
+cp "$FX/limit-scrollback.txt" "$SB/herdr/screen.txt"
+sfh
+wait_log auto-resume "LOG-ONLY NO-DETECT"
+wait_watchers 0 "history: the launched watcher has ended"
+line=$(grep -F 'LOG-ONLY NO-DETECT' "$AUTODEV_HOME/logs/auto-resume.log")
+assert_eq "history: verdict=history:not-newest" "$(field "$line" verdict)" "history:not-newest"
+assert_eq "history: no detection" "$(lines 'LOG-ONLY would send')" 0
+assert_eq "history: the mux send mock was called 0 times" "$(sent_calls)" 0
+assert_eq "history: nothing typed, nothing sent" "$(sends)" ""
+out=$(python3 "$BIN/auto-resume-report.py" --now "$(( $(date +%s) + 1 ))" --days 1 --fixtures "$FX")
+assert_contains "history: true stops detected 0 of 1" "$out" "true stops detected: 0 of 1 "
+assert_contains "history: the stop is missed" "$(printf '%s\n' "$out" | grep -E "^  $SID " | tr -s ' ')" " 0 0 1"
+assert_contains "history: no real stop" "$out" "first real stop: none yet"
+sandbox_rm
+
+# The switches, read by the hook as the watcher reads them.
+setup; record_sends
+: > "$STATE/disable-auto-compact"; : > "$STATE/auto-resume.log-only"
+live_screen -1 3 > "$SB/herdr/screen.txt"
+sfh; sleep 1
+assert_eq "disable-auto-compact: no log line at all" "$(LOG auto-resume)" ""
+assert_eq "disable-auto-compact: no watcher" "$(watchers)" 0
+rm -f "$STATE/disable-auto-compact" "$STATE/auto-resume.log-only"; : > "$STATE/disable-auto-resume"
+sfh; sleep 1
+assert_eq "disable-auto-resume, no log-only: the STOPFAILURE line" "$(lines "^STOPFAILURE $SID ")" 1
+assert_eq "disable-auto-resume, no log-only: no launch" "$(lines '^STOPFAILURE-')" 0
+assert_eq "disable-auto-resume, no log-only: no watcher ran" "$(lines "\\[$SID\\]")" 0
+rm -f "$STATE/disable-auto-resume"; : > "$STATE/auto-resume.log-only"
+sfh server_error; sleep 1
+assert_eq "another error: no launch" "$(lines '^STOPFAILURE-')" 0
+sfh billing_error
+wait_log auto-resume "LOG-ONLY would send"
+wait_watchers 0 "billing_error: the launched watcher has ended"
+assert_eq "billing_error: launched" "$(lines "^STOPFAILURE-LAUNCH $SID ")" 1
+assert_eq "all switches: nothing sent" "$(sends)" ""
+sandbox_rm
+
+# No double watcher. A StopFailure-launched watcher holds the lock it was
+# started under for its whole run; a second StopFailure then starts none.
+setup; record_sends
+: > "$STATE/auto-resume.log-only"; : > "$STATE/disable-auto-resume"
+live_screen -1 3 > "$SB/herdr/screen.txt"
+: > "$SB/herdr/hold-read"
+sfh
+wait_watchers 1 "double: the first StopFailure starts a watcher"
+sfh
+sleep 1
+assert_eq "double: still one watcher after a second StopFailure" "$(watchers)" 1
+assert_eq "double: one launch" "$(lines "^STOPFAILURE-LAUNCH $SID ")" 1
+assert_eq "double: the second is logged as not launched" "$(lines "^STOPFAILURE-NOLAUNCH $SID watcher-running ")" 1
+rm -f "$SB/herdr/hold-read"
+wait_watchers 0 "double: the watcher has ended"
+assert_eq "double: one detection" "$(lines 'LOG-ONLY would send')" 1
+# The lock goes with the watcher: the next stop starts one again.
+sfh
+wait_log auto-resume "STOPFAILURE-LAUNCH $SID"
+wait_watchers 0 "double: the next stop's watcher has ended"
+assert_eq "double: the next stop launches" "$(lines "^STOPFAILURE-LAUNCH $SID ")" 2
+assert_eq "double: and detects" "$(lines 'LOG-ONLY would send')" 2
+# A watcher the Stop hook started (no lock): found by its command line.
+: > "$SB/herdr/hold-read"
+setsid "$BIN/session-resume-watch.sh" "$SID" </dev/null >/dev/null 2>&1 &
+wait_watchers 1 "double: a Stop-launched watcher runs"
+sfh
+sleep 1
+assert_eq "double: a StopFailure beside it starts none" "$(watchers)" 1
+assert_eq "double: logged as not launched" "$(lines "^STOPFAILURE-NOLAUNCH $SID watcher-running ")" 2
+rm -f "$SB/herdr/hold-read"
+wait_watchers 0 "double: the Stop-launched watcher has ended"
+assert_eq "double: nothing sent" "$(sends)" ""
+sandbox_rm
+SID=$SID_A
 
 echo "== auto-resume-report.py: the days of proof =="
 setup
@@ -829,7 +964,7 @@ assert_contains "screens saved" "$out" "screens saved: 1"
 assert_contains "screens withheld" "$out" "screens withheld: 1"
 assert_contains "StopFailure events" "$out" "StopFailure events: 3"
 assert_contains "a detection 3 min after its StopFailure is matched; 10 min is not" "$out" "detections with no StopFailure within 5 min: 1"
-assert_contains "the unmatched detection is listed" "$out" "  2026-11-21T08:00:00Z bbb"
+assert_not_contains "the unmatched detection of a withheld seat is counted, not listed" "$out" "  2026-11-21T08:00:00Z bbb"
 assert_contains "StopFailure events no detection saw" "$out" "StopFailure events with no detection within 5 min: 2"
 out=$(AUTODEV_LOGONLY_DAYS=30 python3 "$REP" --now "$NOW")
 assert_contains "AUTODEV_LOGONLY_DAYS sets the window" "$out" "log-only report: 30 day(s)"
@@ -901,6 +1036,75 @@ assert_eq "withheld seat: no detection or missed row" \
   "$(printf '%s\n' "$out" | sed -n '/^per detection/,$p' | grep -cE '^  2026-[^ ]+ +jjj ')" 0
 assert_not_contains "withheld seat: its hash is not shown" "$out" "$SHA_J"
 assert_eq "a NO-DETECT is no detection row" "$(printf '%s\n' "$out" | grep -c ' lll ')" 0
+# A withheld seat's unmatched events: counted in both totals, never listed.
+{
+  lo sss '2026-11-22 10:00:00' "would send [continue] pane=w1:p88 kind=5-hour reset=1 $(proof sss "$SHA_J" withheld withheld | sed 's/^pane=w1:p1 kind=5-hour //')"
+  lo sss '2026-11-22 10:00:00' 'screen-withheld pane=w1:p88'
+  printf 'STOPFAILURE sss billing_error 2026-11-22T08:00:00Z\n'
+  lo ttt '2026-11-22 11:00:00' "would send [continue] $(proof ttt "$SHA_H" "'/work/t'" "'b'")"
+  printf 'STOPFAILURE ttt rate_limit 2026-11-22T07:00:00Z\n'
+} > "$AUTODEV_HOME/logs/auto-resume.log"
+out=$(python3 "$REP" --now "$NOW" --days 1)
+assert_contains "withheld unmatched: both detections counted" "$out" "detections with no StopFailure within 5 min: 2"
+assert_contains "withheld unmatched: both StopFailures counted" "$out" "StopFailure events with no detection within 5 min: 2"
+assert_not_contains "withheld unmatched: no pane id of the withheld seat" "$out" "w1:p88"
+assert_not_contains "withheld unmatched: no event line for the withheld seat" "$out" "Z sss "
+assert_contains "withheld unmatched: an open seat's detection is listed" "$out" "  2026-11-22T11:00:00Z ttt "
+assert_contains "withheld unmatched: an open seat's StopFailure is listed" "$out" "  2026-11-22T07:00:00Z ttt rate_limit"
+sandbox_rm
+
+echo "== auto-resume-report.py: B's first day, true stops, the first real stop =="
+setup
+REP="$BIN/auto-resume-report.py"
+SHA_FX=$(printf '%s\n' "$(cat "$FX/limit-live.txt")" | sha256sum | cut -d' ' -f1)
+SHA_R=$(printf 'real' | sha256sum | cut -d' ' -f1)
+{
+  printf 'STOPFAILURE mmm rate_limit 2026-11-20T09:00:00Z\n'                    # out of the window
+  printf 'STOPFAILURE nnn rate_limit 2026-11-22T09:00:00Z\n'
+  printf 'STOPFAILURE-LAUNCH nnn 2026-11-22T09:00:00Z\n'
+  lo nnn '2026-11-22 09:00:03' "would send [continue] $(proof nnn "$SHA_FX" "'/w'" "'b'")"   # a fixture's screen
+  printf 'STOPFAILURE ooo rate_limit 2026-11-22T10:00:00Z\n'
+  lo ooo '2026-11-22 10:00:03' "would send [continue] $(proof ooo "$SHA_R" "'/w'" "'b'")"    # no launch line
+  printf 'STOPFAILURE ppp rate_limit 2026-11-22T11:00:00Z\n'
+  printf 'STOPFAILURE-LAUNCH ppp 2026-11-22T11:00:00Z\n'
+  lo ppp '2026-11-22 11:00:03' "would send [continue] $(proof ppp "$SHA_R" "'/w'" "'b'")"
+  printf 'STOPFAILURE qqq rate_limit 2026-11-22T11:30:00Z\n'
+  printf 'STOPFAILURE-NOLAUNCH qqq watcher-running 2026-11-22T11:30:00Z\n'
+} > "$AUTODEV_HOME/logs/auto-resume.log"
+out=$(python3 "$REP" --now "$NOW" --days 1 --fixtures "$FX")
+assert_contains "true stops: those with a detection, of all in the window" "$out" "true stops detected: 3 of 4 "
+assert_contains "B live since: the first STOPFAILURE-LAUNCH" "$out" \
+  "StopFailure launch live since: 2026-11-22 (first STOPFAILURE-LAUNCH 2026-11-22T09:00:00Z"
+assert_contains "first real stop: launched from StopFailure, a screen no fixture has" "$out" \
+  "first real stop: 2026-11-22T11:00:03Z ppp screen_sha256=$SHA_R"
+assert_contains "a NOLAUNCH line is no StopFailure event" "$out" "StopFailure events: 4"
+out=$(python3 "$REP" --now "$NOW" --days 1 --fixtures "$SB/no-such-dir")
+assert_contains "no fixtures: the first real stop is unknown" "$out" "first real stop: unknown"
+grep -v ppp "$AUTODEV_HOME/logs/auto-resume.log" > "$SB/log2"
+out=$(python3 "$REP" --log "$SB/log2" --now "$NOW" --days 1 --fixtures "$FX")
+assert_contains "a fixture's screen is no real stop" "$out" "first real stop: none yet"
+printf 'STOPFAILURE rrr rate_limit 2026-11-22T11:00:00Z\n' > "$SB/log3"
+out=$(python3 "$REP" --log "$SB/log3" --now "$NOW" --days 1 --fixtures "$FX")
+assert_contains "no launch yet: B is not live" "$out" "StopFailure launch live since: never"
+# A withheld seat's first launch and first real stop: counted, never its time, sid or hash.
+SHA_W=$(printf 'withheld-real' | sha256sum | cut -d' ' -f1)
+{
+  printf 'STOPFAILURE www rate_limit 2026-11-22T08:41:17Z\n'
+  printf 'STOPFAILURE-LAUNCH www 2026-11-22T08:41:17Z\n'
+  lo www '2026-11-22 08:41:19' "would send [continue] $(proof www "$SHA_W" withheld withheld)"
+  lo www '2026-11-22 08:41:19' 'screen-withheld pane=w1:p1'
+  cat "$AUTODEV_HOME/logs/auto-resume.log"
+} > "$SB/log4"
+out=$(python3 "$REP" --log "$SB/log4" --now "$NOW" --days 1 --fixtures "$FX")
+assert_contains "withheld first stop: a real stop is still reported" "$out" \
+  "first real stop: yes (withheld seat; counts only)"
+assert_contains "withheld first launch: B's first day still shows" "$out" \
+  "StopFailure launch live since: 2026-11-22 (first STOPFAILURE-LAUNCH from a withheld seat; proof days count from then)"
+assert_not_contains "withheld first stop: no hash" "$out" "$SHA_W"
+assert_not_contains "withheld first stop: no launch time" "$out" "08:41:17"
+assert_not_contains "withheld first stop: no detection time" "$out" "08:41:19"
+assert_eq "withheld first stop: no sid outside the seat table" \
+  "$(printf '%s\n' "$out" | grep -v -E '^  www +[0-9]+ +[0-9]+ +[0-9]+ +withheld: counts only$' | grep -c www)" 0
 sandbox_rm
 
 finish
