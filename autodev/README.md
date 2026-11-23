@@ -145,9 +145,20 @@ Logs: `$AUTODEV_HOME/logs/{auto-handoff,auto-resume}.log`.
 A limit stop fires Claude Code's `StopFailure` hook, not `Stop` (the turn loop returns on the API
 error before the Stop hooks), so `cc-stop-hook.sh` does not launch Phoenix on the limit stop
 itself. `cc-stopfailure-hook.sh` logs `STOPFAILURE <sid> <error> <UTC>` to `auto-resume.log` for
-`rate_limit` and `billing_error`. `bin/auto-resume-report.py` summarises log-only mode over the
+`rate_limit` and `billing_error`, then launches `session-resume-watch.sh` for that session,
+detached, as the Stop hook does, and logs `STOPFAILURE-LAUNCH <sid> <UTC>`. The switches keep the
+watcher's precedence: `disable-auto-compact` means no line and no launch; `auto-resume.log-only`
+launches a watcher that only detects and logs; otherwise `disable-auto-resume` means the
+`STOPFAILURE` line and no launch. One watcher per session: the launched watcher inherits a flock
+on `state/<sid>.resume-watch.lock` for its whole run, and a watcher the Stop hook started is found
+by its command line; either way the hook logs `STOPFAILURE-NOLAUNCH <sid> watcher-running <UTC>`
+and starts none. `bin/auto-resume-report.py` summarises log-only mode over the
 days of proof (`--days`, else `AUTODEV_LOGONLY_DAYS`, default 7): detections, screens saved and
-withheld, StopFailure events, and the detections with no StopFailure within 5 minutes.
+withheld, StopFailure events, the detections with no StopFailure within 5 minutes, true stops
+detected (StopFailure events with a detection within 5 minutes, out of all of them), the first
+day a watcher was launched from StopFailure (proof days count from then), and the first real
+stop: the first StopFailure-launched detection whose screen hash matches no screen in
+`test/fixtures/panes` (`--fixtures DIR`).
 
 Each log-only detection (`LOG-ONLY would send`) and each `LOG-ONLY NO-DETECT` with a reason
 carries, on its one line: `seat=<sid>`, `cwd=<pane cwd>` (`withheld` under a no-save prefix),
