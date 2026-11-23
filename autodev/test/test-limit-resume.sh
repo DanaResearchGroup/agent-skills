@@ -156,6 +156,13 @@ wait_log() { # $1 log, $2 text, $3 timeout s
   local end=$(( $(date +%s) + ${3:-15} ))
   until grep -qF "$2" "$AUTODEV_HOME/logs/$1.log" 2>/dev/null || [ "$(date +%s)" -ge "$end" ]; do sleep 0.2; done
 }
+# wait_log returns at once on text an earlier step in the same sandbox already
+# logged. After a repeated event, wait for the new count instead.
+wait_count() { # $1 log, $2 regex (grep -E), $3 count, $4 timeout s
+  local end=$(( $(date +%s) + ${4:-15} ))
+  until [ "$(grep -cE -- "$2" "$AUTODEV_HOME/logs/$1.log" 2>/dev/null)" -ge "$3" ] 2>/dev/null \
+    || [ "$(date +%s)" -ge "$end" ]; do sleep 0.2; done
+}
 
 echo "== watcher: what is not a live banner types nothing =="
 for fx in limit-scrollback limit-prose limit-no-reset limit-after-output; do
@@ -919,8 +926,11 @@ rm -f "$SB/herdr/hold-read"
 wait_watchers 0 "double: the watcher has ended"
 assert_eq "double: one detection" "$(lines 'LOG-ONLY would send')" 1
 # The lock goes with the watcher: the next stop starts one again.
+# The first stop's lines are already in the log: wait for the second of each,
+# so the new watcher has started and detected before waiting for it to end.
 sfh
-wait_log auto-resume "STOPFAILURE-LAUNCH $SID"
+wait_count auto-resume "^STOPFAILURE-LAUNCH $SID " 2
+wait_count auto-resume 'LOG-ONLY would send' 2
 wait_watchers 0 "double: the next stop's watcher has ended"
 assert_eq "double: the next stop launches" "$(lines "^STOPFAILURE-LAUNCH $SID ")" 2
 assert_eq "double: and detects" "$(lines 'LOG-ONLY would send')" 2
