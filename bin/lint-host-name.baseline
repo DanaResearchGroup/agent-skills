@@ -1,0 +1,8 @@
+# Known host-name uses that BRANCH on the host: refused in new code, listed here
+# until each moves to factory-machine. These skills live in another repository;
+# the entries apply when the lint scans a tree that holds them.
+# Format: path | needle (substring of the line, or * for the whole file) | reason
+auto-proposals/lib/paths.py | socket.gethostname() | publish gate compares the host name to the designated publish host
+auto-proposals/test/_env.py | socket.gethostname() | test env sets the publish host to this host, feeding the same gate
+babysit-arc/SKILL.md | hostname | picks the cluster connection per machine from the host name
+babysit-t3/SKILL.md | hostname | restricts the skill to one machine by host name

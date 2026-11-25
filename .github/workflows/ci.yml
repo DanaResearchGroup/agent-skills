@@ -90,6 +90,8 @@ jobs:
           python-version: "3.x"
       - name: Lint skills
         run: python3 bin/lint-skills.py
+      - name: Lint host-name use
+        run: python3 bin/lint-host-name
 
   # One job for every skill's tests, not one per skill: a matrix grows a new
   # required check each time a skill gains a suite, which is not sustainable as

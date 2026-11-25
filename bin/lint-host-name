@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""Refuse skill files that read the host name to decide what to do.
+
+A skill that needs to know which machine it runs on asks
+`factory-machine/bin/factory-machine` instead; the host name is not a contract.
+
+Every line that reads this machine's host name (`hostname`, `uname -n`,
+`$HOSTNAME`, `socket.gethostname`, `platform.node`, `/etc/hostname`) is a
+finding unless an entry in one of two lists covers it:
+
+  bin/lint-host-name.allow     uses that may stay: they record the host
+                               (provenance, a message's sender), never branch
+  bin/lint-host-name.baseline  known uses that DO branch, not fixed yet
+
+Each list line is `path | needle | reason`: the path relative to the scanned
+root, a substring the offending line must contain (`*` covers the whole file),
+and a one-line reason. An entry covers only lines containing its needle, so a
+new branch added to an allow-listed file is still refused. An entry whose file
+is in the tree but matches nothing is stale and fails the lint; an entry whose
+file is not in the tree (a skill from another repository) is skipped.
+
+Usage: bin/lint-host-name [--root DIR] [--allow FILE] [--baseline FILE]
+Scans the files git would track under the root (default: this repository), or
+every file when the root is not a git work tree.
+Exit 0 clean, 1 findings or stale entries, 2 usage or a malformed list.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+
+# (form named in the finding, pattern). First match per line wins.
+FORMS = [
+    ("/etc/hostname", re.compile(r"/(?:etc|proc/sys/kernel)/hostname\b")),
+    # The command, where a shell or an agent would run it: `$(hostname`, inline
+    # code `hostname`, line start, after ; | & or (, or an argv list item. Not a
+    # variable or key (`hostname = ...`, `hostname:`), a URL's `.hostname`, a
+    # `--hostname` flag, or the word in prose or an error message.
+    ("hostname", re.compile(
+        r"(?:\$\(\s*|`\s*|^\s*|[;|&(]\s*)hostname(?:ctl)?(?![\w'-])(?!\s*[=:])"
+        r"|[\[(,]\s*['\"]hostname(?:ctl)?['\"\s]")),
+    ("uname -n", re.compile(r"\buname\s+(?:-[A-Za-z]*n[A-Za-z]*\b|--nodename\b)")),
+    ("$HOSTNAME", re.compile(r"\$\{?HOSTNAME\b|['\"]HOSTNAME['\"]")),
+    ("socket.gethostname", re.compile(r"\b(?:gethostname|getfqdn)\b")),
+    ("platform.node", re.compile(r"\bplatform\.node\b|\.nodename\b|\bplatform\.uname\(\)\.node\b")),
+]
+
+SKIP_DIRS = {".git", "node_modules", "__pycache__"}
+
+
+class Malformed(Exception):
+    pass
+
+
+class Entry:
+    def __init__(self, source: Path, lineno: int, path: str, needle: str, reason: str) -> None:
+        self.source, self.lineno = source, lineno
+        self.path, self.needle, self.reason = path, needle, reason
+        self.used = False
+
+    def covers(self, path: str, text: str) -> bool:
+        return path == self.path and (self.needle == "*" or self.needle in text)
+
+
+def load_entries(source: Path) -> list[Entry]:
+    try:
+        text = source.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise Malformed(f"{source}: unreadable: {exc.__class__.__name__}")
+    entries = []
+    for n, line in enumerate(text.splitlines(), 1):
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        parts = [p.strip() for p in line.split(" | ", 2)]
+        if len(parts) != 3 or not all(parts):
+            raise Malformed(f"{source}:{n}: want `path | needle | reason`, each non-empty")
+        entries.append(Entry(source, n, *parts))
+    return entries
+
+
+def list_files(root: Path) -> list[str]:
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+            capture_output=True, check=True,
+        ).stdout.decode("utf-8", "surrogateescape")
+        inside = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--show-prefix"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        if inside == "":  # root is the work tree's top, not a subdirectory
+            return sorted(p for p in out.split("\0") if p)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass
+    files = []
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=True):
+        dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS)
+        for name in filenames:
+            files.append(os.path.relpath(os.path.join(dirpath, name), root))
+    return sorted(files)
+
+
+def scan(root: Path, rel: str) -> list[tuple[int, str, str]]:
+    path = root / rel
+    if not path.is_file():
+        return []
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return []  # binary or unreadable: not a skill text
+    hits = []
+    for n, line in enumerate(text.splitlines(), 1):
+        for form, pattern in FORMS:
+            if pattern.search(line):
+                hits.append((n, form, line.strip()))
+                break
+    return hits
+
+
+def main(argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(prog="lint-host-name", description=__doc__.split("\n")[0])
+    ap.add_argument("--root", type=Path, default=HERE.parent)
+    ap.add_argument("--allow", type=Path, default=HERE / "lint-host-name.allow")
+    ap.add_argument("--baseline", type=Path, default=HERE / "lint-host-name.baseline")
+    args = ap.parse_args(argv)
+    root = args.root.resolve()
+    try:
+        allow = load_entries(args.allow)
+        baseline = load_entries(args.baseline)
+    except Malformed as exc:
+        print(f"lint-host-name: {exc}", file=sys.stderr)
+        return 2
+
+    # The two lists quote the needles they match, so they never scan themselves.
+    lists = {args.allow.resolve(), args.baseline.resolve()}
+    files = [f for f in list_files(root) if (root / f).resolve() not in lists]
+    present = set(files)
+
+    findings, known = [], []
+    for rel in files:
+        for n, form, text in scan(root, rel):
+            hit = f"{rel}:{n}: [{form}] {text}"
+            covering = [e for e in allow + baseline if e.covers(rel, text)]
+            for e in covering:
+                e.used = True
+            if any(e in baseline for e in covering) and not any(e in allow for e in covering):
+                known.append(hit)
+            elif not covering:
+                findings.append(hit)
+
+    stale = [e for e in allow + baseline if e.path in present and not e.used]
+
+    for hit in known:
+        print(f"known (baseline, not fixed here): {hit}")
+    for hit in findings:
+        print(hit)
+    for e in stale:
+        print(f"{e.source}:{e.lineno}: stale entry: {e.path} | {e.needle} matches nothing")
+    if findings:
+        try:
+            allow_name = args.allow.resolve().relative_to(root)
+        except ValueError:
+            allow_name = args.allow
+        print(f"\nlint-host-name: {len(findings)} line(s) read the host name. A skill asks "
+              "factory-machine which machine it is on; never the host name. A use that only "
+              f"records the host goes in {allow_name} with a one-line reason.")
+    return 1 if findings or stale else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
