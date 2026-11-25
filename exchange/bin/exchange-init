@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+"""Write a fresh exchange tree: the fixed folders for every plane whose zone is `any`, and a
+read-only AGENTS.md for this side. Safe to re-run: it adds missing folders and rewrites AGENTS.md.
+
+Exit 0 written, 2 could not run.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import exchangelib as xl  # noqa: E402
+
+PROG = "exchange-init"
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    ap = argparse.ArgumentParser(prog=PROG, description=__doc__.splitlines()[0])
+    ap.add_argument("dir", type=Path, help="tree root (exchange/<peer>/ on HL, exchange/hl/ on a peer)")
+    ap.add_argument("--side", required=True, choices=xl.SIDES, help="this machine's role")
+    ap.add_argument("--peer", required=True, help="the peer's name, e.g. lmf")
+    ap.add_argument("--planes", type=Path, default=xl.DEFAULT_PLANES, help="planes file")
+    return ap.parse_args(argv)
+
+
+def write_agents(root: Path, text: str) -> None:
+    path = root / xl.AGENTS
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        raise xl.CannotRun(f"{path} exists and is not a plain file")
+    tmp = root / f".{xl.AGENTS}.tmp"
+    tmp.unlink(missing_ok=True)  # a read-only leftover from an interrupted run
+    tmp.write_text(text)
+    os.chmod(tmp, 0o444)
+    os.replace(tmp, path)
+
+
+def main(argv: list[str]) -> int:
+    try:
+        args = parse_args(argv)
+    except SystemExit as e:  # argparse already printed usage or help
+        if e.code:
+            print(f"{PROG}: bad arguments", file=sys.stderr)
+            return 2
+        return 0
+    try:
+        peer = xl.peer_slug(args.peer)
+        planes = xl.read_planes(args.planes)
+        text = xl.render_agents(args.side, peer)
+        root = args.dir.expanduser()
+        if root.is_symlink() or (root.exists() and not root.is_dir()):
+            raise xl.CannotRun(f"{root} exists and is not a folder")
+        # Rule 1: no links. mkdir and is_dir follow one, so refuse before writing anything.
+        for rel in xl.tree_dirs(peer, planes):
+            if (root / rel).is_symlink():
+                raise xl.CannotRun(f"{root / rel} is a link; the tree holds no links")
+        for rel in xl.tree_dirs(peer, planes):
+            (root / rel).mkdir(parents=True, exist_ok=True)
+        write_agents(root, text)
+    except xl.CannotRun as e:
+        print(f"{PROG}: {e}", file=sys.stderr)
+        return 2
+    except OSError as e:
+        print(f"{PROG}: {e}", file=sys.stderr)
+        return 2
+    except Exception as e:  # e.g. an undecodable planes file
+        print(f"{PROG}: could not run: {type(e).__name__}", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
