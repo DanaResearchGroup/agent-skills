@@ -428,7 +428,8 @@ class TestRule5Manifest(Base):
     def test_wrong_hash_on_escaped_line(self):
         self.real_manifest()
         self.write("to-hl/data/beta/2026.11.25 b Results/back\\slash.csv", "edited\n")
-        self.assertRule(self.lint(), 5, "to-hl/data/beta/2026.11.25 b Results/back\\slash.csv")
+        self.assertRule(self.lint(), 5,
+                        "to-hl/data/beta/2026.11.25 b Results/back\\\\slash.csv")
 
     def test_malformed_escape(self):
         m = self.tree / "to-hl/data/beta/2026.11.25 b Results/MANIFEST.sha256"
@@ -599,6 +600,39 @@ class TestRule9Output(Base):
         lines = self.defects(r)
         self.assertEqual(len(lines), len(set(lines)))
         self.assertEqual(lines, sorted(lines, key=lambda s: (int(s.split()[1][:-1]), s)))
+
+    ITEM = "to-hl/data/beta/2026.11.25 b Results"
+
+    def assertOddNameLines(self, name: str, want: list[str]) -> None:
+        """A clean tree plus one unlisted file `name` in a data item prints exactly `want`."""
+        self.build_clean()
+        self.write(f"{self.ITEM}/{name}")
+        r = subprocess.run(self.lint().args, capture_output=True)  # bytes: no newline translation
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertEqual(r.stdout.decode(), "".join(f"{line}\n" for line in want))
+        for line in want:
+            self.assertRegex(line, DEFECT_LINE)
+
+    def test_newline_in_a_name_prints_one_line(self):
+        self.assertOddNameLines("new\nline.csv",
+                                [f"rule 5: {self.ITEM}/new\\nline.csv: not in the manifest"])
+
+    def test_carriage_return_in_a_name_prints_one_line(self):
+        self.assertOddNameLines("car\rriage.csv",
+                                [f"rule 5: {self.ITEM}/car\\rriage.csv: not in the manifest"])
+
+    def test_backslash_in_a_name_prints_doubled(self):
+        self.assertOddNameLines("back\\slash\\n.csv",
+                                [f"rule 5: {self.ITEM}/back\\\\slash\\\\n.csv: "
+                                 "not in the manifest"])
+
+    def test_listed_term_after_a_newline_is_masked_before_the_escape(self):
+        # Escaped first, `\nzorblax` puts a letter before the term and the whole-word match
+        # fails; masked first, the newline is the word boundary and the term is withheld.
+        path = f"{self.ITEM}/notes\\n[withheld].csv"
+        self.assertOddNameLines("notes\nzorblax.csv",
+                                [f"rule 5: {path}: not in the manifest",
+                                 f"rule 7: {path}: a listed term in the name"])
 
 
 if __name__ == "__main__":
