@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Check an exchange tree against its nine rules (see ../templates/AGENTS.md.tmpl).
 
-One line per defect: `rule N: <path in the tree>: <what is wrong>`, sorted by rule then path.
+One line per defect: `rule N: <path in the tree>: <what is wrong>`, sorted by rule then path. A
+path writes `\\`, a newline and a carriage return as `\\\\`, `\\n` and `\\r`, as sha256sum does.
 Every printed path and message has listed terms and secret values masked as `[withheld]`; no
 message echoes a file name or a match. Exit 0 clean, 1 defects, 2 could not run.
 """
@@ -40,6 +41,8 @@ ARCHIVE_MONTH_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
 MANIFEST_LINE_RE = re.compile(r"^(\\?)([0-9a-fA-F]{64}) [ *](.+)$")
 MANIFEST_ESCAPES = {"\\\\": "\\", "\\n": "\n", "\\r": "\r"}
 MANIFEST_ESCAPE_RE = re.compile(r"\\.?", re.S)
+# Rule 9: a printed path uses the same escapes, so a name with a newline stays on one line.
+OUTPUT_ESCAPES = str.maketrans({"\\": "\\\\", "\n": "\\n", "\r": "\\r"})
 
 # Rule 7: common secret shapes. Values are masked wherever they appear in a printed path.
 SECRET_VALUE_RES = [re.compile(p) for p in (
@@ -195,7 +198,11 @@ class Lint:
         self.defects: set[tuple[int, str, str]] = set()
 
     def add(self, rule: int, rel: str, what: str) -> None:
-        self.defects.add((rule, self.mask(rel), self.mask(what)))  # messages repeat the peer name
+        # Mask before the escape: `\nterm` would hide a term that follows a newline. Escape here,
+        # not in lines(), so the sort is on the printed path. Messages quote no file name, and
+        # one quotes the escapes themselves, so they are masked but not escaped.
+        path = self.mask(rel).translate(OUTPUT_ESCAPES)
+        self.defects.add((rule, path, self.mask(what)))  # messages repeat the peer name
 
     def mask(self, text: str) -> str:
         for pattern in (*self.terms, *SECRET_VALUE_RES):
