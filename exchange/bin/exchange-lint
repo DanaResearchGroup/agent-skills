@@ -1,0 +1,466 @@
+#!/usr/bin/env python3
+"""Check an exchange tree against its nine rules (see ../templates/AGENTS.md.tmpl).
+
+One line per defect: `rule N: <path in the tree>: <what is wrong>`, sorted by rule then path.
+Every printed path and message has listed terms and secret values masked as `[withheld]`; no
+message echoes a file name or a match. Exit 0 clean, 1 defects, 2 could not run.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import os
+import posixpath
+import re
+import stat
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import exchangelib as xl  # noqa: E402
+
+PROG = "exchange-lint"
+DEFAULT_MAX_ITEM_BYTES = 1_000_000_000  # 1 GB
+WITHHELD = "[withheld]"
+SNIFF_BYTES = 8192
+
+# Rule 4: `YYYY.MM.DD <letter> <Title Case Name>.<ext>`; a data item folder drops `.<ext>`.
+_DATE = r"(?P<y>\d{4})\.(?P<m>\d{2})\.(?P<d>\d{2})"
+_WORD = r"[A-Za-z0-9][A-Za-z0-9&'()+,_-]*"
+_TITLE = rf"(?P<title>{_WORD}(?: {_WORD})*)"
+FILE_NAME_RE = re.compile(rf"^{_DATE} [a-z] {_TITLE}\.[A-Za-z0-9]+$")
+ITEM_NAME_RE = re.compile(rf"^{_DATE} [a-z] {_TITLE}$")
+MINOR_WORDS = frozenset(
+    "a an the and but or nor for of in on at to by vs with from per via as".split())
+ARCHIVE_MONTH_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
+# sha256sum escapes a name that holds a backslash, a newline or a carriage return: the line
+# starts with '\' and the name carries '\\', '\n' or '\r'.
+MANIFEST_LINE_RE = re.compile(r"^(\\?)([0-9a-fA-F]{64}) [ *](.+)$")
+MANIFEST_ESCAPES = {"\\\\": "\\", "\\n": "\n", "\\r": "\r"}
+MANIFEST_ESCAPE_RE = re.compile(r"\\.?", re.S)
+
+# Rule 7: common secret shapes. Values are masked wherever they appear in a printed path.
+SECRET_VALUE_RES = [re.compile(p) for p in (
+    r"AKIA[0-9A-Z]{16}",                                   # AWS access key id
+    r"gh[pousr]_[A-Za-z0-9]{36,}",                         # GitHub token
+    r"github_pat_[A-Za-z0-9_]{22,}",                       # GitHub fine-grained token
+    r"xox[abposr]-[A-Za-z0-9-]{10,}",                      # Slack token
+    r"sk-ant-[A-Za-z0-9_-]{20,}",                          # Anthropic key
+    r"sk-(?:proj-)?[A-Za-z0-9_-]{32,}",                    # OpenAI key
+    r"AIza[0-9A-Za-z_-]{35}",                              # Google API key
+    r"-----BEGIN (?:[A-Z]+ )*PRIVATE KEY(?: BLOCK)?-----",  # PEM / OpenSSH / PGP private key
+)]
+SECRET_FILE_RE = re.compile(
+    r"^(?:id_(?:rsa|dsa|ecdsa|ed25519)|\.env(?:\..*)?|\.netrc|\.pgpass|\.npmrc|\.pypirc)$"
+    r"|\.(?:pem|key|p12|pfx|kdbx|jks|keystore|ppk)$", re.IGNORECASE)
+
+# Rule 8: what a file named or shaped as instructions looks like.
+INSTRUCTION_NAMES = frozenset({
+    "agents.md", "agent.md", "claude.md", "gemini.md", "codex.md", "skill.md",
+    "copilot-instructions.md", ".cursorrules", ".windsurfrules"})
+INSTRUCTION_WORDS = frozenset({"prompt", "prompts", "instruction", "instructions"})
+INSTRUCTION_DIRS = frozenset({"instructions", "prompts", ".claude", ".codex", ".agents",
+                              ".cursor", ".github"})
+PROMPT_OPENING_RE = re.compile(
+    r"^(?:#+\s*)?(?:you are (?:an?|the) |your task\b|instructions\b|system prompt\b)",
+    re.IGNORECASE)
+FRONT_MATTER_RE = re.compile(r"\A---\r?\n(.*?)\r?\n---", re.DOTALL)
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    ap = argparse.ArgumentParser(prog=PROG, description=__doc__.splitlines()[0])
+    ap.add_argument("tree", type=Path, help="tree root (exchange/<peer>/ on HL, exchange/hl/ on a peer)")
+    ap.add_argument("--side", required=True, choices=xl.SIDES, help="this machine's role")
+    ap.add_argument("--peer", required=True, help="the peer's name, e.g. lmf")
+    ap.add_argument("--planes", type=Path, default=xl.DEFAULT_PLANES, help="planes file")
+    ap.add_argument("--terms", type=Path,
+                    help="term list for rule 7, one per line; `re:` starts a regex. Required.")
+    ap.add_argument("--max-item-bytes", type=int, default=DEFAULT_MAX_ITEM_BYTES,
+                    help="rule 6 limit per item (default 1 GB)")
+    return ap.parse_args(argv)
+
+
+def read_terms(path: Path | None) -> list[re.Pattern]:
+    """Each line a term: literal (whole word, any case) or `re:<regex>` (any case)."""
+    if path is None:
+        raise xl.CannotRun("rule 7 needs --terms FILE; the term check never passes silently")
+    try:
+        text = path.expanduser().read_text()
+    except OSError as e:
+        raise xl.CannotRun(f"cannot read the terms file {path}: {e.strerror}") from None
+    out = []
+    for n, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("re:"):
+            try:
+                out.append(re.compile(line[3:], re.IGNORECASE))
+            except re.error:
+                raise xl.CannotRun(f"terms file line {n} is not a valid regex") from None
+        else:
+            out.append(re.compile(rf"(?<![a-z0-9]){re.escape(line)}(?![a-z0-9])", re.IGNORECASE))
+    if not out:
+        raise xl.CannotRun("the terms file lists no term; the term check never passes silently")
+    return out
+
+
+def read_stamp(root: Path) -> float | None:
+    """The last inbound transfer as epoch seconds, or None when none has arrived yet."""
+    path = root / xl.STAMP
+    if not path.exists() and not path.is_symlink():
+        return None
+    if path.is_symlink() or not path.is_file():
+        raise xl.CannotRun(f"{xl.STAMP} is not a plain file")
+    raw = path.read_text().strip()
+    try:
+        when = dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        raise xl.CannotRun(f"{xl.STAMP} does not hold an ISO 8601 time") from None
+    if when.tzinfo is None:
+        raise xl.CannotRun(f"{xl.STAMP} time has no time zone")
+    return when.timestamp()
+
+
+def is_text(path: Path) -> bool:
+    with open(path, "rb") as fh:
+        return b"\0" not in fh.read(SNIFF_BYTES)
+
+
+def valid_name(name: str, pattern: re.Pattern) -> bool:
+    m = pattern.match(name)
+    if not m:
+        return False
+    try:
+        dt.date(int(m["y"]), int(m["m"]), int(m["d"]))
+    except ValueError:
+        return False
+    words = m["title"].split(" ")
+    return all(not w[0].islower() or (i > 0 and w in MINOR_WORDS) for i, w in enumerate(words))
+
+
+def sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def entries(path: Path) -> list[tuple[str, str]]:
+    """(name, 'dir' | 'file' | 'other') per entry, sorted, links never followed."""
+    out = []
+    with os.scandir(path) as it:
+        for e in it:
+            if e.is_dir(follow_symlinks=False):
+                out.append((e.name, "dir"))
+            elif e.is_file(follow_symlinks=False):
+                out.append((e.name, "file"))
+            else:
+                out.append((e.name, "other"))
+    return sorted(out)
+
+
+def _raise(err: OSError) -> None:
+    raise err  # os.walk skips an unreadable folder by default; a skipped folder is a silent pass
+
+
+def unescape_manifest_name(name: str) -> str | None:
+    """Decode a name from an escaped sha256sum line; None on an unknown escape."""
+    if any(e not in MANIFEST_ESCAPES for e in MANIFEST_ESCAPE_RE.findall(name)):
+        return None
+    return MANIFEST_ESCAPE_RE.sub(lambda m: MANIFEST_ESCAPES[m[0]], name)
+
+
+def walk_item(item: Path) -> tuple[list[str], list[str]]:
+    """Plain files and folders inside a data item, as paths relative to it."""
+    files, dirs = [], []
+    for dirpath, dirnames, filenames in os.walk(item, onerror=_raise):
+        rel = Path(dirpath).relative_to(item)
+        dirs += [(rel / d).as_posix() for d in dirnames if not os.path.islink(Path(dirpath, d))]
+        files += [(rel / f).as_posix() for f in filenames
+                  if stat.S_ISREG(os.lstat(Path(dirpath, f)).st_mode)]
+    return sorted(files), sorted(dirs)
+
+
+class Lint:
+    def __init__(self, root: Path, side: str, peer: str, planes: dict[str, xl.Plane],
+                 terms: list[re.Pattern], stamp: float | None, max_item: int):
+        self.root, self.side, self.peer = root, side, peer
+        self.planes, self.terms, self.stamp, self.max_item = planes, terms, stamp, max_item
+        self.inbound = xl.inbound(side, peer)
+        self.writer = xl.HUB.upper() if self.inbound == f"to-{peer}" else peer.upper()
+        self.defects: set[tuple[int, str, str]] = set()
+
+    def add(self, rule: int, rel: str, what: str) -> None:
+        self.defects.add((rule, self.mask(rel), self.mask(what)))  # messages repeat the peer name
+
+    def mask(self, text: str) -> str:
+        for pattern in (*self.terms, *SECRET_VALUE_RES):
+            text = pattern.sub(WITHHELD, text)
+        return text
+
+    def lines(self) -> list[str]:
+        return [f"rule {r}: {p}: {w}" for r, p, w in sorted(self.defects)]
+
+    def run(self) -> list[str]:
+        self.sweep()
+        self.check_root()
+        return self.lines()
+
+    # Rules 1 (links and devices), 2 and 7: every entry in the tree, wherever it sits.
+
+    def sweep(self) -> None:
+        for dirpath, dirnames, filenames in os.walk(self.root, onerror=_raise):
+            base = Path(dirpath)
+            for name in sorted(dirnames + filenames):
+                path = base / name
+                rel = path.relative_to(self.root).as_posix()
+                mode = os.lstat(path).st_mode
+                if not (stat.S_ISDIR(mode) or stat.S_ISREG(mode)):
+                    self.add(1, rel, "not a plain file or folder (a link, device or pipe)")
+                    continue
+                self.check_name_rule7(rel, name)
+                if stat.S_ISREG(mode):
+                    self.check_writer(rel, path)
+                    self.check_content_rule7(rel, path)
+
+    def check_name_rule7(self, rel: str, name: str) -> None:
+        if any(p.search(name) for p in self.terms):
+            self.add(7, rel, "a listed term in the name")
+        if any(p.search(name) for p in SECRET_VALUE_RES) or SECRET_FILE_RE.search(name):
+            self.add(7, rel, "a secret or key file by its name")
+
+    def check_content_rule7(self, rel: str, path: Path) -> None:
+        if not is_text(path):
+            return
+        term = secret = False
+        with open(path, "rb") as fh:
+            for raw in fh:
+                line = raw.decode("utf-8", errors="replace")
+                term = term or any(p.search(line) for p in self.terms)
+                secret = secret or any(p.search(line) for p in SECRET_VALUE_RES)
+                if term and secret:
+                    break
+        if term:
+            self.add(7, rel, "a listed term in the content")
+        if secret:
+            self.add(7, rel, "a secret pattern in the content")
+
+    def check_writer(self, rel: str, path: Path) -> None:
+        if not rel.startswith(f"{self.inbound}/"):
+            return
+        if self.stamp is None:
+            self.add(2, rel, f"no transfer has arrived yet, so this was written here; "
+                             f"only {self.writer} writes {self.inbound}/")
+        elif os.lstat(path).st_mtime > self.stamp:
+            self.add(2, rel, f"newer than the last transfer; only {self.writer} writes "
+                             f"{self.inbound}/")
+
+    # Rules 1, 3, 4, 5, 6 and 8: what sits where.
+
+    def check_root(self) -> None:
+        directions = xl.directions(self.peer)
+        found = entries(self.root)
+        for name, kind in found:
+            if kind == "other":
+                continue
+            if name == xl.AGENTS and kind == "file":
+                self.check_agents_md()
+            elif name == xl.STAMP and kind == "file":
+                pass
+            elif name == xl.ARCHIVE and kind == "dir":
+                self.check_archive()
+            elif name in directions and kind == "dir":
+                self.check_direction(name, directions[name])
+            else:
+                self.add(1, name, f"not part of the tree; the top holds {xl.AGENTS}, "
+                                  f"{', '.join(f'{d}/' for d in directions)}, {xl.ARCHIVE}/")
+        if (xl.AGENTS, "file") not in found:
+            self.add(1, xl.AGENTS, "missing; run exchange-init to write it")
+
+    def check_agents_md(self) -> None:
+        if (self.root / xl.AGENTS).read_text(errors="replace") != xl.render_agents(
+                self.side, self.peer):
+            self.add(8, xl.AGENTS, "differs from what exchange-init writes for this side; "
+                                   "only the tool writes it")
+
+    def check_archive(self) -> None:
+        for name, kind in entries(self.root / xl.ARCHIVE):
+            if kind != "other" and not (kind == "dir" and ARCHIVE_MONTH_RE.match(name)):
+                self.add(1, f"{xl.ARCHIVE}/{name}", "the archive holds only YYYY-MM folders")
+
+    def check_direction(self, direction: str, kinds: tuple[str, ...]) -> None:
+        for name, kind in entries(self.root / direction):
+            rel = f"{direction}/{name}"
+            if kind == "other":
+                continue
+            if direction == f"to-{xl.HUB}" and name == "instructions":
+                self.add(8, rel, f"instructions come only from HL, in to-{self.peer}/instructions/")
+            elif kind == "file":
+                self.add(1, rel, "a file above the item; items go in <kind>/<plane>/")
+            elif name not in kinds:
+                self.add(1, rel, f"not a kind of {direction}/; its kinds are {', '.join(kinds)}")
+            else:
+                self.check_kind(direction, name)
+
+    def check_kind(self, direction: str, kind_name: str) -> None:
+        base = f"{direction}/{kind_name}"
+        for name, kind in entries(self.root / base):
+            rel = f"{base}/{name}"
+            if kind == "file":
+                self.add(1, rel, "a file above the item; items go in <plane>/")
+            elif kind == "dir":
+                self.check_plane_slug(rel, name)
+                self.check_plane(direction, kind_name, rel)
+
+    def check_plane_slug(self, rel: str, name: str) -> None:
+        plane = self.planes.get(name)
+        if plane is None:
+            self.add(3, rel, "not a plane in the planes file")
+        elif plane.zone != "any":
+            self.add(3, rel, f"the plane's zone is {plane.zone}; it may have no exchange folder")
+
+    def check_plane(self, direction: str, kind_name: str, rel: str) -> None:
+        to_hl = direction == f"to-{xl.HUB}"
+        for name, kind in entries(self.root / rel):
+            item = f"{rel}/{name}"
+            if kind == "other":
+                continue
+            if kind_name == "data":
+                if kind == "dir":
+                    self.check_data_item(item, to_hl)
+                else:
+                    self.add(4, item, f"a loose file; a data item is a folder with {xl.MANIFEST}")
+            elif kind_name == "artifacts" and name == xl.SHOW_ME and kind == "dir":
+                self.check_show_me(item, to_hl)
+            elif kind == "dir":
+                self.add(1, item, "a folder where only file items go")
+            else:
+                self.check_file_item(item, to_hl)
+
+    def check_show_me(self, rel: str, to_hl: bool) -> None:
+        for name, kind in entries(self.root / rel):
+            if kind == "dir":
+                self.add(1, f"{rel}/{name}", "a folder in show-me/; its items are files")
+            elif kind == "file":
+                self.check_file_item(f"{rel}/{name}", to_hl)
+
+    def check_file_item(self, rel: str, to_hl: bool) -> None:
+        path = self.root / rel
+        if not valid_name(path.name, FILE_NAME_RE):
+            self.add(4, rel, "the name is not 'YYYY.MM.DD <letter> <Title Case Name>.<ext>'")
+        self.check_size(rel, os.lstat(path).st_size)
+        if to_hl:
+            self.check_not_instructions(rel)
+
+    def check_data_item(self, rel: str, to_hl: bool) -> None:
+        path = self.root / rel
+        if not valid_name(path.name, ITEM_NAME_RE):
+            self.add(4, rel, "the folder name is not 'YYYY.MM.DD <letter> <Title Case Name>'")
+        files, dirs = walk_item(path)
+        if xl.MANIFEST in files:
+            self.check_manifest(rel, files)
+        else:
+            self.add(4, rel, f"no {xl.MANIFEST} in the data item")
+        self.check_size(rel, sum(os.lstat(path / f).st_size for f in files))
+        if to_hl:
+            for d in dirs:
+                if d.rsplit("/", 1)[-1].lower() in INSTRUCTION_DIRS:
+                    self.add(8, f"{rel}/{d}", "a folder named as instructions; "
+                                              "a file from the peer is data")
+            for f in files:
+                if f != xl.MANIFEST:
+                    self.check_not_instructions(f"{rel}/{f}")
+
+    def check_manifest(self, rel: str, files: list[str]) -> None:
+        item = self.root / rel
+        where = f"{rel}/{xl.MANIFEST}"
+        listed: dict[str, str] = {}
+        text = (item / xl.MANIFEST).read_text(errors="replace")
+        for n, line in enumerate(text.splitlines(), 1):
+            if not line.strip():
+                continue
+            m = MANIFEST_LINE_RE.match(line)
+            if not m:
+                self.add(5, where, f"line {n} is not '<sha256>  <path>'")
+                continue
+            name = unescape_manifest_name(m[3]) if m[1] else m[3]
+            if name is None:
+                self.add(5, where, f"line {n} has an escape other than \\\\, \\n or \\r")
+                continue
+            name = posixpath.normpath(name)
+            if name.startswith(("/", "../")) or name in (".", ".."):
+                self.add(5, where, f"line {n} names a path outside the item")
+            elif name in listed:
+                self.add(5, where, f"line {n} lists a path a second time")
+            elif name != xl.MANIFEST:
+                listed[name] = m[2].lower()
+        for f in files:
+            if f != xl.MANIFEST and f not in listed:
+                self.add(5, f"{rel}/{f}", "not in the manifest")
+        for name, digest in listed.items():
+            if name not in files:
+                self.add(5, f"{rel}/{name}", "in the manifest but missing")
+            elif sha256(item / name) != digest:
+                self.add(5, f"{rel}/{name}", "does not match its manifest hash; "
+                                             "edited after the transfer?")
+
+    def check_size(self, rel: str, size: int) -> None:
+        if size > self.max_item:
+            self.add(6, rel, f"the item is {size} bytes, over the {self.max_item}-byte limit")
+
+    def check_not_instructions(self, rel: str) -> None:
+        path = self.root / rel
+        name = path.name.lower()
+        words = set(re.split(r"[^a-z0-9]+", name))
+        if name in INSTRUCTION_NAMES or words & INSTRUCTION_WORDS or name.endswith(".prompt"):
+            self.add(8, rel, "named as instructions; a file from the peer is data")
+            return
+        if not is_text(path):
+            return
+        with open(path, "rb") as fh:
+            head = fh.read(SNIFF_BYTES).decode("utf-8", errors="replace")
+        front = FRONT_MATTER_RE.match(head)
+        first = next((ln.strip() for ln in head.splitlines() if ln.strip()), "")
+        if front and re.search(r"(?m)^description\s*:", front[1]):
+            self.add(8, rel, "shaped as a skill or agent file (front matter with a description)")
+        elif PROMPT_OPENING_RE.match(first) or "paste below this line" in head.lower():
+            self.add(8, rel, "shaped as a prompt; a file from the peer is data")
+
+
+def main(argv: list[str]) -> int:
+    try:
+        args = parse_args(argv)
+    except SystemExit as e:  # argparse already printed usage or help
+        if e.code:
+            print(f"{PROG}: bad arguments", file=sys.stderr)
+            return 2
+        return 0
+    try:
+        root = args.tree.expanduser()
+        if not root.is_dir() or root.is_symlink():
+            raise xl.CannotRun(f"{args.tree} is not a folder")
+        if args.max_item_bytes <= 0:
+            raise xl.CannotRun("--max-item-bytes must be positive")
+        lint = Lint(root, args.side, xl.peer_slug(args.peer), xl.read_planes(args.planes),
+                    read_terms(args.terms), read_stamp(root), args.max_item_bytes)
+        lines = lint.run()
+    except xl.CannotRun as e:
+        print(f"{PROG}: {e}", file=sys.stderr)
+        return 2
+    except OSError as e:
+        print(f"{PROG}: cannot read the tree: {e.strerror}", file=sys.stderr)
+        return 2
+    except Exception as e:  # a crash must not exit 1, which reads as "defects"
+        print(f"{PROG}: could not run: {type(e).__name__}", file=sys.stderr)
+        return 2
+    for line in lines:
+        print(line)
+    return 1 if lines else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
