@@ -1,0 +1,10 @@
+# Host-name uses that may stay: each records the host and never branches on it.
+# Format: path | needle (substring of the line, or * for the whole file) | reason
+# Read by bin/lint-host-name; an entry that matches nothing fails the lint.
+autodev/bin/alert-lib.sh | host=$(hostname 2>/dev/null | names the sending machine in the Slack alert text
+autodev/bin/fleet-digest.sh | HOST=$(hostname 2>/dev/null | records the generating host in the digest JSON (provenance)
+slack-ask/SKILL.md | Run `hostname` | names the asking machine in the Slack message
+slack-notify/SKILL.md | Run `hostname` | names the sending machine in the Slack message
+bin/lint-host-name | * | the lint's own pattern table and docs
+bin/test/test_lint_host_name.py | * | fixtures for each refused form
+factory-machine/SKILL.md | `socket.gethostname`, `platform.node`, `/etc/hostname` | lists the forms the lint refuses

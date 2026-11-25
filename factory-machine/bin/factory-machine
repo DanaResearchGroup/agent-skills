@@ -1,0 +1,354 @@
+#!/usr/bin/env python3
+"""factory-machine: answer which machine this is and what it may do.
+
+Reads two files the owner's install writes; never guesses, never falls back to
+the host name, never writes, never touches the network.
+
+  machine.env  ${FACTORY_MACHINE_ENV:-~/.config/factory/machine.env}
+  planes       ${FACTORY_PLANES:-~/.config/factory/planes}
+
+Exit codes: 0 yes/ok, 1 no (may-open-browser, has), 2 refused or a fault in
+either file. A refusal prints one line on stderr naming the file and the fault;
+a calling skill stops with that line.
+
+See ../SKILL.md for the contract and every subcommand.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import sys
+
+PROG = "factory-machine"
+MACHINES = ("HL", "LMF", "OL")
+HUB = "HL"
+ZONES = ("any", "hl-only")
+CAPS = {"vault": "HAS_VAULT", "slack": "HAS_SLACK", "herdr": "HAS_HERDR",
+        "display": "HAS_DISPLAY"}
+# Contract order; `show` prints in this order.
+KEYS = ("MACHINE", "HAS_DISPLAY", "EXCHANGE_ROOT", "PEERS", "HL_EXCHANGE_ROOT",
+        "HAS_VAULT", "HAS_SLACK", "HAS_HERDR")
+OPTIONAL_FLAGS = ("HAS_VAULT", "HAS_SLACK", "HAS_HERDR")
+PATH_KEYS = ("EXCHANGE_ROOT", "HL_EXCHANGE_ROOT")
+
+KEY_RE = re.compile(r"[A-Z_][A-Z0-9_]*")
+# One plane slug or artifact kind: a single safe path segment.
+SEGMENT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+# Unquoted shell words we accept: no whitespace, quotes, $, `, ;, |, &, #, \.
+UNQUOTED_RE = re.compile(r"[A-Za-z0-9_./:@%+,=~-]*")
+HOME_RE = re.compile(r"\$\{HOME\}|\$HOME(?![A-Za-z0-9_])")
+
+
+class Refused(Exception):
+    """One line for stderr; the process exits 2."""
+
+
+def default_path(var: str, rel: str) -> str:
+    value = os.environ.get(var, "")
+    return value if value else os.path.join(os.path.expanduser("~"), rel)
+
+
+def home() -> str:
+    return os.path.expanduser("~")
+
+
+# --------------------------------------------------------------------------
+# machine.env
+# --------------------------------------------------------------------------
+
+def parse_value(raw: str) -> str | None:
+    """A shell assignment's right-hand side, or None when we refuse it.
+
+    Accepts the subset a hand-written file needs: an unquoted word, a
+    "double-quoted" or 'single-quoted' string, a leading ~ and $HOME. Anything
+    that would make a shell run, split or expand something else is refused,
+    so the file means the same here as when a shell sources it.
+    """
+    if raw.startswith("'"):
+        if len(raw) < 2 or not raw.endswith("'") or "'" in raw[1:-1]:
+            return None
+        return raw[1:-1]
+    if raw.startswith('"'):
+        if len(raw) < 2 or not raw.endswith('"'):
+            return None
+        inner = raw[1:-1]
+        if any(c in inner for c in '"\\`'):
+            return None
+        rest = HOME_RE.sub("", inner)
+        if "$" in rest:
+            return None
+        return HOME_RE.sub(lambda _m: home(), inner)
+    rest = HOME_RE.sub("", raw)
+    if not UNQUOTED_RE.fullmatch(rest):
+        return None
+    value = HOME_RE.sub(lambda _m: home(), raw)
+    if value == "~" or value.startswith("~/"):
+        value = home() + value[1:]
+    return value
+
+
+def load_env(path: str) -> dict[str, str]:
+    def fault(msg: str) -> Refused:
+        return Refused(f"{path}: {msg}")
+
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    except FileNotFoundError:
+        raise fault("missing; the owner's install writes it (no fallback to the host name)")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise fault(f"unreadable: {exc.__class__.__name__}")
+
+    values: dict[str, str] = {}
+    for n, line in enumerate(text.splitlines(), 1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("export "):
+            stripped = stripped[len("export "):].lstrip()
+        key, eq, raw = stripped.partition("=")
+        if not eq or not KEY_RE.fullmatch(key):
+            raise fault(f"line {n}: not a KEY=value line")
+        value = parse_value(raw)
+        if value is None:
+            raise fault(f"line {n}: {key}: value is not a plain shell word or quoted string")
+        if key not in KEYS:
+            raise fault(f"line {n}: unknown key {key}")
+        if key in values:
+            raise fault(f"line {n}: {key} set twice")
+        values[key] = value
+
+    machine = values.get("MACHINE")
+    if machine is None:
+        raise fault("MACHINE missing")
+    if machine not in MACHINES:
+        raise fault(f"MACHINE={machine} is not one of {' '.join(MACHINES)}")
+    for key in ("HAS_DISPLAY", "EXCHANGE_ROOT", "PEERS"):
+        if key not in values:
+            raise fault(f"{key} missing")
+    for key in ("HAS_DISPLAY",) + OPTIONAL_FLAGS:
+        values.setdefault(key, "0")
+        if values[key] not in ("0", "1"):
+            raise fault(f"{key}={values[key]} is not 0 or 1")
+    peers = values["PEERS"].split()
+    if machine == HUB:
+        if not peers or any(p not in MACHINES or p == HUB for p in peers) \
+                or len(set(peers)) != len(peers):
+            raise fault(f"PEERS={values['PEERS']} on HL must name peers from LMF OL")
+        if "HL_EXCHANGE_ROOT" in values:
+            raise fault("HL_EXCHANGE_ROOT is set on HL; it belongs to peers only")
+    else:
+        if peers != [HUB]:
+            raise fault(f"PEERS={values['PEERS']} on a peer must be HL")
+        if "HL_EXCHANGE_ROOT" not in values:
+            raise fault(f"HL_EXCHANGE_ROOT missing on peer {machine}")
+    values["PEERS"] = " ".join(peers)
+    for key in PATH_KEYS:
+        if key in values:
+            if not os.path.isabs(values[key]):
+                raise fault(f"{key}={values[key]} is not an absolute path")
+            values[key] = os.path.normpath(values[key])
+    return values
+
+
+def env_path() -> str:
+    return default_path("FACTORY_MACHINE_ENV", os.path.join(".config", "factory", "machine.env"))
+
+
+def machine_env() -> tuple[str, dict[str, str]]:
+    path = env_path()
+    return path, load_env(path)
+
+
+# --------------------------------------------------------------------------
+# planes
+# --------------------------------------------------------------------------
+
+def planes_path() -> str:
+    return default_path("FACTORY_PLANES", os.path.join(".config", "factory", "planes"))
+
+
+def load_planes() -> tuple[str, list[list[str]]]:
+    path = planes_path()
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    except FileNotFoundError:
+        raise Refused(f"{path}: missing; the owner's install writes it")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise Refused(f"{path}: unreadable: {exc.__class__.__name__}")
+    rows: list[list[str]] = []
+    seen: set[str] = set()
+    for n, line in enumerate(text.splitlines(), 1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        cols = stripped.split()
+        if len(cols) != 4:
+            raise Refused(f"{path}: line {n}: want 4 columns (slug repo owning_persona zone), "
+                          f"got {len(cols)}")
+        slug, _repo, _persona, zone = cols
+        if not SEGMENT_RE.fullmatch(slug):
+            raise Refused(f"{path}: line {n}: slug {slug!r} is not one path segment")
+        if zone not in ZONES:
+            raise Refused(f"{path}: line {n}: zone {zone!r} is not one of {' '.join(ZONES)}")
+        if slug in seen:
+            raise Refused(f"{path}: line {n}: slug {slug} listed twice")
+        seen.add(slug)
+        rows.append(cols)
+    return path, rows
+
+
+def plane_row(slug: str) -> list[str]:
+    path, rows = load_planes()
+    for row in rows:
+        if row[0] == slug:
+            return row
+    raise Refused(f"{path}: plane {slug!r} is not listed (deny by default)")
+
+
+# --------------------------------------------------------------------------
+# subcommands
+# --------------------------------------------------------------------------
+
+def segment(what: str, value: str) -> str:
+    if not SEGMENT_RE.fullmatch(value) or value in (".", ".."):
+        raise Refused(f"{what} {value!r} is not one path segment")
+    return value
+
+
+def cmd_get(args: list[str]) -> int:
+    key = one_arg("get", "KEY", args)
+    path, env = machine_env()
+    if key not in KEYS:
+        raise Refused(f"{path}: unknown key {key}")
+    if key not in env:
+        raise Refused(f"{path}: {key} is not set on {env['MACHINE']}")
+    print(env[key])
+    return 0
+
+
+def cmd_show(args: list[str]) -> int:
+    no_args("show", args)
+    _path, env = machine_env()
+    for key in KEYS:
+        if key in env:
+            print(f"{key}={env[key]}")
+    return 0
+
+
+def cmd_may_open_browser(args: list[str]) -> int:
+    no_args("may-open-browser", args)
+    _path, env = machine_env()
+    return 0 if env["MACHINE"] == HUB and env["HAS_DISPLAY"] == "1" else 1
+
+
+def cmd_artifact_dir(args: list[str]) -> int:
+    if len(args) not in (1, 2):
+        raise Refused("usage: factory-machine artifact-dir PLANE [KIND]")
+    plane = segment("plane", args[0])
+    kind = segment("kind", args[1]) if len(args) == 2 else "show-me"
+    _path, env = machine_env()
+    row = plane_row(plane)
+    if env["MACHINE"] == HUB:
+        show_me = os.environ.get("SHOW_ME_DIR", "")
+        print(show_me if show_me else os.path.join(home(), "Dropbox", "remote-work", "show-me"))
+        return 0
+    if row[3] == "hl-only":
+        raise Refused(f"{planes_path()}: plane {plane} is hl-only; its files never leave HL "
+                      f"(this is {env['MACHINE']})")
+    print(os.path.join(env["EXCHANGE_ROOT"], "to-hl", "artifacts", plane, kind))
+    return 0
+
+
+def cmd_hl_path(args: list[str]) -> int:
+    given = one_arg("hl-path", "PATH", args)
+    path, env = machine_env()
+    if env["MACHINE"] == HUB:
+        raise Refused(f"{path}: hl-path runs on a peer only; this is HL")
+    root = env["EXCHANGE_ROOT"]
+    target = os.path.normpath(os.path.abspath(given))
+    if target != root and not target.startswith(root + os.sep):
+        raise Refused(f"{path}: {target} is not under EXCHANGE_ROOT={root}")
+    rel = os.path.relpath(target, root)
+    print(env["HL_EXCHANGE_ROOT"] if rel == "." else os.path.join(env["HL_EXCHANGE_ROOT"], rel))
+    return 0
+
+
+def cmd_exchange_dir(args: list[str]) -> int:
+    peer = one_arg("exchange-dir", "PEER", args)
+    path, env = machine_env()
+    if env["MACHINE"] != HUB:
+        raise Refused(f"{path}: exchange-dir runs on HL only; this is {env['MACHINE']}")
+    if peer not in env["PEERS"].split():
+        raise Refused(f"{path}: {peer!r} is not in PEERS={env['PEERS']}")
+    print(os.path.join(env["EXCHANGE_ROOT"], peer))
+    return 0
+
+
+def cmd_has(args: list[str]) -> int:
+    cap = one_arg("has", "CAP", args)
+    if cap not in CAPS:
+        raise Refused(f"unknown capability {cap!r}; one of {' '.join(CAPS)}")
+    _path, env = machine_env()
+    return 0 if env[CAPS[cap]] == "1" else 1
+
+
+def cmd_planes(args: list[str]) -> int:
+    zone = None
+    if args:
+        if len(args) != 2 or args[0] != "--zone":
+            raise Refused("usage: factory-machine planes [--zone any|hl-only]")
+        zone = args[1]
+        if zone not in ZONES:
+            raise Refused(f"zone {zone!r} is not one of {' '.join(ZONES)}")
+    _path, rows = load_planes()
+    for row in rows:
+        if zone is None or row[3] == zone:
+            print(row[0])
+    return 0
+
+
+def cmd_plane(args: list[str]) -> int:
+    slug = one_arg("plane", "SLUG", args)
+    print(" ".join(plane_row(slug)))
+    return 0
+
+
+def one_arg(cmd: str, name: str, args: list[str]) -> str:
+    if len(args) != 1:
+        raise Refused(f"usage: factory-machine {cmd} {name}")
+    return args[0]
+
+
+def no_args(cmd: str, args: list[str]) -> None:
+    if args:
+        raise Refused(f"usage: factory-machine {cmd}")
+
+
+COMMANDS = {
+    "get": cmd_get,
+    "show": cmd_show,
+    "may-open-browser": cmd_may_open_browser,
+    "artifact-dir": cmd_artifact_dir,
+    "hl-path": cmd_hl_path,
+    "exchange-dir": cmd_exchange_dir,
+    "has": cmd_has,
+    "planes": cmd_planes,
+    "plane": cmd_plane,
+}
+
+
+def main(argv: list[str]) -> int:
+    try:
+        if not argv or argv[0] not in COMMANDS:
+            raise Refused("usage: factory-machine {" + "|".join(COMMANDS) + "} ...")
+        return COMMANDS[argv[0]](argv[1:])
+    except Refused as exc:
+        sys.stderr.write(f"{PROG}: {exc}\n")
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
