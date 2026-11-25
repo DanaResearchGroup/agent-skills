@@ -121,21 +121,40 @@ function expandSkill(command: string): string {
 
 ### The file
 
-Write one HTML file per invocation that supports desktop and mobile; inline its styles, and load nothing but the Mermaid module from a CDN. Save every one in a single folder, `${SHOW_ME_DIR:-$HOME/Dropbox/remote-work/show-me}`, never in the repo or the working directory. Name it `YYYY.MM.DD <letter> <Name>.html`: today's date, the next unused letter for that date and name (`a`, then `b`), and a Title Case name. Once the file is written, always open it in the default browser; this step is not optional:
+Write one HTML file per invocation that supports desktop and mobile; inline its styles, and load
+nothing but the Mermaid module from a CDN. Never save it in the repo or the working directory.
+Name it `YYYY.MM.DD <letter> <Name>.html`: today's date, the next unused letter for that date and
+name (`a`, then `b`), and a Title Case name.
+
+Where it goes, and whether it opens, depends on the machine. `bin/show-me-place` asks the
+`factory-machine` skill and decides:
+
+- **HL** (the hub, with a display): the single show-me folder,
+  `${SHOW_ME_DIR:-$HOME/Dropbox/remote-work/show-me}`. Once the file is written, open it in the
+  default browser; this step is not optional on HL.
+- **A peer** (LMF, OL; no display): `$EXCHANGE_ROOT/to-hl/artifacts/<plane>/show-me/`. No browser
+  call. `new` prints a second line, the path the page will have on HL; give the user both.
+- **A refusal** (exit 2: no `machine.env`, a malformed one, an unknown or `hl-only` plane on a
+  peer, no plane on a peer): stop. Nothing is saved. Show the one line it printed, and do not
+  fall back to another folder or a browser call.
+
+The plane is `SHOW_ME_PLANE` when set, else the `slug` in the nearest `.pm/config.json` above the
+working directory.
 
 ```bash
-DIR="${SHOW_ME_DIR:-$HOME/Dropbox/remote-work/show-me}"; mkdir -p "$DIR"
-D=$(date +%Y.%m.%d); NAME="Session Event Flow"
-F=""   # noclobber creates the name atomically, so two runs never get the same letter
-for L in a b c d e f g h i j k l m n o p q r s t u v w x y z; do
-  ( set -C; : > "$DIR/$D $L $NAME.html" ) 2>/dev/null && { F="$DIR/$D $L $NAME.html"; break; }
+P=""
+for root in "$HOME/.agents/skills" "$HOME/.claude/skills" "$HOME/.codex/skills"; do
+  [ -x "$root/show-me/bin/show-me-place" ] && { P="$root/show-me/bin/show-me-place"; break; }
 done
-[ -n "$F" ] || { echo "26 pages named $NAME today; pick another name" >&2; exit 1; }
-# write the HTML to "$F" here (it exists, empty)
-xdg-open "$F" 2>/dev/null || open "$F"
+[ -n "$P" ] || { echo "show-me-place not found; install the show-me skill" >&2; exit 2; }
+OUT=$("$P" new "Session Event Flow") || exit   # exit 2: show its one line and stop
+F=${OUT%%$'\n'*}   # line 1: the file here (it exists, empty); line 2 on a peer: the path on HL
+# write the HTML to "$F" here
+"$P" open "$F"     # opens it on HL only; on a peer it prints the HL path instead
 ```
 
-Then print the file's full absolute path. If the open command fails (no display, or a sandbox refusal), say so in one line so the user knows to open the path by hand.
+Then print the file's full absolute path, and on a peer the HL path too. If the open fails on HL
+(a sandbox refusal), say so in one line so the user knows to open the path by hand.
 
 ### guidance
 
