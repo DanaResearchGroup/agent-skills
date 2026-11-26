@@ -98,8 +98,8 @@ printf '%s\n' "$hf" > "$tmp" && mv "$tmp" "${AUTODEV_HOME:-$HOME/agents}/handoff
 # This is the one that matters. --handoff records the PER-SESSION reload pointer
 # (.latest.<sid>) naming the file you just wrote, which is the only thing the
 # watcher and the SessionStart hook will read back after compaction. Pass it
-# ALWAYS: without it the helper can only copy the shared .latest, which another
-# session may already have clobbered.
+# ALWAYS: without it the helper refuses (no marker) unless .latest.<sid> already
+# names an existing handoff. It never copies the shared .latest.
 #
 # It also files the compact-request that makes the watcher run /compact + reload
 # even below the 35% threshold. No-op when autodev is not installed; defers on

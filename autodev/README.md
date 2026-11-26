@@ -229,8 +229,8 @@ reload. The reactive `THRESHOLD` gate never fires below 35%, and a plain `handof
 make the watcher write a *second, redundant* handoff — so neither fits.
 
 ```bash
-bash ~/.agents/skills/autodev/bin/request-handoff.sh --compact-only            # raise
-bash ~/.agents/skills/autodev/bin/request-handoff.sh --compact-only --cancel   # withdraw
+bash ~/.agents/skills/autodev/bin/request-handoff.sh --compact-only --handoff "$hf"   # raise
+bash ~/.agents/skills/autodev/bin/request-handoff.sh --compact-only --cancel          # withdraw
 ```
 
 This drops `~/agents/state/<sid>.compact-request`. The watcher honors it as a **compact-only**
@@ -258,12 +258,16 @@ in the directory"). A missing pointer **fails closed** — the session is told t
 its own transcript. Resuming nothing is recoverable; silently resuming another session's mission
 while the pane still reads healthy is not.
 
-Always pass `--handoff`. Without it the helper can only *copy* the shared `.latest`, which is a
-race, not a safeguard: another session can clobber it between the handoff being written and the
-copy, permanently caching their mission as ours. That legacy path is kept only for older handoff
-skills and logs a `WARN`. In the threshold path the watcher accepts the shared `.latest` solely
-when the file it names was written during the handoff turn the watcher itself just drove
-(mtime proof) — the one moment it is provably ours.
+Always pass `--handoff`. Without it, `--compact-only` files a marker only when `.latest.<sid>`
+already names an existing handoff, so a re-run after an earlier `--handoff` still works. Otherwise
+it **refuses**: exit 2, one stderr line telling you to pass `--handoff <absolute path>`, and no
+marker, on the mid-cycle path too. It **never copies** the shared `.latest`: that file names
+whichever session handed off last, and copying it once pointed a seat at another seat's handoff. The
+pointed-to file's name need not hold the sid (handoff files are named
+`<YYYY.MM.DD HH.MM.SS> handoff-<topic>.md`); `.latest.<sid>` is written only by an explicit
+`--handoff` for that sid, and that is the proof. In the threshold path the watcher accepts the
+shared `.latest` solely when the file it names was written during the handoff turn the watcher
+itself just drove (mtime proof) — the one moment it is provably ours.
 
 Resolution of "this session" is `explicit arg` → the host session environment
 (`$CLAUDE_CODE_SESSION_ID`, `$CODEX_SESSION_ID`, or `$CODEX_THREAD_ID`) → the reverse pane-owner
