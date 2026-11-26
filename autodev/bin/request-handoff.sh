@@ -220,6 +220,13 @@ elif [ "$COMPACT_ONLY" = 1 ]; then
   # (not a symlink, which could lead back to the shared one) whose first line is
   # an absolute path to an existing regular file. Anything else refuses, here,
   # before the deferral, so no path files a marker the reload cannot honour.
+  #
+  # There is deliberately NO check that the target's file NAME holds the sid.
+  # The handoff skill names files "<YYYY.MM.DD HH.MM.SS> handoff-<topic>.md",
+  # with no sid (on 2026-11-26, 25 of 1466 files in handoffs/ held one), so such
+  # a check would refuse every normal pointer. The proof of ownership is where
+  # the pointer came from: .latest.<sid> is written only by an explicit
+  # --handoff for that sid (above), never from the shared .latest.
   ptr=""
   if [ -f "$per" ] && ! [ -L "$per" ]; then ptr=$(head -n1 "$per" 2>/dev/null); fi
   case "$ptr" in
