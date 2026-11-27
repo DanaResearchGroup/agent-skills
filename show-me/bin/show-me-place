@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+# show-me-place: where a show-me page goes on this machine, and whether to open it.
+#
+#   show-me-place new NAME   create "<dir>/YYYY.MM.DD <letter> NAME.html", empty, and print
+#                            its path; on a peer, print a second line: the path on HL
+#   show-me-place open FILE  open FILE in the browser only where factory-machine allows it
+#
+# Which machine this is, the folder, and the HL path all come from factory-machine
+# (../../factory-machine/bin/factory-machine). It reads the owner's machine.env and planes
+# files; this script never reads the host name and never falls back to a default folder.
+#
+# The plane is SHOW_ME_PLANE when set, else the "slug" in the nearest .pm/config.json above
+# the working directory. On HL, with no plane, the neutral plane "factory" is used if the
+# planes file lists it (the HL folder does not depend on the plane). On a peer, no plane stops.
+#
+# Exit codes: 0 ok; 1 the page was not made or opened (26 letters used, the opener failed);
+# 2 refused: factory-machine refused (its one line is shown), or no plane, or a bad argument.
+set -uo pipefail
+
+PROG=show-me-place
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+FM="$HERE/../../factory-machine/bin/factory-machine"
+HUB=HL
+NEUTRAL_PLANE=factory
+
+refuse() { printf '%s: %s\n' "$PROG" "$1" >&2; exit 2; }
+
+[ -x "$FM" ] || refuse "factory-machine not found at $FM; install the factory-machine skill"
+
+# machine -- print MACHINE; on a refusal the helper's line is already on stderr.
+machine() { "$FM" get MACHINE; }
+
+# config_slug FILE -- print the slug in a .pm/config.json, or refuse naming the file.
+config_slug() {
+  local slug
+  slug=$(python3 - "$1" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        slug = json.load(fh).get("slug")
+except (OSError, ValueError, AttributeError):
+    sys.exit(1)
+if not isinstance(slug, str) or not slug:
+    sys.exit(1)
+print(slug)
+PY
+  ) || refuse "$1: no \"slug\" string (set SHOW_ME_PLANE to choose a plane)"
+  printf '%s\n' "$slug"
+}
+
+# plane MACHINE -- print the plane slug, or refuse.
+plane() {
+  if [ -n "${SHOW_ME_PLANE:-}" ]; then printf '%s\n' "$SHOW_ME_PLANE"; return; fi
+  local d=$PWD
+  while :; do
+    if [ -f "$d/.pm/config.json" ]; then config_slug "$d/.pm/config.json"; return; fi
+    [ "$d" = / ] && break
+    d=$(dirname "$d")
+  done
+  if [ "$1" != "$HUB" ]; then
+    refuse "no plane: set SHOW_ME_PLANE or run inside a plane (no .pm/config.json above $PWD)"
+  fi
+  local why
+  why=$("$FM" plane "$NEUTRAL_PLANE" 2>&1 >/dev/null) \
+    || refuse "no plane (set SHOW_ME_PLANE), and the default $NEUTRAL_PLANE is refused: $why"
+  printf '%s\n' "$NEUTRAL_PLANE"
+}
+
+cmd_new() {
+  [ $# -eq 1 ] || refuse "usage: $PROG new NAME"
+  local name=$1
+  case "$name" in
+    ''|*/*|*$'\n'*|.|..) refuse "name '$name' is not one file name" ;;
+  esac
+  local m p dir hl_dir=""
+  m=$(machine) || exit 2
+  p=$(plane "$m") || exit 2
+  if [ "$m" = "$HUB" ]; then
+    dir=$("$FM" artifact-dir "$p") || exit 2
+  else
+    dir=$("$FM" artifact-dir "$p" show-me) || exit 2
+    # Map the folder before making anything, so a refusal leaves nothing behind.
+    hl_dir=$("$FM" hl-path "$dir") || exit 2
+  fi
+  mkdir -p "$dir" || refuse "cannot create $dir"
+  local day f="" letter
+  day=$(date +%Y.%m.%d)
+  # noclobber creates the name atomically, so two runs never get the same letter.
+  for letter in a b c d e f g h i j k l m n o p q r s t u v w x y z; do
+    if ( set -C; : > "$dir/$day $letter $name.html" ) 2>/dev/null; then
+      f="$dir/$day $letter $name.html"; break
+    fi
+  done
+  [ -n "$f" ] || { printf '%s: 26 pages named %s today in %s; pick another name\n' \
+    "$PROG" "$name" "$dir" >&2; exit 1; }
+  printf '%s\n' "$f"
+  [ -z "$hl_dir" ] || printf '%s\n' "$hl_dir/${f##*/}"
+}
+
+cmd_open() {
+  [ $# -eq 1 ] || refuse "usage: $PROG open FILE"
+  local f=$1 rc
+  [ -f "$f" ] || refuse "$f is not a file"
+  "$FM" may-open-browser; rc=$?
+  case $rc in
+    0)
+      xdg-open "$f" 2>/dev/null || open "$f" 2>/dev/null || {
+        printf '%s: could not open a browser; open %s by hand\n' "$PROG" "$f" >&2; exit 1; }
+      ;;
+    1)
+      local m hl
+      m=$(machine) || exit 2
+      if [ "$m" = "$HUB" ]; then
+        printf 'not opened: this HL has no display; open %s by hand\n' "$f"
+      else
+        hl=$("$FM" hl-path "$f") || exit 2
+        printf 'not opened: %s opens no browser; on HL the page is %s\n' "$m" "$hl"
+      fi
+      ;;
+    *) exit 2 ;;
+  esac
+}
+
+case "${1:-}" in
+  new) shift; cmd_new "$@" ;;
+  open) shift; cmd_open "$@" ;;
+  *) refuse "usage: $PROG new NAME | open FILE" ;;
+esac
