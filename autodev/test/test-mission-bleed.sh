@@ -65,22 +65,6 @@ assert_contains "hook: own pointer => names our own handoff" "$ctx" "$H2"
 assert_not_contains "hook: own pointer => never names the foreign one" "$ctx" "$H1"
 sandbox_rm
 
-# Hold a live cycle lock for a session, the way the watcher does mid-cycle.
-#
-# request-handoff.sh tests the lock with `kill -0`, so a pid that exits first
-# makes the lock look STALE and the deferral is never exercised. That must not be
-# allowed to pass quietly: the non-deferred path writes the pointer too, so the
-# pointer assertion below — the actual regression guard — would go green against
-# the very ordering it exists to catch. Hence both the generous margin (the pid is
-# killed immediately after, so it costs no runtime) and the explicit liveness
-# check, which turns a dead pid into a loud harness failure instead.
-hold_cycle_lock() { # $1 = sid; sets $lockpid
-  sleep 300 & lockpid=$!
-  /bin/ln -s "/dev/null/autodev-lock-owner/$lockpid" "$STATE/$1.cycle.lock"
-  kill -0 "$lockpid" 2>/dev/null ||
-    _fail "harness: cycle-lock pid died before the test ran" "the deferral was never exercised"
-}
-release_cycle_lock() { kill "$lockpid" 2>/dev/null; wait "$lockpid" 2>/dev/null; }
 
 echo "== request-handoff.sh =="
 
@@ -111,17 +95,16 @@ assert_no_file "request-handoff: mid-cycle files no compact-request" "$STATE/$S2
 assert_contains "request-handoff: mid-cycle says why nothing was filed" "$out" "already mid-cycle"
 sandbox_rm
 
-# Deferring with no --handoff cannot record anything authoritative. The racy
-# shared-.latest copy must NOT be promoted up here: a fresh pointer makes the
-# watcher skip its bridge, so a mid-cycle copy would replace the bridge's mtime
-# proof with something weaker. Warn the caller instead.
+# Deferring with no --handoff cannot record anything authoritative, and the
+# shared .latest must never be copied: it names whoever handed off last. With no
+# pointer of our own the helper refuses (test-pointer-refuse.sh pins the rest).
 setup
 hold_cycle_lock "$S2"
 printf '%s\n' "$H1" > "$AUTODEV_HOME/handoffs/.latest"
 out=$(bash "$BIN/request-handoff.sh" "$S2" --compact-only 2>&1)
 release_cycle_lock
 assert_no_file "request-handoff: mid-cycle never copies the shared .latest" "$AUTODEV_HOME/handoffs/.latest.$S2"
-assert_contains "request-handoff: mid-cycle without --handoff warns" "$out" "no reload pointer"
+assert_contains "request-handoff: mid-cycle without --handoff refuses and names the fix" "$out" "pass --handoff <absolute path>"
 sandbox_rm
 
 echo "== auto-handoff-watch.sh reload =="

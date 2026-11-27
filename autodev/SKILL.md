@@ -300,7 +300,9 @@ subagent. This is opt-in — the default remains the reactive `ctx-over.sh` beat
 **Already wrote a handoff below threshold?** (You invoked the `handoff` skill
 did.) Do **nothing** — the `handoff` skill files a `compact-request`, and the watcher runs a
 **compact-only** cycle: it skips a second handoff and goes straight to `/compact` → reload, even
-below the line. File it by hand only if needed — `request-handoff.sh --compact-only` (`--cancel` withdraws).
+below the line. File it by hand only if needed — `request-handoff.sh --compact-only --handoff
+<absolute path>` (`--cancel` withdraws). Without `--handoff` it refuses unless this session's own
+`.latest.<sid>` already names an existing handoff; it never copies the shared `.latest`.
 
 ## Step 3 — Context / compaction (resumable by design)
 

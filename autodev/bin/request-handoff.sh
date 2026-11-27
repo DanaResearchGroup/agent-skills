@@ -25,7 +25,10 @@
 #                    since that is the common case and the pointer is what makes
 #                    the in-flight cycle reload OUR handoff.
 #     --handoff <p>  absolute path of the handoff just written; recorded as the
-#                    per-session reload pointer .latest.<sid>. Always pass it.
+#                    per-session reload pointer .latest.<sid>. Always pass it:
+#                    without it --compact-only refuses unless .latest.<sid>
+#                    already names an existing file. The shared .latest is
+#                    never copied.
 #     --cancel       remove a pending request for the current session (pairs with
 #                    --compact-only to cancel a compact-request)
 #     --reason <t>   label for the log line: "REQUEST raised (<t>)" in place of
@@ -40,7 +43,8 @@
 #                    (order-independent with flags; mainly for testing/scripts)
 #
 # Exit status: 0 on success (marker written/removed, or already absent on cancel),
-# 2 on a usage error (bad flag / unresolvable or unsafe sid).
+# 2 on a usage error (bad flag / unresolvable or unsafe sid / --compact-only with
+# no --handoff and no valid .latest.<sid>; no marker is filed then).
 
 set -u
 
@@ -63,8 +67,9 @@ usage(){ echo "usage: $(basename "$0") [sid] [--cancel] [--compact-only] [--hand
 # (skip handoff, go straight to /compact -> reload). It also records the
 # per-session reload pointer .latest.<sid>.
 # --handoff <path> names the handoff this session just wrote. ALWAYS pass it:
-# without it we can only copy the shared, machine-wide .latest, which any of the
-# concurrent sessions on this box may already have clobbered.
+# without it --compact-only refuses unless this session's own .latest.<sid>
+# already names an existing handoff. It never falls back to the shared,
+# machine-wide .latest, which names whichever session handed off last.
 CANCEL=0
 COMPACT_ONLY=0
 SID_ARG=""
@@ -192,14 +197,10 @@ fi
 # cross-mission bleed this pointer exists to prevent, re-entering through the
 # back door.
 #
-# Only the AUTHORITATIVE form moves up. --handoff names the file the caller just
-# wrote, so nothing shared is consulted. The legacy shared-.latest copy stays
-# below the deferral on purpose: mid-cycle it would overwrite the pointer with an
-# unvalidated guess and, because a fresh pointer makes the watcher skip its
-# bridge entirely, would REPLACE the bridge's mtime proof with something weaker.
-pointer=0
+# --handoff names the file the caller just wrote, so nothing shared is consulted.
+# Without it, see the refusal below: the shared .latest is never copied.
+per="$AUTODEV_HOME/handoffs/.latest.$sid"
 if [ "$COMPACT_ONLY" = 1 ] && [ -n "$HANDOFF" ]; then
-  per="$AUTODEV_HOME/handoffs/.latest.$sid"
   case "$HANDOFF" in
     /*) ;;
     *) echo "--handoff must be an absolute path: '$HANDOFF'" >&2; exit 2 ;;
@@ -210,7 +211,33 @@ if [ "$COMPACT_ONLY" = 1 ] && [ -n "$HANDOFF" ]; then
   printf '%s\n' "$HANDOFF" > "$ptmp" 2>/dev/null && mv -f "$ptmp" "$per" 2>/dev/null ||
     { rm -f "$ptmp" 2>/dev/null; echo "failed to write $per" >&2; exit 2; }
   log "pointer .latest.$sid -> $HANDOFF (explicit)"
-  pointer=1
+elif [ "$COMPACT_ONLY" = 1 ]; then
+  # --- no --handoff: file only on a pointer this session already owns. ---
+  # The shared .latest names whichever seat handed off last. Copying it here
+  # (the old fallback) once set a seat's pointer to another seat's handoff, and
+  # the reload would have resumed the wrong mission. So without --handoff the
+  # marker is filed only when .latest.<sid> already exists as a regular file
+  # (not a symlink, which could lead back to the shared one) whose first line is
+  # an absolute path to an existing regular file. Anything else refuses, here,
+  # before the deferral, so no path files a marker the reload cannot honour.
+  #
+  # There is deliberately NO check that the target's file NAME holds the sid.
+  # The handoff skill names files "<YYYY.MM.DD HH.MM.SS> handoff-<topic>.md",
+  # with no sid (on 2026-11-26, 25 of 1466 files in handoffs/ held one), so such
+  # a check would refuse every normal pointer. The proof of ownership is where
+  # the pointer came from: .latest.<sid> is written only by an explicit
+  # --handoff for that sid (above), never from the shared .latest.
+  ptr=""
+  if [ -f "$per" ] && ! [ -L "$per" ]; then ptr=$(head -n1 "$per" 2>/dev/null); fi
+  case "$ptr" in
+    /*) [ -f "$ptr" ] || ptr="" ;;
+    *) ptr="" ;;
+  esac
+  if [ -z "$ptr" ]; then
+    log "COMPACT-REQUEST refused — no --handoff and no valid .latest.$sid"
+    echo "refusing --compact-only for $sid: no --handoff, and .latest.$sid does not name an existing handoff; pass --handoff <absolute path> of the handoff this session wrote (no marker filed)" >&2
+    exit 2
+  fi
 fi
 
 # --- compact-only: defer when a watcher cycle is already in progress. ---
@@ -218,7 +245,7 @@ fi
 # the /handoff -> /compact -> reload itself. Filing a compact-request here would
 # survive that cycle and fire a SECOND, spurious /compact on the reloaded session.
 # So detect the live lock and defer — the watcher will compact on its own. The
-# pointer above is already recorded, so that in-flight cycle reloads OUR handoff.
+# pointer above is already recorded or verified, so that cycle reloads OUR handoff.
 # Best-effort only: from a sandboxed session the watcher's pid is in another PID
 # namespace, `kill -0` fails, and the marker is filed anyway. The watcher drops
 # such a marker once its own compaction lands; that, not this check, is what
@@ -231,12 +258,7 @@ if [ "$COMPACT_ONLY" = 1 ]; then
     if [ -n "$lpid" ] && kill -0 "$lpid" 2>/dev/null; then
       log "COMPACT-REQUEST deferred — watcher cycle in progress (pid $lpid)"
       echo "auto-handoff watcher is already mid-cycle for $sid — it will compact; no marker filed"
-      if [ "$pointer" = 1 ]; then
-        echo "(reload pointer .latest.$sid recorded, so that cycle reloads THIS session's handoff)"
-      else
-        echo "WARNING: no --handoff given, so no reload pointer was recorded — that cycle may" >&2
-        echo "reload nothing. Re-run with --compact-only --handoff <path> to record it." >&2
-      fi
+      echo "(reload pointer .latest.$sid names this session's handoff, so that cycle reloads it)"
       exit 0
     fi
   fi
@@ -284,23 +306,6 @@ if [ "$IF_ABSENT" = 1 ]; then
 else
   : > "$tmp" 2>/dev/null && mv -f "$tmp" "$req" 2>/dev/null || {
     rm -f "$tmp" 2>/dev/null; echo "failed to write $req" >&2; exit 2; }
-fi
-
-# The authoritative pointer was already recorded above, before the deferral. All
-# that is left is the legacy fallback for an older handoff skill that does not
-# pass --handoff: copy the shared .latest. That copy is inherently racy — another
-# session can clobber .latest between the handoff being written and this copy,
-# caching THEIR mission as ours permanently and invisibly — so it stays here,
-# below the deferral, and says plainly in the log that it was used.
-if [ "$COMPACT_ONLY" = 1 ] && [ -z "$HANDOFF" ]; then
-  per="$AUTODEV_HOME/handoffs/.latest.$sid"
-  gl="$AUTODEV_HOME/handoffs/.latest"
-  if [ -s "$gl" ]; then
-    mkdir -p "$AUTODEV_HOME/handoffs" 2>/dev/null
-    ptmp="$per.tmp.$$"
-    cp -f "$gl" "$ptmp" 2>/dev/null && mv -f "$ptmp" "$per" 2>/dev/null || rm -f "$ptmp" 2>/dev/null
-    log "WARN legacy copy .latest -> .latest.$sid (racy; caller should pass --handoff)"
-  fi
 fi
 
 log "REQUEST raised (${REASON:-voluntary $kind}${warn:+; ${warn%; }})"

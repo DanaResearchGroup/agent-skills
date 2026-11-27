@@ -61,6 +61,23 @@ handoff_pointer() { # $1 = sid
   printf '%s\n' "$hf" > "$AUTODEV_HOME/handoffs/.latest.$1"
 }
 
+# Hold a live cycle lock for a session, the way the watcher does mid-cycle.
+#
+# request-handoff.sh tests the lock with `kill -0`, so a pid that exits first
+# makes the lock look STALE and the deferral is never exercised. That must not be
+# allowed to pass quietly: the non-deferred path writes the pointer too, so a
+# mid-cycle pointer assertion (test-mission-bleed.sh, test-pointer-refuse.sh)
+# would go green against the very ordering it exists to catch. Hence both the generous margin (the pid is
+# killed immediately after, so it costs no runtime) and the explicit liveness
+# check, which turns a dead pid into a loud harness failure instead.
+hold_cycle_lock() { # $1 = sid; sets $lockpid
+  sleep 300 & lockpid=$!
+  /bin/ln -s "/dev/null/autodev-lock-owner/$lockpid" "$STATE/$1.cycle.lock"
+  kill -0 "$lockpid" 2>/dev/null ||
+    _fail "harness: cycle-lock pid died before the test ran" "the deferral was never exercised"
+}
+release_cycle_lock() { kill "$lockpid" 2>/dev/null; wait "$lockpid" 2>/dev/null; }
+
 # Give a session a tab with a starting label. The label lives in a file the mux
 # stub reads and writes, so a test can inspect it, rename it behind the watcher's
 # back, or delete it to model the tab being closed.
